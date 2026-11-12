@@ -12,6 +12,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::results::{Measurement, Results, Suite};
 
+pub const COLD_START_NS: &str = "fleetd_cold_start_ns";
+pub const IDLE_RSS_BYTES: &str = "fleetd_idle_rss_bytes";
+pub const FLOOD_WALL_NS: &str = "flood50_wall_ns";
+pub const FLOOD_CPU_NS_PER_MIB: &str = "flood50_cpu_ns_per_mib";
+pub const FLOOD_PEAK_RSS_BYTES: &str = "flood50_peak_rss_bytes";
+/// Every metric the wall suite emits.
+pub const METRIC_NAMES: &[&str] = &[
+    COLD_START_NS,
+    IDLE_RSS_BYTES,
+    FLOOD_WALL_NS,
+    FLOOD_CPU_NS_PER_MIB,
+    FLOOD_PEAK_RSS_BYTES,
+];
+
 const FLOOD_AGENTS: usize = 50;
 const FLOOD_BYTES: u64 = 8 * 1024 * 1024;
 const QUICK_FLOOD_BYTES: u64 = 256 * 1024;
@@ -273,15 +287,15 @@ pub fn run(quick: bool) -> Result<Results, String> {
         unit: unit.to_string(),
     };
     let metrics = BTreeMap::from([
-        ("fleetd_cold_start_ns".to_string(), m(cold, "ns")),
-        ("fleetd_idle_rss_bytes".to_string(), m(rss, "bytes")),
-        ("flood50_wall_ns".to_string(), m(pick(|f| f.wall_ns), "ns")),
+        (COLD_START_NS.to_string(), m(cold, "ns")),
+        (IDLE_RSS_BYTES.to_string(), m(rss, "bytes")),
+        (FLOOD_WALL_NS.to_string(), m(pick(|f| f.wall_ns), "ns")),
         (
-            "flood50_cpu_ns_per_mib".to_string(),
+            FLOOD_CPU_NS_PER_MIB.to_string(),
             m(pick(|f| f.cpu_ns_per_mib), "ns"),
         ),
         (
-            "flood50_peak_rss_bytes".to_string(),
+            FLOOD_PEAK_RSS_BYTES.to_string(),
             m(pick(|f| f.peak_rss_bytes), "bytes"),
         ),
     ]);

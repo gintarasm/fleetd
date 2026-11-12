@@ -244,3 +244,43 @@ fn absent_at_merge_base_means_nothing_loosened() {
     commit(&d, "add baselines");
     assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
 }
+
+#[test]
+fn adding_per_metric_tolerance_needs_approval() {
+    let d = repo(&toml(100, 0.05, ""));
+    write(
+        d.path(),
+        "bench/baselines.toml",
+        &toml(100, 0.05, "tolerance = 0.10\n"),
+    );
+    commit(&d, "per-metric tolerance");
+    let o = run(&d);
+    let ApprovalOutcome::Rejected(msg) = o else {
+        panic!("{o:?}")
+    };
+    assert!(msg.contains("loosened: a"), "{msg}");
+}
+
+#[test]
+fn raising_per_metric_tolerance_needs_approval() {
+    let d = repo(&toml(100, 0.05, "tolerance = 0.10\n"));
+    write(
+        d.path(),
+        "bench/baselines.toml",
+        &toml(100, 0.05, "tolerance = 0.20\n"),
+    );
+    commit(&d, "raise per-metric tolerance");
+    assert!(is_rejected(&run(&d)));
+}
+
+#[test]
+fn tightening_per_metric_tolerance_not_needed() {
+    let d = repo(&toml(100, 0.05, ""));
+    write(
+        d.path(),
+        "bench/baselines.toml",
+        &toml(100, 0.05, "tolerance = 0.03\n"),
+    );
+    commit(&d, "tighter per-metric tolerance");
+    assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
+}

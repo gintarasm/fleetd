@@ -9,6 +9,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 use crate::results::{Results, Suite};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Tolerance {
     pub instr: f64,
     pub wall: f64,
@@ -24,18 +25,32 @@ impl Tolerance {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Gate {
     pub approvers: Vec<String>,
     pub tolerance: Tolerance,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricSpec {
     pub suite: Suite,
     pub unit: String,
     #[serde(default)]
     pub budget: Option<f64>,
     pub baseline: f64,
+    /// Per-metric override of the gate's suite tolerance. Setting or
+    /// raising it is a loosening that needs user approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<f64>,
+}
+
+impl Gate {
+    /// Tolerance that applies to `spec`: its own override, else its suite's.
+    pub fn tolerance_for(&self, spec: &MetricSpec) -> f64 {
+        spec.tolerance
+            .unwrap_or_else(|| self.tolerance.for_suite(spec.suite))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +81,9 @@ impl Baselines {
             }
             if m.budget.is_some_and(|b| !ok(b)) {
                 return Err(format!("metrics.{name}.budget must be finite and >= 0"));
+            }
+            if m.tolerance.is_some_and(|t| !ok(t)) {
+                return Err(format!("metrics.{name}.tolerance must be finite and >= 0"));
             }
         }
         Ok(())
@@ -157,10 +175,10 @@ fn delta_pct(baseline: f64, value: f64) -> f64 {
 }
 
 pub fn compare(b: &Baselines, r: &Results) -> Report {
-    let tol = b.gate.tolerance.for_suite(r.suite);
     let mut rows = Vec::new();
 
     for (name, spec) in b.metrics.iter().filter(|(_, s)| s.suite == r.suite) {
+        let tol = b.gate.tolerance_for(spec);
         let Some(m) = r.metrics.get(name) else {
             rows.push(Row {
                 name: name.clone(),
@@ -299,6 +317,7 @@ pub fn baseline_add(b: &mut Baselines, r: &Results) -> Vec<String> {
                     unit: m.unit.clone(),
                     budget: None,
                     baseline: m.value,
+                    tolerance: None,
                 },
             );
             added.push(name.clone());
@@ -347,6 +366,9 @@ pub fn write_into(text: &str, b: &Baselines) -> Result<String, toml_edit::TomlEr
                 t.insert("unit", toml_edit::value(spec.unit.as_str()));
                 if let Some(budget) = spec.budget {
                     t.insert("budget", Item::Value(number(budget)));
+                }
+                if let Some(tol) = spec.tolerance {
+                    t.insert("tolerance", Item::Value(Value::from(tol)));
                 }
                 t.insert("baseline", Item::Value(number(spec.baseline)));
                 metrics.insert(name, Item::Table(t));
@@ -434,6 +456,54 @@ baseline = 100
             let t = TOML.replace(from, to);
             assert!(Baselines::parse(&t).is_err(), "{to} accepted");
         }
+    }
+
+    #[test]
+    fn per_metric_tolerance_overrides_suite_tolerance() {
+        let t = TOML.replace("budget = 1000", "budget = 1000\ntolerance = 0.10");
+        let b = Baselines::parse(&t).unwrap();
+        assert_eq!(b.metrics["m_wall"].tolerance, Some(0.10));
+        let r = res(Suite::Wall, &[("m_wall", 109.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Ok, false));
+        let r = res(Suite::Wall, &[("m_wall", 110.5)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Regressed, true));
+        // Without the override the suite's 5% applies.
+        let r = res(Suite::Wall, &[("m_wall", 109.0)]);
+        assert_eq!(status(&base(), &r, "m_wall"), (Status::Regressed, true));
+    }
+
+    #[test]
+    fn parse_rejects_bad_per_metric_tolerance() {
+        for v in ["nan", "inf", "-0.01"] {
+            let t = TOML.replace("budget = 1000", &format!("budget = 1000\ntolerance = {v}"));
+            assert!(Baselines::parse(&t).is_err(), "tolerance = {v} accepted");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fields() {
+        for (from, to) in [
+            ("budget = 1000", "budget = 1000\ntolerence = 0.1"),
+            ("approvers = [", "approver = [\"x\"]\napprovers = ["),
+            ("wall = 0.05 }", "wall = 0.05, wal = 0.5 }"),
+        ] {
+            assert!(TOML.contains(from), "{from}");
+            assert!(Baselines::parse(&TOML.replace(from, to)).is_err(), "{to}");
+        }
+    }
+
+    #[test]
+    fn shipped_baselines_cover_exactly_the_emitted_metrics() {
+        let text = include_str!("../../../bench/baselines.toml");
+        let b = Baselines::parse(text).unwrap();
+        let shipped: std::collections::BTreeSet<&str> =
+            b.metrics.keys().map(String::as_str).collect();
+        let emitted: std::collections::BTreeSet<&str> = crate::wall::METRIC_NAMES
+            .iter()
+            .chain(crate::instr::METRIC_NAMES)
+            .copied()
+            .collect();
+        assert_eq!(shipped, emitted);
     }
 
     #[test]

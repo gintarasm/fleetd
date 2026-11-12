@@ -6,8 +6,11 @@ use std::process::{Command, Stdio};
 
 use crate::results::{Measurement, Results, Suite};
 
+pub const STARTUP_INSTRUCTIONS: &str = "fleetd_startup_instructions";
 /// Bench function name -> metric name.
-const METRICS: &[(&str, &str)] = &[("fleetd_startup", "fleetd_startup_instructions")];
+const METRICS: &[(&str, &str)] = &[("fleetd_startup", STARTUP_INSTRUCTIONS)];
+/// Every metric the instr suite emits.
+pub const METRIC_NAMES: &[&str] = &[STARTUP_INSTRUCTIONS];
 
 /// Parse `--output-format=json` output (one summary object per line) into results.
 pub fn parse_summaries(stdout: &str) -> Result<Results, String> {
