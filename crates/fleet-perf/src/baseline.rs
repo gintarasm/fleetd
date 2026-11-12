@@ -81,6 +81,8 @@ pub enum Status {
     Missing,
     Unknown,
     Unrecorded,
+    Invalid,
+    UnitMismatch,
 }
 
 impl Status {
@@ -97,6 +99,8 @@ impl Status {
             Status::Missing => "MISSING",
             Status::Unknown => "UNKNOWN",
             Status::Unrecorded => "UNRECORDED",
+            Status::Invalid => "INVALID",
+            Status::UnitMismatch => "UNIT MISMATCH",
         }
     }
 
@@ -115,6 +119,11 @@ impl Status {
             }
             Status::Unknown => Some("metric has no baseline entry: run `fleet-perf baseline-add`"),
             Status::Unrecorded => Some("baseline not yet recorded: run `fleet-perf tighten`"),
+            Status::Invalid => {
+                Some("measurement produced an invalid value (non-finite or <= 0): fix the suite")
+            }
+            // Per-row: the row's `detail` names both units.
+            Status::UnitMismatch => None,
         }
     }
 }
@@ -127,6 +136,9 @@ pub struct Row {
     pub value: f64,
     pub delta_pct: f64,
     pub status: Status,
+    /// Row-specific explanation printed under the table (e.g. both units of
+    /// a unit mismatch).
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,11 +167,21 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
                 value: f64::NAN,
                 delta_pct: 0.0,
                 status: Status::Missing,
+                detail: None,
             });
             continue;
         };
         let value = m.value;
-        let status = if spec.budget.is_some_and(|budget| value > budget) {
+        let mut detail = None;
+        let status = if !value.is_finite() || value <= 0.0 {
+            Status::Invalid
+        } else if m.unit != spec.unit {
+            detail = Some(format!(
+                "{name}: results unit `{}` differs from baseline unit `{}`",
+                m.unit, spec.unit
+            ));
+            Status::UnitMismatch
+        } else if spec.budget.is_some_and(|budget| value > budget) {
             Status::OverBudget
         } else if spec.baseline == 0.0 {
             Status::Unrecorded
@@ -176,6 +198,7 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
             value,
             delta_pct: delta_pct(spec.baseline, value),
             status,
+            detail,
         });
     }
 
@@ -188,6 +211,7 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
                 value: m.value,
                 delta_pct: 0.0,
                 status: Status::Unknown,
+                detail: None,
             });
         }
     }
@@ -235,6 +259,11 @@ impl fmt::Display for Report {
             {
                 seen.push(r.status.label());
                 writeln!(f, "\n{}: {h}", r.status.label())?;
+            }
+        }
+        for r in &self.rows {
+            if let Some(d) = &r.detail {
+                writeln!(f, "\n{}: {d}", r.status.label())?;
             }
         }
         writeln!(f, "\n{}", if self.failed { "FAIL" } else { "PASS" })
@@ -359,6 +388,10 @@ baseline = 100
     }
 
     fn res(suite: Suite, items: &[(&str, f64)]) -> Results {
+        let unit = match suite {
+            Suite::Wall => "ns",
+            Suite::Instr => "instructions",
+        };
         Results {
             suite,
             metrics: items
@@ -368,7 +401,7 @@ baseline = 100
                         n.to_string(),
                         Measurement {
                             value: *v,
-                            unit: "ns".into(),
+                            unit: unit.into(),
                         },
                     )
                 })
@@ -452,6 +485,29 @@ baseline = 100
         b.metrics.get_mut("m_wall").unwrap().baseline = 0.0;
         let r = res(Suite::Wall, &[("m_wall", 100.0)]);
         assert_eq!(status(&b, &r, "m_wall"), (Status::Unrecorded, true));
+    }
+
+    #[test]
+    fn invalid_value_fails() {
+        for v in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let r = res(Suite::Wall, &[("m_wall", v)]);
+            assert_eq!(
+                status(&base(), &r, "m_wall"),
+                (Status::Invalid, true),
+                "{v}"
+            );
+        }
+        let s = compare(&base(), &res(Suite::Wall, &[("m_wall", 0.0)])).to_string();
+        assert!(s.contains("measurement produced an invalid value"), "{s}");
+    }
+
+    #[test]
+    fn unit_mismatch_fails() {
+        let mut r = res(Suite::Wall, &[("m_wall", 100.0)]);
+        r.metrics.get_mut("m_wall").unwrap().unit = "ms".into();
+        assert_eq!(status(&base(), &r, "m_wall"), (Status::UnitMismatch, true));
+        let s = compare(&base(), &r).to_string();
+        assert!(s.contains("`ms`") && s.contains("`ns`"), "{s}");
     }
 
     #[test]

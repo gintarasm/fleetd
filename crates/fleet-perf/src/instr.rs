@@ -28,6 +28,11 @@ pub fn parse_summaries(stdout: &str) -> Result<Results, String> {
             .find(|p| p["tool"] == "Callgrind")
             .and_then(|p| p["data"]["total"]["metrics"]["Ir"]["values"]["new"].as_f64())
             .ok_or_else(|| format!("no Callgrind Ir in summary for {func}"))?;
+        if ir <= 0.0 {
+            return Err(format!(
+                "Callgrind Ir for {func} is {ir}: nothing was measured"
+            ));
+        }
         found.insert((*metric).to_string(), ir);
     }
     for (_, metric) in METRICS {
@@ -81,6 +86,12 @@ mod tests {
         assert_eq!(r.suite, Suite::Instr);
         let m = &r.metrics["fleetd_startup_instructions"];
         assert_eq!((m.value, m.unit.as_str()), (7243.0, "instructions"));
+    }
+
+    #[test]
+    fn zero_ir_is_an_error() {
+        let zero = LINE.replace("7243", "0");
+        assert!(parse_summaries(&zero).is_err());
     }
 
     #[test]
