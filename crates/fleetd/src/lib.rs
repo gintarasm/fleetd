@@ -13,6 +13,17 @@ use tokio::signal::unix::{SignalKind, signal};
 /// Longest socket path macOS accepts: `sun_path` is 104 bytes including the NUL.
 const MAX_SOCKET_PATH_BYTES: usize = 103;
 
+/// Pause after EMFILE/ENFILE so a full fd table does not spin the accept loop.
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+// errno values are identical on macOS and Linux.
+const ENFILE: i32 = 23;
+const EMFILE: i32 = 24;
+
+fn is_fd_exhaustion(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(ENFILE | EMFILE))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub state_dir: PathBuf,
@@ -126,15 +137,37 @@ impl Daemon {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = int.recv() => break,
-                accepted = listener.accept() => {
+                accepted = listener.accept() => match accepted {
                     // Protocol arrives in M1: drop the stream, closing it.
-                    drop(accepted?);
-                }
+                    Ok(stream) => drop(stream),
+                    // Accept errors never end `serve`; only a signal does.
+                    Err(e) => {
+                        eprintln!("fleetd: accept failed: {e}");
+                        if is_fd_exhaustion(&e) {
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        }
+                    }
+                },
             }
         }
         match fs::remove_file(&self.socket_path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fd_exhaustion_is_detected_and_other_errors_are_not() {
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(EMFILE)));
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(ENFILE)));
+        assert!(!is_fd_exhaustion(&io::Error::from(
+            io::ErrorKind::ConnectionAborted
+        )));
+        assert!(!is_fd_exhaustion(&io::Error::from_raw_os_error(4)));
     }
 }
