@@ -17,6 +17,7 @@ const FLOOD_BYTES: u64 = 8 * 1024 * 1024;
 const QUICK_FLOOD_BYTES: u64 = 256 * 1024;
 const MIB: f64 = 1024.0 * 1024.0;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const TIGHT_POLL: Duration = Duration::from_millis(50);
 
 /// A spawned child that is killed and reaped on drop.
 struct Reaped(Child);
@@ -53,9 +54,11 @@ fn spawn_fleetd(fleetd: &Path, state_dir: &Path) -> Result<Reaped, String> {
         .map_err(|e| format!("spawning {}: {e}", fleetd.display()))
 }
 
-/// Poll every millisecond until the daemon socket accepts a connection.
+/// Poll until the daemon socket accepts a connection: tight (yielding) for the
+/// first 50 ms so cold start is not quantised by sleeps, then every millisecond.
 fn wait_ready(daemon: &mut Reaped, sock: &Path) -> Result<(), String> {
-    let deadline = Instant::now() + READY_TIMEOUT;
+    let begin = Instant::now();
+    let deadline = begin + READY_TIMEOUT;
     loop {
         if UnixStream::connect(sock).is_ok() {
             return Ok(());
@@ -66,7 +69,11 @@ fn wait_ready(daemon: &mut Reaped, sock: &Path) -> Result<(), String> {
         if Instant::now() >= deadline {
             return Err("fleetd not ready within 10s".into());
         }
-        std::thread::sleep(Duration::from_millis(1));
+        if begin.elapsed() < TIGHT_POLL {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -223,7 +230,12 @@ fn flood(bytes: u64) -> Result<Flood, String> {
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.total_cmp(b));
-    v[v.len() / 2]
+    let mid = v.len() / 2;
+    if v.len().is_multiple_of(2) {
+        (v[mid - 1] + v[mid]) / 2.0
+    } else {
+        v[mid]
+    }
 }
 
 fn repeat(n: usize, mut f: impl FnMut() -> Result<f64, String>) -> Result<f64, String> {
@@ -316,4 +328,19 @@ pub fn flood_host(agents: usize, bytes: u64, fake_agent: &Path) -> Result<HostUs
         }
     }
     Ok(self_usage())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::median;
+
+    #[test]
+    fn median_of_odd_count_is_the_middle_value() {
+        assert_eq!(median(vec![3.0, 1.0, 2.0]), 2.0);
+    }
+
+    #[test]
+    fn median_of_even_count_is_mean_of_the_two_middle_values() {
+        assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]), 2.5);
+    }
 }
