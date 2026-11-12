@@ -2,4 +2,5 @@
 /bench/baselines.toml     @gintarasm
 /docs/perf-log.md         @gintarasm
 /.github/workflows/       @gintarasm
+/crates/fleet-perf/       @gintarasm
 /.github/CODEOWNERS       @gintarasm

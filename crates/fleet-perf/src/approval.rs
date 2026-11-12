@@ -3,6 +3,10 @@
 //!
 //! The approvers list is read from the merge-base, never from HEAD, so a
 //! branch cannot add its own approver.
+//!
+//! Changing the gate's own code (comparator, approval check, suites, CI
+//! workflows) needs the same approval, so the gate cannot be weakened
+//! instead of the baselines. Files created on the branch are exempt.
 
 use std::fmt;
 use std::path::Path;
@@ -13,6 +17,30 @@ use crate::baseline::Baselines;
 const BASELINES_PATH: &str = "bench/baselines.toml";
 const PERF_LOG_PATH: &str = "docs/perf-log.md";
 const DEFAULT_APPROVER: &str = "gintarasm";
+/// Gate code: changing (or deleting) any of these needs approval when it
+/// existed at the merge-base. Entries ending in `/` are directory prefixes.
+const GATE_PATHS: &[&str] = &[
+    "crates/fleet-perf/src/baseline.rs",
+    "crates/fleet-perf/src/approval.rs",
+    "crates/fleet-perf/src/wall.rs",
+    "crates/fleet-perf/src/instr.rs",
+    "crates/fleet-perf/benches/instr.rs",
+    ".github/workflows/",
+];
+
+fn is_gate_path(path: &str) -> bool {
+    GATE_PATHS.iter().any(|g| match g.strip_suffix('/') {
+        Some(dir) => path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/')),
+        None => path == *g,
+    })
+}
+
+fn exists_at(repo: &Path, rev: &str, path: &str) -> Result<bool, Error> {
+    let tree = git_ok(repo, &["ls-tree", "--name-only", rev, "--", path])?;
+    Ok(!tree.trim().is_empty())
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -140,7 +168,15 @@ pub fn check(repo: &Path, base: &str) -> Result<ApprovalOutcome, Error> {
     };
 
     let loose = loosened(&old, &new);
-    if loose.is_empty() {
+    // --no-renames: a rename must show the old (gate) path as deleted.
+    let changed = git_ok(repo, &["diff", "--no-renames", "--name-only", &mb, "HEAD"])?;
+    let mut gate_changed = Vec::new();
+    for path in changed.lines().map(str::trim).filter(|l| is_gate_path(l)) {
+        if exists_at(repo, &mb, path)? {
+            gate_changed.push(path.to_string());
+        }
+    }
+    if loose.is_empty() && gate_changed.is_empty() {
         return Ok(ApprovalOutcome::NotNeeded);
     }
 
@@ -157,7 +193,6 @@ pub fn check(repo: &Path, base: &str) -> Result<ApprovalOutcome, Error> {
         .lines()
         .map(str::trim)
         .any(|v| old.gate.approvers.iter().any(|a| a == v));
-    let changed = git_ok(repo, &["diff", "--name-only", &mb, "HEAD"])?;
     let logged = changed.lines().any(|l| l.trim() == PERF_LOG_PATH);
 
     let mut problems = Vec::new();
@@ -173,9 +208,16 @@ pub fn check(repo: &Path, base: &str) -> Result<ApprovalOutcome, Error> {
     if problems.is_empty() {
         return Ok(ApprovalOutcome::Approved);
     }
+    let mut what = Vec::new();
+    if !loose.is_empty() {
+        what.push(format!("loosened: {}", loose.join(", ")));
+    }
+    if !gate_changed.is_empty() {
+        what.push(format!("changed gate files: {}", gate_changed.join(", ")));
+    }
     Ok(ApprovalOutcome::Rejected(format!(
-        "loosened perf gate needs user approval; loosened: {}; {}",
-        loose.join(", "),
+        "loosened perf gate needs user approval; {}; {}",
+        what.join("; "),
         problems.join("; ")
     )))
 }

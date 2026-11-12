@@ -312,3 +312,85 @@ fn disabling_report_only_not_needed() {
     commit(&d, "gate it again");
     assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
 }
+
+/// Repo whose `main` also holds the gate code files.
+fn repo_with_gate_code() -> TempDir {
+    let d = repo(&toml(100, 0.05, ""));
+    git(d.path(), &["checkout", "-q", "main"]);
+    write(d.path(), "crates/fleet-perf/src/baseline.rs", "// gate\n");
+    write(d.path(), ".github/workflows/ci.yml", "name: ci\n");
+    commit(&d, "gate code");
+    git(d.path(), &["checkout", "-q", "work"]);
+    git(d.path(), &["merge", "-q", "--ff-only", "main"]);
+    d
+}
+
+#[test]
+fn gate_code_change_without_trailer_rejected() {
+    let d = repo_with_gate_code();
+    write(
+        d.path(),
+        "crates/fleet-perf/src/baseline.rs",
+        "// weakened\n",
+    );
+    write(d.path(), "docs/perf-log.md", "# log\nchanged gate\n");
+    commit(&d, "edit comparator");
+    let o = run(&d);
+    let ApprovalOutcome::Rejected(msg) = o else {
+        panic!("{o:?}")
+    };
+    assert!(msg.contains("crates/fleet-perf/src/baseline.rs"), "{msg}");
+}
+
+#[test]
+fn workflow_change_without_trailer_rejected() {
+    let d = repo_with_gate_code();
+    write(
+        d.path(),
+        ".github/workflows/ci.yml",
+        "name: ci\n# skip perf\n",
+    );
+    commit(&d, "edit ci");
+    let o = run(&d);
+    let ApprovalOutcome::Rejected(msg) = o else {
+        panic!("{o:?}")
+    };
+    assert!(msg.contains(".github/workflows/ci.yml"), "{msg}");
+}
+
+#[test]
+fn gate_code_rename_without_trailer_rejected() {
+    let d = repo_with_gate_code();
+    git(
+        d.path(),
+        &[
+            "mv",
+            "crates/fleet-perf/src/baseline.rs",
+            "crates/fleet-perf/src/other.rs",
+        ],
+    );
+    commit(&d, "move comparator away");
+    assert!(is_rejected(&run(&d)));
+}
+
+#[test]
+fn gate_code_change_with_trailer_and_log_approved() {
+    let d = repo_with_gate_code();
+    write(
+        d.path(),
+        "crates/fleet-perf/src/baseline.rs",
+        "// changed\n",
+    );
+    write(d.path(), "docs/perf-log.md", "# log\nchanged gate\n");
+    commit(&d, "edit comparator\n\nPerf-Approved: gintarasm");
+    assert_eq!(run(&d), ApprovalOutcome::Approved);
+}
+
+#[test]
+fn gate_code_created_not_needed() {
+    let d = repo(&toml(100, 0.05, ""));
+    write(d.path(), "crates/fleet-perf/src/approval.rs", "// new\n");
+    write(d.path(), ".github/workflows/ci.yml", "name: ci\n");
+    commit(&d, "create gate code");
+    assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
+}
