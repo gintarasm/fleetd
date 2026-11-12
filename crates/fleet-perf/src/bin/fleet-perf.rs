@@ -30,7 +30,7 @@ enum Cmd {
         #[arg(long)]
         results: PathBuf,
     },
-    /// Lower baselines (or record unrecorded ones) from results. Never raises.
+    /// Record unrecorded baselines and lock in improvements beyond tolerance. Never raises.
     Tighten {
         #[arg(long, default_value = "bench/baselines.toml")]
         baselines: PathBuf,

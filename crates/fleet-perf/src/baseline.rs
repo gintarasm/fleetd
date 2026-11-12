@@ -106,7 +106,8 @@ impl Status {
 
     fn hint(self) -> Option<&'static str> {
         match self {
-            Status::Ok | Status::Improved => None,
+            Status::Ok => None,
+            Status::Improved => Some("run `fleet-perf tighten` to lock in the improvement"),
             Status::Regressed => Some(
                 "regressed beyond tolerance: fix the regression, or ask the user to approve it \
                  (Perf-Approved trailer, updated baseline, docs/perf-log.md entry)",
@@ -270,15 +271,17 @@ impl fmt::Display for Report {
     }
 }
 
-/// Lower baselines only: sets baseline where it is unrecorded (0) or `value` is lower.
-/// Only metrics of the results' suite are touched.
+/// Lower baselines only: records unrecorded (0) baselines and locks in
+/// improvements beyond tolerance (`Status::Improved`). Never raises, and
+/// leaves within-tolerance noise alone so baselines do not ratchet down on
+/// lucky runs. Only metrics of the results' suite are touched.
 pub fn tighten(b: &mut Baselines, r: &Results) {
-    for (name, m) in &r.metrics {
-        if let Some(spec) = b.metrics.get_mut(name)
-            && spec.suite == r.suite
-            && (spec.baseline == 0.0 || m.value < spec.baseline)
+    let report = compare(b, r);
+    for row in report.rows {
+        if matches!(row.status, Status::Improved | Status::Unrecorded)
+            && let Some(spec) = b.metrics.get_mut(&row.name)
         {
-            spec.baseline = m.value;
+            spec.baseline = row.value;
         }
     }
 }
@@ -523,8 +526,36 @@ baseline = 100
         let mut b = base();
         tighten(&mut b, &res(Suite::Wall, &[("m_wall", 120.0)]));
         assert_eq!(b.metrics["m_wall"].baseline, 100.0);
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", 104.0)]));
+        assert_eq!(b.metrics["m_wall"].baseline, 100.0);
         tighten(&mut b, &res(Suite::Wall, &[("m_wall", 90.0)]));
         assert_eq!(b.metrics["m_wall"].baseline, 90.0);
+    }
+
+    #[test]
+    fn tighten_ignores_within_tolerance_improvement() {
+        let mut b = base();
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", 96.0)]));
+        assert_eq!(b.metrics["m_wall"].baseline, 100.0);
+        tighten(&mut b, &res(Suite::Instr, &[("m_instr", 98.5)]));
+        assert_eq!(b.metrics["m_instr"].baseline, 100.0);
+    }
+
+    #[test]
+    fn tighten_skips_invalid_values() {
+        let mut b = base();
+        b.metrics.get_mut("m_wall").unwrap().baseline = 0.0;
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", f64::NAN)]));
+        assert_eq!(b.metrics["m_wall"].baseline, 0.0);
+    }
+
+    #[test]
+    fn improved_hint_suggests_tighten() {
+        let s = compare(&base(), &res(Suite::Wall, &[("m_wall", 90.0)])).to_string();
+        assert!(
+            s.contains("run `fleet-perf tighten` to lock in the improvement"),
+            "{s}"
+        );
     }
 
     #[test]
