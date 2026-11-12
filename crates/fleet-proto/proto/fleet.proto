@@ -1,0 +1,74 @@
+syntax = "proto3";
+package fleet.v1;
+
+message Hello { uint32 protocol_version = 1; string client = 2; }
+message HelloOk { uint32 protocol_version = 1; string server = 2; }
+message HandshakeReject { string reason = 1; }
+
+message Request {
+  uint64 id = 1;
+  oneof kind {
+    SpawnAgent spawn = 2;
+    ListAgents list = 3;
+    Attach attach = 4;
+    Detach detach = 5;
+    SendInput input = 6;
+    Resize resize = 7;
+    KillAgent kill = 8;
+  }
+}
+
+message Response {
+  uint64 id = 1;
+  oneof kind {
+    AgentInfo spawned = 2;
+    AgentList agents = 3;
+    AttachOk attached = 4;
+    Ack ack = 5;
+    Error error = 6;
+  }
+}
+
+message Event {
+  oneof kind { AgentExited exited = 1; }
+}
+
+message SpawnAgent {
+  string program = 1;
+  repeated string args = 2;
+  string cwd = 3;
+  map<string, string> env = 4;
+  uint32 cols = 5;
+  uint32 rows = 6;
+}
+
+message ListAgents {}
+
+message AgentList { repeated AgentInfo agents = 1; }
+
+enum AgentState {
+  AGENT_STATE_UNSPECIFIED = 0;
+  RUNNING = 1;
+  EXITED = 2;
+  LOST = 3;
+}
+
+message AgentInfo {
+  uint64 id = 1;
+  string program = 2;
+  repeated string args = 3;
+  string cwd = 4;
+  AgentState state = 5;
+  optional int32 exit_code = 6;
+  int64 created_unix_ms = 7;
+}
+
+message Attach { uint64 agent_id = 1; }
+message AttachOk { uint64 agent_id = 1; bytes snapshot = 2; uint32 cols = 3; uint32 rows = 4; }
+message SendInput { uint64 agent_id = 1; bytes data = 2; }
+message Resize { uint64 agent_id = 1; uint32 cols = 2; uint32 rows = 3; }
+message KillAgent { uint64 agent_id = 1; }
+message Detach { uint64 agent_id = 1; }
+message AgentExited { uint64 agent_id = 1; int32 exit_code = 2; }
+message Error { string message = 1; }
+message Ack {}
