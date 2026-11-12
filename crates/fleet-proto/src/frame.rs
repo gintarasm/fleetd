@@ -263,20 +263,100 @@ mod tests {
 
     #[test]
     fn partial_frames_buffer() {
-        let mut wire = BytesMut::new();
-        let frame = Frame::Request(Request {
-            id: 1,
-            kind: Some(request::Kind::Attach(Attach { agent_id: 2 })),
-        });
-        FrameCodec.encode(frame.clone(), &mut wire).unwrap();
-        let mut buf = BytesMut::new();
-        let mut out = Vec::new();
-        for b in wire.iter() {
-            buf.put_u8(*b);
-            if let Some(f) = FrameCodec.decode(&mut buf).unwrap() {
-                out.push(f);
+        for frame in [
+            Frame::Request(Request {
+                id: 1,
+                kind: Some(request::Kind::Attach(Attach { agent_id: 2 })),
+            }),
+            Frame::Output {
+                agent_id: 5,
+                data: Bytes::from_static(b"xyz"),
+            },
+        ] {
+            let mut wire = BytesMut::new();
+            FrameCodec.encode(frame.clone(), &mut wire).unwrap();
+            let mut buf = BytesMut::new();
+            let last = wire.len() - 1;
+            for (i, b) in wire.iter().enumerate() {
+                buf.put_u8(*b);
+                let got = FrameCodec.decode(&mut buf).unwrap();
+                if i < last {
+                    assert!(got.is_none(), "frame yielded early at byte {i}");
+                } else {
+                    assert_eq!(got, Some(frame.clone()));
+                }
             }
+            assert!(buf.is_empty());
         }
-        assert_eq!(out, vec![frame]);
+    }
+
+    #[test]
+    fn garbage_protobuf_is_decode_error() {
+        let mut buf = BytesMut::new();
+        buf.put_u32(4);
+        buf.put_u8(KIND_REQUEST);
+        buf.put_slice(&[0xff, 0xff, 0xff]);
+        assert!(matches!(
+            FrameCodec.decode(&mut buf),
+            Err(FrameError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn zero_length_frame_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u32(0);
+        assert!(matches!(
+            FrameCodec.decode(&mut buf),
+            Err(FrameError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn short_output_payload_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u32(1 + 7);
+        buf.put_u8(KIND_OUTPUT);
+        buf.put_slice(&[0; 7]);
+        assert!(matches!(
+            FrameCodec.decode(&mut buf),
+            Err(FrameError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_output_encode_rejected() {
+        let data = Bytes::from(vec![0u8; MAX_FRAME]);
+        let mut buf = BytesMut::new();
+        let res = FrameCodec.encode(Frame::Output { agent_id: 1, data }, &mut buf);
+        assert!(matches!(res, Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 9));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn back_to_back_frames_decode_in_order() {
+        let frames = every_frame();
+        let mut buf = BytesMut::new();
+        FrameCodec.encode(frames[0].clone(), &mut buf).unwrap();
+        FrameCodec.encode(frames[6].clone(), &mut buf).unwrap();
+        assert_eq!(
+            FrameCodec.decode(&mut buf).unwrap(),
+            Some(frames[0].clone())
+        );
+        assert!(!buf.is_empty());
+        assert_eq!(
+            FrameCodec.decode(&mut buf).unwrap(),
+            Some(frames[6].clone())
+        );
+        assert!(buf.is_empty());
+        assert_eq!(FrameCodec.decode(&mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn max_frame_length_accepted_by_header_check() {
+        let mut buf = BytesMut::new();
+        buf.put_u32(MAX_FRAME as u32);
+        buf.put_u8(KIND_OUTPUT);
+        assert!(FrameCodec.decode(&mut buf).unwrap().is_none());
     }
 }
