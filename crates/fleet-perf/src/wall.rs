@@ -310,7 +310,6 @@ pub fn run(quick: bool) -> Result<Results, String> {
 /// process's own resource usage.
 pub fn flood_host(agents: usize, bytes: u64, fake_agent: &Path) -> Result<HostUsage, String> {
     let host = PtyHost::new();
-    // Spawn from a single thread: macOS `ptsname` is not reentrant.
     let mut ids: Vec<AgentId> = Vec::with_capacity(agents);
     for i in 0..agents {
         let id = host

@@ -58,3 +58,31 @@ fn nonzero_exit_is_reported() {
     host.wait_all(Duration::from_secs(5)).unwrap();
     assert_eq!(host.stats(id).unwrap().exit_code, Some(3));
 }
+
+#[test]
+fn spawns_from_many_threads_at_once() {
+    // macOS `ptsname` is not reentrant: concurrent opens must be serialised
+    // inside PtyHost, so callers can spawn from any thread.
+    let host = PtyHost::new();
+    let ids: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                s.spawn(|| {
+                    (0..8)
+                        .map(|_| host.spawn(sh("printf 0123456789")).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    host.wait_all(Duration::from_secs(60)).unwrap();
+    for id in ids {
+        let s = host.stats(id).unwrap();
+        assert_eq!(s.exit_code, Some(0));
+        assert_eq!(s.bytes_read, 10);
+    }
+}

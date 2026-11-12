@@ -63,12 +63,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Serialises `openpty` process-wide: macOS `ptsname` (used inside it) is not
+/// reentrant, so `PtyHost::spawn` is safe to call from any thread.
+static OPEN_PTY: Mutex<()> = Mutex::new(());
+
 /// Open a PTY, retrying briefly: macOS occasionally reports ENXIO under
 /// concurrent opens while PTY devices are being recycled.
 fn open_pty(size: PtySize) -> std::io::Result<portable_pty::PtyPair> {
     let mut attempt = 0;
     loop {
-        match native_pty_system().openpty(size) {
+        let opened = {
+            let _guard = lock(&OPEN_PTY);
+            native_pty_system().openpty(size)
+        };
+        match opened {
             Ok(pair) => return Ok(pair),
             Err(e) if attempt >= 5 => return Err(std::io::Error::other(e)),
             Err(_) => {
