@@ -238,11 +238,16 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-fn repeat(n: usize, mut f: impl FnMut() -> Result<f64, String>) -> Result<f64, String> {
-    (0..n)
-        .map(|_| f())
-        .collect::<Result<Vec<_>, _>>()
-        .map(median)
+fn minimum(v: Vec<f64>) -> f64 {
+    v.into_iter().fold(f64::INFINITY, f64::min)
+}
+
+fn repeat(
+    n: usize,
+    stat: fn(Vec<f64>) -> f64,
+    mut f: impl FnMut() -> Result<f64, String>,
+) -> Result<f64, String> {
+    (0..n).map(|_| f()).collect::<Result<Vec<_>, _>>().map(stat)
 }
 
 pub fn run(quick: bool) -> Result<Results, String> {
@@ -253,8 +258,10 @@ pub fn run(quick: bool) -> Result<Results, String> {
         (20, 5, 5, FLOOD_BYTES)
     };
 
-    let cold = repeat(cold_runs, || cold_start_ns(&fleetd))?;
-    let rss = repeat(rss_runs, || idle_rss_bytes(&fleetd))?;
+    // Minimum, not median: process-spawn latency on macOS has a heavy right
+    // tail, and the minimum is the stable statistic for startup latency.
+    let cold = repeat(cold_runs, minimum, || cold_start_ns(&fleetd))?;
+    let rss = repeat(rss_runs, median, || idle_rss_bytes(&fleetd))?;
     let mut floods = Vec::new();
     for _ in 0..flood_runs {
         floods.push(flood(bytes)?);
@@ -332,7 +339,7 @@ pub fn flood_host(agents: usize, bytes: u64, fake_agent: &Path) -> Result<HostUs
 
 #[cfg(test)]
 mod tests {
-    use super::median;
+    use super::{median, minimum};
 
     #[test]
     fn median_of_odd_count_is_the_middle_value() {
@@ -342,5 +349,10 @@ mod tests {
     #[test]
     fn median_of_even_count_is_mean_of_the_two_middle_values() {
         assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]), 2.5);
+    }
+
+    #[test]
+    fn minimum_picks_the_smallest_value() {
+        assert_eq!(minimum(vec![3.0, 1.0, 2.0]), 1.0);
     }
 }

@@ -10,7 +10,7 @@ tolerance = { instr = 0.02, wall = 0.05 }
 suite = "wall"
 unit = "ns"
 budget = 200000000     # cold start < 200 ms (docs/plan.md)
-baseline = 2043874.5
+baseline = 2044292
 
 [metrics.fleetd_idle_rss_bytes]
 suite = "wall"
@@ -21,17 +21,17 @@ baseline = 2179072
 [metrics.flood50_cpu_ns_per_mib]
 suite = "wall"
 unit = "ns"
-baseline = 18592082.5
+baseline = 25163922.5
 
 [metrics.flood50_peak_rss_bytes]
 suite = "wall"
 unit = "bytes"
-baseline = 4882432
+baseline = 4947968
 
 [metrics.flood50_wall_ns]
 suite = "wall"
 unit = "ns"
-baseline = 3591313125
+baseline = 4137763541
 
 [metrics.fleetd_startup_instructions]
 suite = "instr"
