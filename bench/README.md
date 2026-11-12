@@ -22,7 +22,7 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 
 | Metric | Suite | Measures |
 |---|---|---|
-| `fleetd_cold_start_ns` | wall | spawn `fleetd` until its socket accepts a connection (median of 20); budget 200 ms |
+| `fleetd_cold_start_ns` | wall | spawn `fleetd` until its socket accepts a connection (minimum of 20; spawn latency has a heavy right tail); budget 200 ms |
 | `fleetd_idle_rss_bytes` | wall | daemon RSS 1 s after ready (median of 5); budget 50 MB |
 | `flood50_wall_ns` | wall | wall time for 50 fake agents flooding PTYs (median of 5) |
 | `flood50_cpu_ns_per_mib` | wall | CPU time of the PTY host per MiB read |
@@ -37,7 +37,7 @@ Tolerances: `instr` 2%, `wall` 5%.
 - `fleet-perf baseline-add` adds a baseline for a new metric. Agents may run it.
 - Raising a baseline or accepting a regression is user-only: a commit with the trailer `Perf-Approved: gintarasm`, the updated baseline, and a row in `docs/perf-log.md`. `fleet-perf check-approval --base <ref>` enforces this in CI. Agents never write the trailer or the log.
 
-`fleetd_startup_instructions` is recorded from the first CI `instr-results` artifact (x86_64); run `tighten` with it.
+`fleetd_startup_instructions` starts at `baseline = 0`, so the first CI run of `perf-instr` on a branch is EXPECTED to fail as Unrecorded. Record it by downloading the `instr-results` artifact (x86_64) and running `fleet-perf tighten --results <file>`, then commit the updated `bench/baselines.toml` to the same PR. Recording 0 -> value needs no approval.
 
 ## One-time user setup
 
