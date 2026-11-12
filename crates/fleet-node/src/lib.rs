@@ -1,3 +1,4 @@
+pub mod node;
 pub mod pty;
 pub mod scrollback;
 pub mod term;

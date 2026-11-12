@@ -12,10 +12,20 @@
 //!   exposes no accessor, so the client starts with a full-screen region.
 //! - Not carried either: the saved cursor (DECSC), charsets, tab stops, kitty
 //!   keyboard mode stack, hyperlinks and soft-wrap (WRAPLINE) markers.
+//!
+//! Synchronized updates (`?2026h` … `?2026l`) are buffered by the parser; a
+//! frame whose ESU never arrives is applied once its timeout (150 ms) expires,
+//! on the next [`Terminal::feed`] or [`Terminal::flush_expired_sync`].
+//!
+//! Replies to terminal queries (DSR/CPR, DA, …) are collected and returned by
+//! [`Terminal::take_replies`]; the owner decides whether to send them to the
+//! agent.
 
 use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -52,10 +62,26 @@ impl Dimensions for Size {
     }
 }
 
+/// Collects the bytes alacritty wants written back to the PTY.
+#[derive(Clone, Default)]
+struct Replies(Arc<Mutex<Vec<u8>>>);
+
+impl EventListener for Replies {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(text) = event {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(text.as_bytes());
+        }
+    }
+}
+
 /// Headless terminal emulator holding the visible screen of one agent.
 pub struct Terminal {
-    term: Term<VoidListener>,
+    term: Term<Replies>,
     parser: Processor,
+    replies: Replies,
 }
 
 impl Terminal {
@@ -65,15 +91,36 @@ impl Terminal {
             scrolling_history: 0,
             ..Config::default()
         };
+        let replies = Replies::default();
         Self {
-            term: Term::new(config, &Size::new(cols, rows), VoidListener),
+            term: Term::new(config, &Size::new(cols, rows), replies.clone()),
             parser: Processor::new(),
+            replies,
         }
     }
 
     /// Feeds raw PTY output through the VT parser.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.flush_expired_sync();
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Applies a synchronized update whose timeout has expired without an ESU.
+    /// Call before [`Terminal::snapshot`] so a stalled frame is not hidden.
+    pub fn flush_expired_sync(&mut self) {
+        let expired = self
+            .parser
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| deadline <= Instant::now());
+        if expired {
+            self.parser.stop_sync(&mut self.term);
+        }
+    }
+
+    /// Takes the replies to terminal queries produced since the last call.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.replies.0.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Resizes the screen (reflowing the primary screen); zero dimensions are clamped to 1.
@@ -387,6 +434,7 @@ impl<'a> Sgr<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Deterministic xorshift64* PRNG for fixture generation.
     struct Rng(u64);
@@ -706,5 +754,35 @@ mod tests {
         t.resize(30, 5);
         assert_eq!(&t.visible_text()[..3], &["first", "second", "third"]);
         assert_same_screen(&t, &roundtrip(&t));
+    }
+
+    #[test]
+    fn query_replies_are_collected() {
+        let mut t = Terminal::new(20, 5);
+        assert!(t.take_replies().is_empty());
+        t.feed(b"ab\x1b[6n");
+        assert_eq!(t.take_replies(), b"\x1b[1;3R");
+        assert!(t.take_replies().is_empty(), "replies are taken once");
+        t.feed(b"\x1b[c");
+        assert!(t.take_replies().starts_with(b"\x1b[?"), "DA reply");
+    }
+
+    #[test]
+    fn expired_sync_update_is_applied() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[?2026hframe");
+        assert_eq!(t.visible_text()[0], "", "buffered until ESU or timeout");
+        t.flush_expired_sync();
+        assert_eq!(t.visible_text()[0], "", "timeout not reached yet");
+        std::thread::sleep(Duration::from_millis(200));
+        t.flush_expired_sync();
+        assert_eq!(t.visible_text()[0], "frame");
+
+        // An expired update is also applied by the next feed, before new bytes.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[?2026hone ");
+        std::thread::sleep(Duration::from_millis(200));
+        t.feed(b"two");
+        assert_eq!(t.visible_text()[0], "one two");
     }
 }
