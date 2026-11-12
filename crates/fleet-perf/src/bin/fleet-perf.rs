@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use fleet_perf::approval::{ApprovalOutcome, check};
 use fleet_perf::baseline::{Baselines, baseline_add, compare, tighten, write_into};
+use fleet_perf::instr;
 use fleet_perf::results::Results;
 use fleet_perf::wall;
 
@@ -17,6 +18,7 @@ struct Cli {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum SuiteArg {
     Wall,
+    Instr,
 }
 
 #[derive(Subcommand)]
@@ -102,6 +104,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Cmd::Run { suite, out, quick } => {
             let results = match suite {
                 SuiteArg::Wall => wall::run(quick)?,
+                SuiteArg::Instr => match instr::run() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("fleet-perf: {e}");
+                        return Ok(ExitCode::from(1));
+                    }
+                },
             };
             let json = serde_json::to_string_pretty(&results).map_err(|e| e.to_string())?;
             std::fs::write(&out, json).map_err(|e| format!("writing {}: {e}", out.display()))?;

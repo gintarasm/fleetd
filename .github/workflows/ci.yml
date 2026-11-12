@@ -12,3 +12,22 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+  perf-instr:
+    # Pinned: instruction counts depend on arch and libc.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (from rust-toolchain.toml)
+        run: rustup show
+      - name: Install valgrind and the gungraun runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          cargo install gungraun-runner --version 0.20.0 --locked
+      - run: cargo run -p fleet-perf --release --bin fleet-perf -- run --suite instr --out instr.json
+      - run: cargo run -p fleet-perf --release --bin fleet-perf -- compare --baselines bench/baselines.toml --results instr.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: instr-results
+          path: instr.json
