@@ -9,4 +9,4 @@
 - **Baselines:** `bench/baselines.toml`. Improvements tighten baselines.
 - **Regressions:** CI fails. A regression is accepted only with explicit approval **by the user** — a `Perf-Approved: <user>` commit trailer together with the updated baseline and a `docs/perf-log.md` entry with the justification. AI agents must never add the trailer or edit baselines themselves; they stop and ask (see `CLAUDE.md`). This will be automated later.
 
-**Consequences:** Performance cannot drift silently — the failure mode of Orca.
+**Consequences:** Performance cannot drift silently — the failure mode of Orca. Enforcement details: `0017-perf-approval-enforcement.md`.

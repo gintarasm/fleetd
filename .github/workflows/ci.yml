@@ -1,7 +1,8 @@
 name: ci
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -32,3 +33,26 @@ jobs:
         with:
           name: instr-results
           path: instr.json
+  perf-wall:
+    runs-on: [self-hosted, macOS, fleet-perf]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release --workspace
+      - run: target/release/fleet-perf run --suite wall --out wall.json
+      - run: target/release/fleet-perf compare --baselines bench/baselines.toml --results wall.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wall-results
+          path: wall.json
+  perf-approval:
+    # A loosened baseline needs the user's Perf-Approved trailer (docs/decisions/0014).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (from rust-toolchain.toml)
+        run: rustup show
+      - run: cargo run -p fleet-perf --release --bin fleet-perf -- check-approval --base origin/${{ github.base_ref }}
