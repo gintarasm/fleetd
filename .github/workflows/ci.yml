@@ -24,6 +24,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y valgrind
           cargo install gungraun-runner --version 0.20.0 --locked
+      # Local Docker runs (rust:1) need --security-opt seccomp=unconfined for valgrind.
       - run: cargo run -p fleet-perf --release --bin fleet-perf -- run --suite instr --out instr.json
       - run: cargo run -p fleet-perf --release --bin fleet-perf -- compare --baselines bench/baselines.toml --results instr.json
       - uses: actions/upload-artifact@v4

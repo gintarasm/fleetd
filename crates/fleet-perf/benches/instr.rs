@@ -1,5 +1,8 @@
 //! Instruction-count benchmarks (Callgrind via gungraun). Linux + valgrind only;
 //! run through `fleet-perf run --suite instr`.
+//!
+//! Local runs in Docker (`rust:1`) need `--security-opt seccomp=unconfined`,
+//! otherwise valgrind fails.
 
 use std::hint::black_box;
 
@@ -14,12 +17,14 @@ fn state_dir() -> TempDir {
 
 #[library_benchmark]
 #[bench::startup(setup = state_dir)]
-fn fleetd_startup(dir: TempDir) {
+fn fleetd_startup(dir: TempDir) -> TempDir {
     let cfg = Config {
         state_dir: dir.path().to_path_buf(),
     };
     let daemon = fleetd::startup(&cfg).expect("startup");
     drop(black_box(daemon));
+    // Returned so the directory is removed after measurement, not inside it.
+    dir
 }
 
 library_benchmark_group!(name = startup; benchmarks = fleetd_startup);
