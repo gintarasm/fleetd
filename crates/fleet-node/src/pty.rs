@@ -1,10 +1,11 @@
 //! PTY host: spawns agents in pseudo-terminals and drains their output.
 //!
-//! M0 counts and discards output; M1 will feed it into a terminal grid.
+//! Each agent gets a reader thread that counts its output and hands it to an
+//! [`OutputSink`]; input, resize and kill go through [`PtyHost`].
 
-use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -47,9 +48,63 @@ impl std::fmt::Display for WaitTimeout {
 
 impl std::error::Error for WaitTimeout {}
 
+/// Receives an agent's PTY output on its reader thread.
+///
+/// Calls arrive in order on one thread: `on_spawn` once before any output,
+/// `on_output` per read, then `on_exit` once after the output is drained and
+/// the child reaped. Implementations must not block for long: the agent stalls
+/// while its output is not read.
+pub trait OutputSink: Send + 'static {
+    /// Hands the sink a handle to the agent's input (e.g. to answer terminal
+    /// queries). The default ignores it.
+    fn on_spawn(&mut self, _input: AgentInput) {}
+    fn on_output(&mut self, bytes: &[u8]);
+    fn on_exit(&mut self, code: i32);
+}
+
+/// Discards output; `PtyHost::spawn` still counts it in [`AgentStats`].
+struct DiscardSink;
+
+impl OutputSink for DiscardSink {
+    fn on_output(&mut self, _bytes: &[u8]) {}
+    fn on_exit(&mut self, _code: i32) {}
+}
+
+/// Writes to an agent's PTY input; cheap to clone. Fails once the agent has
+/// exited.
+#[derive(Clone)]
+pub struct AgentInput(Arc<Mutex<Option<Box<dyn Write + Send>>>>);
+
+impl AgentInput {
+    pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut writer = lock(&self.0);
+        let writer = writer.as_mut().ok_or_else(exited)?;
+        writer.write_all(bytes)?;
+        writer.flush()
+    }
+
+    fn close(&self) {
+        lock(&self.0).take();
+    }
+}
+
+fn exited() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "agent has exited")
+}
+
+fn unknown() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, "unknown agent")
+}
+
 struct Agent {
-    stats: Mutex<AgentStats>,
+    bytes_read: AtomicU64,
+    exit_code: Mutex<Option<i32>>,
+    /// Child pid; the child is a session (and process group) leader.
+    pid: Option<u32>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// `None` once the agent has exited (closed to release the fd).
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    input: AgentInput,
 }
 
 /// Shared "an agent finished" signal for `wait_all`.
@@ -69,7 +124,7 @@ static OPEN_PTY: Mutex<()> = Mutex::new(());
 
 /// Open a PTY, retrying briefly: macOS occasionally reports ENXIO under
 /// concurrent opens while PTY devices are being recycled.
-fn open_pty(size: PtySize) -> std::io::Result<portable_pty::PtyPair> {
+fn open_pty(size: PtySize) -> io::Result<portable_pty::PtyPair> {
     let mut attempt = 0;
     loop {
         let opened = {
@@ -78,7 +133,7 @@ fn open_pty(size: PtySize) -> std::io::Result<portable_pty::PtyPair> {
         };
         match opened {
             Ok(pair) => return Ok(pair),
-            Err(e) if attempt >= 5 => return Err(std::io::Error::other(e)),
+            Err(e) if attempt >= 5 => return Err(io::Error::other(e)),
             Err(_) => {
                 attempt += 1;
                 std::thread::sleep(Duration::from_millis(20 * attempt));
@@ -99,7 +154,17 @@ impl PtyHost {
         Self::default()
     }
 
-    pub fn spawn(&self, spec: CommandSpec) -> std::io::Result<AgentId> {
+    /// Spawns an agent whose output is counted and discarded.
+    pub fn spawn(&self, spec: CommandSpec) -> io::Result<AgentId> {
+        self.spawn_with_sink(spec, Box::new(DiscardSink))
+    }
+
+    /// Spawns an agent whose output is counted and handed to `sink`.
+    pub fn spawn_with_sink(
+        &self,
+        spec: CommandSpec,
+        mut sink: Box<dyn OutputSink>,
+    ) -> io::Result<AgentId> {
         let pair = open_pty(PtySize {
             rows: spec.rows,
             cols: spec.cols,
@@ -114,25 +179,22 @@ impl PtyHost {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(std::io::Error::other)?;
+        let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
         // Close our copy of the slave so readers see EOF once the child exits.
         drop(pair.slave);
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(std::io::Error::other)?;
+        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+        let writer = pair.master.take_writer().map_err(io::Error::other)?;
 
         let id = AgentId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let agent = Arc::new(Agent {
-            stats: Mutex::new(AgentStats {
-                bytes_read: 0,
-                exit_code: None,
-            }),
+            bytes_read: AtomicU64::new(0),
+            exit_code: Mutex::new(None),
+            pid: child.process_id(),
             killer: Mutex::new(child.clone_killer()),
+            master: Mutex::new(Some(pair.master)),
+            input: AgentInput(Arc::new(Mutex::new(Some(writer)))),
         });
+        sink.on_spawn(agent.input.clone());
         *lock(&self.signal.running) += 1;
         lock(&self.agents).insert(id, Arc::clone(&agent));
 
@@ -140,13 +202,15 @@ impl PtyHost {
         let spawned = std::thread::Builder::new()
             .name(format!("pty-reader-{}", id.0))
             .spawn(move || {
-                let master = pair.master; // keep the PTY open until drained
                 let mut buf = vec![0u8; READ_BUF];
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
-                        Ok(n) => lock(&agent.stats).bytes_read += n as u64,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Ok(n) => {
+                            agent.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                            sink.on_output(&buf[..n]);
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                         Err(_) => break, // EIO on Linux once the slave closes
                     }
                 }
@@ -154,8 +218,10 @@ impl PtyHost {
                     Ok(status) => status.exit_code() as i32,
                     Err(_) => -1,
                 };
-                lock(&agent.stats).exit_code = Some(code);
-                drop(master);
+                *lock(&agent.exit_code) = Some(code);
+                agent.input.close();
+                lock(&agent.master).take();
+                sink.on_exit(code);
                 *lock(&signal.running) -= 1;
                 signal.cv.notify_all();
             });
@@ -167,18 +233,77 @@ impl PtyHost {
         Ok(id)
     }
 
-    pub fn stats(&self, id: AgentId) -> Option<AgentStats> {
-        let agent = lock(&self.agents).get(&id).cloned()?;
-        let stats = *lock(&agent.stats);
-        Some(stats)
+    fn agent(&self, id: AgentId) -> io::Result<Arc<Agent>> {
+        lock(&self.agents).get(&id).cloned().ok_or_else(unknown)
     }
 
-    pub fn kill(&self, id: AgentId) -> std::io::Result<()> {
-        let agent = lock(&self.agents)
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "unknown agent"))?;
-        lock(&agent.killer).kill()
+    pub fn stats(&self, id: AgentId) -> Option<AgentStats> {
+        let agent = lock(&self.agents).get(&id).cloned()?;
+        let exit_code = *lock(&agent.exit_code);
+        Some(AgentStats {
+            bytes_read: agent.bytes_read.load(Ordering::Relaxed),
+            exit_code,
+        })
+    }
+
+    /// Writes `bytes` to the agent's terminal input.
+    pub fn write_input(&self, id: AgentId, bytes: &[u8]) -> io::Result<()> {
+        self.agent(id)?.input.write_all(bytes)
+    }
+
+    /// Resizes the agent's PTY (the child gets SIGWINCH).
+    pub fn resize(&self, id: AgentId, cols: u16, rows: u16) -> io::Result<()> {
+        let agent = self.agent(id)?;
+        let master = lock(&agent.master);
+        let master = master.as_ref().ok_or_else(exited)?;
+        master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io::Error::other)
+    }
+
+    /// Sends SIGTERM to the agent's process group, so children it started
+    /// (which may hold the PTY open) go too. A no-op once the agent has exited.
+    pub fn kill(&self, id: AgentId) -> io::Result<()> {
+        let agent = self.agent(id)?;
+        // Skip finished agents: their pid may have been reused. A narrow window
+        // remains between the reader thread reaping the child and recording
+        // its exit code; holding the lock keeps it from widening while we signal.
+        let exit_code = lock(&agent.exit_code);
+        if exit_code.is_some() {
+            return Ok(());
+        }
+        let Some(pid) = agent.pid else {
+            return lock(&agent.killer).kill();
+        };
+        let pgid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
+        // SAFETY: killpg has no memory-safety preconditions.
+        if unsafe { libc::killpg(pgid, libc::SIGTERM) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(()); // the whole group already exited
+        }
+        Err(err)
+    }
+
+    /// Forgets a finished agent. Fails with `ResourceBusy` while it runs.
+    pub fn remove(&self, id: AgentId) -> io::Result<()> {
+        let mut agents = lock(&self.agents);
+        let agent = agents.get(&id).ok_or_else(unknown)?;
+        if lock(&agent.exit_code).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "agent is still running",
+            ));
+        }
+        agents.remove(&id);
+        Ok(())
     }
 
     /// Block until every spawned agent has exited and been fully drained.
