@@ -31,6 +31,12 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 
 Tolerances: `instr` 2%, `wall` 5%.
 
+`flood50_cpu_ns_per_mib` is `report_only` (see below) until the self-hosted runner is characterised.
+
+### Report-only metrics
+
+A metric with `report_only = true` is still measured, printed (its status is marked `(report-only)`) and tightened, but a regression or budget breach on it does not fail the gate. Missing, unknown, invalid (non-finite or <= 0) and unit-mismatched values still fail: the measurement must exist and be sane. Turning `report_only` on is a loosening and needs user approval; turning it off is free.
+
 ## Baselines
 
 - `fleet-perf tighten --results <file>` lowers baselines that improved and records unrecorded ones (`baseline = 0`). It never raises. Agents may run it.

@@ -58,7 +58,8 @@ pub fn loosened(old: &Baselines, new: &Baselines) -> Vec<String> {
         // Relative to the effective tolerance at the merge-base, so adding an
         // override above the suite tolerance counts as well as raising one.
         let tolerance_loosened = new.gate.tolerance_for(n) > old.gate.tolerance_for(o);
-        if baseline_raised || budget_loosened || tolerance_loosened {
+        let made_report_only = n.report_only && !o.report_only;
+        if baseline_raised || budget_loosened || tolerance_loosened || made_report_only {
             out.push(name.clone());
         }
     }

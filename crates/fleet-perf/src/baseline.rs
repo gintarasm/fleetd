@@ -43,6 +43,10 @@ pub struct MetricSpec {
     /// raising it is a loosening that needs user approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tolerance: Option<f64>,
+    /// Printed and tightened, but a regression or budget breach does not
+    /// fail the gate. Turning it on needs user approval; turning it off is free.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub report_only: bool,
 }
 
 impl Gate {
@@ -158,6 +162,25 @@ pub struct Row {
     /// Row-specific explanation printed under the table (e.g. both units of
     /// a unit mismatch).
     pub detail: Option<String>,
+    pub report_only: bool,
+}
+
+impl Row {
+    /// Whether this row fails the gate. Report-only metrics are exempt from
+    /// regression and budget failures, but must still be measured, sane and
+    /// in the right unit.
+    pub fn fails(&self) -> bool {
+        self.status.is_failure()
+            && !(self.report_only && matches!(self.status, Status::Regressed | Status::OverBudget))
+    }
+
+    fn label(&self) -> String {
+        if self.report_only {
+            format!("{} (report-only)", self.status.label())
+        } else {
+            self.status.label().to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +210,7 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
                 delta_pct: 0.0,
                 status: Status::Missing,
                 detail: None,
+                report_only: spec.report_only,
             });
             continue;
         };
@@ -218,6 +242,7 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
             delta_pct: delta_pct(spec.baseline, value),
             status,
             detail,
+            report_only: spec.report_only,
         });
     }
 
@@ -231,11 +256,12 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
                 delta_pct: 0.0,
                 status: Status::Unknown,
                 detail: None,
+                report_only: false,
             });
         }
     }
 
-    let failed = rows.iter().any(|row| row.status.is_failure());
+    let failed = rows.iter().any(Row::fails);
     Report { rows, failed }
 }
 
@@ -268,12 +294,15 @@ impl fmt::Display for Report {
                 num(r.baseline),
                 num(r.value),
                 r.delta_pct,
-                r.status.label()
+                r.label()
             )?;
         }
         let mut seen = Vec::new();
         for r in &self.rows {
+            // A report-only regression is informational: no "fix it" hint.
+            let exempt = r.status.is_failure() && !r.fails();
             if let Some(h) = r.status.hint()
+                && !exempt
                 && !seen.contains(&r.status.label())
             {
                 seen.push(r.status.label());
@@ -282,7 +311,7 @@ impl fmt::Display for Report {
         }
         for r in &self.rows {
             if let Some(d) = &r.detail {
-                writeln!(f, "\n{}: {d}", r.status.label())?;
+                writeln!(f, "\n{}: {d}", r.label())?;
             }
         }
         writeln!(f, "\n{}", if self.failed { "FAIL" } else { "PASS" })
@@ -318,6 +347,7 @@ pub fn baseline_add(b: &mut Baselines, r: &Results) -> Vec<String> {
                     budget: None,
                     baseline: m.value,
                     tolerance: None,
+                    report_only: false,
                 },
             );
             added.push(name.clone());
@@ -369,6 +399,9 @@ pub fn write_into(text: &str, b: &Baselines) -> Result<String, toml_edit::TomlEr
                 }
                 if let Some(tol) = spec.tolerance {
                     t.insert("tolerance", Item::Value(Value::from(tol)));
+                }
+                if spec.report_only {
+                    t.insert("report_only", toml_edit::value(true));
                 }
                 t.insert("baseline", Item::Value(number(spec.baseline)));
                 metrics.insert(name, Item::Table(t));
@@ -504,6 +537,48 @@ baseline = 100
             .copied()
             .collect();
         assert_eq!(shipped, emitted);
+    }
+
+    fn report_only() -> Baselines {
+        let t = TOML.replace("budget = 1000", "budget = 1000\nreport_only = true");
+        let b = Baselines::parse(&t).unwrap();
+        assert!(b.metrics["m_wall"].report_only);
+        b
+    }
+
+    #[test]
+    fn report_only_regression_and_over_budget_do_not_fail() {
+        let b = report_only();
+        let r = res(Suite::Wall, &[("m_wall", 150.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Regressed, false));
+        let s = compare(&b, &r).to_string();
+        assert!(
+            s.contains("REGRESSED (report-only)") && s.contains("PASS"),
+            "{s}"
+        );
+        let r = res(Suite::Wall, &[("m_wall", 1001.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::OverBudget, false));
+        let r = res(Suite::Wall, &[("m_wall", 90.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Improved, false));
+    }
+
+    #[test]
+    fn report_only_still_fails_when_missing_unknown_invalid_or_mismatched() {
+        let b = report_only();
+        let r = res(Suite::Wall, &[]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Missing, true));
+        let r = res(Suite::Wall, &[("m_wall", 0.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Invalid, true));
+        let mut r = res(Suite::Wall, &[("m_wall", 100.0)]);
+        r.metrics.get_mut("m_wall").unwrap().unit = "ms".into();
+        assert_eq!(status(&b, &r, "m_wall"), (Status::UnitMismatch, true));
+    }
+
+    #[test]
+    fn report_only_is_tightened_like_any_metric() {
+        let mut b = report_only();
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", 90.0)]));
+        assert_eq!(b.metrics["m_wall"].baseline, 90.0);
     }
 
     #[test]

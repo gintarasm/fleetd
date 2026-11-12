@@ -284,3 +284,31 @@ fn tightening_per_metric_tolerance_not_needed() {
     commit(&d, "tighter per-metric tolerance");
     assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
 }
+
+#[test]
+fn enabling_report_only_needs_approval() {
+    let d = repo(&toml(100, 0.05, ""));
+    write(
+        d.path(),
+        "bench/baselines.toml",
+        &toml(100, 0.05, "report_only = true\n"),
+    );
+    commit(&d, "report-only");
+    let o = run(&d);
+    let ApprovalOutcome::Rejected(msg) = o else {
+        panic!("{o:?}")
+    };
+    assert!(msg.contains("loosened: a"), "{msg}");
+}
+
+#[test]
+fn disabling_report_only_not_needed() {
+    let d = repo(&toml(100, 0.05, "report_only = true\n"));
+    write(
+        d.path(),
+        "bench/baselines.toml",
+        &toml(100, 0.05, "report_only = false\n"),
+    );
+    commit(&d, "gate it again");
+    assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
+}
