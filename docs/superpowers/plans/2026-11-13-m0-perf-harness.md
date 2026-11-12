@@ -221,6 +221,7 @@ Other crates from decision 0016 (`fleet-proto`, `fleet-controller`, `fleet-plugi
   - `fleetd_idle_rss_bytes` — start fleetd, wait until ready + 1 s, read RSS (`proc_pidinfo`/`ps -o rss=` on macOS, `/proc/<pid>/statm` on Linux); median of 5.
   - `flood50_wall_ns`, `flood50_cpu_ns_per_mib`, `flood50_peak_rss_bytes` — run `fleet-perf flood-host --agents 50 --bytes 8388608` as a child (it uses `PtyHost` to run 50 `fake-agent --ansi` and `wait_all(120s)`, asserting every agent read exactly 8 MiB and exited 0, else exit 1). From the parent: wall time, child rusage (`wait4`) `ru_utime+ru_stime` divided by total MiB (400), and `ru_maxrss` (bytes on macOS, KiB on Linux — normalise). Median of 5.
   - `--quick` reduces runs to 1 and bytes to 256 KiB (for the smoke test only).
+  - Note: cold start later became minimum-of-20 with tight polling (Task 8 fixes).
 
 - [ ] **Step 1: Write failing test** `wall_suite_quick_emits_all_metrics`: run `fleet-perf run --suite wall --quick --out <tmp>`; parse `Results`; suite is Wall; contains exactly the five wall metric names; every value > 0.
 - [ ] **Step 2:** `cargo test -p fleet-perf --test wall_smoke` → FAIL.

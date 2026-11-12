@@ -39,14 +39,24 @@ A metric with `report_only = true` is still measured, printed (its status is mar
 
 ## Baselines
 
-- `fleet-perf tighten --results <file>` lowers baselines that improved and records unrecorded ones (`baseline = 0`). It never raises. Agents may run it.
+- `fleet-perf tighten --results <file>` records unrecorded baselines (`baseline = 0`) and locks in improvements **beyond tolerance** (status `improved`); within-tolerance noise leaves the baseline alone, so baselines do not ratchet down on lucky runs. It never raises. Agents may run it.
 - `fleet-perf baseline-add` adds a baseline for a new metric. Agents may run it.
 - Raising a baseline or accepting a regression is user-only: a commit with the trailer `Perf-Approved: gintarasm`, the updated baseline, and a row in `docs/perf-log.md`. `fleet-perf check-approval --base <ref>` enforces this in CI. Agents never write the trailer or the log.
+- Per-metric tolerance: a metric may set `tolerance = <fraction>` to override its suite's tolerance. Setting one above the effective tolerance at the merge-base, or raising it, is a loosening and needs the same user approval. No metric sets one today.
+- Gate code: changing or deleting `crates/fleet-perf/src/{baseline,approval,wall,instr}.rs`, `crates/fleet-perf/benches/instr.rs` or anything under `.github/workflows/` (when it existed at the merge-base) needs the same approval — trailer plus `docs/perf-log.md` entry. Newly created files are exempt.
+- `compare` also fails on invalid values (non-finite or <= 0) and on a results unit that differs from the baseline's unit.
 
-`fleetd_startup_instructions` starts at `baseline = 0`, so the first CI run of `perf-instr` on a branch is EXPECTED to fail as Unrecorded. Record it by downloading the `instr-results` artifact (x86_64) and running `fleet-perf tighten --results <file>`, then commit the updated `bench/baselines.toml` to the same PR. Recording 0 -> value needs no approval.
+### Recording baselines
+
+Both suites are recorded from CI, never from a local run:
+
+- **wall:** download the `wall-results` artifact from the self-hosted runner's `perf-wall` job and run `fleet-perf tighten --results <file>` (same procedure as instr). Confirm the numbers by re-running `perf-wall` before committing.
+- **instr:** re-run `perf-instr` at least 3 times and check the spread of `fleetd_startup_instructions` across the `instr-results` artifacts before recording one of them.
+
+`fleetd_startup_instructions` starts at `baseline = 0`, so the first CI run of `perf-instr` on a branch is EXPECTED to fail as Unrecorded. Record it by downloading the `instr-results` artifact (x86_64; after the spread check above) and running `fleet-perf tighten --results <file>`, then commit the updated `bench/baselines.toml` to the same PR. Recording 0 -> value needs no approval.
 
 ## One-time user setup
 
 1. Register this Mac as a self-hosted runner for the repo with labels `self-hosted, macOS, fleet-perf` (Settings > Actions > Runners). Put `~/.cargo/bin` on the runner's `PATH`, and keep the Mac awake (no sleep) while it is the runner.
-2. Branch protection on `main`: require a PR and the status checks `check`, `perf-instr`, `perf-wall`, `perf-approval`. Until the runner exists `perf-wall` stays queued.
-3. Private repos need GitHub Pro for enforced branch rulesets.
+2. Before merging any PR, check that `check`, `perf-instr`, `perf-wall` and `perf-approval` are all green: on the Free plan GitHub refuses branch protection for this private repo, so this manual check is the only gate (`docs/decisions/0017-perf-approval-enforcement.md`). Until the runner exists `perf-wall` stays queued.
+3. With GitHub Pro: branch protection on `main` requiring a PR and those four status checks.
