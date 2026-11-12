@@ -161,3 +161,86 @@ fn self_added_approver_rejected() {
     commit(&d, "raise\n\nPerf-Approved: claude");
     assert!(is_rejected(&run(&d)));
 }
+
+fn rejected_or_err(d: &TempDir) -> bool {
+    match check(d.path(), "main") {
+        Err(_) => true,
+        Ok(o) => is_rejected(&o),
+    }
+}
+
+#[test]
+fn nan_baseline_not_bypass() {
+    let d = repo(&toml(100, 0.05, ""));
+    let t = toml(100, 0.05, "").replace("baseline = 100", "baseline = nan");
+    write(d.path(), "bench/baselines.toml", &t);
+    commit(&d, "nan");
+    assert!(rejected_or_err(&d));
+}
+
+#[test]
+fn nan_tolerance_not_bypass() {
+    let d = repo(&toml(100, 0.05, ""));
+    let t = toml(100, 0.05, "").replace("wall = 0.05", "wall = nan");
+    write(d.path(), "bench/baselines.toml", &t);
+    commit(&d, "nan tol");
+    assert!(rejected_or_err(&d));
+}
+
+#[test]
+fn zeroed_baseline_needs_approval() {
+    let d = repo(&toml(100, 0.05, ""));
+    write(d.path(), "bench/baselines.toml", &toml(0, 0.05, ""));
+    commit(&d, "zero");
+    assert!(is_rejected(&run(&d)));
+}
+
+#[test]
+fn suite_change_needs_approval() {
+    let d = repo(&toml(100, 0.05, ""));
+    let t = toml(100, 0.05, "").replace("suite = \"wall\"", "suite = \"instr\"");
+    write(d.path(), "bench/baselines.toml", &t);
+    commit(&d, "suite");
+    assert!(is_rejected(&run(&d)));
+}
+
+#[test]
+fn unit_change_needs_approval() {
+    let d = repo(&toml(100, 0.05, ""));
+    let t = toml(100, 0.05, "").replace("unit = \"ns\"", "unit = \"ms\"");
+    write(d.path(), "bench/baselines.toml", &t);
+    commit(&d, "unit");
+    assert!(is_rejected(&run(&d)));
+}
+
+#[test]
+fn unresolvable_base_ref_is_error() {
+    let d = repo(&toml(100, 0.05, ""));
+    assert!(check(d.path(), "no-such-ref").is_err());
+}
+
+#[test]
+fn unreadable_merge_base_file_is_error_not_empty() {
+    // Corrupt baselines at the merge-base must not be treated as absent.
+    let d = repo("this is = not [valid");
+    write(d.path(), "bench/baselines.toml", &toml(200, 0.05, ""));
+    commit(&d, "raise");
+    assert!(check(d.path(), "main").is_err());
+}
+
+#[test]
+fn absent_at_merge_base_means_nothing_loosened() {
+    let d = TempDir::new().unwrap();
+    let p = d.path();
+    git(p, &["init", "-b", "main"]);
+    git(p, &["config", "user.name", "Test"]);
+    git(p, &["config", "user.email", "test@example.com"]);
+    git(p, &["config", "commit.gpgsign", "false"]);
+    write(p, "README", "x");
+    git(p, &["add", "."]);
+    git(p, &["commit", "-m", "base"]);
+    git(p, &["checkout", "-b", "work"]);
+    write(p, "bench/baselines.toml", &toml(500, 0.05, ""));
+    commit(&d, "add baselines");
+    assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
+}

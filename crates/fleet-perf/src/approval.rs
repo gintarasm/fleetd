@@ -45,7 +45,11 @@ pub fn loosened(old: &Baselines, new: &Baselines) -> Vec<String> {
             out.push(name.clone());
             continue;
         };
-        let baseline_raised = o.baseline != 0.0 && n.baseline > o.baseline;
+        let baseline_raised = o.baseline != 0.0 && (n.baseline > o.baseline || n.baseline == 0.0);
+        if o.suite != n.suite || o.unit != n.unit {
+            out.push(name.clone());
+            continue;
+        }
         let budget_loosened = match (o.budget, n.budget) {
             (Some(_), None) => true,
             (Some(ob), Some(nb)) => nb > ob,
@@ -91,10 +95,22 @@ fn git_ok(repo: &Path, args: &[&str]) -> Result<String, Error> {
 
 /// Contents of `bench/baselines.toml` at `rev`, or None when absent there.
 fn baselines_at(repo: &Path, rev: &str) -> Result<Option<Baselines>, Error> {
+    let commit = format!("{rev}^{{commit}}");
+    git_ok(repo, &["rev-parse", "--verify", "--quiet", &commit])?;
     let spec = format!("{rev}:{BASELINES_PATH}");
+    // Only a genuinely absent path maps to None; any other failure is an error.
+    if !git(repo, &["cat-file", "-e", &spec])?.status.success() {
+        let tree = git_ok(repo, &["ls-tree", "--name-only", rev, BASELINES_PATH])?;
+        if tree.trim().is_empty() {
+            return Ok(None);
+        }
+    }
     let out = git(repo, &["show", &spec])?;
     if !out.status.success() {
-        return Ok(None);
+        return Err(Error::Git(format!(
+            "git show {spec} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     Baselines::parse(&text)

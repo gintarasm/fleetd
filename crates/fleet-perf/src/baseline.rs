@@ -45,8 +45,30 @@ pub struct Baselines {
 }
 
 impl Baselines {
+    /// Parses and validates: baselines, budgets and tolerances must be finite
+    /// and non-negative (NaN would make every comparison silently pass).
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(text)
+        let b: Self = toml::from_str(text)?;
+        b.validate()
+            .map_err(<toml::de::Error as serde::de::Error>::custom)?;
+        Ok(b)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let ok = |v: f64| v.is_finite() && v >= 0.0;
+        let t = self.gate.tolerance;
+        if !ok(t.instr) || !ok(t.wall) {
+            return Err("gate.tolerance values must be finite and >= 0".into());
+        }
+        for (name, m) in &self.metrics {
+            if !ok(m.baseline) {
+                return Err(format!("metrics.{name}.baseline must be finite and >= 0"));
+            }
+            if m.budget.is_some_and(|b| !ok(b)) {
+                return Err(format!("metrics.{name}.budget must be finite and >= 0"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -358,6 +380,24 @@ baseline = 100
         let rep = compare(b, r);
         let row = rep.rows.iter().find(|x| x.name == name).unwrap();
         (row.status, rep.failed)
+    }
+
+    #[test]
+    fn parse_rejects_nan_inf_negative() {
+        for (from, to) in [
+            ("baseline = 100   #", "baseline = nan   #"),
+            ("baseline = 100   #", "baseline = inf   #"),
+            ("baseline = 100   #", "baseline = -1   #"),
+            ("budget = 1000", "budget = nan"),
+            ("budget = 1000", "budget = -5"),
+            ("wall = 0.05", "wall = nan"),
+            ("instr = 0.02", "instr = inf"),
+            ("instr = 0.02", "instr = -0.02"),
+        ] {
+            assert!(TOML.contains(from), "{from}");
+            let t = TOML.replace(from, to);
+            assert!(Baselines::parse(&t).is_err(), "{to} accepted");
+        }
     }
 
     #[test]
