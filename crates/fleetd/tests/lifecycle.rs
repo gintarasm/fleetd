@@ -1,6 +1,6 @@
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use fleetd::{Config, StartupError, startup};
@@ -45,6 +45,22 @@ impl Drop for Reaper {
     }
 }
 
+/// Wait for `child` to exit; kill it and fail the test after 10 s.
+fn wait_exit(child: &mut Child) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("process {} did not exit within 10s", child.id());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn becomes_ready() {
     let dir = TempDir::new().unwrap();
@@ -57,8 +73,8 @@ fn second_instance_exits_2_and_keeps_socket() {
     let dir = TempDir::new().unwrap();
     let _first = Reaper(spawn(dir.path()));
     wait_ready(dir.path());
-    let mut second = spawn(dir.path());
-    let status = second.wait().unwrap();
+    let mut second = Reaper(spawn(dir.path()));
+    let status = wait_exit(&mut second.0);
     assert_eq!(status.code(), Some(2));
     assert!(UnixStream::connect(dir.path().join("fleetd.sock")).is_ok());
 }
@@ -87,10 +103,14 @@ fn overlong_socket_path_errors() {
 #[test]
 fn lock_released_on_exit() {
     let dir = TempDir::new().unwrap();
-    let mut first = spawn(dir.path());
+    let mut first = Reaper(spawn(dir.path()));
     wait_ready(dir.path());
-    sigterm(&first);
-    first.wait().unwrap();
+    sigterm(&first.0);
+    let status = wait_exit(&mut first.0);
+    assert!(
+        status.success(),
+        "fleetd exited with {status} after SIGTERM"
+    );
     assert!(!dir.path().join("fleetd.sock").exists());
     let _second = Reaper(spawn(dir.path()));
     wait_ready(dir.path());
