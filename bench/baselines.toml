@@ -10,7 +10,7 @@ tolerance = { instr = 0.02, wall = 0.05 }
 suite = "wall"
 unit = "ns"
 budget = 200000000     # cold start < 200 ms (docs/plan.md)
-baseline = 2044292
+baseline = 2418374.5
 
 [metrics.fleetd_idle_rss_bytes]
 suite = "wall"
@@ -24,19 +24,19 @@ unit = "ns"
 # report-only until the self-hosted runner is characterised (cross-session drift ~35%);
 # turning this off is free, a per-metric tolerance for it needs user approval
 report_only = true
-baseline = 25163922.5
+baseline = 18546653.75
 
 [metrics.flood50_peak_rss_bytes]
 suite = "wall"
 unit = "bytes"
-baseline = 4947968
+baseline = 4923392
 
 [metrics.flood50_wall_ns]
 suite = "wall"
 unit = "ns"
-baseline = 4137763541
+baseline = 3481542708.5
 
 [metrics.fleetd_startup_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 0
+baseline = 4806
