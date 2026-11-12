@@ -1,6 +1,17 @@
 //! Headless VT grid per agent (decision 0005): PTY output is fed through a
 //! [`Terminal`]; on (re)attach a client receives [`Terminal::snapshot`] and
 //! then the live stream, so reattach cost is O(screen).
+//!
+//! The snapshot carries the visible grid, the active SGR pen, the cursor and
+//! the terminal modes a client needs to keep interacting (alt screen, input,
+//! mouse, cursor visibility, wrap, origin, insert, LNM). Known limits:
+//! - While an alt-screen app runs, the primary screen's content is not carried
+//!   (alacritty keeps the inactive grid private); on `?1049l` the client shows a
+//!   blank primary screen until the app redraws.
+//! - The scroll region (DECSTBM) is not carried: alacritty keeps it private and
+//!   exposes no accessor, so the client starts with a full-screen region.
+//! - Not carried either: the saved cursor (DECSC), charsets, tab stops, kitty
+//!   keyboard mode stack, hyperlinks and soft-wrap (WRAPLINE) markers.
 
 use std::io::Write;
 
@@ -8,7 +19,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 
 /// Grid size handed to alacritty. Scrollback is disabled: history lives in the
@@ -79,13 +90,19 @@ impl Terminal {
     /// ANSI byte sequence that redraws the visible screen into a fresh terminal of
     /// the same size: text, SGR attributes, the active pen and the cursor position.
     ///
-    /// Starts with `\x1b[0m\x1b[H\x1b[2J` and ends with `\x1b[{row};{col}H`
+    /// Starts with `\x1b[0m\x1b[H\x1b[2J` (preceded by `\x1b[?1049h` when the alt
+    /// screen is active), then the grid, the pen, the non-default modes, and ends
+    /// with `\x1b[{row};{col}H`
     /// (1-based), except when the cursor has a pending autowrap: then the glyph
     /// under the cursor is re-emitted after the CUP to recreate that state.
     pub fn snapshot(&self) -> Vec<u8> {
         let grid = self.term.grid();
         let (cols, rows) = (grid.columns(), grid.screen_lines());
-        let mut out = Vec::with_capacity(rows * (cols + 8) + 64);
+        let mode = *self.term.mode();
+        let mut out = Vec::with_capacity(rows * (cols + 8) + 128);
+        if mode.contains(TermMode::ALT_SCREEN) {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
         out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
         let mut pen = Pen::default();
         for row in 0..rows {
@@ -109,6 +126,7 @@ impl Terminal {
         let cursor = &grid.cursor;
         let (row, col) = (cursor.point.line.0 as usize, cursor.point.column.0);
         pen.transition(&mut out, Pen::of(&cursor.template));
+        put_modes(&mut out, mode);
         cup(&mut out, row, col);
         if cursor.input_needs_wrap {
             let line = &grid[cursor.point.line];
@@ -160,6 +178,12 @@ impl Terminal {
     fn cell_attrs(&self, row: u16, col: u16) -> Pen {
         Pen::of(&self.term.grid()[Line(i32::from(row))][Column(usize::from(col))])
     }
+
+    /// Terminal modes, for roundtrip comparisons in tests.
+    #[cfg(test)]
+    fn mode(&self) -> TermMode {
+        *self.term.mode()
+    }
 }
 
 fn to_u16(n: usize) -> u16 {
@@ -188,6 +212,39 @@ fn is_blank(cell: &Cell) -> bool {
     glyph(cell) == ' '
         && cell.zerowidth().is_none_or(<[char]>::is_empty)
         && Pen::of(cell) == Pen::default()
+}
+
+/// Modes restored by the snapshot: `(mode, set sequence, reset sequence)`. A
+/// sequence is emitted when the mode differs from a fresh terminal's default.
+/// ALT_SCREEN is handled separately (it must precede drawing). Origin mode homes
+/// the cursor, so these go before the final CUP.
+const MODES: [(TermMode, &[u8], &[u8]); 15] = [
+    (TermMode::SHOW_CURSOR, b"\x1b[?25h", b"\x1b[?25l"),
+    (TermMode::APP_CURSOR, b"\x1b[?1h", b"\x1b[?1l"),
+    (TermMode::APP_KEYPAD, b"\x1b=", b"\x1b>"),
+    (TermMode::MOUSE_REPORT_CLICK, b"\x1b[?1000h", b"\x1b[?1000l"),
+    (TermMode::MOUSE_DRAG, b"\x1b[?1002h", b"\x1b[?1002l"),
+    (TermMode::MOUSE_MOTION, b"\x1b[?1003h", b"\x1b[?1003l"),
+    (TermMode::FOCUS_IN_OUT, b"\x1b[?1004h", b"\x1b[?1004l"),
+    (TermMode::UTF8_MOUSE, b"\x1b[?1005h", b"\x1b[?1005l"),
+    (TermMode::SGR_MOUSE, b"\x1b[?1006h", b"\x1b[?1006l"),
+    (TermMode::ALTERNATE_SCROLL, b"\x1b[?1007h", b"\x1b[?1007l"),
+    (TermMode::BRACKETED_PASTE, b"\x1b[?2004h", b"\x1b[?2004l"),
+    (TermMode::LINE_WRAP, b"\x1b[?7h", b"\x1b[?7l"),
+    (TermMode::ORIGIN, b"\x1b[?6h", b"\x1b[?6l"),
+    (TermMode::INSERT, b"\x1b[4h", b"\x1b[4l"),
+    (TermMode::LINE_FEED_NEW_LINE, b"\x1b[20h", b"\x1b[20l"),
+];
+
+fn put_modes(out: &mut Vec<u8>, mode: TermMode) {
+    let default = TermMode::default();
+    for (flag, set, reset) in MODES {
+        match (mode.contains(flag), default.contains(flag)) {
+            (true, false) => out.extend_from_slice(set),
+            (false, true) => out.extend_from_slice(reset),
+            _ => {}
+        }
+    }
 }
 
 /// 0-based CUP.
@@ -421,6 +478,7 @@ mod tests {
     fn assert_same_screen(a: &Terminal, b: &Terminal) {
         assert_eq!(a.visible_text(), b.visible_text());
         assert_eq!(a.cursor(), b.cursor());
+        assert_eq!(a.mode(), b.mode());
         let (cols, rows) = a.size();
         for row in 0..rows {
             for col in 0..cols {
@@ -541,6 +599,88 @@ mod tests {
             assert_same_screen(&a, &b);
             assert_eq!(b.visible_text()[1], "f", "input {input:?}");
         }
+    }
+
+    /// Feeds `setup` into A, roundtrips the snapshot into B and checks B's modes.
+    fn roundtrip_modes(setup: &str, expect_set: TermMode, expect_unset: TermMode) -> Terminal {
+        let mut a = Terminal::new(20, 5);
+        a.feed(setup.as_bytes());
+        assert!(
+            a.mode().contains(expect_set),
+            "setup {setup:?} did not set {expect_set:?}"
+        );
+        let b = roundtrip(&a);
+        assert!(
+            b.mode().contains(expect_set),
+            "{setup:?}: B lacks {expect_set:?}: {:?}",
+            b.mode()
+        );
+        assert!(
+            !b.mode().intersects(expect_unset),
+            "{setup:?}: B has {expect_unset:?}"
+        );
+        assert_same_screen(&a, &b);
+        b
+    }
+
+    #[test]
+    fn snapshot_preserves_alt_screen() {
+        let setup = "primary\x1b[?1049h\x1b[2;3Halt \x1b[31mred";
+        let mut a = Terminal::new(20, 5);
+        a.feed(setup.as_bytes());
+        let b = roundtrip_modes(setup, TermMode::ALT_SCREEN, TermMode::empty());
+        assert_eq!(b.visible_text(), a.visible_text());
+        assert_eq!(b.visible_text()[1], "  alt red");
+        assert!(b.snapshot().starts_with(b"\x1b[?1049h\x1b[0m\x1b[H\x1b[2J"));
+        // Leaving the alt screen works on the client (primary content is not carried).
+        let mut b = b;
+        b.feed(b"\x1b[?1049l");
+        assert!(!b.mode().contains(TermMode::ALT_SCREEN));
+    }
+
+    #[test]
+    fn snapshot_preserves_input_modes() {
+        roundtrip_modes("\x1b[?2004h", TermMode::BRACKETED_PASTE, TermMode::empty());
+        roundtrip_modes("\x1b[?1h", TermMode::APP_CURSOR, TermMode::empty());
+        roundtrip_modes("\x1b=", TermMode::APP_KEYPAD, TermMode::empty());
+        roundtrip_modes("\x1b[?1004h", TermMode::FOCUS_IN_OUT, TermMode::empty());
+    }
+
+    #[test]
+    fn snapshot_preserves_mouse_modes() {
+        roundtrip_modes(
+            "\x1b[?1000h\x1b[?1006h",
+            TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE,
+            TermMode::empty(),
+        );
+        roundtrip_modes(
+            "\x1b[?1002h\x1b[?1005h",
+            TermMode::MOUSE_DRAG | TermMode::UTF8_MOUSE,
+            TermMode::empty(),
+        );
+        roundtrip_modes("\x1b[?1003h", TermMode::MOUSE_MOTION, TermMode::empty());
+    }
+
+    #[test]
+    fn snapshot_preserves_cursor_visibility_and_wrap() {
+        roundtrip_modes("ab\x1b[?25l", TermMode::empty(), TermMode::SHOW_CURSOR);
+        roundtrip_modes("ab\x1b[?7l", TermMode::empty(), TermMode::LINE_WRAP);
+        roundtrip_modes(
+            "ab\x1b[?1007l",
+            TermMode::empty(),
+            TermMode::ALTERNATE_SCROLL,
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_origin_insert_and_newline_modes() {
+        roundtrip_modes("ab\x1b[?6h\x1b[3;4H", TermMode::ORIGIN, TermMode::empty());
+        roundtrip_modes("ab\x1b[4h", TermMode::INSERT, TermMode::empty());
+        roundtrip_modes(
+            "ab\x1b[20h",
+            TermMode::LINE_FEED_NEW_LINE,
+            TermMode::empty(),
+        );
     }
 
     #[test]
