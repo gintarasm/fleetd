@@ -3,11 +3,12 @@
 //! Layout: 16-byte header `[u64 LE write_pos][u64 LE total_written]` followed
 //! by `capacity` data bytes. Appends accumulate in an in-memory pending buffer
 //! and reach the file on `flush()`, drop, or when the buffer would overflow;
-//! there is never an fsync. The header is rewritten on flush only.
+//! there is never an fsync. Every write to the data region is followed by a
+//! header rewrite (one 16-byte pwrite per flush).
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const HEADER_LEN: u64 = 16;
@@ -45,6 +46,7 @@ impl Scrollback {
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(0o600)
             .open(path)?;
         file.set_len(HEADER_LEN + capacity)?;
         let s = Scrollback {
@@ -55,7 +57,7 @@ impl Scrollback {
             flushed_total: 0,
             pending: Vec::new(),
         };
-        s.write_header()?;
+        s.write_header(0, 0)?;
         Ok(s)
     }
 
@@ -108,8 +110,7 @@ impl Scrollback {
         }
         self.flush_pending()?;
         if bytes.len() > PENDING_MAX {
-            self.write_ring(bytes)?;
-            self.write_header()
+            self.persist(bytes)
         } else {
             self.pending.extend_from_slice(bytes);
             Ok(())
@@ -118,11 +119,7 @@ impl Scrollback {
 
     /// Write pending bytes to the file and update the header.
     pub fn flush(&mut self) -> io::Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        self.flush_pending()?;
-        self.write_header()
+        self.flush_pending()
     }
 
     /// Most recent `max` bytes (fewer if less retained), oldest first.
@@ -145,14 +142,16 @@ impl Scrollback {
         Ok(out)
     }
 
+    /// Persist pending bytes (data then header). On error the bytes stay
+    /// pending and in-memory state is unchanged, so a retry rewrites the same
+    /// ring region.
     fn flush_pending(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        // Take the buffer so write_ring can borrow self mutably; restore its
-        // allocation afterwards. On error the bytes stay pending.
+        // Take the buffer so persist can borrow self mutably.
         let mut pending = std::mem::take(&mut self.pending);
-        let res = self.write_ring(&pending);
+        let res = self.persist(&pending);
         if res.is_ok() {
             pending.clear();
         }
@@ -160,8 +159,11 @@ impl Scrollback {
         res
     }
 
-    /// Write bytes at the ring position, keeping only the last `capacity`.
-    fn write_ring(&mut self, bytes: &[u8]) -> io::Result<()> {
+    /// Write bytes at the ring position (keeping only the last `capacity`),
+    /// then the header, then commit the new position to memory. State advances
+    /// only after both writes succeed. A failed attempt may have overwritten
+    /// ring bytes beyond the committed position; a retry rewrites them.
+    fn persist(&mut self, bytes: &[u8]) -> io::Result<()> {
         let total_len = bytes.len() as u64;
         let skip = total_len.saturating_sub(self.capacity);
         let data = &bytes[skip as usize..];
@@ -171,15 +173,18 @@ impl Scrollback {
         if first < data.len() {
             self.file.write_all_at(&data[first..], HEADER_LEN)?;
         }
-        self.write_pos = (self.write_pos + total_len) % self.capacity;
-        self.flushed_total += total_len;
+        let new_pos = (self.write_pos + total_len) % self.capacity;
+        let new_total = self.flushed_total + total_len;
+        self.write_header(new_pos, new_total)?;
+        self.write_pos = new_pos;
+        self.flushed_total = new_total;
         Ok(())
     }
 
-    fn write_header(&self) -> io::Result<()> {
+    fn write_header(&self, write_pos: u64, total_written: u64) -> io::Result<()> {
         let mut hdr = [0u8; HEADER_LEN as usize];
-        hdr[..8].copy_from_slice(&self.write_pos.to_le_bytes());
-        hdr[8..].copy_from_slice(&self.flushed_total.to_le_bytes());
+        hdr[..8].copy_from_slice(&write_pos.to_le_bytes());
+        hdr[8..].copy_from_slice(&total_written.to_le_bytes());
         self.file.write_all_at(&hdr, 0)
     }
 }
@@ -310,5 +315,68 @@ mod tests {
         s.flush().unwrap();
         let raw = std::fs::read(s.path()).unwrap();
         assert_eq!(&raw[16..19], b"abc");
+    }
+
+    /// Tiny deterministic xorshift PRNG.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    fn model_check_and_crash_recovery() {
+        for cap in [1000u64, 2345, 5000] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("sb");
+            let mut s = Scrollback::create(&p, cap).unwrap();
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ cap);
+            let mut model: Vec<u8> = Vec::new();
+            while model.len() < 400_000 {
+                let n = 7 + (rng.next() % 294) as usize;
+                let chunk: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+                s.append(&chunk).unwrap();
+                model.extend_from_slice(&chunk);
+                for k in [1usize, 17, 500, cap as usize, cap as usize + 10] {
+                    let want = &model[model.len() - k.min(cap as usize).min(model.len())..];
+                    assert_eq!(s.read_tail(k).unwrap(), want, "cap {cap} k {k}");
+                }
+                assert_eq!(s.len(), (model.len() as u64).min(cap));
+            }
+            // Crash: no Drop, pending bytes lost.
+            std::mem::forget(s);
+            let c = Scrollback::open(&p).unwrap();
+            assert_eq!(c.len(), cap);
+            let tail = c.read_tail(cap as usize).unwrap();
+            assert!(
+                (tail.len()..=model.len()).any(|end| model[end - tail.len()..end] == tail[..]),
+                "crash-recovered tail is not a contiguous slice of history"
+            );
+            drop(c);
+
+            // Clean path: explicit flush then reopen is exact.
+            let mut s = Scrollback::open(&p).unwrap();
+            s.append(b"tail-end").unwrap();
+            model.extend_from_slice(b"tail-end");
+            s.flush().unwrap();
+            std::mem::forget(s);
+            let c = Scrollback::open(&p).unwrap();
+            assert_eq!(
+                c.read_tail(cap as usize).unwrap(),
+                model[model.len() - cap as usize..]
+            );
+        }
+    }
+
+    #[test]
+    fn file_mode_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, s) = sb(100);
+        let mode = std::fs::metadata(s.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
