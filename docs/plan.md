@@ -1,0 +1,130 @@
+# fleetd — Plan
+
+Status: agreed design, pre-implementation (2026-11-13). Decisions are recorded in [`decisions/`](decisions/).
+
+## Vision
+
+A fast, reliable agent fleet manager — in the same space as [Orca](https://github.com/stablyai/orca) — written in Rust.
+
+- **Start:** orchestrate existing CLI coding agents (Claude Code, Codex, Gemini CLI, …) running locally and on remote machines.
+- **End goal:** also host a built-in agent runtime, plugged in as a native adapter ([0015](decisions/0015-scope-positioning-roadmap.md)).
+
+**Positioning:** a small, opinionated core done extremely well, extensible through plugins, leaning server/headless-first. We win on exactly where Orca hurts: daemon that survives UI crashes, no lag with many agents, solid remote connectivity, no leaked daemons.
+
+**User:** a single developer (the author). Data model and protocol must not preclude multi-user later.
+
+## Performance budget (hard, CI-enforced)
+
+| Metric | Budget |
+|---|---|
+| Cold start (GUI to usable) | < 200 ms |
+| Concurrent agents per node without UI lag | ≥ 50 |
+| Input-to-render latency | < 16 ms |
+| Daemon idle RSS | < 50 MB |
+
+Any regression fails CI and requires explicit approval by the user. See [0014](decisions/0014-performance-gate.md) and [`perf-log.md`](perf-log.md).
+
+## Architecture
+
+```
+            macOS laptop                                   Linux box(es)
+ ┌──────────────────────────────────────┐          ┌──────────────────────────┐
+ │ fleet-gui (gpui, menu-bar resident)  │          │ fleetd (role: node)      │
+ │        │ unix socket (protobuf)      │          │  PTYs · terminal grids   │
+ │ fleetd (roles: controller + node)    │──SSH────▶│  worktrees · SQLite      │
+ │  controller: fleet view, plugins,    │  stdio   │  adapter plugins (wasm)  │
+ │   secrets (Keychain), node bootstrap │          │  systemd --user, lingering│
+ │  node: local PTYs, worktrees, SQLite │          └──────────────────────────┘
+ └──────────────────────────────────────┘
+```
+
+- **One binary, two roles.** `fleetd` runs as `node` (owns agent processes, PTYs, terminal state, worktrees, SQLite) and/or `controller` (aggregates nodes, runs fleet-level plugins, holds secrets). The Mac runs both in one process; remote boxes run node only. Nodes are autonomous: agents keep running if the laptop sleeps or the GUI crashes. ([0002](decisions/0002-daemon-and-gpui-client.md), [0003](decisions/0003-node-controller-roles.md))
+- **Transport:** controller → node over SSH (`ssh host fleetd --stdio` / forwarded socket). No open ports, no relay. TLS/QUIC listener later. ([0004](decisions/0004-ssh-transport.md))
+- **Protocol:** protobuf (prost) messages, length-framed over any byte stream, custom light RPC, dedicated binary frames for terminal output, version handshake. Same protocol GUI↔daemon and controller↔node. ([0006](decisions/0006-wire-protocol.md))
+- **Terminal state:** each node keeps a headless `alacritty_terminal` grid + bounded on-disk scrollback per agent. Reattach = instant snapshot + live stream. ([0005](decisions/0005-terminal-state-on-node.md))
+- **Plugins:** WASM components (wasmtime + WIT), subprocess-over-stdio escape hatch, no native dylibs. UI plugins return a declarative view tree rendered natively. ([0007](decisions/0007-plugin-system.md))
+- **Status detection:** agent CLI hooks first, PTY heuristics fallback; status carries source + confidence. ([0008](decisions/0008-agent-status-detection.md))
+
+## Domain model ([0009](decisions/0009-domain-model.md))
+
+```
+Project ─┬─ Workspace (node + directory)
+         │    ├─ git repo?  ── Worktree (branch, on that node) ── Task*
+         │    │                └─ (or Task* directly on main checkout, explicit opt-in)
+         │    └─ not git?   ── Task*
+         └─ Workspace (another node / directory) …
+```
+
+- **Project** groups workspaces; workspaces may live on different nodes.
+- **Workspace** = any directory on a node. If it is a git repo, worktrees can be created from it.
+- **Worktree** = git worktree on a branch, on the workspace's node. Default target for tasks in git workspaces.
+- **Task** = one agent session. Several tasks may share a worktree (e.g. coder + reviewer); no locking, warning when >1 writer is active ([0009](decisions/0009-domain-model.md)).
+- Comparing agents = multiple worktrees, each with its own task.
+- Diff view: git worktrees/checkouts only in v1; non-git workspaces show "not a git repo" (snapshot diff later).
+
+## Storage ([0010](decisions/0010-storage-and-layout.md))
+
+- Worktrees: `~/.fleet/worktrees/<repo>/<slug>`, branch `fleet/<slug>`.
+- State: SQLite (WAL) per node. Scrollback: on-disk ring buffers per agent.
+- Archive cleanup refuses when dirty/unpushed unless forced.
+
+## Remote nodes ([0011](decisions/0011-remote-nodes.md))
+
+- `fleet node add user@host`: detect OS/arch, upload static (musl) `fleetd` to `~/.fleet/bin`, run as `systemd --user` with lingering, auto-upgrade on version mismatch. No root.
+- Workspaces on a node: point at an existing directory, or clone (from origin via ssh-agent forwarding; git bundle over SSH as fallback).
+- Results: local repo fetches the task branch from the node over SSH — no need to push WIP to the forge.
+
+## Credentials ([0012](decisions/0012-credentials.md))
+
+- Secrets live in macOS Keychain on the controller, granted per node / project / workspace / task.
+- Injected at agent spawn as env vars or tmpfs files (0600), deleted on exit; never logged; masked in scrollback.
+- Browser/OAuth flows on nodes (MCP OAuth, `claude login`): controller opens the URL on the Mac and sets up an SSH reverse port-forward for the localhost callback.
+- ssh-agent forwarding: opt-in per node.
+
+## Plugins ([0007](decisions/0007-plugin-system.md))
+
+| Kind | Runs on | v1 |
+|---|---|---|
+| Agent adapter | node | yes |
+| Remote provider | controller | yes |
+| Lifecycle hooks | where the event fires | yes |
+| UI (declarative) | controller → rendered by GUI | yes |
+| Integrations (GitHub, Linear, Slack) | — | later |
+
+Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `net:<host>`, `exec:<bin>`, `notify`, `storage:own`); approved at install, re-approved on new capabilities. Controller distributes pinned `.wasm` to nodes.
+
+## v1 scope
+
+**In:** spawn/manage CLI agents in PTYs · project/workspace/worktree/task hierarchy · live terminal + fleet sidebar (grouped by node → workspace, status badge, last line) · up to 4 splits · command palette · status detection · native notifications via menu-bar app · read-only diff view · local + remote nodes · plugins (adapters, providers, hooks, declarative UI) · credential forwarding.
+
+**Later:** chat UI · diff line comments → agent · coordinator/sub-agents · built-in browser / computer use · mobile apps · scheduled automations · usage/account tracking · integrations · TLS/QUIC transport · live PTY handoff on upgrade · non-git snapshot diffs · built-in agent runtime · multi-user.
+
+**Platforms:** controller + GUI on macOS; nodes on Linux (and macOS). Windows deferred.
+
+## Crate layout ([0016](decisions/0016-crate-layout.md))
+
+| Crate | Purpose |
+|---|---|
+| `fleet-proto` | protobuf messages + framing |
+| `fleet-node` | PTYs, terminal grid, worktrees, SQLite |
+| `fleet-controller` | fleet view, SSH transport, bootstrap, secrets |
+| `fleet-plugin-host` | wasmtime host, WIT worlds |
+| `fleetd` | daemon binary wiring roles |
+| `fleet-gui` | gpui client |
+| `fleet-cli` | thin scripting client |
+
+## Milestones
+
+| | Milestone |
+|---|---|
+| **M0** | Workspace skeleton, benchmark harness (50 fake agents flooding PTYs), CI perf gate, baselines |
+| **M1** | Local node: PTYs, terminal grid, scrollback, SQLite, protocol, `fleet-cli` |
+| **M2** | gpui client: sidebar, terminal pane, splits, menu-bar app |
+| **M3** | Project/workspace/worktree/task hierarchy, diff view |
+| **M4** | Plugin host, Claude Code + Codex adapters, hook-based status, notifications |
+| **M5** | Remote nodes: SSH transport, bootstrap, workspace clone, git fetch-back |
+| **M6** | Secrets, OAuth reverse-forwarding, ssh-agent forwarding |
+
+## Licensing
+
+Private for now; revisit before the plugin API stabilises.

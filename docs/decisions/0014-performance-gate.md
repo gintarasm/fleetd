@@ -1,0 +1,12 @@
+# 0014 — Performance budgets and the regression gate
+
+**Status:** accepted · 2026-11-13
+
+**Decision:**
+- **Budgets:** cold start < 200 ms; ≥ 50 concurrent agents per node without UI lag; input-to-render < 16 ms; daemon idle RSS < 50 MB.
+- **Built first (M0):** a benchmark harness that spawns 50 fake agents flooding their PTYs, measuring daemon RSS/CPU, reattach snapshot latency, protocol throughput and GUI frame time. These benchmarks are required in CI.
+- **Measurement:** deterministic instruction counts (iai-callgrind, Linux) for daemon/protocol code, gated at ~2%. Wall-clock budgets for GUI and end-to-end on a dedicated self-hosted Mac runner, gated at ~5%.
+- **Baselines:** `bench/baselines.toml`. Improvements tighten baselines.
+- **Regressions:** CI fails. A regression is accepted only with explicit approval **by the user** — a `Perf-Approved: <user>` commit trailer together with the updated baseline and a `docs/perf-log.md` entry with the justification. AI agents must never add the trailer or edit baselines themselves; they stop and ask (see `CLAUDE.md`). This will be automated later.
+
+**Consequences:** Performance cannot drift silently — the failure mode of Orca.
