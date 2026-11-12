@@ -1,0 +1,39 @@
+# Perf gate baselines. All metrics are lower-is-better.
+# `baseline = 0` means not yet recorded; run `fleet-perf tighten` to record it.
+# Regressions beyond tolerance need `Perf-Approved: gintarasm` (user only).
+
+[gate]
+approvers = ["gintarasm"]
+tolerance = { instr = 0.02, wall = 0.05 }
+
+[metrics.fleetd_cold_start_ns]
+suite = "wall"
+unit = "ns"
+budget = 200000000     # cold start < 200 ms (docs/plan.md)
+baseline = 0
+
+[metrics.fleetd_idle_rss_bytes]
+suite = "wall"
+unit = "bytes"
+budget = 52428800      # hard ceiling from docs/plan.md
+baseline = 0
+
+[metrics.flood50_cpu_ns_per_mib]
+suite = "wall"
+unit = "ns"
+baseline = 0
+
+[metrics.flood50_peak_rss_bytes]
+suite = "wall"
+unit = "bytes"
+baseline = 0
+
+[metrics.flood50_wall_ns]
+suite = "wall"
+unit = "ns"
+baseline = 0
+
+[metrics.fleetd_startup_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 0

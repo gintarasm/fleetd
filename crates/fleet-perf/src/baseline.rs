@@ -1,0 +1,472 @@
+//! Baselines file model, the gate comparator, and comment-preserving writes.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, Item, Table, Value};
+
+use crate::results::{Results, Suite};
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Tolerance {
+    pub instr: f64,
+    pub wall: f64,
+}
+
+impl Tolerance {
+    pub fn for_suite(&self, suite: Suite) -> f64 {
+        match suite {
+            Suite::Wall => self.wall,
+            Suite::Instr => self.instr,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Gate {
+    pub approvers: Vec<String>,
+    pub tolerance: Tolerance,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricSpec {
+    pub suite: Suite,
+    pub unit: String,
+    #[serde(default)]
+    pub budget: Option<f64>,
+    pub baseline: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Baselines {
+    pub gate: Gate,
+    pub metrics: BTreeMap<String, MetricSpec>,
+}
+
+impl Baselines {
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Ok,
+    Improved,
+    Regressed,
+    OverBudget,
+    Missing,
+    Unknown,
+    Unrecorded,
+}
+
+impl Status {
+    pub fn is_failure(self) -> bool {
+        !matches!(self, Status::Ok | Status::Improved)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Status::Ok => "ok",
+            Status::Improved => "improved",
+            Status::Regressed => "REGRESSED",
+            Status::OverBudget => "OVER BUDGET",
+            Status::Missing => "MISSING",
+            Status::Unknown => "UNKNOWN",
+            Status::Unrecorded => "UNRECORDED",
+        }
+    }
+
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Status::Ok | Status::Improved => None,
+            Status::Regressed => Some(
+                "regressed beyond tolerance: fix the regression, or ask the user to approve it \
+                 (Perf-Approved trailer, updated baseline, docs/perf-log.md entry)",
+            ),
+            Status::OverBudget => {
+                Some("value exceeds the hard budget: the budget cannot be raised by an agent")
+            }
+            Status::Missing => {
+                Some("metric is in baselines but the results lack it: the suite did not measure it")
+            }
+            Status::Unknown => Some("metric has no baseline entry: run `fleet-perf baseline-add`"),
+            Status::Unrecorded => Some("baseline not yet recorded: run `fleet-perf tighten`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    pub name: String,
+    pub baseline: f64,
+    /// NaN when the metric is Missing.
+    pub value: f64,
+    pub delta_pct: f64,
+    pub status: Status,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    pub rows: Vec<Row>,
+    pub failed: bool,
+}
+
+fn delta_pct(baseline: f64, value: f64) -> f64 {
+    if baseline > 0.0 {
+        (value - baseline) / baseline * 100.0
+    } else {
+        0.0
+    }
+}
+
+pub fn compare(b: &Baselines, r: &Results) -> Report {
+    let tol = b.gate.tolerance.for_suite(r.suite);
+    let mut rows = Vec::new();
+
+    for (name, spec) in b.metrics.iter().filter(|(_, s)| s.suite == r.suite) {
+        let Some(m) = r.metrics.get(name) else {
+            rows.push(Row {
+                name: name.clone(),
+                baseline: spec.baseline,
+                value: f64::NAN,
+                delta_pct: 0.0,
+                status: Status::Missing,
+            });
+            continue;
+        };
+        let value = m.value;
+        let status = if spec.budget.is_some_and(|budget| value > budget) {
+            Status::OverBudget
+        } else if spec.baseline == 0.0 {
+            Status::Unrecorded
+        } else if value > spec.baseline * (1.0 + tol) {
+            Status::Regressed
+        } else if value < spec.baseline * (1.0 - tol) {
+            Status::Improved
+        } else {
+            Status::Ok
+        };
+        rows.push(Row {
+            name: name.clone(),
+            baseline: spec.baseline,
+            value,
+            delta_pct: delta_pct(spec.baseline, value),
+            status,
+        });
+    }
+
+    for (name, m) in &r.metrics {
+        let known = b.metrics.get(name).is_some_and(|s| s.suite == r.suite);
+        if !known {
+            rows.push(Row {
+                name: name.clone(),
+                baseline: 0.0,
+                value: m.value,
+                delta_pct: 0.0,
+                status: Status::Unknown,
+            });
+        }
+    }
+
+    let failed = rows.iter().any(|row| row.status.is_failure());
+    Report { rows, failed }
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn num(v: f64) -> String {
+            if v.is_nan() {
+                "-".to_string()
+            } else {
+                format!("{v:.1}")
+            }
+        }
+        let w = self
+            .rows
+            .iter()
+            .map(|r| r.name.len())
+            .max()
+            .unwrap_or(0)
+            .max(6);
+        writeln!(
+            f,
+            "{:<w$}  {:>18}  {:>18}  {:>8}  status",
+            "metric", "baseline", "value", "delta%"
+        )?;
+        for r in &self.rows {
+            writeln!(
+                f,
+                "{:<w$}  {:>18}  {:>18}  {:>+8.2}  {}",
+                r.name,
+                num(r.baseline),
+                num(r.value),
+                r.delta_pct,
+                r.status.label()
+            )?;
+        }
+        let mut seen = Vec::new();
+        for r in &self.rows {
+            if let Some(h) = r.status.hint()
+                && !seen.contains(&r.status.label())
+            {
+                seen.push(r.status.label());
+                writeln!(f, "\n{}: {h}", r.status.label())?;
+            }
+        }
+        writeln!(f, "\n{}", if self.failed { "FAIL" } else { "PASS" })
+    }
+}
+
+/// Lower baselines only: sets baseline where it is unrecorded (0) or `value` is lower.
+/// Only metrics of the results' suite are touched.
+pub fn tighten(b: &mut Baselines, r: &Results) {
+    for (name, m) in &r.metrics {
+        if let Some(spec) = b.metrics.get_mut(name)
+            && spec.suite == r.suite
+            && (spec.baseline == 0.0 || m.value < spec.baseline)
+        {
+            spec.baseline = m.value;
+        }
+    }
+}
+
+/// Adds metrics present in the results but not in the baselines, with
+/// `baseline = value` and no budget. Returns the names added.
+pub fn baseline_add(b: &mut Baselines, r: &Results) -> Vec<String> {
+    let mut added = Vec::new();
+    for (name, m) in &r.metrics {
+        if !b.metrics.contains_key(name) {
+            b.metrics.insert(
+                name.clone(),
+                MetricSpec {
+                    suite: r.suite,
+                    unit: m.unit.clone(),
+                    budget: None,
+                    baseline: m.value,
+                },
+            );
+            added.push(name.clone());
+        }
+    }
+    added
+}
+
+fn number(v: f64) -> Value {
+    if v.fract() == 0.0 && v.abs() < 9_007_199_254_740_992.0 {
+        Value::from(v as i64)
+    } else {
+        Value::from(v)
+    }
+}
+
+/// Writes `b`'s baselines into the original TOML text, editing in place so
+/// comments, ordering and formatting survive. New metrics are appended.
+pub fn write_into(text: &str, b: &Baselines) -> Result<String, toml_edit::TomlError> {
+    let mut doc: DocumentMut = text.parse()?;
+    let metrics = doc
+        .entry("metrics")
+        .or_insert_with(|| {
+            let mut t = Table::new();
+            t.set_implicit(true);
+            Item::Table(t)
+        })
+        .as_table_mut()
+        .expect("`metrics` is a table");
+    for (name, spec) in &b.metrics {
+        match metrics.get_mut(name).and_then(Item::as_table_mut) {
+            Some(t) => {
+                let decor = t
+                    .get("baseline")
+                    .and_then(|i| i.as_value())
+                    .map(|v| v.decor().clone());
+                let mut v = number(spec.baseline);
+                if let Some(d) = decor {
+                    *v.decor_mut() = d;
+                }
+                t.insert("baseline", Item::Value(v));
+            }
+            None => {
+                let mut t = Table::new();
+                t.insert("suite", toml_edit::value(suite_str(spec.suite)));
+                t.insert("unit", toml_edit::value(spec.unit.as_str()));
+                if let Some(budget) = spec.budget {
+                    t.insert("budget", Item::Value(number(budget)));
+                }
+                t.insert("baseline", Item::Value(number(spec.baseline)));
+                metrics.insert(name, Item::Table(t));
+            }
+        }
+    }
+    Ok(doc.to_string())
+}
+
+fn suite_str(s: Suite) -> &'static str {
+    match s {
+        Suite::Wall => "wall",
+        Suite::Instr => "instr",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::results::Measurement;
+
+    const TOML: &str = r#"
+# top comment
+[gate]
+approvers = ["gintarasm"]
+tolerance = { instr = 0.02, wall = 0.05 }
+
+[metrics.m_wall]
+suite = "wall"
+unit = "ns"
+budget = 1000
+baseline = 100   # keep this note
+
+[metrics.m_instr]
+suite = "instr"
+unit = "instructions"
+baseline = 100
+"#;
+
+    fn base() -> Baselines {
+        Baselines::parse(TOML).unwrap()
+    }
+
+    fn res(suite: Suite, items: &[(&str, f64)]) -> Results {
+        Results {
+            suite,
+            metrics: items
+                .iter()
+                .map(|(n, v)| {
+                    (
+                        n.to_string(),
+                        Measurement {
+                            value: *v,
+                            unit: "ns".into(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn status(b: &Baselines, r: &Results, name: &str) -> (Status, bool) {
+        let rep = compare(b, r);
+        let row = rep.rows.iter().find(|x| x.name == name).unwrap();
+        (row.status, rep.failed)
+    }
+
+    #[test]
+    fn within_tolerance_ok() {
+        let r = res(Suite::Wall, &[("m_wall", 104.9)]);
+        assert_eq!(status(&base(), &r, "m_wall"), (Status::Ok, false));
+    }
+
+    #[test]
+    fn regression_fails() {
+        let r = res(Suite::Wall, &[("m_wall", 105.1)]);
+        assert_eq!(status(&base(), &r, "m_wall"), (Status::Regressed, true));
+    }
+
+    #[test]
+    fn instr_uses_2pct() {
+        let r = res(Suite::Instr, &[("m_instr", 102.1)]);
+        assert_eq!(status(&base(), &r, "m_instr"), (Status::Regressed, true));
+        let r = res(Suite::Instr, &[("m_instr", 101.9)]);
+        assert_eq!(status(&base(), &r, "m_instr"), (Status::Ok, false));
+    }
+
+    #[test]
+    fn over_budget_fails_even_if_baseline_higher() {
+        let mut b = base();
+        b.metrics.get_mut("m_wall").unwrap().baseline = 5000.0;
+        let r = res(Suite::Wall, &[("m_wall", 1001.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::OverBudget, true));
+    }
+
+    #[test]
+    fn improvement_passes() {
+        let r = res(Suite::Wall, &[("m_wall", 94.0)]);
+        assert_eq!(status(&base(), &r, "m_wall"), (Status::Improved, false));
+    }
+
+    #[test]
+    fn missing_metric_fails() {
+        let r = res(Suite::Wall, &[]);
+        assert_eq!(status(&base(), &r, "m_wall"), (Status::Missing, true));
+    }
+
+    #[test]
+    fn unknown_metric_fails() {
+        let r = res(Suite::Wall, &[("m_wall", 100.0), ("brand_new", 1.0)]);
+        assert_eq!(status(&base(), &r, "brand_new"), (Status::Unknown, true));
+    }
+
+    #[test]
+    fn unrecorded_baseline_fails() {
+        let mut b = base();
+        b.metrics.get_mut("m_wall").unwrap().baseline = 0.0;
+        let r = res(Suite::Wall, &[("m_wall", 100.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Unrecorded, true));
+    }
+
+    #[test]
+    fn other_suite_ignored() {
+        let r = res(Suite::Wall, &[("m_wall", 100.0)]);
+        let rep = compare(&base(), &r);
+        assert!(!rep.failed);
+        assert!(rep.rows.iter().all(|x| x.name != "m_instr"));
+    }
+
+    #[test]
+    fn tighten_never_raises() {
+        let mut b = base();
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", 120.0)]));
+        assert_eq!(b.metrics["m_wall"].baseline, 100.0);
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", 90.0)]));
+        assert_eq!(b.metrics["m_wall"].baseline, 90.0);
+    }
+
+    #[test]
+    fn tighten_records_unrecorded() {
+        let mut b = base();
+        b.metrics.get_mut("m_wall").unwrap().baseline = 0.0;
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", 120.0)]));
+        assert_eq!(b.metrics["m_wall"].baseline, 120.0);
+    }
+
+    #[test]
+    fn baseline_add_adds_unknown_only() {
+        let mut b = base();
+        let added = baseline_add(
+            &mut b,
+            &res(Suite::Wall, &[("m_wall", 1.0), ("new_m", 7.0)]),
+        );
+        assert_eq!(added, vec!["new_m"]);
+        assert_eq!(b.metrics["new_m"].baseline, 7.0);
+        assert_eq!(b.metrics["new_m"].budget, None);
+        assert_eq!(b.metrics["m_wall"].baseline, 100.0);
+    }
+
+    #[test]
+    fn toml_roundtrip_preserves_comments() {
+        let mut b = base();
+        tighten(&mut b, &res(Suite::Wall, &[("m_wall", 90.0)]));
+        baseline_add(&mut b, &res(Suite::Wall, &[("new_m", 7.0)]));
+        let out = write_into(TOML, &b).unwrap();
+        assert!(out.contains("# top comment"));
+        assert!(out.contains("baseline = 90   # keep this note"), "{out}");
+        assert_eq!(Baselines::parse(&out).unwrap(), b);
+    }
+
+    #[test]
+    fn report_prints_table_and_hints() {
+        let r = res(Suite::Wall, &[("m_wall", 105.1)]);
+        let s = compare(&base(), &r).to_string();
+        assert!(s.contains("m_wall") && s.contains("REGRESSED") && s.contains("FAIL"));
+    }
+}
