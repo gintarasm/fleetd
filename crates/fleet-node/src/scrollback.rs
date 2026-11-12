@@ -357,6 +357,9 @@ mod tests {
                 "crash-recovered tail is not a contiguous slice of history"
             );
             drop(c);
+            // Pending bytes were lost in the crash; history resumes from what
+            // was recovered.
+            model = tail;
 
             // Clean path: explicit flush then reopen is exact.
             let mut s = Scrollback::open(&p).unwrap();
