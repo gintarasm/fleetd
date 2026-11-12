@@ -5,12 +5,18 @@ use clap::{Parser, Subcommand};
 use fleet_perf::approval::{ApprovalOutcome, check};
 use fleet_perf::baseline::{Baselines, baseline_add, compare, tighten, write_into};
 use fleet_perf::results::Results;
+use fleet_perf::wall;
 
 #[derive(Parser)]
 #[command(name = "fleet-perf", about = "fleetd perf gate")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SuiteArg {
+    Wall,
 }
 
 #[derive(Subcommand)]
@@ -35,6 +41,26 @@ enum Cmd {
         baselines: PathBuf,
         #[arg(long)]
         results: PathBuf,
+    },
+    /// Run a benchmark suite and write its results JSON.
+    Run {
+        #[arg(long, value_enum)]
+        suite: SuiteArg,
+        #[arg(long)]
+        out: PathBuf,
+        /// One run, small payloads; for smoke tests only.
+        #[arg(long)]
+        quick: bool,
+    },
+    /// Child process of the wall suite: spawn N fake agents on PTYs.
+    #[command(hide = true)]
+    FloodHost {
+        #[arg(long)]
+        agents: usize,
+        #[arg(long)]
+        bytes: u64,
+        #[arg(long)]
+        fake_agent: PathBuf,
     },
     /// Fail if baselines were loosened without user approval.
     CheckApproval {
@@ -73,6 +99,25 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             write(&baselines, &text, &b)?;
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Run { suite, out, quick } => {
+            let results = match suite {
+                SuiteArg::Wall => wall::run(quick)?,
+            };
+            let json = serde_json::to_string_pretty(&results).map_err(|e| e.to_string())?;
+            std::fs::write(&out, json).map_err(|e| format!("writing {}: {e}", out.display()))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::FloodHost {
+            agents,
+            bytes,
+            fake_agent,
+        } => match wall::flood_host(agents, bytes, &fake_agent) {
+            Ok(()) => Ok(ExitCode::SUCCESS),
+            Err(e) => {
+                eprintln!("fleet-perf: flood-host: {e}");
+                Ok(ExitCode::from(1))
+            }
+        },
         Cmd::CheckApproval { base } => {
             match check(std::path::Path::new("."), &base).map_err(|e| e.to_string())? {
                 ApprovalOutcome::NotNeeded => println!("approval not needed"),

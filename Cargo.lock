@@ -179,6 +179,8 @@ name = "fleet-perf"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fleet-node",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
