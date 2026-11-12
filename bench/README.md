@@ -43,7 +43,7 @@ A metric with `report_only = true` is still measured, printed (its status is mar
 - `fleet-perf baseline-add` adds a baseline for a new metric. Agents may run it.
 - Raising a baseline or accepting a regression is user-only: a commit with the trailer `Perf-Approved: gintarasm`, the updated baseline, and a row in `docs/perf-log.md`. `fleet-perf check-approval --base <ref>` enforces this in CI. Agents never write the trailer or the log.
 - Per-metric tolerance: a metric may set `tolerance = <fraction>` to override its suite's tolerance. Setting one above the effective tolerance at the merge-base, or raising it, is a loosening and needs the same user approval. No metric sets one today.
-- Gate code: changing or deleting `crates/fleet-perf/src/{baseline,approval,wall,instr}.rs`, `crates/fleet-perf/benches/instr.rs` or anything under `.github/workflows/` (when it existed at the merge-base) needs the same approval — trailer plus `docs/perf-log.md` entry. Newly created files are exempt.
+- Gate code: changing or deleting `crates/fleet-perf/src/{baseline,approval,wall,instr,lib,results}.rs`, `crates/fleet-perf/src/bin/fleet-perf.rs`, `crates/fleet-perf/Cargo.toml`, `rust-toolchain.toml`, `crates/fleet-perf/benches/instr.rs` or anything under `.github/workflows/` (when it existed at the merge-base) needs the same approval — trailer plus `docs/perf-log.md` entry. Newly created files are exempt.
 - `compare` also fails on invalid values (non-finite or <= 0) and on a results unit that differs from the baseline's unit.
 
 ### Recording baselines

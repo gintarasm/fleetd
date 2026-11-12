@@ -394,3 +394,31 @@ fn gate_code_created_not_needed() {
     commit(&d, "create gate code");
     assert_eq!(run(&d), ApprovalOutcome::NotNeeded);
 }
+
+#[test]
+fn cli_wiring_change_without_trailer_rejected() {
+    let d = repo(&toml(100, 0.05, ""));
+    git(d.path(), &["checkout", "-q", "main"]);
+    write(
+        d.path(),
+        "crates/fleet-perf/src/bin/fleet-perf.rs",
+        "// cli\n",
+    );
+    commit(&d, "cli wiring");
+    git(d.path(), &["checkout", "-q", "work"]);
+    git(d.path(), &["merge", "-q", "--ff-only", "main"]);
+    write(
+        d.path(),
+        "crates/fleet-perf/src/bin/fleet-perf.rs",
+        "// bypass\n",
+    );
+    commit(&d, "edit cli");
+    let o = run(&d);
+    let ApprovalOutcome::Rejected(msg) = o else {
+        panic!("{o:?}")
+    };
+    assert!(
+        msg.contains("crates/fleet-perf/src/bin/fleet-perf.rs"),
+        "{msg}"
+    );
+}

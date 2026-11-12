@@ -8,8 +8,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain (from rust-toolchain.toml)
-        run: rustup toolchain install
+      - name: Install pinned toolchain
+        run: cargo --version
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
@@ -18,8 +18,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain (from rust-toolchain.toml)
-        run: rustup toolchain install
+      - name: Install pinned toolchain
+        run: cargo --version
       - name: Install valgrind and the gungraun runner
         run: |
           sudo apt-get update
@@ -40,8 +40,8 @@ jobs:
         with:
           # Keep target/ between runs on the persistent runner.
           clean: false
-      - name: Install toolchain (from rust-toolchain.toml)
-        run: rustup toolchain install
+      - name: Install pinned toolchain
+        run: cargo --version
       - run: cargo build --release --workspace
       - run: target/release/fleet-perf run --suite wall --out wall.json
       - run: target/release/fleet-perf compare --baselines bench/baselines.toml --results wall.json
@@ -58,6 +58,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Install toolchain (from rust-toolchain.toml)
-        run: rustup toolchain install
+      - name: Install pinned toolchain
+        run: cargo --version
       - run: cargo run -p fleet-perf --release --bin fleet-perf -- check-approval --base origin/${{ github.base_ref }}

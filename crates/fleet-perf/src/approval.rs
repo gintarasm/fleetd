@@ -25,6 +25,11 @@ const GATE_PATHS: &[&str] = &[
     "crates/fleet-perf/src/wall.rs",
     "crates/fleet-perf/src/instr.rs",
     "crates/fleet-perf/benches/instr.rs",
+    "crates/fleet-perf/src/bin/fleet-perf.rs",
+    "crates/fleet-perf/src/lib.rs",
+    "crates/fleet-perf/src/results.rs",
+    "crates/fleet-perf/Cargo.toml",
+    "rust-toolchain.toml",
     ".github/workflows/",
 ];
 
