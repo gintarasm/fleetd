@@ -1,12 +1,14 @@
 //! Wall-clock suite: fleetd cold start, idle RSS, and the 50-agent flood.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fleet_node::pty::{AgentId, CommandSpec, PtyHost};
+use serde::{Deserialize, Serialize};
 
 use crate::results::{Measurement, Results, Suite};
 
@@ -118,19 +120,71 @@ struct Flood {
     peak_rss_bytes: f64,
 }
 
-/// Run `flood-host` as a child of this process and collect its rusage.
-fn flood(bytes: u64) -> Result<Flood, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let fake_agent = sibling("fake-agent")?;
+/// Process-wide usage of `flood-host` itself (PtyHost and its reader threads,
+/// not the agents), printed by the host as one JSON line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HostUsage {
+    pub cpu_ns: u64,
+    pub maxrss_bytes: u64,
+}
+
+/// Outcome of one `flood-host` child run.
+#[derive(Debug, Clone, Copy)]
+pub struct FloodRun {
+    pub wall_ns: f64,
+    pub host: HostUsage,
+    /// `wait4` rusage of the host process, which the OS also charges for its
+    /// reaped agent children. Kept to show the host figure excludes them.
+    pub wait4_cpu_ns: u64,
+}
+
+fn tv_ns(tv: libc::timeval) -> u64 {
+    tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1_000
+}
+
+/// `ru_maxrss` is bytes on macOS and KiB elsewhere; normalise to bytes.
+fn maxrss_bytes(ru: &libc::rusage) -> u64 {
+    let v = ru.ru_maxrss as u64;
+    if cfg!(target_os = "macos") {
+        v
+    } else {
+        v * 1024
+    }
+}
+
+fn self_usage() -> HostUsage {
+    // SAFETY: zeroed rusage is a valid out-parameter.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    HostUsage {
+        cpu_ns: tv_ns(ru.ru_utime) + tv_ns(ru.ru_stime),
+        maxrss_bytes: maxrss_bytes(&ru),
+    }
+}
+
+/// Run `flood-host` as a child of this process. Wall time and exit status come
+/// from the parent; CPU and peak RSS are the host's own `RUSAGE_SELF` report.
+pub fn run_flood_host(
+    exe: &Path,
+    fake_agent: &Path,
+    agents: usize,
+    bytes: u64,
+) -> Result<FloodRun, String> {
     let start = Instant::now();
-    let child = Command::new(exe)
-        .args(["flood-host", "--agents", &FLOOD_AGENTS.to_string()])
+    let mut child = Command::new(exe)
+        .args(["flood-host", "--agents", &agents.to_string()])
         .args(["--bytes", &bytes.to_string(), "--fake-agent"])
         .arg(fake_agent)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawning flood-host: {e}"))?;
+    let mut out = String::new();
+    let read = child
+        .stdout
+        .take()
+        .ok_or("flood-host stdout not piped")?
+        .read_to_string(&mut out);
     let pid = child.id() as libc::pid_t;
     // Reaped by wait4 below; forget the handle so it is not waited twice.
     std::mem::forget(child);
@@ -146,20 +200,24 @@ fn flood(bytes: u64) -> Result<Flood, String> {
     if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
         return Err(format!("flood-host failed (wait status {status})"));
     }
-
-    let tv_ns = |tv: libc::timeval| tv.tv_sec as f64 * 1e9 + tv.tv_usec as f64 * 1e3;
-    let cpu_ns = tv_ns(ru.ru_utime) + tv_ns(ru.ru_stime);
-    let total_mib = (FLOOD_AGENTS as u64 * bytes) as f64 / MIB;
-    // ru_maxrss is bytes on macOS, KiB elsewhere.
-    let peak = if cfg!(target_os = "macos") {
-        ru.ru_maxrss as f64
-    } else {
-        ru.ru_maxrss as f64 * 1024.0
-    };
-    Ok(Flood {
+    read.map_err(|e| format!("reading flood-host output: {e}"))?;
+    let host: HostUsage = serde_json::from_str(out.trim())
+        .map_err(|e| format!("parsing flood-host output {out:?}: {e}"))?;
+    Ok(FloodRun {
         wall_ns,
-        cpu_ns_per_mib: cpu_ns / total_mib,
-        peak_rss_bytes: peak,
+        host,
+        wait4_cpu_ns: tv_ns(ru.ru_utime) + tv_ns(ru.ru_stime),
+    })
+}
+
+fn flood(bytes: u64) -> Result<Flood, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let run = run_flood_host(&exe, &sibling("fake-agent")?, FLOOD_AGENTS, bytes)?;
+    let total_mib = (FLOOD_AGENTS as u64 * bytes) as f64 / MIB;
+    Ok(Flood {
+        wall_ns: run.wall_ns,
+        cpu_ns_per_mib: run.host.cpu_ns as f64 / total_mib,
+        peak_rss_bytes: run.host.maxrss_bytes as f64,
     })
 }
 
@@ -215,8 +273,9 @@ pub fn run(quick: bool) -> Result<Results, String> {
 }
 
 /// Body of the hidden `flood-host` subcommand: run `agents` fake agents under
-/// a `PtyHost` and check each read at least `bytes` and exited 0.
-pub fn flood_host(agents: usize, bytes: u64, fake_agent: &Path) -> Result<(), String> {
+/// a `PtyHost`, check each read at least `bytes` and exited 0, and return this
+/// process's own resource usage.
+pub fn flood_host(agents: usize, bytes: u64, fake_agent: &Path) -> Result<HostUsage, String> {
     let host = PtyHost::new();
     // Spawn from a single thread: macOS `ptsname` is not reentrant.
     let mut ids: Vec<AgentId> = Vec::with_capacity(agents);
@@ -256,5 +315,5 @@ pub fn flood_host(agents: usize, bytes: u64, fake_agent: &Path) -> Result<(), St
             return Err(format!("agent {i}: exit code {:?}", stats.exit_code));
         }
     }
-    Ok(())
+    Ok(self_usage())
 }

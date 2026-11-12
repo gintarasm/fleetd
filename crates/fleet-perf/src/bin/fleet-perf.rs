@@ -112,7 +112,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             bytes,
             fake_agent,
         } => match wall::flood_host(agents, bytes, &fake_agent) {
-            Ok(()) => Ok(ExitCode::SUCCESS),
+            Ok(usage) => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&usage).map_err(|e| e.to_string())?
+                );
+                Ok(ExitCode::SUCCESS)
+            }
             Err(e) => {
                 eprintln!("fleet-perf: flood-host: {e}");
                 Ok(ExitCode::from(1))
