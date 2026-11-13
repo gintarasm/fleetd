@@ -2,6 +2,8 @@
 
 **Status:** accepted · 2026-11-13
 
+**Amended by:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) — worktree layout and archive cleanup now belong to the git-worktree workflow.
+
 **Decision:**
 - Worktrees: `~/.fleet/worktrees/<repo>/<slug>`, branch `fleet/<slug>`.
 - State: SQLite in WAL mode, one database per node (projects/workspaces/worktrees/tasks/events).

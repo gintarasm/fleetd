@@ -2,6 +2,8 @@
 
 **Status:** accepted · 2026-11-13
 
+**Amended by:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) — adds the `workflow` plugin kind.
+
 **Decision:**
 - **Mechanism:** WebAssembly components (wasmtime + WIT), one versioned WIT world per plugin kind. Escape hatch: subprocess plugins speaking the same interface over stdio, for plugins that need a full OS (e.g. cloud SDKs). No native dylibs — plugins must never be able to crash the daemon.
 - **Kinds in v1:** agent adapters, remote providers, lifecycle hooks, UI. Integrations (GitHub/Linear/Slack) later.

@@ -140,7 +140,7 @@ M1's `daemon_flood50` dropped 45–48 of 50 subscriptions because agents' parsin
 ```
 
 **Sidebar.**
-- Agents are grouped by working directory (a stand-in until M3's hierarchy).
+- Agents are grouped by their `project` label, falling back to the working directory (ADR 0025: the core has no hierarchy).
 - Each row shows the program, state (running / exited with code / lost), the last line from `AgentActivity`, and the time since last output.
 - Clicking opens the agent in the focused pane. Exited agents are dimmed.
 - Kill asks for confirmation. Closing a pane only detaches.
