@@ -10,6 +10,9 @@ pub const STARTUP_INSTRUCTIONS: &str = "fleetd_startup_instructions";
 pub const FRAME_DECODE_OUTPUT_64X64K_INSTRUCTIONS: &str = "frame_decode_output_64x64k_instructions";
 pub const TERMINAL_FEED_64K_INSTRUCTIONS: &str = "terminal_feed_64k_instructions";
 pub const SNAPSHOT_120X40_INSTRUCTIONS: &str = "snapshot_120x40_instructions";
+pub const TERMINAL_FEED_SCROLL_64K_INSTRUCTIONS: &str = "terminal_feed_scroll_64k_instructions";
+pub const HISTORY_PUSH_1K_LINES_INSTRUCTIONS: &str = "history_push_1k_lines_instructions";
+pub const HISTORY_READ_PAGE_INSTRUCTIONS: &str = "history_read_page_instructions";
 /// Bench function name -> metric name.
 const METRICS: &[(&str, &str)] = &[
     ("fleetd_startup", STARTUP_INSTRUCTIONS),
@@ -19,6 +22,12 @@ const METRICS: &[(&str, &str)] = &[
     ),
     ("terminal_feed_64k", TERMINAL_FEED_64K_INSTRUCTIONS),
     ("snapshot_120x40", SNAPSHOT_120X40_INSTRUCTIONS),
+    (
+        "terminal_feed_scroll_64k",
+        TERMINAL_FEED_SCROLL_64K_INSTRUCTIONS,
+    ),
+    ("history_push_1k_lines", HISTORY_PUSH_1K_LINES_INSTRUCTIONS),
+    ("history_read_page", HISTORY_READ_PAGE_INSTRUCTIONS),
 ];
 /// Every metric the instr suite emits.
 pub const METRIC_NAMES: &[&str] = &[
@@ -26,6 +35,9 @@ pub const METRIC_NAMES: &[&str] = &[
     FRAME_DECODE_OUTPUT_64X64K_INSTRUCTIONS,
     TERMINAL_FEED_64K_INSTRUCTIONS,
     SNAPSHOT_120X40_INSTRUCTIONS,
+    TERMINAL_FEED_SCROLL_64K_INSTRUCTIONS,
+    HISTORY_PUSH_1K_LINES_INSTRUCTIONS,
+    HISTORY_READ_PAGE_INSTRUCTIONS,
 ];
 
 /// Parse `--output-format=json` output (one summary object per line) into results.
