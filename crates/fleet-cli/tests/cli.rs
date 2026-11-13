@@ -270,6 +270,30 @@ fn attach_on_pty_detaches_and_restores_terminal() {
 }
 
 #[test]
+fn attach_detaches_on_encoded_ctrl_backslash() {
+    // Kitty keyboard protocol and modifyOtherKeys forms of Ctrl-\, split across
+    // writes; a key release does not detach.
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+    let detach_forms: [&[u8]; 2] = [b"\x1b[92;5:1u", b"\x1b[27;5;92~"];
+    for form in detach_forms {
+        let mut p = PtyAttach::start(&d, &id, false);
+        p.until("\x1b[?1049h\x1b[!p");
+        p.writer.write_all(b"\x1b[92;5:3u").unwrap();
+        p.writer.write_all(b"still-attached\r").unwrap();
+        p.until("still-attached");
+        let (head, tail) = form.split_at(5);
+        p.writer.write_all(head).unwrap();
+        p.writer.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        p.writer.write_all(tail).unwrap();
+        p.until(RESTORE);
+        assert_eq!(p.exit_code(), 0);
+    }
+    assert!(d.ok(&["ls"]).contains("running"));
+}
+
+#[test]
 fn attach_exits_0_and_restores_when_agent_exits() {
     let d = Daemon::start();
     let id = d
