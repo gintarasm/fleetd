@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use fleetd::{Config, StartupError, startup};
+use fleetd::{Config, StartupError, raise_fd_limit, startup};
 
 fn main() -> ExitCode {
     let mut cfg = Config::default();
@@ -17,6 +17,10 @@ fn main() -> ExitCode {
             eprintln!("usage: fleetd [--state-dir <path>]");
             return ExitCode::from(64);
         }
+    }
+
+    if let Err(e) = raise_fd_limit() {
+        eprintln!("fleetd: raising the open-file limit: {e}");
     }
 
     let daemon = match startup(&cfg) {

@@ -31,6 +31,40 @@ fn is_fd_exhaustion(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(ENFILE | EMFILE))
 }
 
+/// `OPEN_MAX` from macOS `<sys/syslimits.h>` (not exported by `libc`).
+const MACOS_OPEN_MAX: libc::rlim_t = 10240;
+
+/// Raises the soft limit on open files to the hard limit (on macOS at most
+/// `OPEN_MAX`, which `setrlimit` requires), so ≥ 50 agents fit under a low
+/// default soft limit. Returns the soft limit now in effect. Called by
+/// `main`, not [`startup`], which is benchmarked.
+pub fn raise_fd_limit() -> io::Result<libc::rlim_t> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit with a valid, initialised struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut target = lim.rlim_max;
+    if cfg!(target_os = "macos") {
+        target = target.min(MACOS_OPEN_MAX);
+    }
+    if target > lim.rlim_cur {
+        let raised = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: as above.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        lim.rlim_cur = target;
+    }
+    Ok(lim.rlim_cur)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub state_dir: PathBuf,

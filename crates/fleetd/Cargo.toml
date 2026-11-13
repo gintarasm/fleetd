@@ -12,6 +12,7 @@ fleet-node = { version = "0.1.0", path = "../fleet-node" }
 fleet-proto = { version = "0.1.0", path = "../fleet-proto" }
 fs4 = "1.1.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+libc = "0.2.191"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "signal", "macros", "time", "sync"] }
 tokio-util = { version = "0.7.20", features = ["codec"] }
 

@@ -78,31 +78,36 @@ impl OutputSink for DiscardSink {
 /// Input and replies go through our own duplicate of the master fd, never
 /// through portable-pty's `take_writer()`: its writer sends `\n` + VEOF with a
 /// blocking write when dropped, which hangs forever on Linux once the slave is
-/// closed and the input queue is full.
+/// closed and the input queue is full. The reader thread reads from the same
+/// duplicate, so a running agent costs three fds: the master, this duplicate
+/// and its scrollback file.
 #[derive(Clone)]
 pub struct AgentInput(Arc<InputPort>);
 
 struct InputPort {
-    /// The duplicate of the master fd; `None` once closed. It shares the open
-    /// file description (and its O_NONBLOCK flag) with the reader, which
-    /// therefore retries on EAGAIN.
-    file: Mutex<Option<File>>,
+    /// The duplicate of the master fd, shared with the reader thread; `None`
+    /// once closed. The reader therefore sees the O_NONBLOCK flag set while
+    /// a reply is written, and retries on EAGAIN.
+    file: Mutex<Option<Arc<File>>>,
     /// Set by [`AgentInput::close`]. A writer that holds the lock while it is
     /// set closes the fd itself, so closing never waits for a blocked write.
     closed: AtomicBool,
 }
 
 impl AgentInput {
-    fn new(master: &dyn MasterPty) -> io::Result<Self> {
+    /// The input and the reader's handle to the same duplicate of the master.
+    fn new(master: &dyn MasterPty) -> io::Result<(Self, Arc<File>)> {
         let fd = master
             .as_raw_fd()
             .ok_or_else(|| io::Error::other("PTY master has no fd"))?;
         // SAFETY: the master owns this fd and outlives the borrow.
         let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
-        Ok(Self(Arc::new(InputPort {
-            file: Mutex::new(Some(file)),
+        let file = Arc::new(file);
+        let input = Self(Arc::new(InputPort {
+            file: Mutex::new(Some(Arc::clone(&file))),
             closed: AtomicBool::new(false),
-        })))
+        }));
+        Ok((input, file))
     }
 
     /// Writes all of `bytes`, blocking while the agent's input queue is full.
@@ -110,7 +115,7 @@ impl AgentInput {
         let written = {
             let file = lock(&self.0.file);
             let file = file.as_ref().ok_or_else(exited)?;
-            (&*file).write_all(bytes)
+            (&**file).write_all(bytes)
         };
         if self.0.closed.load(Ordering::SeqCst) {
             self.release();
@@ -258,8 +263,7 @@ impl PtyHost {
             cmd.env(k, v);
         }
         // Before the spawn, so a failure here leaves no child behind.
-        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
-        let input = AgentInput::new(&*pair.master)?;
+        let (input, reader) = AgentInput::new(&*pair.master)?;
         let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
         // Close our copy of the slave so readers see EOF once the child exits.
         drop(pair.slave);
@@ -283,7 +287,7 @@ impl PtyHost {
             .spawn(move || {
                 let mut buf = vec![0u8; READ_BUF];
                 loop {
-                    match reader.read(&mut buf) {
+                    match (&*reader).read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
                             agent.bytes_read.fetch_add(n as u64, Ordering::Relaxed);

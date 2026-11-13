@@ -26,7 +26,20 @@ struct Daemon {
 
 impl Daemon {
     fn start(dir: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_fleetd"))
+        Self::start_with(dir, Command::new(env!("CARGO_BIN_EXE_fleetd")))
+    }
+
+    /// Starts fleetd through `sh` after `ulimit <limit>` (e.g. `-n 256`).
+    fn start_with_ulimit(dir: &Path, limit: &str) -> Self {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("ulimit {limit} && exec \"$0\" \"$@\""))
+            .arg(env!("CARGO_BIN_EXE_fleetd"));
+        Self::start_with(dir, cmd)
+    }
+
+    fn start_with(dir: &Path, mut cmd: Command) -> Self {
+        let child = cmd
             .arg("--state-dir")
             .arg(dir)
             .stdout(Stdio::null())
@@ -674,4 +687,38 @@ fn sigterm_stops_agents_and_records_their_exit() {
     let rec = find(&c.list(), info.id).clone();
     assert_eq!(rec.state(), AgentState::Exited, "{rec:?}");
     assert!(rec.exit_code.is_some());
+}
+
+/// Spawns 60 agents that stay alive, under fleetd started with `limit`.
+fn sixty_agents_under(limit: &str) {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start_with_ulimit(dir.path(), limit);
+    let mut c = Client::open(dir.path());
+    let mut ids = Vec::new();
+    for i in 0..60 {
+        match c.request(request::Kind::Spawn(SpawnAgent {
+            program: "/bin/sleep".into(),
+            args: vec!["100".into()],
+            ..Default::default()
+        })) {
+            response::Kind::Spawned(info) => ids.push(info.id),
+            other => panic!("spawn {i} under `ulimit {limit}` failed: {other:?}"),
+        }
+    }
+    for id in ids {
+        c.kill(id);
+    }
+}
+
+#[test]
+fn sixty_agents_with_low_soft_fd_limit() {
+    // Too low even for the agents' own fds: fleetd raises its soft limit
+    // to the hard limit.
+    sixty_agents_under("-S -n 128");
+}
+
+#[test]
+fn sixty_agents_within_256_fds() {
+    // Soft and hard limit: the agents' own fds must fit.
+    sixty_agents_under("-n 256");
 }
