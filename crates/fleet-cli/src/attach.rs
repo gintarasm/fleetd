@@ -10,7 +10,7 @@ use fleet_proto::{Attach, Detach, Frame, Resize, SendInput, event, request, resp
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
-use crate::client::{Client, Error, Result};
+use fleet_client::{Connection, Error, Result, Sender};
 
 /// Ctrl-\ as a legacy control byte.
 const DETACH_KEY: u8 = 0x1c;
@@ -98,7 +98,7 @@ fn terminal_size() -> (u32, u32) {
 }
 
 /// Attaches and prints the snapshot only; no terminal changes.
-pub fn snapshot_only(mut client: Client, agent_id: u64) -> Result<()> {
+pub fn snapshot_only(mut client: Connection, agent_id: u64) -> Result<()> {
     match client.call(request::Kind::Attach(Attach { agent_id }))? {
         response::Kind::Attached(ok) => {
             write_stdout(&ok.snapshot)?;
@@ -108,7 +108,7 @@ pub fn snapshot_only(mut client: Client, agent_id: u64) -> Result<()> {
     }
 }
 
-pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
+pub fn run(mut client: Connection, agent_id: u64) -> Result<Outcome> {
     let (events, inbox) = mpsc::channel::<Ev>();
     // Signals first, so none is missed while the terminal is being set up.
     let mut signals = Signals::new([SIGWINCH, SIGINT, SIGTERM, SIGHUP])?;
@@ -259,7 +259,7 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
     Ok(outcome)
 }
 
-fn send_input(sender: &mut crate::client::Sender, agent_id: u64, data: &[u8]) -> Result<()> {
+fn send_input(sender: &mut Sender, agent_id: u64, data: &[u8]) -> Result<()> {
     if !data.is_empty() {
         sender.send(request::Kind::Input(SendInput {
             agent_id,

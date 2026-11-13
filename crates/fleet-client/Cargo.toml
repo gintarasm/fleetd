@@ -1,0 +1,12 @@
+[package]
+name = "fleet-client"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+fleet-proto = { version = "0.1.0", path = "../fleet-proto" }
+tokio-util = { version = "0.7.20", features = ["codec"] }

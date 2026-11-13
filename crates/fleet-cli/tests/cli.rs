@@ -430,3 +430,84 @@ fn stalled_terminal_gets_lagged_exit_2() {
     assert_eq!(p.exit_code(), 2);
     d.ok(&["kill", &id]);
 }
+
+#[test]
+fn spawn_cwd_is_used() {
+    let d = Daemon::start();
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().canonicalize().unwrap();
+    let id = d
+        .ok(&["spawn", "--cwd", dir_path.to_str().unwrap(), "--", "pwd"])
+        .trim()
+        .to_string();
+    wait_for("pwd output", || {
+        let out = d.ok(&["screen", &id]);
+        out.contains(dir_path.file_name().unwrap().to_str().unwrap())
+    });
+}
+
+#[test]
+fn ls_json_parses() {
+    let d = Daemon::start();
+    let id = d
+        .ok(&["spawn", "--label", "role=test", "--", "cat"])
+        .trim()
+        .to_string();
+    let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+    let a = &v.as_array().unwrap()[0];
+    assert_eq!(a["id"].to_string(), id);
+    assert_eq!(a["state"], "running");
+    assert!(a["exit_code"].is_null());
+    assert_eq!(a["program"], "cat");
+    assert_eq!(a["labels"]["role"], "test");
+    assert!(a["created_unix_ms"].is_number());
+    let none: serde_json::Value =
+        serde_json::from_str(&d.ok(&["ls", "--json", "--label", "role=other"])).unwrap();
+    assert!(none.as_array().unwrap().is_empty());
+    d.ok(&["label", &id, "a=b", "--rm", "role"]);
+    let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+    assert_eq!(v[0]["labels"]["a"], "b");
+    assert!(v[0]["labels"]["role"].is_null());
+    let out = d.fleet(&["label", &id, "=x"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn history_plain_prints_all_lines() {
+    let d = Daemon::start();
+    let id = d
+        .ok(&[
+            "spawn",
+            "--",
+            "sh",
+            "-c",
+            "i=1; while [ $i -le 5000 ]; do echo \"line-$i-end\"; i=$((i+1)); done",
+        ])
+        .trim()
+        .to_string();
+    wait_for("exited", || d.ok(&["ls"]).contains("exited"));
+    let out = d.ok(&["history", "--plain", &id]);
+    for i in 1..=5000 {
+        let needle = format!("line-{i}-end");
+        assert_eq!(
+            out.lines().filter(|l| l.trim() == needle).count(),
+            1,
+            "{needle}"
+        );
+    }
+    let last = d.ok(&["history", "--plain", "--lines", "3", &id]);
+    let lines: Vec<_> = last.lines().collect();
+    assert_eq!(lines.len(), 3, "{last:?}");
+    assert!(lines.iter().any(|l| l.contains("line-5000-end")));
+}
+
+#[test]
+fn screen_prints_visible_text() {
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+    d.ok(&["send", "--enter", &id, "hello"]);
+    wait_for("screen text", || d.ok(&["screen", &id]).contains("hello"));
+    let s = d.ok(&["screen", &id]);
+    assert!(!s.contains('\x1b'));
+    assert!(!s.ends_with("\n\n"), "trailing blank rows dropped: {s:?}");
+}

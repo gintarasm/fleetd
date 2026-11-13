@@ -1,9 +1,11 @@
-//! Blocking protocol client: connect, handshake, request/response.
+//! Blocking protocol client: handshake, request/response and frame streaming
+//! over any byte stream (a unix socket, an `ssh host fleetd --stdio` child, ...).
 
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 
 use bytes::BytesMut;
 use fleet_proto::{Frame, FrameCodec, Hello, PROTOCOL_VERSION, Request, request, response};
@@ -41,7 +43,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Decodes frames from the socket.
 pub struct FrameReader {
-    stream: UnixStream,
+    stream: Box<dyn Read + Send>,
     buf: BytesMut,
 }
 
@@ -69,7 +71,7 @@ impl FrameReader {
 
 /// Encodes requests onto the socket.
 pub struct Sender {
-    stream: UnixStream,
+    stream: Box<dyn Write + Send>,
     next_id: u64,
 }
 
@@ -89,36 +91,28 @@ impl Sender {
             )
             .map_err(|e| Error::Protocol(e.to_string()))?;
         self.stream.write_all(&out)?;
+        self.stream.flush()?;
         Ok(id)
     }
 }
 
-pub struct Client {
+pub struct Connection {
     reader: FrameReader,
     sender: Sender,
 }
 
-impl Client {
-    /// Connects to `<state_dir>/fleetd.sock` and completes the handshake.
-    pub fn connect(state_dir: &Path) -> Result<Client> {
-        let stream = match UnixStream::connect(state_dir.join("fleetd.sock")) {
-            Ok(s) => s,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                return Err(Error::NotRunning);
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let mut client = Client {
+impl Connection {
+    /// Handshakes over an already-open byte stream.
+    pub fn over(read: Box<dyn Read + Send>, write: Box<dyn Write + Send>) -> Result<Connection> {
+        let mut conn = Connection {
             reader: FrameReader {
-                stream: stream.try_clone()?,
+                stream: read,
                 buf: BytesMut::new(),
             },
-            sender: Sender { stream, next_id: 1 },
+            sender: Sender {
+                stream: write,
+                next_id: 1,
+            },
         };
         let mut out = BytesMut::new();
         FrameCodec::new()
@@ -130,12 +124,46 @@ impl Client {
                 &mut out,
             )
             .map_err(|e| Error::Protocol(e.to_string()))?;
-        client.sender.stream.write_all(&out)?;
-        match client.reader.read_frame()? {
-            Some(Frame::HelloOk(_)) => Ok(client),
+        conn.sender.stream.write_all(&out)?;
+        conn.sender.stream.flush()?;
+        match conn.reader.read_frame()? {
+            Some(Frame::HelloOk(_)) => Ok(conn),
             Some(Frame::Reject(r)) => Err(Error::Protocol(format!("rejected: {}", r.reason))),
             Some(_) => Err(Error::Protocol("unexpected reply to hello".into())),
             None => Err(Error::Protocol("closed during handshake".into())),
+        }
+    }
+
+    /// Connects to the unix socket at `path` and handshakes.
+    pub fn unix(path: &Path) -> Result<Connection> {
+        let stream = match UnixStream::connect(path) {
+            Ok(s) => s,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Err(Error::NotRunning);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Connection::over(Box::new(stream.try_clone()?), Box::new(stream))
+    }
+
+    /// Spawns `cmd` and talks over its stdin/stdout (e.g. `ssh host fleetd
+    /// --stdio`). The child is returned so the caller can reap or kill it.
+    pub fn command(mut cmd: Command) -> Result<(Connection, Child)> {
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = child.stdout.take().expect("piped stdout");
+        match Connection::over(Box::new(stdout), Box::new(stdin)) {
+            Ok(conn) => Ok((conn, child)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
+            }
         }
     }
 
