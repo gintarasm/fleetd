@@ -6,6 +6,7 @@
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -73,14 +74,65 @@ impl OutputSink for DiscardSink {
 /// Writes to an agent's PTY input; cheap to clone. Fails once the agent has
 /// exited.
 #[derive(Clone)]
-pub struct AgentInput(Arc<Mutex<Option<Box<dyn Write + Send>>>>);
+pub struct AgentInput(Arc<Mutex<Option<InputPort>>>);
+
+struct InputPort {
+    writer: Box<dyn Write + Send>,
+    /// Our own duplicate of the master fd, for non-blocking reply writes. It
+    /// shares the open file description (and its O_NONBLOCK flag) with the
+    /// reader, which therefore retries on EAGAIN.
+    fd: Option<OwnedFd>,
+}
 
 impl AgentInput {
+    fn new(writer: Box<dyn Write + Send>, master: &dyn MasterPty) -> Self {
+        let fd = master
+            .as_raw_fd()
+            // SAFETY: the master owns this fd and outlives the borrow.
+            .and_then(|fd| {
+                unsafe { BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .ok()
+            });
+        Self(Arc::new(Mutex::new(Some(InputPort { writer, fd }))))
+    }
+
+    /// Writes all of `bytes`, blocking while the agent's input queue is full.
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut writer = lock(&self.0);
-        let writer = writer.as_mut().ok_or_else(exited)?;
-        writer.write_all(bytes)?;
-        writer.flush()
+        let mut port = lock(&self.0);
+        let port = port.as_mut().ok_or_else(exited)?;
+        port.writer.write_all(bytes)?;
+        port.writer.flush()
+    }
+
+    /// Best-effort write that never blocks: a reply is dropped when the input
+    /// is busy (another writer holds it) or the agent's input queue is full,
+    /// and is cut short if it only partly fits. Returns whether all of `bytes`
+    /// were written. For terminal query replies from the reader thread, which
+    /// must never wait on an agent that does not read its input.
+    pub fn try_write_reply(&self, bytes: &[u8]) -> bool {
+        let Ok(port) = self.0.try_lock() else {
+            return false;
+        };
+        let Some(fd) = port.as_ref().and_then(|p| p.fd.as_ref()) else {
+            return false;
+        };
+        let fd = fd.as_raw_fd();
+        // A poll for POLLOUT is not enough: macOS reports a PTY master
+        // writable with only two bytes free, and a blocking write then waits
+        // for the rest. So the write itself is made non-blocking. The flag
+        // lives on the shared file description, but is only set while we hold
+        // the input lock (excluding other writers); the reader retries EAGAIN.
+        // SAFETY: fcntl/write on an fd we own, with a valid buffer.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return false;
+            }
+            let n = libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+            libc::fcntl(fd, libc::F_SETFL, flags);
+            usize::try_from(n) == Ok(bytes.len())
+        }
     }
 
     fn close(&self) {
@@ -184,6 +236,7 @@ impl PtyHost {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
         let writer = pair.master.take_writer().map_err(io::Error::other)?;
+        let input = AgentInput::new(writer, &*pair.master);
 
         let id = AgentId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let agent = Arc::new(Agent {
@@ -192,7 +245,7 @@ impl PtyHost {
             pid: child.process_id(),
             killer: Mutex::new(child.clone_killer()),
             master: Mutex::new(Some(pair.master)),
-            input: AgentInput(Arc::new(Mutex::new(Some(writer)))),
+            input,
         });
         sink.on_spawn(agent.input.clone());
         *lock(&self.signal.running) += 1;
@@ -211,6 +264,10 @@ impl PtyHost {
                             sink.on_output(&buf[..n]);
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        // O_NONBLOCK is set briefly while a reply is written.
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
                         Err(_) => break, // EIO on Linux once the slave closes
                     }
                 }
@@ -226,7 +283,10 @@ impl PtyHost {
                 signal.cv.notify_all();
             });
         if let Err(e) = spawned {
-            lock(&self.agents).remove(&id);
+            // The child would run unattended; stop it.
+            if let Some(agent) = lock(&self.agents).remove(&id) {
+                let _ = lock(&agent.killer).kill();
+            }
             *lock(&self.signal.running) -= 1;
             return Err(e);
         }

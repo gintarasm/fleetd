@@ -152,12 +152,11 @@ fn sink_receives_output_and_exit() {
 #[test]
 fn input_reaches_agent() {
     let host = PtyHost::new();
-    let (id, capture) = spawn_captured(&host, sh("stty -echo; cat"));
-    // Wait until `stty -echo` has run so the echo below comes from `cat`.
-    std::thread::sleep(Duration::from_millis(300));
+    // Only the agent produces upper case: the tty echo shows the input as typed.
+    let (id, capture) = spawn_captured(&host, sh("tr a-z A-Z"));
     host.write_input(id, b"ping-from-input\n").unwrap();
     assert!(
-        capture.wait_for("ping-from-input", Duration::from_secs(5)),
+        capture.wait_for("PING-FROM-INPUT", Duration::from_secs(5)),
         "{:?}",
         capture.text()
     );

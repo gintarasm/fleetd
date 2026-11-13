@@ -14,8 +14,10 @@
 //!   keyboard mode stack, hyperlinks and soft-wrap (WRAPLINE) markers.
 //!
 //! Synchronized updates (`?2026h` … `?2026l`) are buffered by the parser; a
-//! frame whose ESU never arrives is applied once its timeout (150 ms) expires,
-//! on the next [`Terminal::feed`] or [`Terminal::flush_expired_sync`].
+//! frame whose ESU never arrives is applied on the next [`Terminal::feed`] after
+//! its timeout (150 ms) expires. [`Terminal::flush_pending_sync`] applies a
+//! pending frame at once (before a snapshot, so the snapshot plus the bytes
+//! that follow reproduce the screen).
 //!
 //! Replies to terminal queries (DSR/CPR, DA, …) are collected and returned by
 //! [`Terminal::take_replies`]; the owner decides whether to send them to the
@@ -105,9 +107,17 @@ impl Terminal {
         self.parser.advance(&mut self.term, bytes);
     }
 
+    /// Applies a buffered synchronized update now, whether or not its ESU or
+    /// timeout has arrived. Call before [`Terminal::snapshot`]: bytes buffered
+    /// mid-frame would otherwise be missing from the snapshot.
+    pub fn flush_pending_sync(&mut self) {
+        if self.parser.sync_timeout().sync_timeout().is_some() {
+            self.parser.stop_sync(&mut self.term);
+        }
+    }
+
     /// Applies a synchronized update whose timeout has expired without an ESU.
-    /// Call before [`Terminal::snapshot`] so a stalled frame is not hidden.
-    pub fn flush_expired_sync(&mut self) {
+    fn flush_expired_sync(&mut self) {
         let expired = self
             .parser
             .sync_timeout()
@@ -784,5 +794,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         t.feed(b"two");
         assert_eq!(t.visible_text()[0], "one two");
+    }
+
+    #[test]
+    fn pending_sync_update_is_applied_on_demand() {
+        let mut t = Terminal::new(20, 5);
+        t.flush_pending_sync(); // no-op without a pending update
+        t.feed(b"\x1b[?2026hhalf ");
+        t.flush_pending_sync();
+        assert_eq!(t.visible_text()[0], "half");
+        // The rest of the frame and its ESU then apply normally.
+        t.feed(b"done\x1b[?2026l");
+        assert_eq!(t.visible_text()[0], "half done");
     }
 }
