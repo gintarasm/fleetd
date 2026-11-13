@@ -23,6 +23,7 @@ pub const FLOOD_PEAK_RSS_BYTES: &str = "flood50_peak_rss_bytes";
 pub const DAEMON_FLOOD_WALL_NS: &str = "daemon_flood50_wall_ns";
 pub const DAEMON_FLOOD_CPU_NS_PER_MIB: &str = "daemon_flood50_cpu_ns_per_mib";
 pub const DAEMON_FLOOD_PEAK_RSS_BYTES: &str = "daemon_flood50_peak_rss_bytes";
+pub const DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS: &str = "daemon_flood50_lagged_subscriptions";
 pub const REATTACH_SNAPSHOT_NS: &str = "reattach_snapshot_ns";
 /// Every metric the wall suite emits.
 pub const METRIC_NAMES: &[&str] = &[
@@ -34,6 +35,7 @@ pub const METRIC_NAMES: &[&str] = &[
     DAEMON_FLOOD_WALL_NS,
     DAEMON_FLOOD_CPU_NS_PER_MIB,
     DAEMON_FLOOD_PEAK_RSS_BYTES,
+    DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS,
     REATTACH_SNAPSHOT_NS,
 ];
 
@@ -337,6 +339,10 @@ pub fn run(quick: bool) -> Result<Results, String> {
         (
             DAEMON_FLOOD_PEAK_RSS_BYTES.to_string(),
             m(pick_daemon(|f| f.peak_rss_bytes), "bytes"),
+        ),
+        (
+            DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS.to_string(),
+            m(pick_daemon(|f| f.lagged_subscriptions), "count"),
         ),
         (REATTACH_SNAPSHOT_NS.to_string(), m(reattach, "ns")),
     ]);

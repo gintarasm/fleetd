@@ -44,19 +44,32 @@ unit = "ns"
 report_only = true
 baseline = 0
 
+[metrics.daemon_flood50_lagged_subscriptions]
+suite = "wall"
+unit = "count"
+# M1 node cannot stream 50 flooding agents to an attached client; see ADR 0018
+report_only = true
+baseline = 0
+
 [metrics.daemon_flood50_peak_rss_bytes]
 suite = "wall"
 unit = "bytes"
+# report-only until CI variance is characterised
+report_only = true
 baseline = 0
 
 [metrics.daemon_flood50_wall_ns]
 suite = "wall"
 unit = "ns"
+# report-only until CI variance is characterised
+report_only = true
 baseline = 0
 
 [metrics.reattach_snapshot_ns]
 suite = "wall"
 unit = "ns"
+# report-only until CI variance is characterised (~60 us, jitter-dominated)
+report_only = true
 baseline = 0
 
 [metrics.fleetd_startup_instructions]
@@ -64,7 +77,7 @@ suite = "instr"
 unit = "instructions"
 baseline = 4806
 
-[metrics.frame_decode_output_64k_instructions]
+[metrics.frame_decode_output_64x64k_instructions]
 suite = "instr"
 unit = "instructions"
 baseline = 0

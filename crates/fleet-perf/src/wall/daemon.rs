@@ -324,6 +324,8 @@ pub(super) struct DaemonFlood {
     pub wall_ns: f64,
     pub cpu_ns_per_mib: f64,
     pub peak_rss_bytes: f64,
+    /// Subscriptions fleetd dropped as lagged during the run.
+    pub lagged_subscriptions: f64,
 }
 
 /// One daemon flood: `agents` fake agents spawned through the protocol, each
@@ -398,6 +400,7 @@ pub(super) fn flood(
         wall_ns,
         cpu_ns_per_mib: end.cpu_ns.saturating_sub(cpu_before) as f64 / total_mib,
         peak_rss_bytes: peak as f64,
+        lagged_subscriptions: streams.lagged as f64,
     })
 }
 

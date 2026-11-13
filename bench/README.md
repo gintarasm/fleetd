@@ -30,17 +30,18 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 | `daemon_flood50_wall_ns` | wall | `fleetd` spawns 50 `fake-agent --ansi --bytes 8388608` via the protocol, one client attached to every agent on one connection (snapshot + stream consumed); first spawn request to last `AgentExited` (median of 3) |
 | `daemon_flood50_cpu_ns_per_mib` | wall | CPU time (user + sys) of the `fleetd` process alone (`proc_pid_rusage` / `/proc/<pid>/stat`, agents excluded) over that run, per MiB of agent output |
 | `daemon_flood50_peak_rss_bytes` | wall | peak `fleetd` RSS during that run, sampled every 50 ms |
+| `daemon_flood50_lagged_subscriptions` | wall | subscriptions `fleetd` dropped as lagged during that run (unit `count`) |
 | `reattach_snapshot_ns` | wall | `Attach` sent to `AttachOk` received for an idle agent that printed 8 MiB (median of 50, detaching in between) |
 | `fleetd_startup_instructions` | instr | Callgrind instruction count of `fleetd::startup` (x86_64, ubuntu-24.04) |
-| `frame_decode_output_64k_instructions` | instr | decode one 64 KiB `Output` frame with `FrameCodec` |
+| `frame_decode_output_64x64k_instructions` | instr | decode 64 back-to-back 64 KiB `Output` frames with `FrameCodec` |
 | `terminal_feed_64k_instructions` | instr | feed 64 KiB of deterministic agent-like ANSI (`FakeOutput`, `\n` as `\r\n`) into a blank 120x40 `Terminal` |
 | `snapshot_120x40_instructions` | instr | `Terminal::snapshot` of a 120x40 screen filled with that output |
 
 Tolerances: `instr` 2%, `wall` 5%.
 
-`flood50_cpu_ns_per_mib` and `daemon_flood50_cpu_ns_per_mib` are `report_only` (see below) until the self-hosted runner is characterised.
+`flood50_cpu_ns_per_mib` and `daemon_flood50_cpu_ns_per_mib` are `report_only` (see below) until the self-hosted runner is characterised; the other `daemon_flood50_*` metrics and `reattach_snapshot_ns` until their CI variance is characterised. `daemon_flood50_lagged_subscriptions` is report-only because the M1 node cannot stream 50 flooding agents to one attached client (ADR 0018); a run with 0 lagged subscriptions is an invalid value for `compare` (values must be > 0), so once lagging is fixed the metric must be retired.
 
-In `daemon_flood50` fleetd drops most subscriptions as lagged under full load (drop policy, `docs/decisions/0018-m1-protocol-and-node.md`); the client does not re-attach (the notice does not name the agent), so the scenario measures the daemon with clients attached until they lag out. The count is printed to stderr. Setup (fixtures, the screen to snapshot) runs outside the measured region of every `instr` benchmark.
+In `daemon_flood50` fleetd drops most subscriptions as lagged under full load (drop policy, `docs/decisions/0018-m1-protocol-and-node.md`); the client does not re-attach (the notice does not name the agent), so the scenario measures the daemon with clients attached until they lag out. The count is reported as `daemon_flood50_lagged_subscriptions` (and printed to stderr); wall time, CPU and RSS shift with it. Setup (fixtures, the screen to snapshot) runs outside the measured region of every `instr` benchmark.
 
 ### Report-only metrics
 

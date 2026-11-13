@@ -7,15 +7,15 @@ use std::process::{Command, Stdio};
 use crate::results::{Measurement, Results, Suite};
 
 pub const STARTUP_INSTRUCTIONS: &str = "fleetd_startup_instructions";
-pub const FRAME_DECODE_OUTPUT_64K_INSTRUCTIONS: &str = "frame_decode_output_64k_instructions";
+pub const FRAME_DECODE_OUTPUT_64X64K_INSTRUCTIONS: &str = "frame_decode_output_64x64k_instructions";
 pub const TERMINAL_FEED_64K_INSTRUCTIONS: &str = "terminal_feed_64k_instructions";
 pub const SNAPSHOT_120X40_INSTRUCTIONS: &str = "snapshot_120x40_instructions";
 /// Bench function name -> metric name.
 const METRICS: &[(&str, &str)] = &[
     ("fleetd_startup", STARTUP_INSTRUCTIONS),
     (
-        "frame_decode_output_64k",
-        FRAME_DECODE_OUTPUT_64K_INSTRUCTIONS,
+        "frame_decode_output_64x64k",
+        FRAME_DECODE_OUTPUT_64X64K_INSTRUCTIONS,
     ),
     ("terminal_feed_64k", TERMINAL_FEED_64K_INSTRUCTIONS),
     ("snapshot_120x40", SNAPSHOT_120X40_INSTRUCTIONS),
@@ -23,7 +23,7 @@ const METRICS: &[(&str, &str)] = &[
 /// Every metric the instr suite emits.
 pub const METRIC_NAMES: &[&str] = &[
     STARTUP_INSTRUCTIONS,
-    FRAME_DECODE_OUTPUT_64K_INSTRUCTIONS,
+    FRAME_DECODE_OUTPUT_64X64K_INSTRUCTIONS,
     TERMINAL_FEED_64K_INSTRUCTIONS,
     SNAPSHOT_120X40_INSTRUCTIONS,
 ];

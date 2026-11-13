@@ -19,7 +19,12 @@
 - **Agent states:** `running`, `exited` (with exit code) and `lost`: on startup the node marks every agent still `running` in the store (left behind by a crashed or killed daemon) as `lost`, since its PTY cannot be recovered (no handoff, 0013).
 - **Schema compilation:** `fleet-proto/build.rs` compiles `proto/fleet.proto` with `protox` (pure-Rust protobuf compiler) and generates types with `prost-build`, so building needs no `protoc` on the machine or in CI.
 
-**Consequences:** a reattach costs one screen (a 120x40 snapshot is well under 64 KiB) regardless of output volume. A client attached to many agents at full throughput can be dropped as lagged even if it keeps up, because the daemon's forwarders compete for CPU with the agents' parsing (seen in the `daemon_flood50` benchmark); since the notice does not carry the agent id, such a client cannot re-attach selectively. Adding the agent id to the notice (a protocol change) is the follow-up. Benchmarks for the new hot paths: `daemon_flood50_*`, `reattach_snapshot_ns`, `frame_decode_output_64k_instructions`, `terminal_feed_64k_instructions`, `snapshot_120x40_instructions` (`bench/README.md`).
+**Consequences:** a reattach costs one screen (a 120x40 snapshot is well under 64 KiB) regardless of output volume. A client attached to many agents at full throughput can be dropped as lagged even if it keeps up, because the daemon's forwarders compete for CPU with the agents' parsing (seen in the `daemon_flood50` benchmark); since the notice does not carry the agent id, such a client cannot re-attach selectively. Adding the agent id to the notice (a protocol change) is the follow-up. Benchmarks for the new hot paths: `daemon_flood50_*`, `reattach_snapshot_ns`, `frame_decode_output_64x64k_instructions`, `terminal_feed_64k_instructions`, `snapshot_120x40_instructions` (`bench/README.md`).
+
+## Known limits / follow-ups
+
+- **Lag notice lacks the agent id.** `Response { id: 0, Error "lagged: re-attach" }` does not say which subscription was dropped, so a client attached to several agents cannot re-attach selectively. Follow-up: carry the agent id in the notice (protocol change, bump or extend `fleet.v1`).
+- **Daemon CPU under a 50-agent flood.** In `daemon_flood50` (50 agents x 8 MiB, one client attached to all) `fleetd` uses ~380% CPU and drops 45–48 of 50 subscriptions as lagged although the client keeps up (~10% CPU): the agents' parsing threads starve the connection's forwarders. Tracked by `daemon_flood50_lagged_subscriptions` (report-only); the first M2-prep perf target.
 
 ## Daemon shutdown
 

@@ -38,25 +38,38 @@ fn fleetd_startup(dir: TempDir) -> TempDir {
 
 library_benchmark_group!(name = startup; benchmarks = fleetd_startup);
 
-/// One encoded `Output` frame carrying 64 KiB. Runs outside the measured region.
-fn output_frame_64k() -> BytesMut {
+/// Output frames decoded per iteration of `frame_decode_output_64x64k`.
+const DECODE_FRAMES: usize = 64;
+
+/// `DECODE_FRAMES` back-to-back encoded `Output` frames of 64 KiB each, and
+/// room for the decoded frames. Runs outside the measured region.
+fn output_frames_64x64k() -> (BytesMut, Vec<Frame>) {
     let data = Bytes::from(vec![b'x'; KIB_64]);
     let mut buf = BytesMut::new();
-    FrameCodec::new()
-        .encode(Frame::Output { agent_id: 1, data }, &mut buf)
-        .expect("encode");
-    buf
+    for agent_id in 0..DECODE_FRAMES as u64 {
+        FrameCodec::new()
+            .encode(
+                Frame::Output {
+                    agent_id,
+                    data: data.clone(),
+                },
+                &mut buf,
+            )
+            .expect("encode");
+    }
+    (buf, Vec::with_capacity(DECODE_FRAMES))
 }
 
 #[library_benchmark]
-#[bench::output_64k(setup = output_frame_64k)]
-fn frame_decode_output_64k(mut buf: BytesMut) -> (Frame, BytesMut) {
-    let frame = FrameCodec::new()
-        .decode(black_box(&mut buf))
-        .expect("decode")
-        .expect("complete frame");
+#[bench::output_64x64k(setup = output_frames_64x64k)]
+fn frame_decode_output_64x64k((mut buf, mut frames): (BytesMut, Vec<Frame>)) -> Vec<Frame> {
+    let mut codec = FrameCodec::new();
+    while let Some(frame) = codec.decode(black_box(&mut buf)).expect("decode") {
+        frames.push(frame);
+    }
+    assert_eq!(frames.len(), DECODE_FRAMES);
     // Returned so dropping happens after measurement.
-    (frame, buf)
+    frames
 }
 
 /// 64 KiB of deterministic agent-like ANSI output, as read from a PTY (ONLCR
@@ -102,7 +115,7 @@ fn snapshot_120x40(term: Terminal) -> (Vec<u8>, Terminal) {
 
 library_benchmark_group!(
     name = hot_paths;
-    benchmarks = frame_decode_output_64k, terminal_feed_64k, snapshot_120x40
+    benchmarks = frame_decode_output_64x64k, terminal_feed_64k, snapshot_120x40
 );
 
 main!(library_benchmark_groups = startup, hot_paths);
