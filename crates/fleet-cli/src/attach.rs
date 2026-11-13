@@ -95,9 +95,13 @@ fn terminal_size() -> (u32, u32) {
         .unwrap_or((80, 24))
 }
 
-/// Attaches and prints the snapshot only; no terminal changes.
+/// Attaches read-only (never taking the primary role) and prints the
+/// snapshot only; no terminal changes.
 pub fn snapshot_only(mut client: Connection, agent_id: u64) -> Result<()> {
-    match client.call(request::Kind::Attach(Attach { agent_id }))? {
+    match client.call(request::Kind::Attach(Attach {
+        agent_id,
+        observe: true,
+    }))? {
         response::Kind::Attached(ok) => {
             write_stdout(&ok.snapshot)?;
             Ok(())
@@ -111,21 +115,31 @@ pub fn run(mut client: Connection, agent_id: u64) -> Result<Outcome> {
     // Signals first, so none is missed while the terminal is being set up.
     let mut signals = Signals::new([SIGWINCH, SIGINT, SIGTERM, SIGHUP])?;
 
-    // Resize first, so the snapshot is drawn at this terminal's size. An
-    // exited agent cannot be resized; attaching still shows its last screen.
-    let (cols, rows) = terminal_size();
-    match client.call(request::Kind::Resize(Resize {
+    // Attach first: only the primary's resizes apply (ADR 0022), and
+    // attaching makes this connection primary. If the agent's size differs,
+    // resize it, then attach again (keeping the role) so the snapshot is
+    // drawn at this terminal's size. An exited agent cannot be resized;
+    // attaching still shows its last screen.
+    let attach = |client: &mut Connection| match client.call(request::Kind::Attach(Attach {
         agent_id,
-        cols,
-        rows,
-    })) {
-        Ok(_) | Err(Error::Server(_)) => {}
-        Err(e) => return Err(e),
-    }
-    let ok = match client.call(request::Kind::Attach(Attach { agent_id }))? {
-        response::Kind::Attached(ok) => ok,
-        _ => return Err(Error::Protocol("unexpected reply to attach".into())),
+        observe: false,
+    }))? {
+        response::Kind::Attached(ok) => Ok(ok),
+        _ => Err(Error::Protocol("unexpected reply to attach".into())),
     };
+    let mut ok = attach(&mut client)?;
+    let (cols, rows) = terminal_size();
+    if (ok.cols, ok.rows) != (cols, rows) {
+        match client.call(request::Kind::Resize(Resize {
+            agent_id,
+            cols,
+            rows,
+        })) {
+            Ok(_) => ok = attach(&mut client)?,
+            Err(Error::Server(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
     let (mut frames, mut sender) = client.split();
 
     let guard = TerminalGuard::enter()?;

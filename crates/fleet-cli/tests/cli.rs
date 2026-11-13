@@ -424,6 +424,34 @@ fn window_resize_reaches_the_agent() {
     assert_eq!(p.exit_code(), 0);
 }
 
+/// A second `fleet attach` becomes primary, and the agent follows its
+/// terminal's size (not the first client's).
+#[test]
+fn second_attach_resizes_the_agent_to_its_terminal() {
+    let d = Daemon::start();
+    let id = d
+        .ok(&[
+            "spawn",
+            "--",
+            "sh",
+            "-c",
+            "while read l; do echo \"size=$(stty size).\"; done",
+        ])
+        .trim()
+        .to_string();
+    let mut first = PtyAttach::start_sized(&d, &id, false, 80, 24);
+    first.until("\x1b[?1049h");
+    let mut second = PtyAttach::start_sized(&d, &id, false, 100, 30);
+    second.until("\x1b[?1049h");
+    second.writer.write_all(b"\r").unwrap();
+    second.until("size=30 100.");
+    for p in [&mut first, &mut second] {
+        p.writer.write_all(&[0x1c]).unwrap();
+        assert_eq!(p.exit_code(), 0);
+    }
+    d.ok(&["kill", &id]);
+}
+
 /// Every `ESC [ row ; col H` in `bytes`.
 fn cursor_positions(bytes: &[u8]) -> Vec<(u32, u32)> {
     let text = String::from_utf8_lossy(bytes);

@@ -11,8 +11,13 @@ use fleet_term::Terminal;
 /// Lines asked for per `ReadHistory` request (the daemon caps it further).
 const PAGE: u32 = 4096;
 
+/// A read-only attach: it never takes the primary role from the user's
+/// `fleet attach` or GUI (ADR 0022).
 fn attach(client: &mut Connection, agent_id: u64) -> Result<AttachOk> {
-    match client.call(request::Kind::Attach(Attach { agent_id }))? {
+    match client.call(request::Kind::Attach(Attach {
+        agent_id,
+        observe: true,
+    }))? {
         response::Kind::Attached(ok) => Ok(*ok),
         _ => Err(Error::Protocol("unexpected reply to attach".into())),
     }
