@@ -38,6 +38,9 @@ baseline = 4923392
 [metrics.flood50_wall_ns]
 suite = "wall"
 unit = "ns"
+# report-only: on the shared self-hosted runner this ranged +6% to +23% over
+# the baseline on unchanged code (main itself, 2026-11-13), beyond the 5% gate.
+report_only = true
 baseline = 3481542708.5
 
 [metrics.daemon_flood50_cpu_ns_per_mib]
