@@ -142,9 +142,10 @@ impl Status {
             }
             Status::Unknown => Some("metric has no baseline entry: run `fleet-perf baseline-add`"),
             Status::Unrecorded => Some("baseline not yet recorded: run `fleet-perf tighten`"),
-            Status::Invalid => {
-                Some("measurement produced an invalid value (non-finite or <= 0): fix the suite")
-            }
+            Status::Invalid => Some(
+                "measurement produced an invalid value (non-finite, or <= 0; a count may be 0): \
+                     fix the suite",
+            ),
             // Per-row: the row's `detail` names both units.
             Status::UnitMismatch => None,
         }
@@ -196,6 +197,16 @@ fn delta_pct(baseline: f64, value: f64) -> f64 {
     }
 }
 
+/// Unit of metrics that count occurrences (e.g. lagged subscriptions).
+pub const COUNT_UNIT: &str = "count";
+
+/// A measurement must be finite and positive; a count may also be 0 (none
+/// happened), when both the results and the baseline say `count`.
+fn valid_value(value: f64, unit: &str, baseline_unit: &str) -> bool {
+    let zero_ok = unit == COUNT_UNIT && baseline_unit == COUNT_UNIT;
+    value.is_finite() && (value > 0.0 || (zero_ok && value == 0.0))
+}
+
 pub fn compare(b: &Baselines, r: &Results) -> Report {
     let mut rows = Vec::new();
 
@@ -215,7 +226,7 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
         };
         let value = m.value;
         let mut detail = None;
-        let status = if !value.is_finite() || value <= 0.0 {
+        let status = if !valid_value(value, &m.unit, &spec.unit) {
             Status::Invalid
         } else if m.unit != spec.unit {
             detail = Some(format!(
@@ -572,6 +583,52 @@ baseline = 100
         let mut r = res(Suite::Wall, &[("m_wall", 100.0)]);
         r.metrics.get_mut("m_wall").unwrap().unit = "ms".into();
         assert_eq!(status(&b, &r, "m_wall"), (Status::UnitMismatch, true));
+    }
+
+    /// `base()` plus a count metric `m_count` (baseline 5).
+    fn with_count() -> Baselines {
+        let mut b = base();
+        let mut spec = b.metrics["m_wall"].clone();
+        spec.unit = COUNT_UNIT.into();
+        spec.budget = None;
+        spec.baseline = 5.0;
+        b.metrics.insert("m_count".into(), spec);
+        b
+    }
+
+    fn count_res(value: f64) -> Results {
+        let mut r = res(Suite::Wall, &[("m_wall", 100.0), ("m_count", value)]);
+        r.metrics.get_mut("m_count").unwrap().unit = COUNT_UNIT.into();
+        r
+    }
+
+    #[test]
+    fn zero_is_a_valid_count() {
+        let b = with_count();
+        assert_eq!(
+            status(&b, &count_res(0.0), "m_count"),
+            (Status::Improved, false)
+        );
+        assert_eq!(status(&b, &count_res(5.0), "m_count"), (Status::Ok, false));
+        assert_eq!(
+            status(&b, &count_res(-1.0), "m_count"),
+            (Status::Invalid, true)
+        );
+        assert_eq!(
+            status(&b, &count_res(f64::NAN), "m_count"),
+            (Status::Invalid, true)
+        );
+    }
+
+    #[test]
+    fn zero_is_invalid_for_other_units() {
+        let b = with_count();
+        let r = res(Suite::Wall, &[("m_wall", 0.0)]);
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Invalid, true));
+        // A zero count reported against a non-count baseline is still invalid.
+        let mut r = res(Suite::Wall, &[("m_wall", 0.0)]);
+        r.metrics.get_mut("m_wall").unwrap().unit = COUNT_UNIT.into();
+        assert_eq!(status(&b, &r, "m_wall"), (Status::Invalid, true));
     }
 
     #[test]
