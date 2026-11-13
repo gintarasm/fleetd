@@ -259,23 +259,36 @@ impl Store {
     }
 
     pub fn list_agents(&self) -> rusqlite::Result<Vec<AgentRecord>> {
-        self.query_agents(|rows| rows.collect())
+        self.query_agents(true, |rows| rows.collect())
     }
 
     /// Like [`Store::list_agents`], but a row that fails to decode is
     /// returned as an error alongside the good rows instead of failing the
     /// whole listing.
     pub fn list_agents_lossy(&self) -> rusqlite::Result<(Vec<AgentRecord>, Vec<rusqlite::Error>)> {
-        self.query_agents(|rows| {
-            let (mut good, mut bad) = (Vec::new(), Vec::new());
-            for row in rows {
-                match row {
-                    Ok(rec) => good.push(rec),
-                    Err(e) => bad.push(e),
-                }
+        self.query_agents(true, Self::split_lossy)
+    }
+
+    /// [`Store::list_agents_lossy`] without reading labels (every record's
+    /// `labels` is empty).
+    pub fn list_agents_lossy_unlabeled(
+        &self,
+    ) -> rusqlite::Result<(Vec<AgentRecord>, Vec<rusqlite::Error>)> {
+        self.query_agents(false, Self::split_lossy)
+    }
+
+    /// Splits decoded rows into the good ones and the errors.
+    fn split_lossy(
+        rows: &mut dyn Iterator<Item = rusqlite::Result<AgentRecord>>,
+    ) -> rusqlite::Result<(Vec<AgentRecord>, Vec<rusqlite::Error>)> {
+        let (mut good, mut bad) = (Vec::new(), Vec::new());
+        for row in rows {
+            match row {
+                Ok(rec) => good.push(rec),
+                Err(e) => bad.push(e),
             }
-            Ok((good, bad))
-        })
+        }
+        Ok((good, bad))
     }
 
     /// Every agent's labels, by agent id.
@@ -296,11 +309,16 @@ impl Store {
 
     fn query_agents<T>(
         &self,
+        with_labels: bool,
         collect: impl FnOnce(
             &mut dyn Iterator<Item = rusqlite::Result<AgentRecord>>,
         ) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
-        let mut labels = self.all_labels()?;
+        let mut labels = if with_labels {
+            self.all_labels()?
+        } else {
+            HashMap::new()
+        };
         let mut stmt = self.conn.prepare(
             "SELECT id, program, args_json, cwd, state, exit_code, created_unix_ms, scrollback_path
              FROM agents ORDER BY id",

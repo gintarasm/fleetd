@@ -1,7 +1,7 @@
 //! Node history: attach tail, paged reads, restart, clear and retention.
 
 use fleet_node::Terminal;
-use fleet_node::node::{Node, RETAINED_EXITED};
+use fleet_node::node::{ConnId, Node, RETAINED_EXITED};
 use fleet_proto::{AttachOk, SpawnAgent};
 use std::io;
 use std::path::Path;
@@ -51,7 +51,7 @@ fn screen_text(ok: &AttachOk) -> Vec<String> {
 fn attach_when_shown(node: &Node, id: u64, needle: &str) -> AttachOk {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let (ok, _sub) = node.attach(id).unwrap();
+        let (ok, _sub) = node.attach(id, ConnId(1)).unwrap();
         if screen_text(&ok).iter().any(|l| l.contains(needle)) {
             return ok;
         }
@@ -160,7 +160,7 @@ fn history_survives_daemon_restart() {
         id
     };
     let node = Node::open(dir.path()).unwrap();
-    let (ok, _sub) = node.attach(id).unwrap();
+    let (ok, _sub) = node.attach(id, ConnId(1)).unwrap();
     let next_line = ok.tail_first_line + ok.history_tail.len() as u64;
     assert!(next_line > 0, "no history after restart");
     let text = read_all_before(
@@ -200,7 +200,7 @@ fn stale_generation_is_rejected() {
         10,
     )
     .unwrap();
-    node.input(id, b"\n").unwrap();
+    node.input(id, ConnId(1), b"\n").unwrap();
     let after = attach_when_shown(&node, id, "CLEARED");
     assert_ne!(after.history_generation, before.history_generation);
     let e = node
@@ -272,8 +272,8 @@ fn rows_a_shrink_pushes_off_become_history() {
     );
     let before = attach_when_shown(&node, id, "DONE");
     assert!(before.history_tail.is_empty());
-    node.resize(id, 80, 5).unwrap();
-    let (after, _sub) = node.attach(id).unwrap();
+    node.resize(id, ConnId(1), 80, 5).unwrap();
+    let (after, _sub) = node.attach(id, ConnId(1)).unwrap();
     assert!(!after.history_tail.is_empty(), "shrink left no history");
     let mut text: Vec<String> = after.history_tail.iter().map(|l| strip_ansi(l)).collect();
     text.extend(screen_text(&after));

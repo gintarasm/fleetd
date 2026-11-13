@@ -1,7 +1,7 @@
 //! Node resource bounds. A single test in its own binary, so no concurrent
 //! test opens or closes fds while they are counted.
 
-use fleet_node::node::Node;
+use fleet_node::node::{ConnId, Node};
 use fleet_proto::SpawnAgent;
 use std::time::{Duration, Instant};
 
@@ -42,10 +42,10 @@ fn exited_agents_release_their_resources() {
     // the oldest exit was evicted (empty snapshot), the newest is retained.
     let listed = node.list().unwrap();
     assert_eq!(listed.len(), AGENTS);
-    let evicted = node.attach(listed[0].id).unwrap().0;
+    let evicted = node.attach(listed[0].id, ConnId(1)).unwrap().0;
     assert!(evicted.snapshot.is_empty() && (evicted.cols, evicted.rows) == (0, 0));
     for info in [&listed[0], &listed[AGENTS - 1]] {
-        let (ok, mut sub) = node.attach(info.id).unwrap();
+        let (ok, mut sub) = node.attach(info.id, ConnId(1)).unwrap();
         assert_eq!(ok.agent_id, info.id);
         assert_eq!(
             sub.blocking_recv(),

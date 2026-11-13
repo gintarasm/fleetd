@@ -25,6 +25,22 @@
 //! Terminal query replies (DSR/CPR, DA, …) are written back to the agent only
 //! while no subscriber is attached; otherwise the client's terminal answers.
 //! They are dropped rather than ever blocking the reader thread.
+//!
+//! **Primary client.** Subscribers taken by a connection ([`ConnId`]) have a
+//! role: the primary is the connection that most recently attached to the
+//! agent or sent it input; only its resizes apply (a resize from another
+//! connection is ignored, one from a connection while no connection is
+//! attached applies). A connection holds at most one subscription per agent:
+//! attaching again replaces it. Role changes reach the affected subscribers
+//! in their stream as [`StreamItem::Role`]. When the primary's subscription
+//! ends (dropped, lagged), the remaining connection that most recently
+//! attached or sent input becomes primary and is told so.
+//!
+//! **Activity.** The output path only marks the agent dirty (a flag and a
+//! timestamp, under the pipeline lock it already holds; the first mark since
+//! the last tick queues the agent for the ticker). A ticker thread (started
+//! by the first output, parked while nothing is queued) reads the queued agents' last non-blank row at
+//! most every [`ACTIVITY_TICK`] and broadcasts [`AgentActivity`] events.
 
 use crate::history::{History, HistoryInfo, Page};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
@@ -32,14 +48,15 @@ use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
 use bytes::Bytes;
-use fleet_proto::{AgentExited, AgentInfo, AttachOk, SpawnAgent};
+use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AttachOk, SpawnAgent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::thread::Thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, error::TrySendError};
 
@@ -219,13 +236,39 @@ pub enum StreamItem {
     Exited(i32),
     /// The subscriber fell behind and was dropped; the stream ends after it.
     Lagged,
+    /// The subscriber's connection became (`true`) or stopped being
+    /// (`false`) the agent's primary client.
+    Role(bool),
 }
+
+/// Identifies a client connection to the node, for the primary-client rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnId(pub u64);
 
 /// Receiving end of a subscription; dropping it detaches.
 pub struct Subscription {
     rx: mpsc::Receiver<StreamItem>,
     lagged: Arc<AtomicBool>,
     done: bool,
+    /// The pipeline and this subscriber's key in it, to unsubscribe eagerly
+    /// on drop (so the primary role moves on at once).
+    owner: Option<(Weak<Mutex<State>>, u64)>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some((state, key)) = self.owner.take()
+            && let Some(state) = state.upgrade()
+        {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pos) = state.subscribers.iter().position(|s| s.key == key) {
+                state.subscribers.remove(pos);
+                if state.primary == Some(key) {
+                    state.elect_primary();
+                }
+            }
+        }
+    }
 }
 
 impl Subscription {
@@ -238,6 +281,7 @@ impl Subscription {
             rx,
             lagged: Arc::new(AtomicBool::new(false)),
             done: false,
+            owner: None,
         }
     }
 
@@ -293,6 +337,13 @@ impl Subscription {
 struct Subscriber {
     tx: mpsc::Sender<StreamItem>,
     lagged: Arc<AtomicBool>,
+    /// Unique within the pipeline.
+    key: u64,
+    /// `None` for an anonymous subscriber ([`AgentPipeline::subscribe`]),
+    /// which takes no part in the primary rule.
+    conn: Option<ConnId>,
+    /// When the connection last attached or sent input (a [`State::tick`]).
+    seen: u64,
 }
 
 impl Subscriber {
@@ -320,9 +371,71 @@ struct State {
     /// `None` without history, and once the agent has exited (flushed and
     /// closed).
     history: Option<History>,
+    /// The primary subscriber's key; `None` while no connection is attached.
+    primary: Option<u64>,
+    /// Source of subscriber keys and recency stamps.
+    clock: u64,
+    /// Output arrived since the activity ticker last looked.
+    activity_dirty: bool,
+    /// When output last arrived (Unix ms).
+    last_output_unix_ms: i64,
 }
 
 impl State {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn subscriber(&self, key: u64) -> Option<&Subscriber> {
+        self.subscribers.iter().find(|s| s.key == key)
+    }
+
+    /// Makes the connection subscriber that most recently attached or sent
+    /// input primary and tells it so; a subscriber that cannot take the
+    /// message is dropped (lagged) and the next one tried.
+    fn elect_primary(&mut self) {
+        loop {
+            let next = self
+                .subscribers
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.conn.is_some())
+                .max_by_key(|(_, s)| s.seen)
+                .map(|(i, _)| i);
+            let Some(i) = next else {
+                self.primary = None;
+                return;
+            };
+            if self.subscribers[i].offer(StreamItem::Role(true)) {
+                self.primary = Some(self.subscribers[i].key);
+                return;
+            }
+            self.subscribers.remove(i);
+        }
+    }
+
+    /// Tells the current primary (if any) it no longer is; a subscriber
+    /// that cannot take the message is dropped (lagged).
+    fn demote_primary(&mut self) {
+        if let Some(key) = self.primary.take()
+            && let Some(i) = self.subscribers.iter().position(|s| s.key == key)
+            && !self.subscribers[i].offer(StreamItem::Role(false))
+        {
+            self.subscribers.remove(i);
+        }
+    }
+
+    /// After subscribers were dropped: elects a new primary if the old one
+    /// went.
+    fn check_primary(&mut self) {
+        if let Some(key) = self.primary
+            && self.subscriber(key).is_none()
+        {
+            self.elect_primary();
+        }
+    }
+
     /// Moves the grid's history events into the agent's history. Must follow
     /// every grid operation that can scroll rows off (feed, sync flush,
     /// resize): undrained events pile up in the terminal.
@@ -360,6 +473,9 @@ pub struct Attached {
     /// `None` if the pipeline keeps no history or the agent has exited.
     pub history: Option<HistoryTail>,
     pub subscription: Subscription,
+    /// The attaching connection is now primary (never for an anonymous
+    /// subscriber or after exit).
+    pub primary: bool,
 }
 
 /// One agent's pipeline; clones share it. Pass a clone to
@@ -392,6 +508,10 @@ impl AgentPipeline {
                 exit_code: None,
                 partial: PartialSequence::new(),
                 history,
+                primary: None,
+                clock: 0,
+                activity_dirty: false,
+                last_output_unix_ms: 0,
             })),
         }
     }
@@ -411,14 +531,20 @@ impl AgentPipeline {
     /// [`AgentPipeline::subscribe`], plus the grid size `(cols, rows)` the
     /// snapshot was taken at.
     pub fn subscribe_sized(&self) -> (Vec<u8>, (u16, u16), Subscription) {
-        let a = self.attach();
+        let a = self.attach_as(None);
         (a.snapshot, a.size, a.subscription)
     }
 
-    /// [`AgentPipeline::subscribe_sized`], plus the history tail taken in the
-    /// same critical section: the tail ends where the snapshot's screen
-    /// begins.
-    pub fn attach(&self) -> Attached {
+    /// [`AgentPipeline::subscribe_sized`] for connection `conn`, plus the
+    /// history tail taken in the same critical section: the tail ends where
+    /// the snapshot's screen begins. Replaces the connection's previous
+    /// subscription, and makes the connection primary (the previous primary
+    /// gets [`StreamItem::Role`]`(false)`).
+    pub fn attach(&self, conn: ConnId) -> Attached {
+        self.attach_as(Some(conn))
+    }
+
+    fn attach_as(&self, conn: Option<ConnId>) -> Attached {
         let mut state = self.lock();
         let snapshot = Self::snapshot_of(&mut state);
         let history = state.history.as_ref().map(|h| {
@@ -431,27 +557,105 @@ impl AgentPipeline {
         });
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
         let lagged = Arc::new(AtomicBool::new(false));
+        let mut owner = None;
+        let mut primary = false;
         match state.exit_code {
             Some(code) => {
                 // Capacity is at least 1, so this cannot fail.
                 let _ = tx.try_send(StreamItem::Exited(code));
             }
-            None => state.subscribers.push(Subscriber {
-                tx,
-                lagged: Arc::clone(&lagged),
-            }),
+            None => {
+                let key = state.tick();
+                if let Some(conn) = conn {
+                    // The connection's previous subscription ends (its
+                    // stream closes); a primary stays primary.
+                    if let Some(i) = state.subscribers.iter().position(|s| s.conn == Some(conn)) {
+                        let old = state.subscribers.remove(i);
+                        if state.primary == Some(old.key) {
+                            state.primary = None;
+                        }
+                    }
+                    state.demote_primary();
+                    state.primary = Some(key);
+                    primary = true;
+                }
+                state.subscribers.push(Subscriber {
+                    tx,
+                    lagged: Arc::clone(&lagged),
+                    key,
+                    conn,
+                    seen: key,
+                });
+                owner = Some((Arc::downgrade(&self.state), key));
+            }
         }
         let subscription = Subscription {
             rx,
             lagged,
             done: false,
+            owner,
         };
         Attached {
             snapshot,
             size: state.term.size(),
             history,
             subscription,
+            primary,
         }
+    }
+
+    /// Records input from `conn`: if it is attached, it becomes primary (the
+    /// previous primary gets [`StreamItem::Role`]`(false)`, it `true`). Input
+    /// from a connection that is not attached changes no role.
+    pub fn input_from(&self, conn: ConnId) {
+        let mut state = self.lock();
+        let Some(i) = state.subscribers.iter().position(|s| s.conn == Some(conn)) else {
+            return;
+        };
+        let seen = state.tick();
+        state.subscribers[i].seen = seen;
+        let key = state.subscribers[i].key;
+        if state.primary == Some(key) {
+            return;
+        }
+        state.demote_primary();
+        // Demoting may have dropped a lagged subscriber, so look it up again.
+        if let Some(i) = state.subscribers.iter().position(|s| s.key == key) {
+            if state.subscribers[i].offer(StreamItem::Role(true)) {
+                state.primary = Some(key);
+            } else {
+                state.subscribers.remove(i);
+                state.elect_primary();
+            }
+        } else {
+            state.elect_primary();
+        }
+    }
+
+    /// Whether a resize from `conn` applies: it is primary, or no
+    /// connection is attached.
+    pub fn may_resize(&self, conn: ConnId) -> bool {
+        let state = self.lock();
+        match state.primary {
+            None => true,
+            Some(key) => state.subscriber(key).and_then(|s| s.conn) == Some(conn),
+        }
+    }
+
+    /// Clears the activity mark and returns the last non-blank visible row
+    /// (trimmed, at most [`ACTIVITY_LINE_CHARS`] chars) and when output last
+    /// arrived; `None` if there was no output since the last call. With
+    /// `read == false` only the mark is cleared.
+    fn take_activity(&self, read: bool) -> Option<(String, i64)> {
+        let mut state = self.lock();
+        if !std::mem::take(&mut state.activity_dirty) || !read {
+            return None;
+        }
+        let mut line = state.term.last_nonblank_line().unwrap_or_default();
+        if let Some((cut, _)) = line.char_indices().nth(ACTIVITY_LINE_CHARS) {
+            line.truncate(cut);
+        }
+        Some((line, state.last_output_unix_ms))
     }
 
     /// A page of the agent's history (see [`History::read_page`]); `None` if
@@ -504,14 +708,18 @@ impl AgentPipeline {
     }
 }
 
-impl OutputSink for AgentPipeline {
-    fn on_spawn(&mut self, input: AgentInput) {
-        self.lock().input = Some(input);
-    }
-
-    fn on_output(&mut self, bytes: &[u8]) {
+impl AgentPipeline {
+    /// Feeds PTY output through the pipeline; `true` if this is the first
+    /// output since the activity ticker last looked.
+    fn feed(&self, bytes: &[u8]) -> bool {
+        let mut marked = false;
         let reply = {
             let mut state = self.lock();
+            state.last_output_unix_ms = unix_ms_now();
+            if !state.activity_dirty {
+                state.activity_dirty = true;
+                marked = true;
+            }
             state.term.feed(bytes);
             state.drain_history();
             state.partial.feed(bytes);
@@ -522,9 +730,13 @@ impl OutputSink for AgentPipeline {
             }
             if !state.subscribers.is_empty() {
                 let chunk = Bytes::copy_from_slice(bytes);
+                let before = state.subscribers.len();
                 state
                     .subscribers
                     .retain(|s| s.offer(StreamItem::Output(chunk.clone())));
+                if state.subscribers.len() != before {
+                    state.check_primary();
+                }
             }
             match (&state.input, replies.is_empty()) {
                 (Some(input), false) if state.subscribers.is_empty() => {
@@ -536,6 +748,17 @@ impl OutputSink for AgentPipeline {
         if let Some((input, replies)) = reply {
             input.try_write_reply(&replies);
         }
+        marked
+    }
+}
+
+impl OutputSink for AgentPipeline {
+    fn on_spawn(&mut self, input: AgentInput) {
+        self.lock().input = Some(input);
+    }
+
+    fn on_output(&mut self, bytes: &[u8]) {
+        self.feed(bytes);
     }
 
     fn on_exit(&mut self, code: i32) {
@@ -553,6 +776,7 @@ impl OutputSink for AgentPipeline {
         }
         state.exit_code = Some(code);
         state.input = None;
+        state.primary = None;
         for sub in std::mem::take(&mut state.subscribers) {
             sub.offer(StreamItem::Exited(code));
         }
@@ -561,6 +785,126 @@ impl OutputSink for AgentPipeline {
 
 /// Exit events a [`Node`] buffers per receiver before it lags.
 pub const EXIT_EVENT_CAPACITY: usize = 256;
+
+/// Activity events a [`Node`] buffers per receiver before it lags (the
+/// buffer is allocated up front, so it is kept small for idle RSS).
+pub const ACTIVITY_EVENT_CAPACITY: usize = 64;
+/// The activity ticker looks at most this often, so each agent yields at
+/// most one [`AgentActivity`] per tick.
+pub const ACTIVITY_TICK: Duration = Duration::from_millis(250);
+/// Longest `AgentActivity.last_line`, in chars.
+pub const ACTIVITY_LINE_CHARS: usize = 200;
+/// The ticker's stack: it only reads grid rows and sends events.
+const ACTIVITY_STACK_BYTES: usize = 256 * 1024;
+
+fn unix_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Agents with output since the activity ticker last looked, and the
+/// ticker's wake-up.
+struct ActivityHub {
+    /// Queued by the first output after each tick.
+    dirty: Mutex<Vec<(u64, AgentPipeline)>>,
+    events: broadcast::Sender<AgentActivity>,
+    /// Started by the first output, so an idle node has no ticker thread;
+    /// `None` if it could not be started (no activity events then).
+    ticker: OnceLock<Option<Thread>>,
+    stop: AtomicBool,
+}
+
+impl ActivityHub {
+    fn new() -> Self {
+        ActivityHub {
+            dirty: Mutex::new(Vec::new()),
+            events: broadcast::channel(ACTIVITY_EVENT_CAPACITY).0,
+            ticker: OnceLock::new(),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    /// Queues the agent; wakes the ticker (starting it the first time) if
+    /// it was idle.
+    fn mark(self: &Arc<Self>, id: u64, pipeline: &AgentPipeline) {
+        let mut dirty = lock(&self.dirty);
+        let was_idle = dirty.is_empty();
+        dirty.push((id, pipeline.clone()));
+        drop(dirty);
+        if was_idle && let Some(ticker) = self.ticker.get_or_init(|| self.start_ticker()) {
+            ticker.unpark();
+        }
+    }
+
+    fn start_ticker(self: &Arc<Self>) -> Option<Thread> {
+        let hub = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("fleet-activity".into())
+            .stack_size(ACTIVITY_STACK_BYTES)
+            .spawn(move || hub.run());
+        match spawned {
+            Ok(handle) => Some(handle.thread().clone()),
+            Err(e) => {
+                eprintln!("fleet-node: starting the activity ticker: {e}");
+                None
+            }
+        }
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(Some(ticker)) = self.ticker.get() {
+            ticker.unpark();
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// The ticker: parked while no agent is queued; otherwise, at most once
+    /// per [`ACTIVITY_TICK`], reads each queued agent's activity and
+    /// broadcasts it (only the marks are cleared while nobody listens).
+    fn run(&self) {
+        let mut last_tick: Option<Instant> = None;
+        let mut batch = Vec::new();
+        loop {
+            while lock(&self.dirty).is_empty() {
+                if self.stopped() {
+                    return;
+                }
+                std::thread::park();
+            }
+            if let Some(last) = last_tick {
+                let due = last + ACTIVITY_TICK;
+                loop {
+                    let now = Instant::now();
+                    if self.stopped() {
+                        return;
+                    }
+                    if now >= due {
+                        break;
+                    }
+                    std::thread::park_timeout(due - now);
+                }
+            }
+            std::mem::swap(&mut *lock(&self.dirty), &mut batch);
+            last_tick = Some(Instant::now());
+            let listened = self.events.receiver_count() > 0;
+            for (agent_id, pipeline) in batch.drain(..) {
+                if let Some((last_line, last_output_unix_ms)) = pipeline.take_activity(listened) {
+                    // No receivers is fine.
+                    let _ = self.events.send(AgentActivity {
+                        agent_id,
+                        last_line,
+                        last_output_unix_ms,
+                    });
+                }
+            }
+        }
+    }
+}
 
 /// How long [`Node::shutdown`] lets agents exit after SIGTERM.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
@@ -583,11 +927,18 @@ pub const MAX_CELLS: u32 = 250_000;
 /// and the grid speak xterm, whatever the daemon's own environment says.
 const DEFAULT_TERM: &str = "xterm-256color";
 
-fn with_default_term(env: HashMap<String, String>) -> Vec<(String, String)> {
-    let mut env: Vec<_> = env.into_iter().collect();
+/// The agent's own id, set by the node in every agent's environment.
+pub const AGENT_ID_ENV: &str = "FLEET_AGENT_ID";
+
+/// The agent's environment: the request's, `TERM` defaulted, and
+/// [`AGENT_ID_ENV`] set to `id`. The node sets the id last, so a spawn
+/// request cannot make an agent claim another's id (ADR 0025).
+fn agent_env(env: HashMap<String, String>, id: u64) -> Vec<(String, String)> {
+    let mut env: Vec<_> = env.into_iter().filter(|(k, _)| k != AGENT_ID_ENV).collect();
     if !env.iter().any(|(k, _)| k == "TERM") {
         env.push(("TERM".into(), DEFAULT_TERM.into()));
     }
+    env.push((AGENT_ID_ENV.into(), id.to_string()));
     env
 }
 
@@ -779,6 +1130,7 @@ struct NodeSink {
     agents: Arc<Mutex<Agents>>,
     histories: Arc<Mutex<Histories>>,
     exits: broadcast::Sender<AgentExited>,
+    activity: Arc<ActivityHub>,
 }
 
 impl OutputSink for NodeSink {
@@ -787,7 +1139,9 @@ impl OutputSink for NodeSink {
     }
 
     fn on_output(&mut self, bytes: &[u8]) {
-        self.pipeline.on_output(bytes);
+        if self.pipeline.feed(bytes) {
+            self.activity.mark(self.id, &self.pipeline);
+        }
     }
 
     fn on_exit(&mut self, code: i32) {
@@ -825,6 +1179,14 @@ pub struct Node {
     exits: broadcast::Sender<AgentExited>,
     scrollback_dir: PathBuf,
     histories: Arc<Mutex<Histories>>,
+    activity: Arc<ActivityHub>,
+}
+
+impl Drop for Node {
+    /// Stops the activity ticker.
+    fn drop(&mut self) {
+        self.activity.stop();
+    }
 }
 
 #[derive(Default)]
@@ -867,6 +1229,9 @@ impl Agents {
     }
 }
 
+/// Runs with a spawn-attached agent's id before its process starts.
+type BeforeStart<'a> = Box<dyn FnOnce(u64) + 'a>;
+
 fn not_live(id: u64) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -895,9 +1260,10 @@ impl Node {
         let store = Store::open(&state_dir.join("state.db")).map_err(store_err)?;
         store.mark_running_as_lost().map_err(store_err)?;
         // A corrupt row's history is not kept (its id is unknown).
-        let (records, _) = store.list_agents_lossy().map_err(store_err)?;
+        let (records, _) = store.list_agents_lossy_unlabeled().map_err(store_err)?;
         prune_history_dirs(&history_dir, &retained_history(&records))?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
+        let activity = Arc::new(ActivityHub::new());
         Ok(Node {
             host: Arc::new(PtyHost::new()),
             store: Arc::new(Mutex::new(store)),
@@ -909,12 +1275,20 @@ impl Node {
                 open: VecDeque::new(),
                 spawning: HashSet::new(),
             })),
+            activity,
         })
     }
 
     /// Receives every agent exit from now on.
     pub fn exit_events(&self) -> broadcast::Receiver<AgentExited> {
         self.exits.subscribe()
+    }
+
+    /// Receives agents' activity from now on: for each agent with output,
+    /// at most one event per [`ACTIVITY_TICK`] carrying its last non-blank
+    /// visible row. Lossy: a receiver that falls behind skips events.
+    pub fn activity_events(&self) -> broadcast::Receiver<AgentActivity> {
+        self.activity.events.subscribe()
     }
 
     /// Spawns an agent. Zero `cols`/`rows` mean 80x24; otherwise the size
@@ -926,17 +1300,18 @@ impl Node {
         self.start(req, None).map(|(info, _)| info)
     }
 
-    /// [`Node::spawn`], attached: the subscription is taken before the
-    /// process starts, so it carries all of the agent's output (and its
-    /// terminal queries reach the subscriber, not the node). `before_start`
-    /// runs with the agent's id before the process starts, e.g. to route the
-    /// agent's exit to this subscription.
+    /// [`Node::spawn`], attached by `conn` (which is primary): the
+    /// subscription is taken before the process starts, so it carries all of
+    /// the agent's output (and its terminal queries reach the subscriber,
+    /// not the node). `before_start` runs with the agent's id before the
+    /// process starts, e.g. to route the agent's exit to this subscription.
     pub fn spawn_attached(
         &self,
         req: SpawnAgent,
+        conn: ConnId,
         before_start: impl FnOnce(u64),
     ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
-        let (info, attached) = self.start(req, Some(Box::new(before_start)))?;
+        let (info, attached) = self.start(req, Some((conn, Box::new(before_start))))?;
         let (ok, sub) = attached.expect("an attached start returns its attachment");
         Ok((info, ok, sub))
     }
@@ -946,7 +1321,7 @@ impl Node {
     fn start(
         &self,
         req: SpawnAgent,
-        attach: Option<Box<dyn FnOnce(u64) + '_>>,
+        attach: Option<(ConnId, BeforeStart<'_>)>,
     ) -> io::Result<(AgentInfo, Option<(AttachOk, Subscription)>)> {
         if lock(&self.agents).closing {
             return Err(shutting_down());
@@ -965,9 +1340,7 @@ impl Node {
         } else {
             PathBuf::from(&req.cwd)
         };
-        let created_unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let created_unix_ms = unix_ms_now();
         let new = NewAgent {
             program: req.program.clone(),
             args: req.args.clone(),
@@ -997,10 +1370,11 @@ impl Node {
                 let pipeline = AgentPipeline::with_history(cols, rows, sb, Some(history));
                 // Subscribed before the process exists: nothing it prints
                 // or asks escapes the subscriber.
-                let attached = attach.map(|before_start| {
+                let attached = attach.map(|(conn, before_start)| {
                     before_start(id);
-                    let a = pipeline.attach();
-                    let ok = attach_ok(id, a.snapshot, a.size, a.history);
+                    let a = pipeline.attach(conn);
+                    let mut ok = attach_ok(id, a.snapshot, a.size, a.history);
+                    ok.primary = a.primary;
                     (ok, a.subscription)
                 });
                 let sink = NodeSink {
@@ -1011,12 +1385,13 @@ impl Node {
                     agents: Arc::clone(&self.agents),
                     histories: Arc::clone(&self.histories),
                     exits: self.exits.clone(),
+                    activity: Arc::clone(&self.activity),
                 };
                 let spec = CommandSpec {
                     program: PathBuf::from(&req.program),
                     args: req.args.clone(),
                     cwd: Some(cwd),
-                    env: with_default_term(req.env),
+                    env: agent_env(req.env, id),
                     cols,
                     rows,
                 };
@@ -1124,20 +1499,22 @@ impl Node {
     /// agent yields its final screen (one of the last [`RETAINED_EXITED`]
     /// exits of this node process) or else an empty snapshot with size 0x0,
     /// then its exit. The history fields describe the agent's history if it
-    /// is still kept (and are zero/empty otherwise).
-    pub fn attach(&self, id: u64) -> io::Result<(AttachOk, Subscription)> {
-        let (snapshot, (cols, rows), history, sub) = {
+    /// is still kept (and are zero/empty otherwise). A running agent's
+    /// attach replaces `conn`'s previous subscription to it and makes `conn`
+    /// primary (`AttachOk.primary`); there is no primary after exit.
+    pub fn attach(&self, id: u64, conn: ConnId) -> io::Result<(AttachOk, Subscription)> {
+        let (snapshot, (cols, rows), history, sub, primary) = {
             let agents = lock(&self.agents);
             if let Some(live) = agents.live.get(&id) {
-                let a = live.pipeline.attach();
-                (a.snapshot, a.size, a.history, a.subscription)
+                let a = live.pipeline.attach(conn);
+                (a.snapshot, a.size, a.history, a.subscription, a.primary)
             } else if let Some(a) = agents.exited(id) {
                 let sub = Subscription::exited(a.exit_code);
-                (a.snapshot.clone(), (a.cols, a.rows), None, sub)
+                (a.snapshot.clone(), (a.cols, a.rows), None, sub, false)
             } else {
                 drop(agents);
                 match lock(&self.store).exit_code(id).map_err(store_err)? {
-                    Some(code) => (Vec::new(), (0, 0), None, Subscription::exited(code)),
+                    Some(code) => (Vec::new(), (0, 0), None, Subscription::exited(code), false),
                     None => return Err(not_live(id)),
                 }
             }
@@ -1156,7 +1533,9 @@ impl Node {
                 })
                 .ok()
         });
-        Ok((attach_ok(id, snapshot, (cols, rows), history), sub))
+        let mut ok = attach_ok(id, snapshot, (cols, rows), history);
+        ok.primary = primary;
+        Ok((ok, sub))
     }
 
     /// The lines of the agent's history immediately before `before_line`
@@ -1185,16 +1564,22 @@ impl Node {
     }
 
     /// Writes to the agent's terminal input; blocks while its input queue is
-    /// full.
-    pub fn input(&self, id: u64, bytes: &[u8]) -> io::Result<()> {
+    /// full. If `conn` is attached to the agent, it becomes primary.
+    pub fn input(&self, id: u64, conn: ConnId, bytes: &[u8]) -> io::Result<()> {
         let live = self.live(id)?;
+        live.pipeline.input_from(conn);
         self.host.write_input(live.host_id, bytes)
     }
 
-    /// Resizes the agent's PTY and grid (within [`MAX_DIM`]/[`MAX_CELLS`]).
-    pub fn resize(&self, id: u64, cols: u32, rows: u32) -> io::Result<()> {
+    /// Resizes the agent's PTY and grid (within [`MAX_DIM`]/[`MAX_CELLS`])
+    /// if `conn` is the primary or no connection is attached; otherwise the
+    /// valid request is ignored.
+    pub fn resize(&self, id: u64, conn: ConnId, cols: u32, rows: u32) -> io::Result<()> {
         let (cols, rows) = checked_size(cols, rows)?;
         let live = self.live(id)?;
+        if !live.pipeline.may_resize(conn) {
+            return Ok(());
+        }
         self.host.resize(live.host_id, cols, rows)?;
         live.pipeline.resize(cols, rows);
         Ok(())
@@ -1322,10 +1707,10 @@ mod tests {
 
         let id = spawn_sized(&node, 1000, 250).unwrap().id;
         for (cols, rows) in bad.into_iter().chain([(0, 24), (80, 0)]) {
-            let e = node.resize(id, cols, rows).unwrap_err();
+            let e = node.resize(id, ConnId(1), cols, rows).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{cols}x{rows}");
         }
-        node.resize(id, 500, 500).unwrap();
+        node.resize(id, ConnId(1), 500, 500).unwrap();
         node.shutdown();
     }
 

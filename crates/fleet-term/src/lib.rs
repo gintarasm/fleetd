@@ -291,21 +291,21 @@ impl Terminal {
         let term = self.term.borrow();
         let grid = term.grid();
         (0..grid.screen_lines())
-            .map(|row| {
-                let line = &grid[Line(row as i32)];
-                let mut text = String::with_capacity(grid.columns());
-                for col in 0..grid.columns() {
-                    let cell = &line[Column(col)];
-                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                        continue;
-                    }
-                    text.push(glyph(cell));
-                    text.extend(cell.zerowidth().unwrap_or_default());
-                }
-                text.truncate(text.trim_end_matches(' ').len());
-                text
-            })
+            .map(|row| row_text(grid, row))
             .collect()
+    }
+
+    /// The bottom-most visible row that is not blank, trimmed of
+    /// surrounding whitespace; `None` for a blank screen. Reads rows from the
+    /// bottom up and stops at the first non-blank one.
+    pub fn last_nonblank_line(&self) -> Option<String> {
+        let term = self.term.borrow();
+        let grid = term.grid();
+        (0..grid.screen_lines()).rev().find_map(|row| {
+            let text = row_text(grid, row);
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
     }
 
     /// Cursor position as 0-based `(row, col)`.
@@ -392,6 +392,22 @@ fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&mut Term<Replies>) 
 
 /// Clears the screen (`\x1b[0m\x1b[H\x1b[2J`, so `pen` becomes the default)
 /// and draws `grid`'s non-blank cells.
+/// A visible row's text, trailing spaces trimmed.
+fn row_text(grid: &Grid<Cell>, row: usize) -> String {
+    let line = &grid[Line(row as i32)];
+    let mut text = String::with_capacity(grid.columns());
+    for col in 0..grid.columns() {
+        let cell = &line[Column(col)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        text.push(glyph(cell));
+        text.extend(cell.zerowidth().unwrap_or_default());
+    }
+    text.truncate(text.trim_end_matches(' ').len());
+    text
+}
+
 fn put_grid(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>) {
     out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
     *pen = Pen::default();
@@ -536,6 +552,16 @@ fn cup(out: &mut Vec<u8>, row: usize, col: usize) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn last_nonblank_line_is_the_lowest_non_blank_row_trimmed() {
+        let mut t = Terminal::new(20, 5);
+        assert_eq!(t.last_nonblank_line(), None);
+        t.feed(b"first\r\n   second \x1b[1mbold\x1b[0m  \r\n\r\n");
+        assert_eq!(t.last_nonblank_line().as_deref(), Some("second bold"));
+        t.feed(b"\x1b[5;1H  \xe4\xb8\xad  ");
+        assert_eq!(t.last_nonblank_line().as_deref(), Some("\u{4e2d}"));
+    }
 
     /// Deterministic xorshift64* PRNG for fixture generation.
     pub(crate) struct Rng(pub(crate) u64);

@@ -243,6 +243,62 @@ impl Client {
         }
     }
 
+    /// Waits for the agent's next `AttachRole` event and returns `primary`.
+    fn role_event(&mut self, agent_id: u64) -> bool {
+        loop {
+            match self.next_frame() {
+                Some(Frame::Event(fleet_proto::Event {
+                    kind: Some(event::Kind::Role(r)),
+                })) if r.agent_id == agent_id => return r.primary,
+                Some(_) => {}
+                None => panic!("closed before role event"),
+            }
+        }
+    }
+
+    /// True if an `AttachRole` event for the agent is buffered.
+    fn has_role_event(&self, agent_id: u64) -> bool {
+        self.pending.iter().any(|f| {
+            matches!(
+                f,
+                Frame::Event(fleet_proto::Event {
+                    kind: Some(event::Kind::Role(r)),
+                }) if r.agent_id == agent_id
+            )
+        })
+    }
+
+    fn resize(&mut self, agent_id: u64, cols: u32, rows: u32) {
+        let r = self.request(request::Kind::Resize(fleet_proto::Resize {
+            agent_id,
+            cols,
+            rows,
+        }));
+        assert!(matches!(r, response::Kind::Ack(_)), "resize failed: {r:?}");
+    }
+
+    /// Next frame (buffered ones first) arriving before `deadline`.
+    fn frame_before(&mut self, deadline: Instant) -> Option<Frame> {
+        if let Some(f) = self.pending.pop_front() {
+            return Some(f);
+        }
+        loop {
+            if let Some(frame) = FrameCodec::default().decode(&mut self.buf).unwrap() {
+                return Some(frame);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let mut chunk = [0u8; 64 * 1024];
+            match self.stream.read(&mut chunk) {
+                Ok(0) => panic!("connection closed"),
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+    }
+
     /// True once the server has closed the connection.
     fn is_closed(&mut self) -> bool {
         loop {
@@ -252,6 +308,16 @@ impl Client {
             }
         }
     }
+}
+
+/// Exit events only: activity and role events may arrive at any time.
+fn is_exit_event(f: &Frame) -> bool {
+    matches!(
+        f,
+        Frame::Event(fleet_proto::Event {
+            kind: Some(event::Kind::Exited(_)),
+        })
+    )
 }
 
 fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -460,10 +526,7 @@ fn exit_event_delivered() {
     // Exactly once for the attached client: nothing more arrives before the
     // response to a later request.
     let listed = attached.list();
-    let dup = attached
-        .pending
-        .iter()
-        .any(|f| matches!(f, Frame::Event(_)));
+    let dup = attached.pending.iter().any(is_exit_event);
     assert!(!dup, "duplicate exit event: {:?}", attached.pending);
 
     let rec = find(&listed, info.id);
@@ -992,7 +1055,7 @@ fn spawn_attach_replies_with_snapshot_and_streams_first_output() {
     c.kill(agent.id);
     c.exit_event(agent.id);
     c.list();
-    let dup = c.pending.iter().any(|f| matches!(f, Frame::Event(_)));
+    let dup = c.pending.iter().any(is_exit_event);
     assert!(!dup, "duplicate exit event: {:?}", c.pending);
 }
 
@@ -1020,7 +1083,7 @@ fn spawn_attach_of_quickly_exiting_agent_streams_output_then_one_exit() {
     c.output_until(agent.id, "quick-bye");
     assert_eq!(c.exit_event(agent.id).exit_code, 5);
     c.list();
-    let dup = c.pending.iter().any(|f| matches!(f, Frame::Event(_)));
+    let dup = c.pending.iter().any(is_exit_event);
     assert!(!dup, "duplicate exit event: {:?}", c.pending);
 }
 
@@ -1201,4 +1264,181 @@ fn labels_survive_daemon_restart() {
     assert_eq!(rec.state(), AgentState::Lost);
     assert_eq!(rec.labels, want);
     assert_eq!(ids(&c.list_selected(&[("role", "reviewer")])), vec![id]);
+}
+
+#[test]
+fn primary_moves_on_input_and_only_primary_resizes() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let mut b = Client::open(dir.path());
+    // Prints the PTY size for every line of input.
+    let info = a.sh("while read l; do echo \"size=$(stty size).\"; done");
+    let id = info.id;
+
+    assert!(a.attach(id).primary, "the only subscriber is primary");
+    assert!(b.attach(id).primary, "the latest attach is primary");
+    assert!(!a.role_event(id), "A was demoted when B attached");
+
+    // A is not primary: its resize is acknowledged and ignored.
+    a.resize(id, 100, 30);
+    b.input(id, b"\n");
+    b.output_until(id, "size=24 80.");
+    assert!(!a.has_role_event(id) && !b.has_role_event(id));
+
+    // Input moves the role to A.
+    a.input(id, b"\n");
+    assert!(a.role_event(id), "A became primary by sending input");
+    assert!(!b.role_event(id), "B was demoted");
+    a.output_until(id, "size=24 80.");
+
+    // Now A's resize applies.
+    a.resize(id, 100, 30);
+    a.input(id, b"\n");
+    a.output_until(id, "size=30 100.");
+    a.kill(id);
+}
+
+#[test]
+fn primary_leaving_promotes_the_latest_remaining_subscriber() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let mut b = Client::open(dir.path());
+    let mut c = Client::open(dir.path());
+    let id = a.spawn("/bin/sleep", &["100"]).id;
+
+    a.attach(id);
+    b.attach(id);
+    assert!(!a.role_event(id));
+    c.attach(id);
+    assert!(!b.role_event(id));
+    // B sends input: B is primary, then the most recent.
+    b.input(id, b"x");
+    assert!(b.role_event(id));
+    assert!(!c.role_event(id));
+
+    // B detaches: C (more recent than A) takes over.
+    let r = b.request(request::Kind::Detach(fleet_proto::Detach { agent_id: id }));
+    assert!(matches!(r, response::Kind::Ack(_)), "{r:?}");
+    assert!(c.role_event(id), "C promoted when the primary detached");
+
+    // C's connection closes: A takes over.
+    drop(c);
+    assert!(a.role_event(id), "A promoted when the primary disconnected");
+    a.kill(id);
+}
+
+#[test]
+fn spawn_attach_makes_the_spawner_primary() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let mut b = Client::open(dir.path());
+    let r = a.request(request::Kind::Spawn(SpawnAgent {
+        program: "/bin/sleep".into(),
+        args: vec!["100".into()],
+        attach: true,
+        ..Default::default()
+    }));
+    let (id, ok) = match r {
+        response::Kind::SpawnedAttached(sa) => (sa.agent.unwrap().id, sa.attached.unwrap()),
+        other => panic!("expected SpawnedAttached, got {other:?}"),
+    };
+    assert!(ok.primary);
+    assert!(b.attach(id).primary);
+    assert!(!a.role_event(id), "the spawner was demoted");
+    a.kill(id);
+}
+
+#[test]
+fn agent_activity_is_throttled() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    // A 250-char line, printed as fast as possible on a 300-column grid.
+    let script = "l=$(printf '%0250d' 0); while :; do echo \"$l\"; done";
+    let id = match c.request(request::Kind::Spawn(SpawnAgent {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        cols: 300,
+        rows: 24,
+        ..Default::default()
+    })) {
+        response::Kind::Spawned(info) => info.id,
+        other => panic!("spawn failed: {other:?}"),
+    };
+
+    // Count the agent's activity events in the second after the first one.
+    let first = Instant::now() + TIMEOUT;
+    let mut events = Vec::new();
+    let mut window_end = first;
+    while let Some(frame) = c.frame_before(window_end) {
+        if let Frame::Event(fleet_proto::Event {
+            kind: Some(event::Kind::Activity(a)),
+        }) = frame
+            && a.agent_id == id
+        {
+            if events.is_empty() {
+                window_end = Instant::now() + Duration::from_secs(1);
+            }
+            events.push(a);
+        }
+    }
+    assert!(!events.is_empty(), "no activity within {TIMEOUT:?}");
+    assert!(
+        (2..=5).contains(&events.len()),
+        "{} activity events in 1s",
+        events.len()
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for a in &events {
+        assert!(a.last_line.chars().count() <= 200, "{:?}", a.last_line);
+        assert!(!a.last_line.is_empty());
+        assert!(a.last_line.chars().all(|ch| ch == '0'), "{:?}", a.last_line);
+        assert!(
+            (now_ms - a.last_output_unix_ms).abs() < 10_000,
+            "last_output_unix_ms {} vs now {now_ms}",
+            a.last_output_unix_ms
+        );
+    }
+    c.kill(id);
+}
+
+#[test]
+fn agent_sees_its_id() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let script = "echo \"id=$FLEET_AGENT_ID.\"; sleep 100";
+    // Clients cannot make an agent impersonate another (ADR 0025).
+    for env in [
+        vec![],
+        vec![("FLEET_AGENT_ID".to_string(), "999".to_string())],
+    ] {
+        let info = match c.request(request::Kind::Spawn(SpawnAgent {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: env.into_iter().collect(),
+            ..Default::default()
+        })) {
+            response::Kind::Spawned(info) => info,
+            other => panic!("spawn failed: {other:?}"),
+        };
+        let want = format!("id={}.", info.id);
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let snap = String::from_utf8_lossy(&c.attach(info.id).snapshot).into_owned();
+            if snap.contains("id=") {
+                assert!(snap.contains(&want), "want {want:?} in {snap:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no output in {snap:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        c.kill(info.id);
+    }
 }

@@ -6,18 +6,24 @@
 //! through a bounded channel. A client that stops reading thus stalls its
 //! forwarders, its subscriptions fill up, and it is told to re-attach
 //! (`Event::Lagged`) instead of slowing the agent down.
+//!
+//! Each connection has a [`ConnId`] for the node's primary-client rule; its
+//! role changes arrive in the agent's stream and are sent as
+//! `Event::Role`. Agents' activity is forwarded to every connection (lossy:
+//! a connection that falls behind skips activity events).
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
-use fleet_node::node::{Node, StreamItem, Subscription};
+use fleet_node::node::{ConnId, Node, StreamItem, Subscription};
 use fleet_proto::{
-    Ack, AgentList, AttachOk, Event, Frame, FrameCodec, HandshakeReject, HelloOk, HistoryPage,
-    Lagged, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, Request, Response, SpawnAgent,
-    SpawnedAttached, event, request, response,
+    Ack, AgentActivity, AgentList, AttachOk, AttachRole, Event, Frame, FrameCodec, HandshakeReject,
+    HelloOk, HistoryPage, Lagged, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, Request, Response,
+    SpawnAgent, SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -39,6 +45,9 @@ const OUTBOX_CAPACITY: usize = 256;
 
 type Writer = FramedWrite<OwnedWriteHalf, FrameCodec>;
 type Reader = FramedRead<OwnedReadHalf, FrameCodec>;
+
+/// Source of connection ids, unique for the daemon's lifetime.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -121,6 +130,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
     let mut writer = FramedWrite::new(wr, FrameCodec::new());
     // Subscribed before `HelloOk`, so no exit after the handshake is missed.
     let exits = node.exit_events();
+    let activity = node.activity_events();
     if !handshake(&mut reader, &mut writer).await {
         return;
     }
@@ -129,6 +139,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
     let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
     let mut conn = Connection {
         node,
+        id: ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)),
         outbox,
         forwarders: HashMap::new(),
         attached: Arc::new(Mutex::new(HashSet::new())),
@@ -140,6 +151,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
             conn.outbox.clone(),
             Arc::clone(&conn.attached),
         )),
+        tokio::spawn(forward_activity(activity, conn.outbox.clone())),
     ]);
 
     while let Some(frame) = reader.next().await {
@@ -178,6 +190,7 @@ impl Drop for Tasks {
 
 struct Connection {
     node: Arc<Node>,
+    id: ConnId,
     outbox: mpsc::Sender<Frame>,
     /// Output forwarder per attached agent.
     forwarders: HashMap<u64, JoinHandle<()>>,
@@ -242,10 +255,18 @@ impl Connection {
                 response::Kind::Ack(Ack {})
             }
             Some(request::Kind::Input(input)) => {
-                ack(blocking(&self.node, move |n| n.input(input.agent_id, &input.data)).await)
+                let conn = self.id;
+                ack(blocking(&self.node, move |n| {
+                    n.input(input.agent_id, conn, &input.data)
+                })
+                .await)
             }
             Some(request::Kind::Resize(r)) => {
-                ack(blocking(&self.node, move |n| n.resize(r.agent_id, r.cols, r.rows)).await)
+                let conn = self.id;
+                ack(blocking(&self.node, move |n| {
+                    n.resize(r.agent_id, conn, r.cols, r.rows)
+                })
+                .await)
             }
             Some(request::Kind::Kill(k)) => {
                 ack(blocking(&self.node, move |n| n.kill(k.agent_id)).await)
@@ -268,13 +289,18 @@ impl Connection {
     }
 
     /// Stops forwarding `agent_id`; once this returns, nothing more of its
-    /// stream is queued.
+    /// stream is queued. Dropping the subscription gives up the role.
     async fn detach(&mut self, agent_id: u64) {
+        self.stop_forwarder(agent_id).await;
+        lock(&self.attached).remove(&agent_id);
+    }
+
+    /// Stops the agent's forwarder (dropping its subscription), if any.
+    async fn stop_forwarder(&mut self, agent_id: u64) {
         if let Some(task) = self.forwarders.remove(&agent_id) {
             task.abort();
             let _ = task.await;
         }
-        lock(&self.attached).remove(&agent_id);
     }
 
     async fn read_history(&self, r: ReadHistory) -> response::Kind {
@@ -294,17 +320,25 @@ impl Connection {
     }
 
     /// Replaces any previous subscription to the agent: `AttachOk` is queued
-    /// before any of the new subscription's output.
+    /// before any of the new subscription's output. The node replaces the
+    /// subscription before the old forwarder stops, so a re-attaching
+    /// primary keeps its role without a flap.
     async fn attach(&mut self, id: u64, agent_id: u64) -> bool {
-        self.detach(agent_id).await;
         lock(&self.attached).insert(agent_id);
-        let (ok, sub) = match blocking(&self.node, move |n| n.attach(agent_id)).await {
+        let conn = self.id;
+        let attached = blocking(&self.node, move |n| n.attach(agent_id, conn)).await;
+        // The old subscription's stream has ended; whatever it queued
+        // precedes `AttachOk`.
+        self.stop_forwarder(agent_id).await;
+        let (ok, sub) = match attached {
             Ok(attached) => attached,
             Err(e) => {
                 lock(&self.attached).remove(&agent_id);
                 return self.respond(id, error(e.to_string())).await;
             }
         };
+        // A lagging old forwarder may have handed the exit event back.
+        lock(&self.attached).insert(agent_id);
         if !self.respond(id, response::Kind::Attached(ok)).await {
             return false;
         }
@@ -318,9 +352,10 @@ impl Connection {
         // The agent is marked attached before it starts, so its exit is
         // announced only by its forwarder, after its output.
         let attached = Arc::clone(&self.attached);
+        let conn = self.id;
         let spawned = blocking(&self.node, move |n| {
             let mut started = None;
-            let r = n.spawn_attached(spawn, |agent_id| {
+            let r = n.spawn_attached(spawn, conn, |agent_id| {
                 started = Some(agent_id);
                 lock(&attached).insert(agent_id);
             });
@@ -383,6 +418,9 @@ async fn forward_output(
     while let Some(item) = sub.recv().await {
         let frame = match item {
             StreamItem::Output(data) => Frame::Output { agent_id, data },
+            StreamItem::Role(primary) => Frame::Event(Event {
+                kind: Some(event::Kind::Role(AttachRole { agent_id, primary })),
+            }),
             StreamItem::Exited(code) => {
                 let _ = outbox.send(exited_event(agent_id, code)).await;
                 return;
@@ -434,6 +472,27 @@ async fn forward_exits(
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("fleetd: client missed {n} exit events");
             }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Forwards every agent's activity; skips what the connection fell behind on.
+async fn forward_activity(
+    mut activity: broadcast::Receiver<AgentActivity>,
+    outbox: mpsc::Sender<Frame>,
+) {
+    loop {
+        match activity.recv().await {
+            Ok(a) => {
+                let frame = Frame::Event(Event {
+                    kind: Some(event::Kind::Activity(a)),
+                });
+                if outbox.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
             Err(broadcast::error::RecvError::Closed) => return,
         }
     }
