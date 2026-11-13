@@ -140,7 +140,8 @@ message Ack {}
 
 // The daemon's log (ADR 0027): the last `tail` lines (capped at 10 000) of
 // `fleetd.log.2`, `.1` and `fleetd.log`, oldest first, answered by
-// `LogLines`. With `follow`, each new line then arrives as `LogLine` until
+// `LogLines` (at most 8 MiB of lines: the oldest are dropped; a line is at
+// most 4 KiB, longer ones are cut and end in " …[truncated]"). With `follow`, each new line then arrives as `LogLine` until
 // `StopLogs` (answered by `Ack`) or disconnect; a follower that falls behind
 // gets a `LogLine` "… N lines dropped" and stays connected.
 message ReadLogs { uint32 tail = 1; bool follow = 2; }

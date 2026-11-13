@@ -42,6 +42,14 @@ pub const QUEUE_LINES: usize = 4096;
 pub const FOLLOW_QUEUE_LINES: usize = 1024;
 /// Most lines one `ReadLogs` returns.
 pub const TAIL_MAX_LINES: u32 = 10_000;
+/// Longest log line (escapes included, newline excluded); longer ones end in
+/// [`TRUNCATED_MARK`].
+pub const LINE_MAX_BYTES: usize = 4096;
+/// Ends a truncated log line.
+pub const TRUNCATED_MARK: &str = " …[truncated]";
+/// Bytes of lines in one `LogLines` reply at most (the oldest go first),
+/// well under the protocol's frame limit.
+pub const TAIL_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Lines the writer handles per lock of the shared state.
 const BATCH: usize = 256;
@@ -223,7 +231,8 @@ struct QueueWriter {
 
 /// `line` (one formatted event) with every control character but its
 /// final newline and tabs escaped (`\n`, `\r`, `\xNN`), so no message or
-/// field, whatever its source, can start a line of its own.
+/// field, whatever its source, can start a line of its own; cut to
+/// [`LINE_MAX_BYTES`] (see [`truncate_line`]).
 fn escape_controls(line: &[u8]) -> Vec<u8> {
     let body = line.strip_suffix(b"\n").unwrap_or(line);
     let is_control = |b: u8| (b < 0x20 && b != b'\t') || b == 0x7f;
@@ -240,6 +249,7 @@ fn escape_controls(line: &[u8]) -> Vec<u8> {
             }
         }
     }
+    truncate_line(&mut out);
     out.push(b'\n');
     out
 }
@@ -313,13 +323,17 @@ pub struct Logs {
 }
 
 impl Logs {
-    /// The last `tail` lines (at most [`TAIL_MAX_LINES`]) of the rotated
+    /// The last `tail` lines (at most [`TAIL_MAX_LINES`], and at most
+    /// [`TAIL_MAX_BYTES`] in all: the oldest are dropped) of the rotated
     /// files and the current one, oldest first; with `follow`, also a queue
     /// receiving every line written after them (none missed, none twice).
     pub fn read(&self, tail: u32, follow: bool) -> (Vec<String>, Option<mpsc::Receiver<String>>) {
         let mut out = lock(&self.out);
         let f = &out.file;
-        let lines = tail_lines(&f.dir, &f.name, tail.min(TAIL_MAX_LINES) as usize);
+        let lines = cap_total(
+            tail_lines(&f.dir, &f.name, tail.min(TAIL_MAX_LINES) as usize),
+            TAIL_MAX_BYTES,
+        );
         let rx = follow.then(|| {
             let (tx, rx) = mpsc::channel(FOLLOW_QUEUE_LINES);
             out.followers.push(Follower { tx, dropped: 0 });
@@ -407,6 +421,49 @@ pub fn init(state_dir: &Path, file_name: &str) -> io::Result<LogGuard> {
     Ok(LogGuard { tx })
 }
 
+/// Cuts `line` to at most [`LINE_MAX_BYTES`] (at a UTF-8 character
+/// boundary), ending it with [`TRUNCATED_MARK`] if anything was cut.
+fn truncate_line(line: &mut Vec<u8>) {
+    if line.len() <= LINE_MAX_BYTES {
+        return;
+    }
+    let mut cut = LINE_MAX_BYTES - TRUNCATED_MARK.len();
+    while cut > 0 && line[cut] & 0xc0 == 0x80 {
+        cut -= 1;
+    }
+    line.truncate(cut);
+    line.extend_from_slice(TRUNCATED_MARK.as_bytes());
+}
+
+/// `lines` (oldest first), each cut to [`LINE_MAX_BYTES`], without the
+/// oldest ones beyond `max` bytes in all (counting a few bytes of framing
+/// per line).
+fn cap_total(lines: Vec<String>, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = lines
+        .into_iter()
+        .map(|l| {
+            if l.len() <= LINE_MAX_BYTES {
+                return l;
+            }
+            let mut b = l.into_bytes();
+            truncate_line(&mut b);
+            String::from_utf8_lossy(&b).into_owned()
+        })
+        .collect();
+    let mut total = 0usize;
+    let mut first = lines.len();
+    while first > 0 {
+        let size = lines[first - 1].len() + 8;
+        if total + size > max {
+            break;
+        }
+        total += size;
+        first -= 1;
+    }
+    lines.drain(..first);
+    lines
+}
+
 /// The last `want` lines of `dir/name.2`, `.1` and `dir/name`, oldest first.
 fn tail_lines(dir: &Path, name: &str, want: usize) -> Vec<String> {
     let mut newest_first = Vec::new();
@@ -489,6 +546,51 @@ mod tests {
         );
         // A missing final newline is added.
         assert_eq!(escape_controls(b"x"), b"x\n");
+    }
+
+    #[test]
+    fn long_lines_are_truncated_and_marked() {
+        let line = format!("{}\n", "a".repeat(10_000));
+        let out = escape_controls(line.as_bytes());
+        assert_eq!(out.len(), LINE_MAX_BYTES + 1);
+        assert!(
+            out.ends_with(
+                TRUNCATED_MARK
+                    .as_bytes()
+                    .iter()
+                    .chain(b"\n")
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
+        );
+        // Escapes count towards the limit.
+        let out = escape_controls(&[0x01; 3000]);
+        assert_eq!(out.len(), LINE_MAX_BYTES + 1);
+        // Never splits a UTF-8 character.
+        let line = "é".repeat(5000);
+        let out = escape_controls(line.as_bytes());
+        assert!(out.len() <= LINE_MAX_BYTES + 1);
+        assert!(std::str::from_utf8(&out).is_ok());
+        // A line at the limit is kept whole.
+        let line = "b".repeat(LINE_MAX_BYTES);
+        assert_eq!(escape_controls(line.as_bytes()).len(), LINE_MAX_BYTES + 1);
+    }
+
+    #[test]
+    fn tail_reply_is_capped_keeping_the_newest_lines() {
+        let lines: Vec<String> = (0..100).map(|i| format!("{i:0>99}")).collect();
+        // 100 bytes plus overhead per line: room for the last few only.
+        let kept = cap_total(lines.clone(), 1_000);
+        assert!(!kept.is_empty() && kept.len() < 10, "{}", kept.len());
+        assert_eq!(kept.last(), lines.last());
+        assert_eq!(kept[0], lines[lines.len() - kept.len()]);
+        assert_eq!(cap_total(lines.clone(), usize::MAX), lines);
+        // Lines read from the files are truncated too.
+        let long = vec!["x".repeat(LINE_MAX_BYTES * 2)];
+        let kept = cap_total(long, usize::MAX);
+        assert_eq!(kept[0].len(), LINE_MAX_BYTES);
+        assert!(kept[0].ends_with(TRUNCATED_MARK));
     }
 
     #[test]
