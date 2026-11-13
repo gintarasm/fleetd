@@ -369,7 +369,10 @@ pub(super) fn flood(
             other => return Err(format!("spawn: unexpected {other:?}")),
         };
         ids.insert(agent_id);
-        let req = client.request(request::Kind::Attach(Attach { agent_id }))?;
+        let req = client.request(request::Kind::Attach(Attach {
+            agent_id,
+            observe: false,
+        }))?;
         match streams.wait(&mut client, req)? {
             response::Kind::Attached(_) => {}
             other => return Err(format!("attach: unexpected {other:?}")),
@@ -439,7 +442,10 @@ pub(super) fn reattach_snapshot_ns(
     };
 
     let attach = |client: &mut Client, streams: &mut Streams| -> Result<Vec<u8>, String> {
-        let req = client.request(request::Kind::Attach(Attach { agent_id }))?;
+        let req = client.request(request::Kind::Attach(Attach {
+            agent_id,
+            observe: false,
+        }))?;
         let snapshot = match streams.wait(client, req)? {
             response::Kind::Attached(ok) => ok.snapshot,
             other => return Err(format!("attach: unexpected {other:?}")),
@@ -469,7 +475,10 @@ pub(super) fn reattach_snapshot_ns(
 
     let mut samples = Vec::with_capacity(attaches);
     for _ in 0..attaches {
-        let req = client.request(request::Kind::Attach(Attach { agent_id }))?;
+        let req = client.request(request::Kind::Attach(Attach {
+            agent_id,
+            observe: false,
+        }))?;
         let sent = Instant::now();
         match streams.wait(&mut client, req)? {
             response::Kind::Attached(_) => {}
@@ -514,7 +523,10 @@ fn spawn_fake_agent(
 }
 
 fn attach_agent(client: &mut Client, streams: &mut Streams, agent_id: u64) -> Result<(), String> {
-    let req = client.request(request::Kind::Attach(Attach { agent_id }))?;
+    let req = client.request(request::Kind::Attach(Attach {
+        agent_id,
+        observe: false,
+    }))?;
     match streams.wait(client, req)? {
         response::Kind::Attached(_) => Ok(()),
         other => Err(format!("attach: unexpected {other:?}")),

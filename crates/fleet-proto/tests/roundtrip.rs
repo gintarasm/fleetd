@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use fleet_proto::{
-    Ack, AgentActivity, AgentExited, AgentInfo, AgentList, AgentState, Attach, AttachOk,
-    AttachRole, Detach, Error, Event, Frame, FrameCodec, HandshakeReject, Hello, HelloOk,
+    Ack, AgentActivity, AgentExited, AgentInfo, AgentList, AgentResized, AgentState, Attach,
+    AttachOk, AttachRole, Detach, Error, Event, Frame, FrameCodec, HandshakeReject, Hello, HelloOk,
     HistoryPage, KillAgent, Lagged, ListAgents, PROTOCOL_VERSION, ReadHistory, Request, Resize,
     Response, SendInput, SetLabels, SpawnAgent, SpawnedAttached, event, request, response,
 };
@@ -101,7 +101,10 @@ fn roundtrip_every_kind() {
             ..Default::default()
         })),
         request::Kind::List(ListAgents { selector: labels() }),
-        request::Kind::Attach(Attach { agent_id: 1 }),
+        request::Kind::Attach(Attach {
+            agent_id: 1,
+            observe: true,
+        }),
         request::Kind::Detach(Detach { agent_id: 1 }),
         request::Kind::Input(SendInput {
             agent_id: 1,
@@ -159,6 +162,11 @@ fn roundtrip_every_kind() {
         event::Kind::Role(AttachRole {
             agent_id: 1,
             primary: true,
+        }),
+        event::Kind::AgentResized(AgentResized {
+            agent_id: 1,
+            cols: 100,
+            rows: 30,
         }),
     ];
     let mut frames = vec![

@@ -193,7 +193,16 @@ impl Client {
     }
 
     fn attach(&mut self, agent_id: u64) -> AttachOk {
-        match self.request(request::Kind::Attach(Attach { agent_id })) {
+        self.attach_with(agent_id, false)
+    }
+
+    /// A read-only attach (`Attach.observe`).
+    fn observe(&mut self, agent_id: u64) -> AttachOk {
+        self.attach_with(agent_id, true)
+    }
+
+    fn attach_with(&mut self, agent_id: u64, observe: bool) -> AttachOk {
+        match self.request(request::Kind::Attach(Attach { agent_id, observe })) {
             response::Kind::Attached(ok) => *ok,
             other => panic!("attach failed: {other:?}"),
         }
@@ -442,7 +451,10 @@ fn unknown_agent_is_an_error_response() {
     let dir = TempDir::new().unwrap();
     let _d = Daemon::start(dir.path());
     let mut c = Client::open(dir.path());
-    match c.request(request::Kind::Attach(Attach { agent_id: 999 })) {
+    match c.request(request::Kind::Attach(Attach {
+        agent_id: 999,
+        observe: false,
+    })) {
         response::Kind::Error(e) => assert!(!e.message.is_empty()),
         other => panic!("expected error, got {other:?}"),
     }
@@ -1313,6 +1325,89 @@ fn primary_moves_on_input_and_only_primary_resizes() {
     a.resize(id, 100, 30);
     a.input(id, b"\n");
     a.output_until(id, "size=30 100.");
+    a.kill(id);
+}
+
+#[test]
+fn observing_attach_never_takes_the_primary_role() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let mut b = Client::open(dir.path());
+    let info = a.sh("while read l; do echo \"size=$(stty size).\"; done");
+    let id = info.id;
+
+    assert!(a.attach(id).primary);
+    assert!(!b.observe(id).primary, "an observer is never primary");
+    // The observer's resize is ignored; the primary's still applies.
+    b.resize(id, 120, 40);
+    a.resize(id, 100, 30);
+    a.input(id, b"\n");
+    a.output_until(id, "size=30 100.");
+    b.output_until(id, "size=30 100.");
+    // Input from the observer does not promote it either.
+    b.input(id, b"\n");
+    b.output_until(id, "size=30 100.");
+    a.output_until(id, "size=30 100.");
+    a.list();
+    b.list();
+    assert!(!a.has_role_event(id), "the primary got a role event");
+    assert!(!b.has_role_event(id), "the observer got a role event");
+    a.kill(id);
+}
+
+/// Resizes reach every subscriber in-stream, ordered with the output.
+#[test]
+fn observer_sees_agent_resized_in_stream() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let mut b = Client::open(dir.path());
+    let id = a.sh("while read l; do echo \"line=$l.\"; done").id;
+    a.attach(id);
+    let ok = b.observe(id);
+    assert_eq!((ok.cols, ok.rows), (80, 24));
+
+    a.input(id, b"one\n");
+    b.output_until(id, "line=one.");
+    a.resize(id, 100, 30);
+    a.input(id, b"two\n");
+    // In order: the resize, then the output after it.
+    let mut out = Vec::new();
+    let mut resized = None;
+    while !String::from_utf8_lossy(&out).contains("line=two.") {
+        match b.next_frame() {
+            Some(Frame::Output { agent_id, data }) if agent_id == id => {
+                out.extend_from_slice(&data);
+            }
+            Some(Frame::Event(fleet_proto::Event {
+                kind: Some(event::Kind::AgentResized(r)),
+            })) if r.agent_id == id => {
+                assert!(resized.is_none(), "one resize, one event");
+                assert!(
+                    !String::from_utf8_lossy(&out).contains("line=two."),
+                    "resize event after later output"
+                );
+                resized = Some((r.cols, r.rows));
+            }
+            Some(_) => {}
+            None => panic!("closed"),
+        }
+    }
+    assert_eq!(resized, Some((100, 30)));
+    // The primary gets it too.
+    loop {
+        match a.next_frame() {
+            Some(Frame::Event(fleet_proto::Event {
+                kind: Some(event::Kind::AgentResized(r)),
+            })) if r.agent_id == id => {
+                assert_eq!((r.cols, r.rows), (100, 30));
+                break;
+            }
+            Some(_) => {}
+            None => panic!("closed"),
+        }
+    }
     a.kill(id);
 }
 

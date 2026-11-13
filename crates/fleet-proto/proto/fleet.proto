@@ -43,6 +43,7 @@ message Event {
     AgentActivity activity = 3;
     AttachRole role = 4;
     LogLine log_line = 5;
+    AgentResized agent_resized = 6;
   }
 }
 
@@ -84,7 +85,10 @@ message AgentInfo {
   map<string, string> labels = 8;
 }
 
-message Attach { uint64 agent_id = 1; }
+// With `observe`, a read-only attach (ADR 0022): it never takes or changes
+// the primary role (`AttachOk.primary` is false, no `AttachRole` events), and
+// its input does not promote it. Observers must not answer terminal queries.
+message Attach { uint64 agent_id = 1; bool observe = 2; }
 message AttachOk {
   uint64 agent_id = 1;
   bytes snapshot = 2;
@@ -129,6 +133,9 @@ message SetLabels {
 message Lagged { uint64 agent_id = 1; }
 message AgentActivity { uint64 agent_id = 1; string last_line = 2; int64 last_output_unix_ms = 3; }
 message AttachRole { uint64 agent_id = 1; bool primary = 2; }
+// The agent's grid was resized; arrives in the agent's stream, in order with
+// its output, on every subscription (primary or not).
+message AgentResized { uint64 agent_id = 1; uint32 cols = 2; uint32 rows = 3; }
 message Ack {}
 
 // The daemon's log (ADR 0027): the last `tail` lines (capped at 10 000) of

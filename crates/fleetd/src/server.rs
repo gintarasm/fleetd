@@ -22,9 +22,9 @@ use std::time::Duration;
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
 use fleet_node::node::{ActivityReceiver, ConnId, Node, StreamItem, Subscription};
 use fleet_proto::{
-    Ack, AgentList, AttachOk, AttachRole, Event, Frame, FrameCodec, HandshakeReject, HelloOk,
-    HistoryPage, Lagged, LogLine, LogLines, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, ReadLogs,
-    Request, Response, SpawnAgent, SpawnedAttached, event, request, response,
+    Ack, AgentList, AgentResized, AttachOk, AttachRole, Event, Frame, FrameCodec, HandshakeReject,
+    HelloOk, HistoryPage, Lagged, LogLine, LogLines, MAX_FRAME, PROTOCOL_VERSION, ReadHistory,
+    ReadLogs, Request, Response, SpawnAgent, SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -273,7 +273,9 @@ impl Connection {
                     Err(e) => error(e.to_string()),
                 }
             }
-            Some(request::Kind::Attach(a)) => return self.attach(req.id, a.agent_id).await,
+            Some(request::Kind::Attach(a)) => {
+                return self.attach(req.id, a.agent_id, a.observe).await;
+            }
             Some(request::Kind::Detach(d)) => {
                 self.detach(d.agent_id).await;
                 response::Kind::Ack(Ack {})
@@ -386,11 +388,19 @@ impl Connection {
     /// Replaces any previous subscription to the agent: `AttachOk` is queued
     /// before any of the new subscription's output. The node replaces the
     /// subscription before the old forwarder stops, so a re-attaching
-    /// primary keeps its role without a flap.
-    async fn attach(&mut self, id: u64, agent_id: u64) -> bool {
+    /// primary keeps its role without a flap. An observing attach (ADR
+    /// 0022) never takes or changes the primary role.
+    async fn attach(&mut self, id: u64, agent_id: u64, observe: bool) -> bool {
         lock(&self.attached).insert(agent_id);
         let conn = self.id;
-        let attached = blocking(&self.node, move |n| n.attach(agent_id, conn)).await;
+        let attached = blocking(&self.node, move |n| {
+            if observe {
+                n.observe(agent_id)
+            } else {
+                n.attach(agent_id, conn)
+            }
+        })
+        .await;
         // The old subscription's stream has ended; whatever it queued
         // precedes `AttachOk`.
         self.stop_forwarder(agent_id).await;
@@ -407,6 +417,7 @@ impl Connection {
             agent = agent_id,
             conn = self.id.0,
             primary = ok.primary,
+            observe,
             "attached"
         );
         if !self
@@ -505,6 +516,13 @@ async fn forward_output(
                     kind: Some(event::Kind::Role(AttachRole { agent_id, primary })),
                 })
             }
+            StreamItem::Resized { cols, rows } => Frame::Event(Event {
+                kind: Some(event::Kind::AgentResized(AgentResized {
+                    agent_id,
+                    cols: u32::from(cols),
+                    rows: u32::from(rows),
+                })),
+            }),
             StreamItem::Exited(code) => {
                 let _ = outbox.send(exited_event(agent_id, code)).await;
                 return;

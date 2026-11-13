@@ -36,7 +36,10 @@
 //! attaching again replaces it. Role changes reach the affected subscribers
 //! in their stream as [`StreamItem::Role`]. When the primary's subscription
 //! ends (dropped, lagged), the remaining connection that most recently
-//! attached or sent input becomes primary and is told so.
+//! attached or sent input becomes primary and is told so. An observing
+//! attach ([`Node::observe`]) is an anonymous subscriber: it never takes or
+//! changes the role. Applied resizes reach every subscriber in their stream
+//! as [`StreamItem::Resized`], in order with the output.
 //!
 //! **Activity.** The output path only marks the agent dirty (a flag and a
 //! timestamp, under the pipeline lock it already holds; the first mark since
@@ -254,6 +257,9 @@ pub enum StreamItem {
     /// The subscriber's connection became (`true`) or stopped being
     /// (`false`) the agent's primary client.
     Role(bool),
+    /// The grid was resized to `cols` x `rows`; output after it is at that
+    /// size. Every subscriber gets it, primary or not.
+    Resized { cols: u16, rows: u16 },
 }
 
 /// Identifies a client connection to the node, for the primary-client rule.
@@ -741,6 +747,13 @@ impl AgentPipeline {
         self.attach_as(Some(conn))
     }
 
+    /// A read-only [`AgentPipeline::attach`]: an anonymous subscriber that
+    /// takes no part in the primary rule (it is never primary, changes no
+    /// role and gets no [`StreamItem::Role`]).
+    pub fn observe(&self) -> Attached {
+        self.attach_as(None)
+    }
+
     fn attach_as(&self, conn: Option<ConnId>) -> Attached {
         let mut state = self.lock();
         let snapshot = Self::snapshot_of(&mut state);
@@ -889,10 +902,24 @@ impl AgentPipeline {
     }
 
     /// Resizes the grid. Call alongside [`PtyHost::resize`](crate::PtyHost::resize).
+    /// A change of size is queued to every subscriber as
+    /// [`StreamItem::Resized`], in order with the output (under the lock that
+    /// also covers feeding the grid).
     pub fn resize(&self, cols: u16, rows: u16) {
         let mut state = self.lock();
+        let old = state.term.size();
         state.term.resize(cols, rows);
         state.drain_history();
+        let (cols, rows) = state.term.size();
+        if (cols, rows) != old && !state.subscribers.is_empty() {
+            let before = state.subscribers.len();
+            state
+                .subscribers
+                .retain(|s| s.offer(StreamItem::Resized { cols, rows }));
+            if state.subscribers.len() != before {
+                state.check_primary();
+            }
+        }
     }
 
     /// The agent's exit code, once it has exited.
@@ -1828,10 +1855,24 @@ impl Node {
     /// attach replaces `conn`'s previous subscription to it and makes `conn`
     /// primary (`AttachOk.primary`); there is no primary after exit.
     pub fn attach(&self, id: u64, conn: ConnId) -> io::Result<(AttachOk, Subscription)> {
+        self.attach_with(id, Some(conn))
+    }
+
+    /// A read-only [`Node::attach`] (see [`AgentPipeline::observe`]): it
+    /// never takes or changes the primary role, and its connection's input
+    /// does not promote it. `AttachOk.primary` is `false`.
+    pub fn observe(&self, id: u64) -> io::Result<(AttachOk, Subscription)> {
+        self.attach_with(id, None)
+    }
+
+    fn attach_with(&self, id: u64, conn: Option<ConnId>) -> io::Result<(AttachOk, Subscription)> {
         let (snapshot, (cols, rows), history, sub, primary) = {
             let agents = lock(&self.agents);
             if let Some(live) = agents.live.get(&id) {
-                let a = live.pipeline.attach(conn);
+                let a = match conn {
+                    Some(conn) => live.pipeline.attach(conn),
+                    None => live.pipeline.observe(),
+                };
                 (a.snapshot, a.size, a.history, a.subscription, a.primary)
             } else if let Some(a) = agents.exited(id) {
                 let sub = Subscription::exited(a.exit_code);
