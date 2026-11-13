@@ -40,15 +40,19 @@ fn wall_suite_quick_emits_all_metrics() {
             "daemon_flood50_wall_ns",
             "fleetd_cold_start_ns",
             "fleetd_idle_rss_bytes",
+            "flood50_attached4_lagged_subscriptions",
             "flood50_cpu_ns_per_mib",
             "flood50_peak_rss_bytes",
             "flood50_wall_ns",
+            "input_echo_flood50_ns",
             "reattach_snapshot_ns",
         ]
     );
     for (name, m) in &r.metrics {
         // Quick payloads are too small for fleetd to drop a subscriber.
-        if name == "daemon_flood50_lagged_subscriptions" {
+        if name == "daemon_flood50_lagged_subscriptions"
+            || name == "flood50_attached4_lagged_subscriptions"
+        {
             assert!(m.value >= 0.0, "{name} = {}", m.value);
             continue;
         }

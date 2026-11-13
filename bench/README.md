@@ -31,6 +31,8 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 | `daemon_flood50_cpu_ns_per_mib` | wall | CPU time (user + sys) of the `fleetd` process alone (`proc_pid_rusage` / `/proc/<pid>/stat`, agents excluded) over that run, per MiB of agent output |
 | `daemon_flood50_peak_rss_bytes` | wall | peak `fleetd` RSS during that run, sampled every 50 ms |
 | `daemon_flood50_lagged_subscriptions` | wall | subscriptions `fleetd` dropped as lagged during that run (unit `count`) |
+| `flood50_attached4_lagged_subscriptions` | wall | `fleetd` with 50 `fake-agent --ansi --bytes 8388608` spawned on one connection that is attached to agents 0–3 only (a GUI showing four panes) and consumes everything until all exit: subscriptions dropped as lagged (`Event::Lagged`; worst of 3 runs; unit `count`) |
+| `input_echo_flood50_ns` | wall | that flood plus a 51st agent `/bin/cat` attached on its own connection: once every flood agent is spawned, `SendInput` of one byte written until the `Output` holding its PTY echo is read, one at a time 5 ms apart (median of 100, all taken while the flood runs) |
 | `reattach_snapshot_ns` | wall | `Attach` sent to `AttachOk` received for an idle agent that printed 8 MiB (median of 50, detaching in between) |
 | `fleetd_startup_instructions` | instr | Callgrind instruction count of `fleetd::startup` (x86_64, ubuntu-24.04) |
 | `frame_decode_output_64x64k_instructions` | instr | decode 64 back-to-back 64 KiB `Output` frames with `FrameCodec` |
