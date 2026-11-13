@@ -293,7 +293,7 @@ fn agent_output(dir: &Path, cwd: &Path, script: &str) -> String {
         cwd: cwd.to_string_lossy().into_owned(),
         ..Default::default()
     };
-    conn.call(fleet_proto::request::Kind::Spawn(spawn))
+    conn.call(fleet_proto::request::Kind::Spawn(Box::new(spawn)))
         .expect("spawn");
     let out = cwd.join("out");
     let deadline = Instant::now() + Duration::from_secs(10);

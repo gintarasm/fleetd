@@ -200,7 +200,7 @@ fn run(cli: Cli) -> Result<u8> {
                 labels,
                 ..Default::default()
             };
-            match client.call(request::Kind::Spawn(spawn))? {
+            match client.call(request::Kind::Spawn(Box::new(spawn)))? {
                 response::Kind::Spawned(info) => println!("{}", info.id),
                 _ => return Err(Error::Protocol("unexpected reply to spawn".into())),
             }

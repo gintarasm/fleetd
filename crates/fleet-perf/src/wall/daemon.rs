@@ -363,7 +363,7 @@ pub(super) fn flood(
             rows: ROWS,
             ..SpawnAgent::default()
         };
-        let req = client.request(request::Kind::Spawn(spawn))?;
+        let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
         let agent_id = match streams.wait(&mut client, req)? {
             response::Kind::Spawned(info) => info.id,
             other => return Err(format!("spawn: unexpected {other:?}")),
@@ -432,7 +432,7 @@ pub(super) fn reattach_snapshot_ns(
         rows: ROWS,
         ..SpawnAgent::default()
     };
-    let req = client.request(request::Kind::Spawn(spawn))?;
+    let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
     let agent_id = match streams.wait(&mut client, req)? {
         response::Kind::Spawned(info) => info.id,
         other => return Err(format!("spawn: unexpected {other:?}")),
@@ -506,7 +506,7 @@ fn spawn_fake_agent(
         rows: ROWS,
         ..SpawnAgent::default()
     };
-    let req = client.request(request::Kind::Spawn(spawn))?;
+    let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
     match streams.wait(client, req)? {
         response::Kind::Spawned(info) => Ok(info.id),
         other => Err(format!("spawn: unexpected {other:?}")),
@@ -619,7 +619,7 @@ pub(super) fn input_echo_ns(
         rows: ROWS,
         ..SpawnAgent::default()
     };
-    let req = client.request(request::Kind::Spawn(spawn))?;
+    let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
     let cat = match streams.wait(&mut client, req)? {
         response::Kind::Spawned(info) => info.id,
         other => return Err(format!("spawn cat: unexpected {other:?}")),

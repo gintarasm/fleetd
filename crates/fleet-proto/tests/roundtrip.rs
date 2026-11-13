@@ -27,7 +27,7 @@ fn spawn_request_roundtrips_with_env() {
     };
     let f = Frame::Request(Request {
         id: 1,
-        kind: Some(request::Kind::Spawn(spawn)),
+        kind: Some(request::Kind::Spawn(Box::new(spawn))),
     });
     assert_eq!(roundtrip(f.clone()), f);
 }
@@ -45,7 +45,7 @@ fn agent_info_optional_exit_code() {
         };
         let f = Frame::Response(Response {
             id: 2,
-            kind: Some(response::Kind::Spawned(info)),
+            kind: Some(response::Kind::Spawned(Box::new(info))),
         });
         assert_eq!(roundtrip(f.clone()), f);
     }
@@ -94,12 +94,12 @@ fn attach_ok() -> AttachOk {
 #[test]
 fn roundtrip_every_kind() {
     let requests = [
-        request::Kind::Spawn(SpawnAgent {
+        request::Kind::Spawn(Box::new(SpawnAgent {
             program: "p".into(),
             attach: true,
             labels: labels(),
             ..Default::default()
-        }),
+        })),
         request::Kind::List(ListAgents { selector: labels() }),
         request::Kind::Attach(Attach { agent_id: 1 }),
         request::Kind::Detach(Detach { agent_id: 1 }),
@@ -126,11 +126,11 @@ fn roundtrip_every_kind() {
         }),
     ];
     let responses = [
-        response::Kind::Spawned(info()),
+        response::Kind::Spawned(Box::new(info())),
         response::Kind::Agents(AgentList {
             agents: vec![info(), info()],
         }),
-        response::Kind::Attached(attach_ok()),
+        response::Kind::Attached(Box::new(attach_ok())),
         response::Kind::Ack(Ack {}),
         response::Kind::Error(Error {
             message: "nope".into(),
@@ -140,10 +140,10 @@ fn roundtrip_every_kind() {
             first_line: 250,
             lines: vec![Bytes::from_static(b"a"), Bytes::from_static(b"\x1b[31mb")],
         }),
-        response::Kind::SpawnedAttached(SpawnedAttached {
+        response::Kind::SpawnedAttached(Box::new(SpawnedAttached {
             agent: Some(info()),
             attached: Some(attach_ok()),
-        }),
+        })),
     ];
     let events = [
         event::Kind::Exited(AgentExited {
@@ -196,4 +196,11 @@ fn roundtrip_every_kind() {
     for f in frames {
         assert_eq!(roundtrip(f.clone()), f);
     }
+}
+
+/// Frames are moved and initialised per decode; keep the enum no bigger than
+/// it was at protocol v1 (136 bytes on 64-bit).
+#[test]
+fn frame_is_small() {
+    assert!(std::mem::size_of::<fleet_proto::Frame>() <= 136);
 }

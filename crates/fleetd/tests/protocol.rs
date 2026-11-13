@@ -162,14 +162,14 @@ impl Client {
     }
 
     fn spawn(&mut self, program: &str, args: &[&str]) -> AgentInfo {
-        match self.request(request::Kind::Spawn(SpawnAgent {
+        match self.request(request::Kind::Spawn(Box::new(SpawnAgent {
             program: program.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cols: 80,
             rows: 24,
             ..Default::default()
-        })) {
-            response::Kind::Spawned(info) => info,
+        }))) {
+            response::Kind::Spawned(info) => *info,
             other => panic!("spawn failed: {other:?}"),
         }
     }
@@ -194,7 +194,7 @@ impl Client {
 
     fn attach(&mut self, agent_id: u64) -> AttachOk {
         match self.request(request::Kind::Attach(Attach { agent_id })) {
-            response::Kind::Attached(ok) => ok,
+            response::Kind::Attached(ok) => *ok,
             other => panic!("attach failed: {other:?}"),
         }
     }
@@ -330,12 +330,12 @@ fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 }
 
 fn spawn_labeled(c: &mut Client, pairs: &[(&str, &str)]) -> response::Kind {
-    c.request(request::Kind::Spawn(SpawnAgent {
+    c.request(request::Kind::Spawn(Box::new(SpawnAgent {
         program: "/bin/sleep".into(),
         args: vec!["100".into()],
         labels: labels(pairs),
         ..Default::default()
-    }))
+    })))
 }
 
 fn set_labels(
@@ -837,11 +837,11 @@ fn sixty_agents_under(limit: &str) {
     let mut c = Client::open(dir.path());
     let mut ids = Vec::new();
     for i in 0..60 {
-        match c.request(request::Kind::Spawn(SpawnAgent {
+        match c.request(request::Kind::Spawn(Box::new(SpawnAgent {
             program: "/bin/sleep".into(),
             args: vec!["100".into()],
             ..Default::default()
-        })) {
+        }))) {
             response::Kind::Spawned(info) => ids.push(info.id),
             other => panic!("spawn {i} under `ulimit {limit}` failed: {other:?}"),
         }
@@ -870,13 +870,13 @@ fn out_of_range_sizes_are_error_responses() {
     let _d = Daemon::start(dir.path());
     let mut c = Client::open(dir.path());
     for (cols, rows) in [(1001, 24), (80, 1001), (501, 500)] {
-        match c.request(request::Kind::Spawn(SpawnAgent {
+        match c.request(request::Kind::Spawn(Box::new(SpawnAgent {
             program: "/bin/sleep".into(),
             args: vec!["100".into()],
             cols,
             rows,
             ..Default::default()
-        })) {
+        }))) {
             response::Kind::Error(e) => assert!(e.message.contains("out of range"), "{e:?}"),
             other => panic!("spawn {cols}x{rows}: expected error, got {other:?}"),
         }
@@ -910,13 +910,13 @@ fn agents_get_xterm_256color_unless_term_is_given() {
             "term=vt100.",
         ),
     ] {
-        let info = match c.request(request::Kind::Spawn(SpawnAgent {
+        let info = match c.request(request::Kind::Spawn(Box::new(SpawnAgent {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
             env: env.into_iter().collect(),
             ..Default::default()
-        })) {
-            response::Kind::Spawned(info) => info,
+        }))) {
+            response::Kind::Spawned(info) => *info,
             other => panic!("spawn failed: {other:?}"),
         };
         let deadline = Instant::now() + TIMEOUT;
@@ -1044,7 +1044,7 @@ fn spawn_attach_replies_with_snapshot_and_streams_first_output() {
     let mut c = Client::open(dir.path());
     // The very first output, a terminal query included, must be streamed: an
     // unattached agent's queries are answered by the node instead.
-    let r = c.request(request::Kind::Spawn(SpawnAgent {
+    let r = c.request(request::Kind::Spawn(Box::new(SpawnAgent {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "printf 'first-out\\033[6n'; sleep 100".into()],
         cols: 100,
@@ -1052,7 +1052,7 @@ fn spawn_attach_replies_with_snapshot_and_streams_first_output() {
         attach: true,
         labels: labels(&[("project", "fleetd")]),
         ..Default::default()
-    }));
+    })));
     let (agent, attached) = match r {
         response::Kind::SpawnedAttached(sa) => (sa.agent.unwrap(), sa.attached.unwrap()),
         other => panic!("expected SpawnedAttached, got {other:?}"),
@@ -1081,12 +1081,12 @@ fn spawn_attach_of_quickly_exiting_agent_streams_output_then_one_exit() {
     let dir = TempDir::new().unwrap();
     let _d = Daemon::start(dir.path());
     let mut c = Client::open(dir.path());
-    let r = c.request(request::Kind::Spawn(SpawnAgent {
+    let r = c.request(request::Kind::Spawn(Box::new(SpawnAgent {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "echo quick-bye; exit 5".into()],
         attach: true,
         ..Default::default()
-    }));
+    })));
     let agent = match r {
         response::Kind::SpawnedAttached(sa) => sa.agent.unwrap(),
         other => panic!("expected SpawnedAttached, got {other:?}"),
@@ -1352,12 +1352,12 @@ fn spawn_attach_makes_the_spawner_primary() {
     let _d = Daemon::start(dir.path());
     let mut a = Client::open(dir.path());
     let mut b = Client::open(dir.path());
-    let r = a.request(request::Kind::Spawn(SpawnAgent {
+    let r = a.request(request::Kind::Spawn(Box::new(SpawnAgent {
         program: "/bin/sleep".into(),
         args: vec!["100".into()],
         attach: true,
         ..Default::default()
-    }));
+    })));
     let (id, ok) = match r {
         response::Kind::SpawnedAttached(sa) => (sa.agent.unwrap().id, sa.attached.unwrap()),
         other => panic!("expected SpawnedAttached, got {other:?}"),
@@ -1375,13 +1375,13 @@ fn agent_activity_is_throttled() {
     let mut c = Client::open(dir.path());
     // A 250-char line, printed as fast as possible on a 300-column grid.
     let script = "l=$(printf '%0250d' 0); while :; do echo \"$l\"; done";
-    let id = match c.request(request::Kind::Spawn(SpawnAgent {
+    let id = match c.request(request::Kind::Spawn(Box::new(SpawnAgent {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],
         cols: 300,
         rows: 24,
         ..Default::default()
-    })) {
+    }))) {
         response::Kind::Spawned(info) => info.id,
         other => panic!("spawn failed: {other:?}"),
     };
@@ -1436,13 +1436,13 @@ fn agent_sees_its_id() {
         vec![],
         vec![("FLEET_AGENT_ID".to_string(), "999".to_string())],
     ] {
-        let info = match c.request(request::Kind::Spawn(SpawnAgent {
+        let info = match c.request(request::Kind::Spawn(Box::new(SpawnAgent {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
             env: env.into_iter().collect(),
             ..Default::default()
-        })) {
-            response::Kind::Spawned(info) => info,
+        }))) {
+            response::Kind::Spawned(info) => *info,
             other => panic!("spawn failed: {other:?}"),
         };
         let want = format!("id={}.", info.id);

@@ -6,6 +6,12 @@ fn main() {
             ".fleet.v1.AttachOk.history_tail",
             ".fleet.v1.HistoryPage.lines",
         ])
+        // Large oneof variants are boxed so `Frame` stays small: it is moved and
+        // initialised on every decode (see the `frame_decode` benchmark).
+        .boxed(".fleet.v1.Request.kind.spawn")
+        .boxed(".fleet.v1.Response.kind.spawned")
+        .boxed(".fleet.v1.Response.kind.attached")
+        .boxed(".fleet.v1.Response.kind.spawned_attached")
         .compile_fds(fds)
         .expect("generate prost types");
     println!("cargo:rerun-if-changed=proto/fleet.proto");

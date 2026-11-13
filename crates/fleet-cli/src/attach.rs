@@ -74,8 +74,6 @@ fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     out.flush()
 }
 
-// Frames are the common case; boxing them would allocate per frame.
-#[allow(clippy::large_enum_variant)]
 enum Ev {
     Frame(Frame),
     /// The server closed the connection or it failed.

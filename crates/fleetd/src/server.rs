@@ -236,11 +236,11 @@ impl Connection {
         let kind = match req.kind {
             None => error("empty request".into()),
             Some(request::Kind::Spawn(spawn)) if spawn.attach => {
-                return self.spawn_attached(req.id, spawn).await;
+                return self.spawn_attached(req.id, *spawn).await;
             }
             Some(request::Kind::Spawn(spawn)) => {
-                match blocking(&self.node, move |n| n.spawn(spawn)).await {
-                    Ok(info) => response::Kind::Spawned(info),
+                match blocking(&self.node, move |n| n.spawn(*spawn)).await {
+                    Ok(info) => response::Kind::Spawned(Box::new(info)),
                     Err(e) => error(e.to_string()),
                 }
             }
@@ -340,7 +340,10 @@ impl Connection {
         };
         // A lagging old forwarder may have handed the exit event back.
         lock(&self.attached).insert(agent_id);
-        if !self.respond(id, response::Kind::Attached(ok)).await {
+        if !self
+            .respond(id, response::Kind::Attached(Box::new(ok)))
+            .await
+        {
             return false;
         }
         self.forward(agent_id, sub);
@@ -375,10 +378,10 @@ impl Connection {
             Err(e) => return self.respond(id, error(e.to_string())).await,
         };
         let agent_id = info.id;
-        let reply = response::Kind::SpawnedAttached(SpawnedAttached {
+        let reply = response::Kind::SpawnedAttached(Box::new(SpawnedAttached {
             agent: Some(info),
             attached: Some(ok),
-        });
+        }));
         if !self.respond(id, reply).await {
             return false;
         }

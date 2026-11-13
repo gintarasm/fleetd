@@ -13,7 +13,7 @@ const PAGE: u32 = 4096;
 
 fn attach(client: &mut Connection, agent_id: u64) -> Result<AttachOk> {
     match client.call(request::Kind::Attach(Attach { agent_id }))? {
-        response::Kind::Attached(ok) => Ok(ok),
+        response::Kind::Attached(ok) => Ok(*ok),
         _ => Err(Error::Protocol("unexpected reply to attach".into())),
     }
 }
