@@ -5,11 +5,12 @@
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 const READ_BUF: usize = 64 * 1024;
@@ -73,36 +74,48 @@ impl OutputSink for DiscardSink {
 
 /// Writes to an agent's PTY input; cheap to clone. Fails once the agent has
 /// exited.
+///
+/// Input and replies go through our own duplicate of the master fd, never
+/// through portable-pty's `take_writer()`: its writer sends `\n` + VEOF with a
+/// blocking write when dropped, which hangs forever on Linux once the slave is
+/// closed and the input queue is full.
 #[derive(Clone)]
-pub struct AgentInput(Arc<Mutex<Option<InputPort>>>);
+pub struct AgentInput(Arc<InputPort>);
 
 struct InputPort {
-    writer: Box<dyn Write + Send>,
-    /// Our own duplicate of the master fd, for non-blocking reply writes. It
-    /// shares the open file description (and its O_NONBLOCK flag) with the
-    /// reader, which therefore retries on EAGAIN.
-    fd: Option<OwnedFd>,
+    /// The duplicate of the master fd; `None` once closed. It shares the open
+    /// file description (and its O_NONBLOCK flag) with the reader, which
+    /// therefore retries on EAGAIN.
+    file: Mutex<Option<File>>,
+    /// Set by [`AgentInput::close`]. A writer that holds the lock while it is
+    /// set closes the fd itself, so closing never waits for a blocked write.
+    closed: AtomicBool,
 }
 
 impl AgentInput {
-    fn new(writer: Box<dyn Write + Send>, master: &dyn MasterPty) -> Self {
+    fn new(master: &dyn MasterPty) -> io::Result<Self> {
         let fd = master
             .as_raw_fd()
-            // SAFETY: the master owns this fd and outlives the borrow.
-            .and_then(|fd| {
-                unsafe { BorrowedFd::borrow_raw(fd) }
-                    .try_clone_to_owned()
-                    .ok()
-            });
-        Self(Arc::new(Mutex::new(Some(InputPort { writer, fd }))))
+            .ok_or_else(|| io::Error::other("PTY master has no fd"))?;
+        // SAFETY: the master owns this fd and outlives the borrow.
+        let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
+        Ok(Self(Arc::new(InputPort {
+            file: Mutex::new(Some(file)),
+            closed: AtomicBool::new(false),
+        })))
     }
 
     /// Writes all of `bytes`, blocking while the agent's input queue is full.
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut port = lock(&self.0);
-        let port = port.as_mut().ok_or_else(exited)?;
-        port.writer.write_all(bytes)?;
-        port.writer.flush()
+        let written = {
+            let file = lock(&self.0.file);
+            let file = file.as_ref().ok_or_else(exited)?;
+            (&*file).write_all(bytes)
+        };
+        if self.0.closed.load(Ordering::SeqCst) {
+            self.release();
+        }
+        written
     }
 
     /// Best-effort write that never blocks: a reply is dropped when the input
@@ -111,13 +124,13 @@ impl AgentInput {
     /// were written. For terminal query replies from the reader thread, which
     /// must never wait on an agent that does not read its input.
     pub fn try_write_reply(&self, bytes: &[u8]) -> bool {
-        let Ok(port) = self.0.try_lock() else {
+        let Ok(file) = self.0.file.try_lock() else {
             return false;
         };
-        let Some(fd) = port.as_ref().and_then(|p| p.fd.as_ref()) else {
+        let Some(file) = file.as_ref() else {
             return false;
         };
-        let fd = fd.as_raw_fd();
+        let fd = file.as_raw_fd();
         // A poll for POLLOUT is not enough: macOS reports a PTY master
         // writable with only two bytes free, and a blocking write then waits
         // for the rest. So the write itself is made non-blocking. The flag
@@ -135,8 +148,21 @@ impl AgentInput {
         }
     }
 
+    /// Closes the input without ever blocking: if a writer holds it (possibly
+    /// blocked on a full queue), that writer closes it when its write returns.
     fn close(&self) {
-        lock(&self.0).take();
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.release();
+    }
+
+    /// Takes the fd out of the lock, if free, and closes it after unlocking.
+    fn release(&self) {
+        let file = match self.0.file.try_lock() {
+            Ok(mut file) => file.take(),
+            Err(TryLockError::Poisoned(e)) => e.into_inner().take(),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        drop(file);
     }
 }
 
@@ -231,12 +257,12 @@ impl PtyHost {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        // Before the spawn, so a failure here leaves no child behind.
+        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+        let input = AgentInput::new(&*pair.master)?;
         let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
         // Close our copy of the slave so readers see EOF once the child exits.
         drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
-        let writer = pair.master.take_writer().map_err(io::Error::other)?;
-        let input = AgentInput::new(writer, &*pair.master);
 
         let id = AgentId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let agent = Arc::new(Agent {
