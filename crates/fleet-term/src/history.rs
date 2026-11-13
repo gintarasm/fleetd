@@ -5,10 +5,13 @@
 
 use std::io::Write as _;
 
-use alacritty_terminal::grid::{Dimensions, Row};
+use std::ops::Range;
+
+use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 /// What happened to the scrollback since the last
@@ -23,23 +26,79 @@ pub enum HistoryEvent {
     Cleared,
 }
 
-/// Moves the rows alacritty holds in its scrollback into `events` as
-/// [`HistoryEvent::Line`]s, oldest first, and empties the scrollback.
-pub(crate) fn capture<T>(term: &mut Term<T>, events: &mut Vec<HistoryEvent>) {
-    let grid = term.grid();
-    let n = grid.history_size();
-    if n == 0 {
+/// Scrollback rows alacritty may hold while a resize is staged (see
+/// [`History::staged`]). Normally it keeps none: rows are rendered by
+/// [`Recorder`](crate::recorder::Recorder) the moment they scroll off.
+pub(crate) const RESIZE_SLACK: usize = 10_000;
+
+/// History events not yet drained, plus what [`Recorder`](crate::recorder::Recorder)
+/// needs to know when a row scrolls off.
+pub(crate) struct History {
+    pub(crate) events: Vec<HistoryEvent>,
+    /// Mirror of alacritty's scroll region (DECSTBM), which it keeps private:
+    /// screen rows `start..end`. Maintained exactly as `Term` maintains its
+    /// own (set by `set_scrolling_region`, reset by resize and RIS).
+    pub(crate) region: Range<i32>,
+    /// A resize enabled alacritty's scrollback on the primary screen (to
+    /// collect the rows it pushes off) while the alt screen was active; the
+    /// rows are collected and the scrollback disabled again once the primary
+    /// screen is back (see [`settle`]).
+    pub(crate) staged: bool,
+}
+
+impl History {
+    pub(crate) fn new(rows: usize) -> Self {
+        Self {
+            events: Vec::new(),
+            region: 0..rows as i32,
+            staged: false,
+        }
+    }
+
+    /// Renders rows `0..n` of `grid`, about to scroll off, as history lines.
+    pub(crate) fn scroll_off(&mut self, grid: &Grid<Cell>, n: usize) {
+        let n = n.min(grid.screen_lines());
+        self.events.reserve(n);
+        for row in 0..n {
+            self.events
+                .push(HistoryEvent::Line(render_line(&grid[Line(row as i32)])));
+        }
+    }
+}
+
+/// Alacritty config with `history` rows of scrollback.
+pub(crate) fn config(history: usize) -> Config {
+    Config {
+        scrolling_history: history,
+        // Track the kitty keyboard flags so snapshots can carry them.
+        kitty_keyboard: true,
+        ..Config::default()
+    }
+}
+
+/// Finishes a staged resize once the primary screen is active: renders the
+/// rows the resize pushed into alacritty's scrollback (oldest first), then
+/// disables the scrollback again and frees its row cache.
+pub(crate) fn settle<T: EventListener>(term: &mut Term<T>, history: &mut History) {
+    if !history.staged || term.mode().contains(TermMode::ALT_SCREEN) {
         return;
     }
-    events.reserve(n);
+    let grid = term.grid();
+    let n = grid.history_size();
+    history.events.reserve(n);
     for i in (1..=n).rev() {
-        events.push(HistoryEvent::Line(render_line(&grid[Line(-(i as i32))])));
+        history
+            .events
+            .push(HistoryEvent::Line(render_line(&grid[Line(-(i as i32))])));
     }
     term.grid_mut().clear_history();
+    term.set_options(config(0));
+    term.grid_mut().truncate();
+    history.staged = false;
 }
 
 /// One row as a self-contained ANSI line (see [`HistoryEvent::Line`]).
-fn render_line(row: &Row<Cell>) -> Vec<u8> {
+pub(crate) fn render_line(row: &Row<Cell>) -> Vec<u8> {
     let Some(end) = last_non_blank(row) else {
         return Vec::new();
     };
@@ -60,6 +119,18 @@ pub(crate) fn last_non_blank(row: &Row<Cell>) -> Option<usize> {
 /// Draws the cells `0..=end` of `row`, changing `pen` as needed.
 pub(crate) fn put_cells(out: &mut Vec<u8>, pen: &mut Pen, row: &Row<Cell>, end: usize) {
     for cell in &row[..=Column(end)] {
+        // Fast path: a plain ASCII cell drawn with the current pen.
+        if cell.extra.is_none()
+            && pen.underline.is_none()
+            && cell.c.is_ascii()
+            && cell.flags & !SGR_MASK == Flags::empty()
+            && cell.flags == pen.flags
+            && cell.fg == pen.fg
+            && cell.bg == pen.bg
+        {
+            out.push(cell.c as u8);
+            continue;
+        }
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
@@ -114,11 +185,16 @@ const SGR_FLAGS: [(Flags, &str); 11] = [
     (Flags::STRIKEOUT, "9"),
 ];
 
-fn sgr_mask() -> Flags {
-    SGR_FLAGS
-        .iter()
-        .fold(Flags::empty(), |acc, &(flag, _)| acc | flag)
-}
+/// The union of [`SGR_FLAGS`].
+const SGR_MASK: Flags = {
+    let mut mask = Flags::empty();
+    let mut i = 0;
+    while i < SGR_FLAGS.len() {
+        mask = mask.union(SGR_FLAGS[i].0);
+        i += 1;
+    }
+    mask
+};
 
 /// Graphic rendition of a cell (the "pen" that drew it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,7 +221,7 @@ impl Pen {
         Self {
             fg: cell.fg,
             bg: cell.bg,
-            flags: cell.flags & sgr_mask(),
+            flags: cell.flags & SGR_MASK,
             underline: cell.underline_color(),
         }
     }
@@ -397,6 +473,109 @@ mod tests {
         assert!(t.drain_history().is_empty(), "frame still buffered");
         t.flush_pending_sync();
         assert_eq!(texts(&t.drain_history()), ["a", "b"]);
+    }
+
+    #[test]
+    fn scroll_up_sequence_moves_rows_into_history() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"l0\r\nl1\r\nl2\x1b[2S");
+        assert_eq!(texts(&t.drain_history()), ["l0", "l1"]);
+        assert_eq!(t.visible_text(), ["l2", "", "", "", ""]);
+        // Clamped to the region: at most one screen of rows.
+        t.feed(b"\x1b[99S");
+        assert_eq!(texts(&t.drain_history()), ["l2", "", "", "", ""]);
+    }
+
+    #[test]
+    fn scroll_region_below_top_produces_no_history() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"head\x1b[2;5r\x1b[5;1H");
+        for i in 0..10 {
+            t.feed(format!("x{i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[3S\x1b[2;1H\x1b[2M");
+        assert!(t.drain_history().is_empty());
+        assert_eq!(t.visible_text()[0], "head");
+    }
+
+    #[test]
+    fn scroll_region_from_top_feeds_history() {
+        // As in alacritty: a region starting at the top scrolls into history
+        // even when it ends above the bottom; the rows below stay put.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[5;1Hfoot\x1b[1;3r\x1b[3;1Ha\r\nb\r\nc\r\n");
+        assert_eq!(texts(&t.drain_history()), ["", "", "a"]);
+        assert_eq!(t.visible_text(), ["b", "c", "", "", "foot"]);
+    }
+
+    #[test]
+    fn erase_display_pushes_screen_into_history() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"a\r\nb\r\n\x1b[2J");
+        assert_eq!(texts(&t.drain_history()), ["a", "b"]);
+        t.feed(b"\x1b[2J");
+        assert!(t.drain_history().is_empty(), "blank screen: no rows");
+    }
+
+    #[test]
+    fn delete_lines_on_top_row_feeds_history() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"a\r\nb\r\nc\x1b[H\x1b[2M");
+        assert_eq!(texts(&t.drain_history()), ["a", "b"]);
+        t.feed(b"\x1b[2;1H\x1b[M");
+        assert!(t.drain_history().is_empty(), "below the top row");
+    }
+
+    #[test]
+    fn autowrap_on_bottom_row_feeds_history() {
+        let mut t = Terminal::new(4, 2);
+        // Pending wrap, then a character.
+        t.feed(b"top\r\nabcde");
+        assert_eq!(texts(&t.drain_history()), ["top"]);
+        // A wide character that does not fit in the last column.
+        t.feed("\r\nxyz中".as_bytes());
+        assert_eq!(texts(&t.drain_history()), ["abcd", "e"]);
+        assert_eq!(t.visible_text(), ["xyz", "中"]);
+        // A tab with a pending wrap.
+        t.feed(b"\r\nwxyz\t");
+        assert_eq!(texts(&t.drain_history()), ["xyz", "中"]);
+        // No autowrap: nothing scrolls.
+        t.feed(b"\x1b[?7l\r\nlongerline");
+        assert_eq!(texts(&t.drain_history()), ["wxyz"]);
+    }
+
+    #[test]
+    fn resize_on_alt_screen_is_captured_on_return() {
+        let mut t = Terminal::new(20, 10);
+        for i in 0..9 {
+            t.feed(format!("l{i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[?1049h");
+        t.resize(20, 5);
+        assert!(t.drain_history().is_empty());
+        t.feed(b"\x1b[?1049lnext\r\n");
+        assert_eq!(
+            texts(&t.drain_history()),
+            ["l0", "l1", "l2", "l3", "l4", "l5"]
+        );
+        assert_eq!(t.visible_text(), ["l6", "l7", "l8", "next", ""]);
+        assert_eq!(t.term.borrow().grid().history_size(), 0);
+    }
+
+    #[test]
+    fn clear_inside_sync_update_keeps_order() {
+        let mut t = Terminal::new(20, 10);
+        let mut input = b"\x1b[?2026h".to_vec();
+        input.extend_from_slice(&b"a\r\n".repeat(50));
+        input.extend_from_slice(b"\x1b[3J");
+        input.extend_from_slice(&b"b\r\n".repeat(50));
+        input.extend_from_slice(b"\x1b[?2026l");
+        t.feed(&input);
+        let mut expected = vec!["a"; 41];
+        expected.push("<cleared>");
+        expected.extend(["a"; 9]);
+        expected.extend(["b"; 41]);
+        assert_eq!(texts(&t.drain_history()), expected);
     }
 
     #[test]

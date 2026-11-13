@@ -27,18 +27,20 @@
 //! agent.
 //!
 //! Rows that scroll off the top of the primary screen are rendered as ANSI
-//! lines and queued with `CSI 3 J` (erase saved lines) as [`HistoryEvent`]s,
-//! which [`Terminal::drain_history`] hands out in stream order. The grid
-//! itself keeps no scrollback between calls. A row is one grid row: a long
-//! line soft-wrapped by the agent's terminal yields several rows.
+//! lines the moment they scroll off and queued with `CSI 3 J` (erase saved
+//! lines) as [`HistoryEvent`]s, which [`Terminal::drain_history`] hands out in
+//! stream order. The parser drives alacritty through a thin handler that does
+//! this (see `recorder`); alacritty itself keeps no scrollback. A row is one
+//! grid row: a long line soft-wrapped by the agent's terminal yields several
+//! rows.
 
 mod history;
-mod scan;
+mod recorder;
 
 pub use history::HistoryEvent;
 
-use history::{Pen, glyph, last_non_blank, put_cells, put_glyph};
-use scan::ClearScan;
+use history::{History, Pen, glyph, last_non_blank, put_cells, put_glyph};
+use recorder::Recorder;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -49,26 +51,13 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Cursor, Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Handler, KeyboardModes, KeyboardModesApplyBehavior, Processor,
 };
 
-/// Scrollback rows alacritty may hold between two history captures. Rows are
-/// captured and the scrollback emptied after every [`FEED_PIECE`] bytes, which
-/// scroll at most one row per byte (LF, or a wrap after a full row) unless an
-/// agent scrolls with `CSI n S`; so plain output never loses rows to this cap.
-const HISTORY_SLACK: usize = 10_000;
-
-/// Largest slice of input handed to the parser before capturing history.
-///
-/// At most alacritty's scrollback row cache (`MAX_CACHE_SIZE`, 1000 rows): a
-/// piece that scrolls more rows than that makes `clear_history` free the
-/// cached rows, and the next scroll allocates them again (one allocation per
-/// row), which made newline floods ~2x slower with 4096-byte pieces.
-const FEED_PIECE: usize = 1000;
-
-/// Grid size handed to alacritty.
+/// Grid size handed to alacritty. Scrollback is disabled: rows are rendered as
+/// history as they scroll off (see [`recorder`]).
 struct Size {
     cols: usize,
     rows: usize,
@@ -135,29 +124,20 @@ pub struct Terminal {
     term: RefCell<Term<Replies>>,
     parser: Processor,
     replies: Replies,
-    clear_scan: ClearScan,
-    history: Vec<HistoryEvent>,
+    history: History,
 }
 
 impl Terminal {
     /// Creates a blank screen; zero dimensions are clamped to 1.
     pub fn new(cols: u16, rows: u16) -> Self {
-        let config = Config {
-            // Rows that scroll off are captured as history after each piece
-            // of `feed` (see `history::capture`); the slack only has to hold
-            // the rows of one piece.
-            scrolling_history: HISTORY_SLACK,
-            // Track the kitty keyboard flags so snapshots can carry them.
-            kitty_keyboard: true,
-            ..Config::default()
-        };
         let replies = Replies::default();
+        let size = Size::new(cols, rows);
+        let history = History::new(size.rows);
         Self {
-            term: RefCell::new(Term::new(config, &Size::new(cols, rows), replies.clone())),
+            term: RefCell::new(Term::new(history::config(0), &size, replies.clone())),
             parser: Processor::new(),
             replies,
-            clear_scan: ClearScan::default(),
-            history: Vec::new(),
+            history,
         }
     }
 
@@ -165,36 +145,14 @@ impl Terminal {
     ///
     /// Rows that scroll off the primary screen become [`HistoryEvent::Line`]s
     /// and `CSI 3 J` on the primary screen a [`HistoryEvent::Cleared`] (see
-    /// [`Terminal::drain_history`]). The input is parsed in pieces of at most
-    /// [`FEED_PIECE`] bytes, capturing the scrolled rows after each, and split
-    /// around the final byte of each `CSI 3 J`, so the rows scrolled before it
-    /// are captured before alacritty erases its scrollback.
-    pub fn feed(&mut self, mut bytes: &[u8]) {
+    /// [`Terminal::drain_history`]).
+    pub fn feed(&mut self, bytes: &[u8]) {
         self.flush_expired_sync();
-        while !bytes.is_empty() {
-            let piece = &bytes[..bytes.len().min(FEED_PIECE)];
-            let Some(j) = self.clear_scan.find(piece) else {
-                self.advance(piece);
-                bytes = &bytes[piece.len()..];
-                continue;
-            };
-            self.advance(&piece[..j]);
-            self.advance(&piece[j..=j]);
-            if !self.term.get_mut().mode().contains(TermMode::ALT_SCREEN) {
-                self.history.push(HistoryEvent::Cleared);
-            }
-            bytes = &bytes[j + 1..];
-        }
-    }
-
-    /// Parses `bytes` and captures the rows they scrolled off.
-    fn advance(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let term = self.term.get_mut();
-        self.parser.advance(term, bytes);
-        history::capture(term, &mut self.history);
+        let mut recorder = Recorder {
+            term: self.term.get_mut(),
+            history: &mut self.history,
+        };
+        self.parser.advance(&mut recorder, bytes);
     }
 
     /// Takes the history events produced since the last call, in stream order.
@@ -202,7 +160,7 @@ impl Terminal {
     /// Events accumulate until drained; the owner is expected to drain after
     /// every [`Terminal::feed`].
     pub fn drain_history(&mut self) -> Vec<HistoryEvent> {
-        std::mem::take(&mut self.history)
+        std::mem::take(&mut self.history.events)
     }
 
     /// Applies a buffered synchronized update now, whether or not its ESU or
@@ -210,9 +168,7 @@ impl Terminal {
     /// mid-frame would otherwise be missing from the snapshot.
     pub fn flush_pending_sync(&mut self) {
         if self.parser.sync_timeout().sync_timeout().is_some() {
-            let term = self.term.get_mut();
-            self.parser.stop_sync(term);
-            history::capture(term, &mut self.history);
+            self.stop_sync();
         }
     }
 
@@ -224,10 +180,17 @@ impl Terminal {
             .sync_timeout()
             .is_some_and(|deadline| deadline <= Instant::now());
         if expired {
-            let term = self.term.get_mut();
-            self.parser.stop_sync(term);
-            history::capture(term, &mut self.history);
+            self.stop_sync();
         }
+    }
+
+    /// Applies the buffered synchronized update.
+    fn stop_sync(&mut self) {
+        let mut recorder = Recorder {
+            term: self.term.get_mut(),
+            history: &mut self.history,
+        };
+        self.parser.stop_sync(&mut recorder);
     }
 
     /// Takes the replies to terminal queries produced since the last call.
@@ -238,10 +201,23 @@ impl Terminal {
     /// Resizes the screen (reflowing the primary screen); zero dimensions are clamped to 1.
     ///
     /// Rows a shrink pushes off the top of the primary screen become history.
+    ///
+    /// Alacritty pushes those rows (and rows a narrower reflow pushes off)
+    /// into its scrollback, so the resize runs with the scrollback enabled
+    /// and the rows are collected from it afterwards; while the alt screen is
+    /// active that waits until the primary screen is back (`history::settle`).
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        let size = Size::new(cols, rows);
         let term = self.term.get_mut();
-        term.resize(Size::new(cols, rows));
-        history::capture(term, &mut self.history);
+        if (term.columns(), term.screen_lines()) == (size.cols, size.rows) {
+            return;
+        }
+        term.set_options(history::config(history::RESIZE_SLACK));
+        term.resize(size);
+        // `Term::resize` resets the scroll region.
+        self.history.region = 0..term.screen_lines() as i32;
+        self.history.staged = true;
+        history::settle(term, &mut self.history);
     }
 
     /// Current size as `(cols, rows)`.
@@ -555,17 +531,17 @@ mod tests {
     use std::time::Duration;
 
     /// Deterministic xorshift64* PRNG for fixture generation.
-    struct Rng(u64);
+    pub(crate) struct Rng(pub(crate) u64);
 
     impl Rng {
-        fn next(&mut self) -> u64 {
+        pub(crate) fn next(&mut self) -> u64 {
             self.0 ^= self.0 >> 12;
             self.0 ^= self.0 << 25;
             self.0 ^= self.0 >> 27;
             self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
         }
 
-        fn below(&mut self, n: u64) -> u64 {
+        pub(crate) fn below(&mut self, n: u64) -> u64 {
             self.next() % n
         }
     }

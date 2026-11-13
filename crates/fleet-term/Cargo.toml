@@ -8,4 +8,4 @@ workspace = true
 
 [dependencies]
 alacritty_terminal = { version = "0.26.0", default-features = false }
-memchr = "2.8.3"
+unicode-width = "0.2.3"

@@ -439,7 +439,7 @@ name = "fleet-term"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
- "memchr",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
