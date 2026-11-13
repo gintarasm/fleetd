@@ -473,6 +473,25 @@ pub const RETAINED_EXITED: usize = 64;
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+/// Largest accepted `cols` or `rows`.
+pub const MAX_DIM: u32 = 1000;
+/// Largest accepted `cols * rows`.
+pub const MAX_CELLS: u32 = 250_000;
+
+/// Checks a terminal size: each side in `1..=MAX_DIM`, at most `MAX_CELLS`.
+fn checked_size(cols: u32, rows: u32) -> io::Result<(u16, u16)> {
+    let side = |v: u32, what: &str| match u16::try_from(v) {
+        Ok(v) if (1..=MAX_DIM).contains(&u32::from(v)) => Ok(v),
+        _ => Err(invalid(format!("{what} {v} out of range (1..={MAX_DIM})"))),
+    };
+    let (c, r) = (side(cols, "cols")?, side(rows, "rows")?);
+    if cols * rows > MAX_CELLS {
+        return Err(invalid(format!(
+            "size {cols}x{rows} out of range (at most {MAX_CELLS} cells)"
+        )));
+    }
+    Ok((c, r))
+}
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -626,7 +645,8 @@ impl Node {
         self.exits.subscribe()
     }
 
-    /// Spawns an agent. Zero `cols`/`rows` mean 80x24; an empty `cwd` means
+    /// Spawns an agent. Zero `cols`/`rows` mean 80x24; otherwise the size
+    /// must pass the [`MAX_DIM`]/[`MAX_CELLS`] limits. An empty `cwd` means
     /// the daemon's working directory.
     pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
         if lock(&self.agents).closing {
@@ -635,12 +655,11 @@ impl Node {
         if req.program.is_empty() {
             return Err(invalid("program is empty".into()));
         }
-        let dim = |v: u32, default: u16, what: &str| match v {
-            0 => Ok(default),
-            v => u16::try_from(v).map_err(|_| invalid(format!("{what} {v} out of range"))),
-        };
-        let cols = dim(req.cols, DEFAULT_COLS, "cols")?;
-        let rows = dim(req.rows, DEFAULT_ROWS, "rows")?;
+        let or_default = |v: u32, default: u16| if v == 0 { u32::from(default) } else { v };
+        let (cols, rows) = checked_size(
+            or_default(req.cols, DEFAULT_COLS),
+            or_default(req.rows, DEFAULT_ROWS),
+        )?;
         let cwd = if req.cwd.is_empty() {
             std::env::current_dir()?
         } else {
@@ -783,15 +802,9 @@ impl Node {
         self.host.write_input(live.host_id, bytes)
     }
 
-    /// Resizes the agent's PTY and grid.
+    /// Resizes the agent's PTY and grid (within [`MAX_DIM`]/[`MAX_CELLS`]).
     pub fn resize(&self, id: u64, cols: u32, rows: u32) -> io::Result<()> {
-        let dim = |v: u32, what: &str| {
-            u16::try_from(v)
-                .ok()
-                .filter(|v| *v > 0)
-                .ok_or_else(|| invalid(format!("{what} {v} out of range")))
-        };
-        let (cols, rows) = (dim(cols, "cols")?, dim(rows, "rows")?);
+        let (cols, rows) = checked_size(cols, rows)?;
         let live = self.live(id)?;
         self.host.resize(live.host_id, cols, rows)?;
         live.pipeline.resize(cols, rows);
@@ -873,6 +886,36 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spawn_sized(node: &Node, cols: u32, rows: u32) -> io::Result<AgentInfo> {
+        node.spawn(SpawnAgent {
+            program: "/bin/sleep".into(),
+            args: vec!["100".into()],
+            cols,
+            rows,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn spawn_and_resize_reject_out_of_range_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let bad = [(1001, 24), (80, 1001), (501, 500), (u32::MAX, 24)];
+        for (cols, rows) in bad {
+            let e = spawn_sized(&node, cols, rows).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{cols}x{rows}");
+        }
+        assert!(node.list().unwrap().is_empty(), "rejected spawns left rows");
+
+        let id = spawn_sized(&node, 1000, 250).unwrap().id;
+        for (cols, rows) in bad.into_iter().chain([(0, 24), (80, 0)]) {
+            let e = node.resize(id, cols, rows).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{cols}x{rows}");
+        }
+        node.resize(id, 500, 500).unwrap();
+        node.shutdown();
+    }
 
     fn tail_after(chunks: &[&[u8]]) -> Vec<u8> {
         let mut p = PartialSequence::new();

@@ -722,3 +722,34 @@ fn sixty_agents_within_256_fds() {
     // Soft and hard limit: the agents' own fds must fit.
     sixty_agents_under("-n 256");
 }
+
+#[test]
+fn out_of_range_sizes_are_error_responses() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    for (cols, rows) in [(1001, 24), (80, 1001), (501, 500)] {
+        match c.request(request::Kind::Spawn(SpawnAgent {
+            program: "/bin/sleep".into(),
+            args: vec!["100".into()],
+            cols,
+            rows,
+            ..Default::default()
+        })) {
+            response::Kind::Error(e) => assert!(e.message.contains("out of range"), "{e:?}"),
+            other => panic!("spawn {cols}x{rows}: expected error, got {other:?}"),
+        }
+    }
+    let info = c.spawn("/bin/sleep", &["100"]);
+    for (cols, rows) in [(0, 24), (80, 0), (1001, 24), (501, 500)] {
+        match c.request(request::Kind::Resize(fleet_proto::Resize {
+            agent_id: info.id,
+            cols,
+            rows,
+        })) {
+            response::Kind::Error(e) => assert!(e.message.contains("out of range"), "{e:?}"),
+            other => panic!("resize {cols}x{rows}: expected error, got {other:?}"),
+        }
+    }
+    c.kill(info.id);
+}
