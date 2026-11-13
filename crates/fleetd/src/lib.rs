@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fleet_node::node::Node;
@@ -129,18 +129,40 @@ pub struct Daemon {
     _lock: File,
     listener: StdUnixListener,
     socket_path: PathBuf,
-    state_dir: PathBuf,
+}
+
+/// Makes `dir` (and missing parents) exist with mode 0700. The common case,
+/// an existing 0700 dir, costs one `stat` and no `chmod`.
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    let private = || fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    match fs::metadata(dir) {
+        Ok(m) if m.is_dir() => {
+            if m.permissions().mode() & 0o777 != 0o700 {
+                private()?;
+            }
+            Ok(())
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", dir.display()),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+            // The umask may have narrowed the mode.
+            private()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Synchronous (no tokio runtime needed): create the state dir (mode 0700,
 /// also enforced on an existing one), take the instance lock, replace any
 /// stale socket, bind. The node's state is opened by [`Daemon::serve`].
 pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&cfg.state_dir)?;
-    fs::set_permissions(&cfg.state_dir, fs::Permissions::from_mode(0o700))?;
+    ensure_private_dir(&cfg.state_dir)?;
 
     let lock = OpenOptions::new()
         .create(true)
@@ -170,7 +192,6 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
         _lock: lock,
         listener,
         socket_path,
-        state_dir: cfg.state_dir.clone(),
     })
 }
 
@@ -185,7 +206,12 @@ impl Daemon {
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
         let mut hup = signal(SignalKind::hangup())?;
-        let state_dir = self.state_dir;
+        // `socket_path` is `<state_dir>/fleetd.sock` (see `Config::socket_path`).
+        let state_dir = self
+            .socket_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let node = tokio::task::spawn_blocking(move || Node::open(&state_dir))
             .await
             .map_err(io::Error::other)??;
@@ -221,6 +247,21 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_dir_is_created_nested_and_rejects_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a/b");
+        ensure_private_dir(&nested).unwrap();
+        let mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        ensure_private_dir(&nested).unwrap();
+
+        let file = tmp.path().join("f");
+        fs::write(&file, b"").unwrap();
+        let err = ensure_private_dir(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+    }
 
     #[test]
     fn fd_exhaustion_is_detected_and_other_errors_are_not() {
