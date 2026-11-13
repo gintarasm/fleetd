@@ -660,6 +660,16 @@ fn skill_unknown_target_errors() {
 }
 
 #[test]
+fn skill_mentions_untrusted_output() {
+    let lower = SKILL.to_lowercase();
+    assert!(
+        lower.contains("untrusted"),
+        "skill lacks an untrusted-output rule"
+    );
+    assert!(lower.contains("not instructions"));
+}
+
+#[test]
 fn skill_print_has_frontmatter() {
     let home = TempDir::new().unwrap();
     let out = assert_ok(&fleet_home(home.path(), home.path(), &["skill", "print"]));

@@ -259,6 +259,91 @@ fn stdio_fails_when_daemon_cannot_start() {
     assert!(!out.stderr.is_empty());
 }
 
+// ---- session env scrub on auto-start -----------------------------------------
+
+/// A bridge run with `extra` env (and `remove` unset) auto-starts a daemon;
+/// returns what an agent of that daemon sees for the session variables.
+fn agent_session_env(extra: &[(&str, &str)], remove: &[&str]) -> String {
+    let dir = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let _cleanup = DetachedDaemons(dir.path());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetd"));
+    cmd.env(NO_LOGIN_ENV.0, NO_LOGIN_ENV.1)
+        .arg("--stdio")
+        .arg("--state-dir")
+        .arg(dir.path());
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    cmd.envs(extra.iter().copied());
+    let (_conn, _bridge) = fleet_client::Connection::command(cmd).expect("handshake via --stdio");
+    let vars = [
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+        "TMUX",
+        "TMUX_PANE",
+        "STY",
+        "WINDOW",
+    ];
+    let script: String = vars
+        .iter()
+        .map(|v| format!("echo \"{v}=${{{v}-unset}}\" >> out; "))
+        .collect();
+    agent_output(
+        dir.path(),
+        work.path(),
+        &format!("{script}echo done >> out"),
+    )
+}
+
+const SSH_ALL: [&str; 5] = [
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+];
+
+#[test]
+fn stdio_autostart_from_ssh_scrubs_session_env() {
+    let got = agent_session_env(
+        &[
+            ("SSH_CONNECTION", "1.2.3.4 5 6.7.8.9 22"),
+            ("SSH_CLIENT", "1.2.3.4 5 22"),
+            ("SSH_TTY", "/dev/ttys009"),
+            ("SSH_AGENT_PID", "123"),
+            ("SSH_AUTH_SOCK", "/tmp/x"),
+            ("TMUX", "/tmp/tmux-1/default,1,0"),
+            ("TMUX_PANE", "%1"),
+            ("STY", "1.pts"),
+            ("WINDOW", "0"),
+        ],
+        &[],
+    );
+    for v in SSH_ALL
+        .iter()
+        .chain(&["TMUX", "TMUX_PANE", "STY", "WINDOW"])
+    {
+        assert!(got.contains(&format!("{v}=unset\n")), "{v} leaked: {got}");
+    }
+}
+
+#[test]
+fn stdio_autostart_local_keeps_ssh_auth_sock() {
+    let got = agent_session_env(
+        &[
+            ("SSH_AUTH_SOCK", "/tmp/launchd-agent"),
+            ("TMUX", "/tmp/t,1,0"),
+        ],
+        &["SSH_CONNECTION", "SSH_CLIENT"],
+    );
+    assert!(got.contains("SSH_AUTH_SOCK=/tmp/launchd-agent\n"), "{got}");
+    assert!(got.contains("TMUX=unset\n"), "{got}");
+}
+
 // ---- login-shell environment -------------------------------------------------
 
 /// Writes an executable script into `dir`.

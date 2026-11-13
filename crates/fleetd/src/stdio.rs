@@ -58,12 +58,42 @@ fn connect_or_start(cfg: &Config) -> Result<UnixStream, String> {
     }
 }
 
+/// Variables describing the bridge's terminal multiplexer, not the daemon.
+const TERMINAL_VARS: [&str; 4] = ["TMUX", "TMUX_PANE", "STY", "WINDOW"];
+
+/// Variables of the SSH session that ends with the bridge (ADR 0011: agent
+/// forwarding is opt-in).
+const SSH_SESSION_VARS: [&str; 5] = [
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+];
+
+/// Variables to remove from an auto-started daemon's environment. The SSH
+/// ones go only when the bridge itself runs in an SSH session, so a local
+/// start keeps e.g. the launchd `SSH_AUTH_SOCK`.
+fn scrubbed_vars(from_ssh: bool) -> Vec<&'static str> {
+    let mut v = TERMINAL_VARS.to_vec();
+    if from_ssh {
+        v.extend(SSH_SESSION_VARS);
+    }
+    v
+}
+
 /// Starts this binary as a daemon on `cfg`'s state dir, detached: its own
 /// session (so its own process group, and no controlling terminal), stdio on
 /// `/dev/null`. It outlives this bridge and the SSH session that ran it.
 fn start_daemon(cfg: &Config) -> io::Result<Child> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
+    let from_ssh = ["SSH_CONNECTION", "SSH_CLIENT"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
+    for k in scrubbed_vars(from_ssh) {
+        cmd.env_remove(k);
+    }
     cmd.arg("--state-dir")
         .arg(&cfg.state_dir)
         .stdin(Stdio::null())

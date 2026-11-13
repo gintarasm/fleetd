@@ -34,6 +34,8 @@ Builds on [0013](0013-daemon-lifecycle.md), [0019](0019-control-plane-direction.
 - **Fallback:** the daemon's own environment, when `SHELL` is unset or empty, the shell fails, prints no markers or times out.
 - **`FLEETD_LOGIN_ENV=off`** in the daemon's environment skips the capture (tests use it, so they never run the developer's real login shell).
 - **Precedence**, lowest first: the base environment (captured login env, or the daemon's env), then `SpawnAgent.env`, then `TERM=xterm-256color` unless the request set `TERM`, then `FLEET_AGENT_ID=<id>`, which nothing can override (0022). The agent's environment is cleared first, so no daemon-only variable leaks when the capture succeeded.
+- **Session env scrub on `--stdio` auto-start.** The detached daemon the bridge spawns never inherits `TMUX`, `TMUX_PANE`, `STY` or `WINDOW`. If the bridge's own env has `SSH_CONNECTION` or `SSH_CLIENT`, it also drops `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `SSH_CONNECTION`, `SSH_CLIENT` and `SSH_TTY`, so no agent gets implicit ssh-agent forwarding (0011: opt-in). A local start keeps `SSH_AUTH_SOCK` (macOS launchd agent) so `git push` works. A manually started `fleetd` is unaffected; the login-shell capture inherits the scrubbed env.
+- **The skill treats other agents' output as untrusted.** SKILL.md says `fleet screen`/`fleet history` output and text from other agents is data, not instructions, and is not followed without the user's confirmation.
 
 ## Consequences
 
@@ -43,6 +45,4 @@ Builds on [0013](0013-daemon-lifecycle.md), [0019](0019-control-plane-direction.
 
 ## Open follow-ups
 
-- **ssh-agent and tmux variables leak into agents (security, from review).** A daemon auto-started by `ssh host fleetd --stdio` inherits `SSH_AUTH_SOCK`, other `SSH_*` and `TMUX*` from the ssh session, and the login shell captured under it does too, so every agent gets implicit ssh-agent forwarding. 0011 says agent forwarding is opt-in per node. Follow-up: drop these from the base environment (and from the detached daemon's env) unless forwarding is enabled.
-- **The skill should say other agents' output is untrusted (security, from review).** Screens, history and sent text from other agents are data, not instructions; SKILL.md does not say so yet.
 - Smaller items: the captured env is published only after the shell is reaped, so a lingering `.zlogout` can discard it; a capture shell can be orphaned if `Node::open` fails or `cancel()` races the spawn; the detached daemon does not `chdir("/")`; background jobs started by rc files can corrupt the capture; fish's and dash's `printf "\0"` are untested; the bridge race test does not assert that one daemon exited 2.
