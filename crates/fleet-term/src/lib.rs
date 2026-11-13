@@ -25,6 +25,20 @@
 //! Replies to terminal queries (DSR/CPR, DA, …) are collected and returned by
 //! [`Terminal::take_replies`]; the owner decides whether to send them to the
 //! agent.
+//!
+//! Rows that scroll off the top of the primary screen are rendered as ANSI
+//! lines and queued with `CSI 3 J` (erase saved lines) as [`HistoryEvent`]s,
+//! which [`Terminal::drain_history`] hands out in stream order. The grid
+//! itself keeps no scrollback between calls. A row is one grid row: a long
+//! line soft-wrapped by the agent's terminal yields several rows.
+
+mod history;
+mod scan;
+
+pub use history::HistoryEvent;
+
+use history::{Pen, glyph, last_non_blank, put_cells, put_glyph};
+use scan::ClearScan;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -37,11 +51,24 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
-    Color, Handler, KeyboardModes, KeyboardModesApplyBehavior, NamedColor, Processor,
+    Handler, KeyboardModes, KeyboardModesApplyBehavior, Processor,
 };
 
-/// Grid size handed to alacritty. Scrollback is disabled: history lives in the
-/// per-agent ring file (Task 3), and keeping it here would cost memory per agent.
+/// Scrollback rows alacritty may hold between two history captures. Rows are
+/// captured and the scrollback emptied after every [`FEED_PIECE`] bytes, which
+/// scroll at most one row per byte (LF, or a wrap after a full row) unless an
+/// agent scrolls with `CSI n S`; so plain output never loses rows to this cap.
+const HISTORY_SLACK: usize = 10_000;
+
+/// Largest slice of input handed to the parser before capturing history.
+///
+/// At most alacritty's scrollback row cache (`MAX_CACHE_SIZE`, 1000 rows): a
+/// piece that scrolls more rows than that makes `clear_history` free the
+/// cached rows, and the next scroll allocates them again (one allocation per
+/// row), which made newline floods ~2x slower with 4096-byte pieces.
+const FEED_PIECE: usize = 1000;
+
+/// Grid size handed to alacritty.
 struct Size {
     cols: usize,
     rows: usize,
@@ -108,13 +135,18 @@ pub struct Terminal {
     term: RefCell<Term<Replies>>,
     parser: Processor,
     replies: Replies,
+    clear_scan: ClearScan,
+    history: Vec<HistoryEvent>,
 }
 
 impl Terminal {
     /// Creates a blank screen; zero dimensions are clamped to 1.
     pub fn new(cols: u16, rows: u16) -> Self {
         let config = Config {
-            scrolling_history: 0,
+            // Rows that scroll off are captured as history after each piece
+            // of `feed` (see `history::capture`); the slack only has to hold
+            // the rows of one piece.
+            scrolling_history: HISTORY_SLACK,
             // Track the kitty keyboard flags so snapshots can carry them.
             kitty_keyboard: true,
             ..Config::default()
@@ -124,13 +156,53 @@ impl Terminal {
             term: RefCell::new(Term::new(config, &Size::new(cols, rows), replies.clone())),
             parser: Processor::new(),
             replies,
+            clear_scan: ClearScan::default(),
+            history: Vec::new(),
         }
     }
 
     /// Feeds raw PTY output through the VT parser.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    ///
+    /// Rows that scroll off the primary screen become [`HistoryEvent::Line`]s
+    /// and `CSI 3 J` on the primary screen a [`HistoryEvent::Cleared`] (see
+    /// [`Terminal::drain_history`]). The input is parsed in pieces of at most
+    /// [`FEED_PIECE`] bytes, capturing the scrolled rows after each, and split
+    /// around the final byte of each `CSI 3 J`, so the rows scrolled before it
+    /// are captured before alacritty erases its scrollback.
+    pub fn feed(&mut self, mut bytes: &[u8]) {
         self.flush_expired_sync();
-        self.parser.advance(self.term.get_mut(), bytes);
+        while !bytes.is_empty() {
+            let piece = &bytes[..bytes.len().min(FEED_PIECE)];
+            let Some(j) = self.clear_scan.find(piece) else {
+                self.advance(piece);
+                bytes = &bytes[piece.len()..];
+                continue;
+            };
+            self.advance(&piece[..j]);
+            self.advance(&piece[j..=j]);
+            if !self.term.get_mut().mode().contains(TermMode::ALT_SCREEN) {
+                self.history.push(HistoryEvent::Cleared);
+            }
+            bytes = &bytes[j + 1..];
+        }
+    }
+
+    /// Parses `bytes` and captures the rows they scrolled off.
+    fn advance(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let term = self.term.get_mut();
+        self.parser.advance(term, bytes);
+        history::capture(term, &mut self.history);
+    }
+
+    /// Takes the history events produced since the last call, in stream order.
+    ///
+    /// Events accumulate until drained; the owner is expected to drain after
+    /// every [`Terminal::feed`].
+    pub fn drain_history(&mut self) -> Vec<HistoryEvent> {
+        std::mem::take(&mut self.history)
     }
 
     /// Applies a buffered synchronized update now, whether or not its ESU or
@@ -138,7 +210,9 @@ impl Terminal {
     /// mid-frame would otherwise be missing from the snapshot.
     pub fn flush_pending_sync(&mut self) {
         if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.parser.stop_sync(self.term.get_mut());
+            let term = self.term.get_mut();
+            self.parser.stop_sync(term);
+            history::capture(term, &mut self.history);
         }
     }
 
@@ -150,7 +224,9 @@ impl Terminal {
             .sync_timeout()
             .is_some_and(|deadline| deadline <= Instant::now());
         if expired {
-            self.parser.stop_sync(self.term.get_mut());
+            let term = self.term.get_mut();
+            self.parser.stop_sync(term);
+            history::capture(term, &mut self.history);
         }
     }
 
@@ -160,8 +236,12 @@ impl Terminal {
     }
 
     /// Resizes the screen (reflowing the primary screen); zero dimensions are clamped to 1.
+    ///
+    /// Rows a shrink pushes off the top of the primary screen become history.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.term.get_mut().resize(Size::new(cols, rows));
+        let term = self.term.get_mut();
+        term.resize(Size::new(cols, rows));
+        history::capture(term, &mut self.history);
     }
 
     /// Current size as `(cols, rows)`.
@@ -330,25 +410,17 @@ fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&Term<Replies>) -> R
 /// Clears the screen (`\x1b[0m\x1b[H\x1b[2J`, so `pen` becomes the default)
 /// and draws `grid`'s non-blank cells.
 fn put_grid(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>) {
-    let (cols, rows) = (grid.columns(), grid.screen_lines());
     out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
     *pen = Pen::default();
-    for row in 0..rows {
+    for row in 0..grid.screen_lines() {
         let line = &grid[Line(row as i32)];
-        let Some(end) = (0..cols).rev().find(|&c| !is_blank(&line[Column(c)])) else {
+        let Some(end) = last_non_blank(line) else {
             continue;
         };
         if row > 0 {
             cup(out, row, 0);
         }
-        for col in 0..=end {
-            let cell = &line[Column(col)];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            pen.transition(out, Pen::of(cell));
-            put_glyph(out, cell);
-        }
+        put_cells(out, pen, line, end);
     }
 }
 
@@ -439,30 +511,6 @@ fn put_kitty_flags(out: &mut Vec<u8>, mode: TermMode, pushed: bool) -> bool {
     }
 }
 
-/// The character a cell renders; a leading wide-char spacer renders as blank.
-fn glyph(cell: &Cell) -> char {
-    if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
-        ' '
-    } else {
-        cell.c
-    }
-}
-
-fn put_glyph(out: &mut Vec<u8>, cell: &Cell) {
-    let mut buf = [0; 4];
-    out.extend_from_slice(glyph(cell).encode_utf8(&mut buf).as_bytes());
-    for &c in cell.zerowidth().unwrap_or_default() {
-        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-    }
-}
-
-/// A cell that `\x1b[2J` after `\x1b[0m` already produces.
-fn is_blank(cell: &Cell) -> bool {
-    glyph(cell) == ' '
-        && cell.zerowidth().is_none_or(<[char]>::is_empty)
-        && Pen::of(cell) == Pen::default()
-}
-
 /// Modes restored by the snapshot: `(mode, set sequence, reset sequence)`. A
 /// sequence is emitted when the mode differs from a fresh terminal's default.
 /// ALT_SCREEN is handled separately (it must precede drawing). Origin mode homes
@@ -501,138 +549,6 @@ fn cup(out: &mut Vec<u8>, row: usize, col: usize) {
     let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
 }
 
-/// SGR flags that affect rendering and survive a roundtrip, with their SGR codes.
-const SGR_FLAGS: [(Flags, &str); 11] = [
-    (Flags::BOLD, "1"),
-    (Flags::DIM, "2"),
-    (Flags::ITALIC, "3"),
-    (Flags::UNDERLINE, "4"),
-    (Flags::DOUBLE_UNDERLINE, "4:2"),
-    (Flags::UNDERCURL, "4:3"),
-    (Flags::DOTTED_UNDERLINE, "4:4"),
-    (Flags::DASHED_UNDERLINE, "4:5"),
-    (Flags::INVERSE, "7"),
-    (Flags::HIDDEN, "8"),
-    (Flags::STRIKEOUT, "9"),
-];
-
-fn sgr_mask() -> Flags {
-    SGR_FLAGS
-        .iter()
-        .fold(Flags::empty(), |acc, &(flag, _)| acc | flag)
-}
-
-/// Graphic rendition of a cell (the "pen" that drew it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Pen {
-    fg: Color,
-    bg: Color,
-    flags: Flags,
-    underline: Option<Color>,
-}
-
-impl Default for Pen {
-    fn default() -> Self {
-        Self {
-            fg: Color::Named(NamedColor::Foreground),
-            bg: Color::Named(NamedColor::Background),
-            flags: Flags::empty(),
-            underline: None,
-        }
-    }
-}
-
-impl Pen {
-    fn of(cell: &Cell) -> Self {
-        Self {
-            fg: cell.fg,
-            bg: cell.bg,
-            flags: cell.flags & sgr_mask(),
-            underline: cell.underline_color(),
-        }
-    }
-
-    /// Emits the SGR sequence that changes `self` into `to`, then becomes `to`.
-    /// Turning any flag off resets first; otherwise only the differences are sent.
-    fn transition(&mut self, out: &mut Vec<u8>, to: Pen) {
-        if *self == to {
-            return;
-        }
-        let mut sgr = Sgr::start(out);
-        let mut base = *self;
-        if !(base.flags - to.flags).is_empty()
-            || (base.underline.is_some() && to.underline.is_none())
-        {
-            sgr.param("0");
-            base = Pen::default();
-        }
-        for (flag, code) in SGR_FLAGS {
-            if to.flags.contains(flag) && !base.flags.contains(flag) {
-                sgr.param(code);
-            }
-        }
-        if to.fg != base.fg {
-            sgr.color(to.fg, 30, 90, 38, 39);
-        }
-        if to.bg != base.bg {
-            sgr.color(to.bg, 40, 100, 48, 49);
-        }
-        if to.underline != base.underline
-            && let Some(color) = to.underline
-        {
-            sgr.color(color, 0, 0, 58, 59);
-        }
-        sgr.finish();
-        *self = to;
-    }
-}
-
-/// Writer for a single `CSI ... m` sequence.
-struct Sgr<'a> {
-    out: &'a mut Vec<u8>,
-    first: bool,
-}
-
-impl<'a> Sgr<'a> {
-    fn start(out: &'a mut Vec<u8>) -> Self {
-        out.extend_from_slice(b"\x1b[");
-        Self { out, first: true }
-    }
-
-    fn sep(&mut self) {
-        if !self.first {
-            self.out.push(b';');
-        }
-        self.first = false;
-    }
-
-    fn param(&mut self, code: &str) {
-        self.sep();
-        self.out.extend_from_slice(code.as_bytes());
-    }
-
-    /// `normal`/`bright` are the 8-color bases (unused for underline color, which
-    /// always uses the extended form); `ext` is 38/48/58, `default` 39/49/59.
-    fn color(&mut self, color: Color, normal: u8, bright: u8, ext: u8, default: u8) {
-        self.sep();
-        let _ = match color {
-            Color::Named(named) => match named as usize {
-                n @ 0..8 if normal != 0 => write!(self.out, "{}", usize::from(normal) + n),
-                n @ 8..16 if bright != 0 => write!(self.out, "{}", usize::from(bright) + n - 8),
-                n @ 0..16 => write!(self.out, "{ext};5;{n}"),
-                // Foreground/Background and the renderer-only named colors.
-                _ => write!(self.out, "{default}"),
-            },
-            Color::Indexed(i) => write!(self.out, "{ext};5;{i}"),
-            Color::Spec(rgb) => write!(self.out, "{ext};2;{};{};{}", rgb.r, rgb.g, rgb.b),
-        };
-    }
-
-    fn finish(self) {
-        self.out.push(b'm');
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,7 +573,7 @@ mod tests {
     /// Agent-like ANSI output of at least `len` bytes: printable text, SGR
     /// colors (16, 256, truecolor), bold/italic/underline/inverse, CRLF,
     /// `\x1b[2K\r` line rewrites and cursor moves.
-    fn fake_output(seed: u64, len: usize) -> Vec<u8> {
+    pub(crate) fn fake_output(seed: u64, len: usize) -> Vec<u8> {
         const WORDS: &[&str] = &[
             "compiling",
             "fleet",
