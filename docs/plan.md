@@ -58,7 +58,7 @@ Any regression fails CI and requires explicit approval by the user. See [0014](d
 ## Storage ([0010](decisions/0010-storage-and-layout.md))
 
 - Worktrees: `~/.fleet/worktrees/<repo>/<slug>`, branch `fleet/<slug>`.
-- State: SQLite (WAL) per node. Scrollback: on-disk ring buffers per agent.
+- State: SQLite (WAL) per node. Scrollback: on-disk ring buffers per agent. History: rendered lines, an in-memory tail plus on-disk segments per agent ([0021](decisions/0021-agent-history.md)).
 - Archive cleanup refuses when dirty/unpushed unless forced.
 
 ## Remote nodes ([0011](decisions/0011-remote-nodes.md))
@@ -99,7 +99,9 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 | Crate | Purpose |
 |---|---|
 | `fleet-proto` | protobuf messages + framing |
-| `fleet-node` | PTYs, terminal grid, worktrees, SQLite |
+| `fleet-term` | terminal wrapper (alacritty grid, snapshot, history capture and rendering) shared by node, CLI and GUI ([0023](decisions/0023-crates-term-client.md)) |
+| `fleet-node` | PTYs, terminal grid, history, worktrees, SQLite |
+| `fleet-client` | blocking, transport-generic protocol client (unix socket, any stdio command) ([0023](decisions/0023-crates-term-client.md)) |
 | `fleet-controller` | fleet view, SSH transport, bootstrap, secrets |
 | `fleet-plugin-host` | wasmtime host, WIT worlds |
 | `fleetd` | daemon binary wiring roles |
@@ -112,8 +114,9 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 |---|---|
 | **M0** | Workspace skeleton, benchmark harness (50 fake agents flooding PTYs), CI perf gate, baselines |
 | **M1** | Local node: PTYs, terminal grid, scrollback, SQLite, protocol, `fleet-cli` — done 2026-11-13 ([0018](decisions/0018-m1-protocol-and-node.md)); new benchmarks' baselines are recorded from CI |
-| **M2** | gpui client: sidebar, terminal pane, splits, menu-bar app |
-| **M3** | Labels, node primitives (`Exec`/`ReadFile`/`ListDir`), `RunAction` interface, built-in git-worktree workflow, diff view ([0025](decisions/0025-core-knows-agents-workflows-own-hierarchy.md)) |
+| **M2a** | Daemon side of the GUI: agent history (tail + pages), protocol v2 (history, spawn-attach, lag and activity events, primary client, labels), the 50-agent flood fix, `fleet-term` and `fleet-client`, CLI `history`/`screen`/`label`, `fleetd --stdio`, login-shell env, the fleet agent skill — done 2026-11-13 ([0021](decisions/0021-agent-history.md), [0022](decisions/0022-protocol-v2.md), [0023](decisions/0023-crates-term-client.md), [0024](decisions/0024-agent-skill-stdio-env.md)); new benchmarks' baselines are recorded from CI |
+| **M2b** | gpui client: sidebar, terminal pane with history, splits, menu-bar app, connect sheet, GUI benchmarks |
+| **M3** | Node primitives (`Exec`/`ReadFile`/`ListDir`), `RunAction` interface, built-in git-worktree workflow, diff view ([0025](decisions/0025-core-knows-agents-workflows-own-hierarchy.md); core labels landed in M2a) |
 | **M4** | Plugin host (incl. third-party workflows), Claude Code + Codex adapters, hook-based status, notifications |
 | **M5** | Remote nodes via node providers ([0026](decisions/0026-node-providers-and-transports.md)): `node-provider` world, built-in SSH-host provider, SSH/command transports, bootstrap (systemd optional), keepalive and `on_idle`, history archive before teardown; workspace clone and fetch-back as git-worktree actions |
 | **M6** | Secrets, OAuth reverse-forwarding, ssh-agent forwarding |
