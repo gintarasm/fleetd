@@ -32,8 +32,9 @@ fleetd reported problems with about 26 `eprintln!`s. A daemon started by `fleetd
 ### Never block
 
 - Each event is formatted on the thread that emits it and handed to a **bounded queue of 4096 lines** with `try_send`. A dedicated `log-writer` thread writes the queued lines in batches. When the queue is full the line is dropped and counted. The next line queued successfully is preceded by `WARN fleetd::logging: dropped N lines (log queue full)`, at the place where the lines were lost. Neither a PTY reader nor a tokio worker ever waits for the disk.
-- **No events on the output hot path:** nothing in `on_output`, `Terminal::feed`, `Queue::offer`, or the forwarders' per-chunk path. Events happen once per connection, request, agent or failure. The history store's disk-failure warning fires once per store, when it stops writing.
+- **No events on the output hot path:** nothing in `on_output`, `Terminal::feed`, `Queue::offer`, or the forwarders' per-chunk path. Events happen once per connection, request, agent or failure. The history store's disk-failure warning fires only when the store goes from healthy to broken (a failed write, or a clear that cannot rewrite its files), not on every later clear while it stays broken; a clear that succeeds makes it healthy again, so a later failure warns again.
 - At exit, a guard waits for the queue to drain, for at most 1 s.
+- **Bounded lines and replies.** A formatted line is cut to 4 KiB (escapes included, at a character boundary) and ends in ` …[truncated]`. A `LogLines` reply holds at most 8 MiB of lines (lines read from the files are cut the same way); the oldest are dropped first, so a large tail never exceeds the 16 MiB frame limit.
 
 ### What is logged
 

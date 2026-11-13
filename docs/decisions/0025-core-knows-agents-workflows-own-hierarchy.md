@@ -85,7 +85,7 @@ Several agents in one worktree, and the warning about concurrent writers, become
   - a `SetLabels` request;
   - a label filter on `ListAgents`.
 
-  Adding them now avoids another protocol bump.
+  Adding them now avoids another protocol bump. In M2a labels are unauthenticated: any client of the daemon's socket, an agent running `fleet` included, can `SetLabels`. Until the M4 agent channel enforces "who can write labels" above, labels must not gate anything.
 - **M2b:** the sidebar groups by the `project` label, falling back to the cwd.
 - **M3** becomes:
   - labels in the store;

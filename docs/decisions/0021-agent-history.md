@@ -36,6 +36,8 @@ M2's client must show a whole long session (a Claude Code conversation), also af
 
 Running agents keep their history. Of the others, the 64 most recently created keep it (the `RETAINED_EXITED` rule of 0018), including agents that exited under a previous daemon; `Node::open` deletes the history directories of all other agents.
 
+**Deviation from the spec** (which said "the 64 most recently exited"): the two passes use different orders. At startup `Node::open` keeps the 64 most recently *created* non-running agents (the store has no exit time to order by). At runtime, an agent that exits in this process joins the retained-exited list, and the oldest *exit of this process* is evicted (with its history) once the list holds 64. The startup survivors are not on that list, so they are only pruned at the next start: up to 64 + 64 exited histories can exist at once, and an agent that exited long ago but was created recently can outlive one that exited later. The disk use stays bounded (at most 128 exited histories of up to 64 MiB each, plus the running agents'); a single exit-ordered rule needs an exit timestamp in the store.
+
 ## Consequences
 
 - Node memory per agent grows by at most the tail (256 KiB); attach sends tail plus screen, still independent of total history; history survives daemon and GUI restarts.
