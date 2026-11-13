@@ -7,10 +7,26 @@ use std::process::{Command, Stdio};
 use crate::results::{Measurement, Results, Suite};
 
 pub const STARTUP_INSTRUCTIONS: &str = "fleetd_startup_instructions";
+pub const FRAME_DECODE_OUTPUT_64K_INSTRUCTIONS: &str = "frame_decode_output_64k_instructions";
+pub const TERMINAL_FEED_64K_INSTRUCTIONS: &str = "terminal_feed_64k_instructions";
+pub const SNAPSHOT_120X40_INSTRUCTIONS: &str = "snapshot_120x40_instructions";
 /// Bench function name -> metric name.
-const METRICS: &[(&str, &str)] = &[("fleetd_startup", STARTUP_INSTRUCTIONS)];
+const METRICS: &[(&str, &str)] = &[
+    ("fleetd_startup", STARTUP_INSTRUCTIONS),
+    (
+        "frame_decode_output_64k",
+        FRAME_DECODE_OUTPUT_64K_INSTRUCTIONS,
+    ),
+    ("terminal_feed_64k", TERMINAL_FEED_64K_INSTRUCTIONS),
+    ("snapshot_120x40", SNAPSHOT_120X40_INSTRUCTIONS),
+];
 /// Every metric the instr suite emits.
-pub const METRIC_NAMES: &[&str] = &[STARTUP_INSTRUCTIONS];
+pub const METRIC_NAMES: &[&str] = &[
+    STARTUP_INSTRUCTIONS,
+    FRAME_DECODE_OUTPUT_64K_INSTRUCTIONS,
+    TERMINAL_FEED_64K_INSTRUCTIONS,
+    SNAPSHOT_120X40_INSTRUCTIONS,
+];
 
 /// Parse `--output-format=json` output (one summary object per line) into results.
 pub fn parse_summaries(stdout: &str) -> Result<Results, String> {
@@ -83,18 +99,37 @@ mod tests {
 
     const LINE: &str = r#"{"function_name":"fleetd_startup","profiles":[{"data":{"total":{"metrics":{"Ir":{"values":{"new":7243}}}}},"tool":"Callgrind"}]}"#;
 
+    /// `LINE` plus a summary for every other benchmark, so the output is complete.
+    fn all_lines(startup: &str) -> String {
+        let mut out = format!("noise\n{startup}\n");
+        for (func, _) in &METRICS[1..] {
+            out.push_str(&LINE.replace("fleetd_startup", func).replace("7243", "100"));
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn maps_ir_to_metric() {
-        let r = parse_summaries(&format!("noise\n{LINE}\n")).unwrap();
+        let r = parse_summaries(&all_lines(LINE)).unwrap();
         assert_eq!(r.suite, Suite::Instr);
         let m = &r.metrics["fleetd_startup_instructions"];
         assert_eq!((m.value, m.unit.as_str()), (7243.0, "instructions"));
+        let names: Vec<_> = r.metrics.keys().map(String::as_str).collect();
+        let mut expected = METRIC_NAMES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
     }
 
     #[test]
     fn zero_ir_is_an_error() {
         let zero = LINE.replace("7243", "0");
-        assert!(parse_summaries(&zero).is_err());
+        assert!(parse_summaries(&all_lines(&zero)).is_err());
+    }
+
+    #[test]
+    fn one_missing_benchmark_is_an_error() {
+        assert!(parse_summaries(&format!("{LINE}\n")).is_err());
     }
 
     #[test]

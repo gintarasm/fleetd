@@ -408,14 +408,17 @@ dependencies = [
 name = "fleet-perf"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "fleet-node",
+ "fleet-proto",
  "fleetd",
  "gungraun",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio-util",
  "toml",
  "toml_edit",
 ]

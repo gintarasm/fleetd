@@ -34,11 +34,15 @@ fn wall_suite_quick_emits_all_metrics() {
     assert_eq!(
         names,
         [
+            "daemon_flood50_cpu_ns_per_mib",
+            "daemon_flood50_peak_rss_bytes",
+            "daemon_flood50_wall_ns",
             "fleetd_cold_start_ns",
             "fleetd_idle_rss_bytes",
             "flood50_cpu_ns_per_mib",
             "flood50_peak_rss_bytes",
             "flood50_wall_ns",
+            "reattach_snapshot_ns",
         ]
     );
     for (name, m) in &r.metrics {

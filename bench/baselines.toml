@@ -36,7 +36,45 @@ suite = "wall"
 unit = "ns"
 baseline = 3481542708.5
 
+[metrics.daemon_flood50_cpu_ns_per_mib]
+suite = "wall"
+unit = "ns"
+# report-only like flood50_cpu_ns_per_mib: the self-hosted runner is not yet
+# characterised (cross-session drift ~35%); turning this off is free
+report_only = true
+baseline = 0
+
+[metrics.daemon_flood50_peak_rss_bytes]
+suite = "wall"
+unit = "bytes"
+baseline = 0
+
+[metrics.daemon_flood50_wall_ns]
+suite = "wall"
+unit = "ns"
+baseline = 0
+
+[metrics.reattach_snapshot_ns]
+suite = "wall"
+unit = "ns"
+baseline = 0
+
 [metrics.fleetd_startup_instructions]
 suite = "instr"
 unit = "instructions"
 baseline = 4806
+
+[metrics.frame_decode_output_64k_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 0
+
+[metrics.terminal_feed_64k_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 0
+
+[metrics.snapshot_120x40_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 0
