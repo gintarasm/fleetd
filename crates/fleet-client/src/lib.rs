@@ -3,9 +3,13 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use fleet_proto::{
@@ -20,6 +24,9 @@ pub enum Error {
     Protocol(String),
     /// The server answered a request with an error.
     Server(String),
+    /// The server did not complete the handshake within
+    /// [`HANDSHAKE_TIMEOUT`].
+    Timeout,
 }
 
 impl fmt::Display for Error {
@@ -29,6 +36,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "{e}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
             Error::Server(m) => write!(f, "{m}"),
+            Error::Timeout => write!(f, "fleetd did not answer the handshake in time"),
         }
     }
 }
@@ -42,6 +50,10 @@ impl From<io::Error> for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Decodes frames from the socket.
 pub struct FrameReader {
@@ -103,9 +115,57 @@ pub struct Connection {
     sender: Sender,
 }
 
+/// How long a constructor waits for the server's answer to its `Hello`.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Connection {
-    /// Handshakes over an already-open byte stream.
-    pub fn over(read: Box<dyn Read + Send>, write: Box<dyn Write + Send>) -> Result<Connection> {
+    /// Handshakes over an already-open byte stream as `client_name` (shown in
+    /// the daemon's log), within [`HANDSHAKE_TIMEOUT`]. On a timeout the
+    /// handshake thread keeps `read` and `write` until the peer closes the
+    /// stream; prefer [`Connection::unix`] or [`Connection::command`], which
+    /// close it.
+    pub fn over(
+        read: Box<dyn Read + Send>,
+        write: Box<dyn Write + Send>,
+        client_name: &str,
+    ) -> Result<Connection> {
+        Self::over_within(read, write, client_name, HANDSHAKE_TIMEOUT, || {})
+    }
+
+    /// Runs the handshake on its own thread, so a peer that never answers
+    /// (or never reads) cannot block past `timeout`; `on_timeout` should
+    /// close the stream so that thread ends.
+    fn over_within(
+        read: Box<dyn Read + Send>,
+        write: Box<dyn Write + Send>,
+        client_name: &str,
+        timeout: Duration,
+        on_timeout: impl FnOnce(),
+    ) -> Result<Connection> {
+        let (tx, rx) = mpsc::channel();
+        let name = client_name.to_owned();
+        thread::Builder::new()
+            .name("fleet-handshake".into())
+            .spawn(move || {
+                let _ = tx.send(Self::handshake(read, write, &name));
+            })?;
+        match rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                on_timeout();
+                Err(Error::Timeout)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(Error::Protocol("handshake thread failed".into()))
+            }
+        }
+    }
+
+    fn handshake(
+        read: Box<dyn Read + Send>,
+        write: Box<dyn Write + Send>,
+        client_name: &str,
+    ) -> Result<Connection> {
         let mut conn = Connection {
             reader: FrameReader {
                 stream: read,
@@ -121,7 +181,7 @@ impl Connection {
             .encode(
                 Frame::Hello(Hello {
                     protocol_version: PROTOCOL_VERSION,
-                    client: "fleet".into(),
+                    client: client_name.into(),
                 }),
                 &mut out,
             )
@@ -136,8 +196,14 @@ impl Connection {
         }
     }
 
-    /// Connects to the unix socket at `path` and handshakes.
-    pub fn unix(path: &Path) -> Result<Connection> {
+    /// Connects to the unix socket at `path` and handshakes as
+    /// `client_name` within [`HANDSHAKE_TIMEOUT`] (closing the socket on a
+    /// timeout).
+    pub fn unix(path: &Path, client_name: &str) -> Result<Connection> {
+        Self::unix_within(path, client_name, HANDSHAKE_TIMEOUT)
+    }
+
+    fn unix_within(path: &Path, client_name: &str, timeout: Duration) -> Result<Connection> {
         let stream = match UnixStream::connect(path) {
             Ok(s) => s,
             Err(e)
@@ -150,16 +216,56 @@ impl Connection {
             }
             Err(e) => return Err(e.into()),
         };
-        Connection::over(Box::new(stream.try_clone()?), Box::new(stream))
+        let closer = stream.try_clone()?;
+        Self::over_within(
+            Box::new(stream.try_clone()?),
+            Box::new(stream),
+            client_name,
+            timeout,
+            move || {
+                let _ = closer.shutdown(Shutdown::Both);
+            },
+        )
     }
 
     /// Spawns `cmd` and talks over its stdin/stdout (e.g. `ssh host fleetd
-    /// --stdio`). The child is returned so the caller can reap or kill it.
-    pub fn command(mut cmd: Command) -> Result<(Connection, Child)> {
-        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = child.stdout.take().expect("piped stdout");
-        match Connection::over(Box::new(stdout), Box::new(stdin)) {
+    /// --stdio`), handshaking as `client_name` within
+    /// [`HANDSHAKE_TIMEOUT`]. The child is returned so the caller can reap or
+    /// kill it; on any failure (a timeout included) it is killed and reaped.
+    pub fn command(cmd: Command, client_name: &str) -> Result<(Connection, Child)> {
+        Self::command_within(cmd, client_name, HANDSHAKE_TIMEOUT)
+    }
+
+    fn command_within(
+        mut cmd: Command,
+        client_name: &str,
+        timeout: Duration,
+    ) -> Result<(Connection, Child)> {
+        let child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let child = Arc::new(Mutex::new(child));
+        let (stdin, stdout) = {
+            let mut c = lock(&child);
+            (
+                c.stdin.take().expect("piped stdin"),
+                c.stdout.take().expect("piped stdout"),
+            )
+        };
+        let killer = Arc::clone(&child);
+        let r = Self::over_within(
+            Box::new(stdout),
+            Box::new(stdin),
+            client_name,
+            timeout,
+            move || {
+                // Ends the child, and with it the handshake thread's read.
+                let _ = lock(&killer).kill();
+            },
+        );
+        let mut child = match Arc::try_unwrap(child) {
+            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(_) => unreachable!("the timeout closure has run or been dropped"),
+        };
+        match r {
             Ok(conn) => Ok((conn, child)),
             Err(e) => {
                 let _ = child.kill();
@@ -169,8 +275,12 @@ impl Connection {
         }
     }
 
-    /// Sends `kind` and waits for its response; unrelated frames (exit events
-    /// for other agents) are skipped. A server error becomes `Error::Server`.
+    /// Sends `kind` and waits for its response. Every other frame read
+    /// meanwhile (agent output, every event) is discarded, so use it only on
+    /// a connection that has not attached to anything, or before
+    /// [`Connection::split`]; afterwards send with the [`Sender`] and match
+    /// responses in the [`FrameReader`]'s stream. A server error becomes
+    /// `Error::Server`.
     pub fn call(&mut self, kind: request::Kind) -> Result<response::Kind> {
         let id = self.sender.send(kind)?;
         loop {
@@ -214,5 +324,91 @@ impl Connection {
 
     pub fn split(self) -> (FrameReader, Sender) {
         (self.reader, self.sender)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+
+    const SHORT: Duration = Duration::from_millis(300);
+
+    /// Runs `f` on a thread and fails if it takes longer than 5 s.
+    fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> (T, Duration) {
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        let r = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("handshake did not time out");
+        (r, start.elapsed())
+    }
+
+    fn is_timeout(r: &Result<impl Sized>) -> bool {
+        matches!(r, Err(Error::Timeout))
+    }
+
+    #[test]
+    fn handshake_times_out_over_a_silent_stream() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let closer = client.try_clone().unwrap();
+        let (r, took) = within_5s(move || {
+            Connection::over_within(
+                Box::new(client.try_clone().unwrap()),
+                Box::new(client),
+                "t",
+                SHORT,
+                move || {
+                    let _ = closer.shutdown(Shutdown::Both);
+                },
+            )
+        });
+        assert!(is_timeout(&r), "{:?}", r.err());
+        assert!(took >= SHORT);
+        drop(server);
+    }
+
+    #[test]
+    fn handshake_times_out_on_a_silent_unix_socket() {
+        let dir = std::env::temp_dir().join(format!("fleet-client-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("silent.sock");
+        let _ = std::fs::remove_file(&path);
+        // Accepts (via the backlog) but never answers.
+        let listener = UnixListener::bind(&path).unwrap();
+        let p = path.clone();
+        let (r, _) = within_5s(move || Connection::unix_within(&p, "t", SHORT));
+        assert!(is_timeout(&r), "{:?}", r.err());
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handshake_times_out_on_a_silent_command_and_kills_it() {
+        let mut cmd = Command::new("/bin/sh");
+        // Prints its pid, then never answers.
+        cmd.args(["-c", "echo $$ >&2; exec sleep 30"]);
+        let pidfile = std::env::temp_dir().join(format!("fleet-client-pid-{}", std::process::id()));
+        cmd.stderr(std::fs::File::create(&pidfile).unwrap());
+        let (r, _) = within_5s(move || Connection::command_within(cmd, "t", SHORT));
+        assert!(is_timeout(&r), "{:?}", r.err().map(|e| e.to_string()));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&pidfile);
+        // Killed and reaped: the pid no longer exists.
+        let alive = Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the silent child {pid} is still running");
     }
 }

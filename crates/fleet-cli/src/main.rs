@@ -199,7 +199,7 @@ fn run(cli: Cli) -> Result<u8> {
     if let Command::Skill(args) = cli.command {
         return skill::run(args).map(|()| 0);
     }
-    let mut client = Connection::unix(&state_dir(&cli).join("fleetd.sock"))?;
+    let mut client = Connection::unix(&state_dir(&cli).join("fleetd.sock"), "fleet")?;
     match cli.command {
         Command::Spawn {
             cols,

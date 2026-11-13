@@ -145,7 +145,8 @@ fn bridge(dir: &Path) -> (fleet_client::Connection, Reaper) {
         .arg("--stdio")
         .arg("--state-dir")
         .arg(dir);
-    let (conn, child) = fleet_client::Connection::command(cmd).expect("handshake via --stdio");
+    let (conn, child) =
+        fleet_client::Connection::command(cmd, "lifecycle-test").expect("handshake via --stdio");
     (conn, Reaper(child))
 }
 
@@ -276,7 +277,8 @@ fn agent_session_env(extra: &[(&str, &str)], remove: &[&str]) -> String {
         cmd.env_remove(k);
     }
     cmd.envs(extra.iter().copied());
-    let (_conn, _bridge) = fleet_client::Connection::command(cmd).expect("handshake via --stdio");
+    let (_conn, _bridge) =
+        fleet_client::Connection::command(cmd, "lifecycle-test").expect("handshake via --stdio");
     let vars = [
         "SSH_AUTH_SOCK",
         "SSH_AGENT_PID",
@@ -374,7 +376,8 @@ fn spawn_with_shell(dir: &Path, shell: &Path, extra: &[(&str, &str)]) -> Child {
 
 /// Spawns `sh -c script` in `cwd` and waits up to 10 s for `cwd/out`.
 fn agent_output(dir: &Path, cwd: &Path, script: &str) -> String {
-    let mut conn = fleet_client::Connection::unix(&dir.join("fleetd.sock")).unwrap();
+    let mut conn =
+        fleet_client::Connection::unix(&dir.join("fleetd.sock"), "lifecycle-test").unwrap();
     let spawn = fleet_proto::SpawnAgent {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],

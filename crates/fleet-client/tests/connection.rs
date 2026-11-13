@@ -31,7 +31,10 @@ fn connection_over_pipe_pair() {
     let srv = std::thread::spawn(move || {
         let mut buf = BytesMut::new();
         match read_frame(&mut server, &mut buf) {
-            Frame::Hello(h) => assert_eq!(h.protocol_version, PROTOCOL_VERSION),
+            Frame::Hello(h) => {
+                assert_eq!(h.protocol_version, PROTOCOL_VERSION);
+                assert_eq!(h.client, "pane-3");
+            }
             _ => panic!("expected hello"),
         }
         write_frame(&mut server, Frame::HelloOk(HelloOk::default()));
@@ -53,6 +56,7 @@ fn connection_over_pipe_pair() {
     let mut conn = Connection::over(
         Box::new(client_side.try_clone().unwrap()),
         Box::new(client_side),
+        "pane-3",
     )
     .unwrap();
     let reply = conn.call(request::Kind::List(Default::default())).unwrap();

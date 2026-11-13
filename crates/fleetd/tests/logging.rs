@@ -355,6 +355,17 @@ fn read_logs_tail_spans_rotated_files() {
     assert_eq!(c.read_logs(u32::MAX, false)[0], "rotated2-0");
 }
 
+/// The name a `fleet-client` connection hands over appears in the daemon's
+/// connection line.
+#[test]
+fn client_name_is_logged() {
+    let dir = TempDir::new().unwrap();
+    let _d = start(dir.path(), &[]);
+    let _conn = fleet_client::Connection::unix(&dir.path().join("fleetd.sock"), "gui-pane-7")
+        .expect("connect");
+    wait_log(dir.path(), &["connection opened", "client=\"gui-pane-7\""]);
+}
+
 #[test]
 fn follow_streams_new_lines() {
     let dir = TempDir::new().unwrap();
@@ -423,7 +434,7 @@ fn stdio_bridge_never_writes_logs_to_stdout() {
         .arg(dir.path())
         .stderr(Stdio::null());
     let (mut conn, mut child) =
-        fleet_client::Connection::command(cmd).expect("handshake via --stdio");
+        fleet_client::Connection::command(cmd, "logging-test").expect("handshake via --stdio");
     match conn
         .call(request::Kind::List(Default::default()))
         .expect("list")
