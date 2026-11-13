@@ -39,13 +39,13 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 
 Tolerances: `instr` 2%, `wall` 5%.
 
-`flood50_cpu_ns_per_mib` and `daemon_flood50_cpu_ns_per_mib` are `report_only` (see below) until the self-hosted runner is characterised; the other `daemon_flood50_*` metrics and `reattach_snapshot_ns` until their CI variance is characterised. `daemon_flood50_lagged_subscriptions` is report-only because the M1 node cannot stream 50 flooding agents to one attached client (ADR 0018); a run with 0 lagged subscriptions is an invalid value for `compare` (values must be > 0), so once lagging is fixed the metric must be retired.
+`flood50_cpu_ns_per_mib` and `daemon_flood50_cpu_ns_per_mib` are `report_only` (see below) until the self-hosted runner is characterised; the other `daemon_flood50_*` metrics and `reattach_snapshot_ns` until their CI variance is characterised. `fleetd_cold_start_ns` is `report_only` against its baseline because a ~2 ms process start varies about ±15% run to run on the runner; its 200 ms budget still gates. `daemon_flood50_lagged_subscriptions` is report-only because the M1 node cannot stream 50 flooding agents to one attached client (ADR 0018); a run with 0 lagged subscriptions is an invalid value for `compare` (values must be > 0), so once lagging is fixed the metric must be retired.
 
 In `daemon_flood50` fleetd drops most subscriptions as lagged under full load (drop policy, `docs/decisions/0018-m1-protocol-and-node.md`); the client does not re-attach (the notice does not name the agent), so the scenario measures the daemon with clients attached until they lag out. The count is reported as `daemon_flood50_lagged_subscriptions` (and printed to stderr); wall time, CPU and RSS shift with it. Setup (fixtures, the screen to snapshot) runs outside the measured region of every `instr` benchmark.
 
 ### Report-only metrics
 
-A metric with `report_only = true` is still measured, printed (its status is marked `(report-only)`) and tightened, but a regression or budget breach on it does not fail the gate. Missing, unknown, invalid (non-finite or <= 0) and unit-mismatched values still fail: the measurement must exist and be sane. Turning `report_only` on is a loosening and needs user approval; turning it off is free.
+A metric with `report_only = true` is still measured, printed (its status is marked `(report-only)`) and tightened, but a regression against its baseline does not fail the gate. Its `budget`, if any, still does: the budget is the hard limit. Missing, unknown, invalid (non-finite or <= 0) and unit-mismatched values still fail: the measurement must exist and be sane. Turning `report_only` on is a loosening and needs user approval; turning it off is free.
 
 ## Baselines
 

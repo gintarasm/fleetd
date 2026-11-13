@@ -167,11 +167,10 @@ pub struct Row {
 
 impl Row {
     /// Whether this row fails the gate. Report-only metrics are exempt from
-    /// regression and budget failures, but must still be measured, sane and
-    /// in the right unit.
+    /// regression failures only: they must still be measured, sane, in the
+    /// right unit and within their budget (the budget is the hard limit).
     pub fn fails(&self) -> bool {
-        self.status.is_failure()
-            && !(self.report_only && matches!(self.status, Status::Regressed | Status::OverBudget))
+        self.status.is_failure() && !(self.report_only && self.status == Status::Regressed)
     }
 
     fn label(&self) -> String {
@@ -547,7 +546,7 @@ baseline = 100
     }
 
     #[test]
-    fn report_only_regression_and_over_budget_do_not_fail() {
+    fn report_only_regression_does_not_fail_but_over_budget_does() {
         let b = report_only();
         let r = res(Suite::Wall, &[("m_wall", 150.0)]);
         assert_eq!(status(&b, &r, "m_wall"), (Status::Regressed, false));
@@ -557,7 +556,8 @@ baseline = 100
             "{s}"
         );
         let r = res(Suite::Wall, &[("m_wall", 1001.0)]);
-        assert_eq!(status(&b, &r, "m_wall"), (Status::OverBudget, false));
+        assert_eq!(status(&b, &r, "m_wall"), (Status::OverBudget, true));
+        assert!(compare(&b, &r).failed);
         let r = res(Suite::Wall, &[("m_wall", 90.0)]);
         assert_eq!(status(&b, &r, "m_wall"), (Status::Improved, false));
     }
