@@ -142,7 +142,10 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
 
 impl Daemon {
     /// Open the node's state, then serve protocol connections until
-    /// SIGTERM/SIGINT; then remove the socket file and return.
+    /// SIGTERM/SIGINT. Then stop every agent (v1 has no PTY handoff, decision
+    /// 0018): SIGTERM to each agent's process group, up to 2 s grace, then
+    /// SIGKILL; their exits are recorded. Finally remove the socket file and
+    /// return.
     pub async fn serve(self) -> io::Result<()> {
         let listener = UnixListener::from_std(self.listener)?;
         let mut term = signal(SignalKind::terminate())?;
@@ -151,7 +154,8 @@ impl Daemon {
         let node = tokio::task::spawn_blocking(move || Node::open(&state_dir))
             .await
             .map_err(io::Error::other)??;
-        let server = server::Server::new(Arc::new(node));
+        let node = Arc::new(node);
+        let server = server::Server::new(Arc::clone(&node));
         loop {
             tokio::select! {
                 _ = term.recv() => break,
@@ -168,6 +172,9 @@ impl Daemon {
                 },
             }
         }
+        tokio::task::spawn_blocking(move || node.shutdown())
+            .await
+            .map_err(io::Error::other)?;
         match fs::remove_file(&self.socket_path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),

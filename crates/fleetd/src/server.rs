@@ -283,6 +283,7 @@ impl Connection {
             return false;
         }
         let task = tokio::spawn(forward_output(
+            Arc::clone(&self.node),
             agent_id,
             sub,
             self.outbox.clone(),
@@ -304,6 +305,7 @@ fn exited_event(agent_id: u64, exit_code: i32) -> Frame {
 
 /// Streams one agent's output, then its exit or a lag notice.
 async fn forward_output(
+    node: Arc<Node>,
     agent_id: u64,
     mut sub: Subscription,
     outbox: mpsc::Sender<Frame>,
@@ -317,13 +319,21 @@ async fn forward_output(
                 return;
             }
             StreamItem::Lagged => {
-                // The exit event now comes from the exit-event forwarder.
+                // Hand the exit event back to the exit-event forwarder. If
+                // the agent already exited, that event was skipped (and its
+                // `Exited` item discarded with the lag), so send it here. An
+                // exit racing this hand-off may be announced twice.
                 lock(&attached).remove(&agent_id);
                 let lagged = Frame::Response(Response {
                     id: 0,
                     kind: Some(error(LAGGED.into())),
                 });
-                let _ = outbox.send(lagged).await;
+                if outbox.send(lagged).await.is_err() {
+                    return;
+                }
+                if let Some(code) = node.exit_code(agent_id) {
+                    let _ = outbox.send(exited_event(agent_id, code)).await;
+                }
                 return;
             }
         };

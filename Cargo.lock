@@ -379,6 +379,7 @@ dependencies = [
  "fleet-proto",
  "fs4",
  "futures-util",
+ "libc",
  "tempfile",
  "tokio",
  "tokio-util",

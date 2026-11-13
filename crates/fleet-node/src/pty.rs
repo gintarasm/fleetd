@@ -329,6 +329,15 @@ impl PtyHost {
     /// Sends SIGTERM to the agent's process group, so children it started
     /// (which may hold the PTY open) go too. A no-op once the agent has exited.
     pub fn kill(&self, id: AgentId) -> io::Result<()> {
+        self.signal_group(id, libc::SIGTERM)
+    }
+
+    /// Like [`PtyHost::kill`], but SIGKILL.
+    pub fn force_kill(&self, id: AgentId) -> io::Result<()> {
+        self.signal_group(id, libc::SIGKILL)
+    }
+
+    fn signal_group(&self, id: AgentId, sig: libc::c_int) -> io::Result<()> {
         let agent = self.agent(id)?;
         // Skip finished agents: their pid may have been reused. A narrow window
         // remains between the reader thread reaping the child and recording
@@ -342,7 +351,7 @@ impl PtyHost {
         };
         let pgid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
         // SAFETY: killpg has no memory-safety preconditions.
-        if unsafe { libc::killpg(pgid, libc::SIGTERM) } == 0 {
+        if unsafe { libc::killpg(pgid, sig) } == 0 {
             return Ok(());
         }
         let err = io::Error::last_os_error();

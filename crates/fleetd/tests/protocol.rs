@@ -607,3 +607,71 @@ fn restart_marks_agents_lost() {
     assert!(next.id > running.id && next.id > done.id);
     c.kill(next.id);
 }
+
+#[test]
+fn attach_to_exited_agent_gets_snapshot_and_exit() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let info = c.sh("echo bye-now; exit 4");
+    assert_eq!(wait_not_running(&mut c, info.id).exit_code, Some(4));
+    c.pending.clear();
+    let ok = c.attach(info.id);
+    assert!(
+        String::from_utf8_lossy(&ok.snapshot).contains("bye-now"),
+        "snapshot: {:?}",
+        String::from_utf8_lossy(&ok.snapshot)
+    );
+    assert_eq!(c.exit_event(info.id).exit_code, 4);
+}
+
+/// True while any process of group `pgid` exists.
+fn group_alive(pgid: i32) -> bool {
+    // SAFETY: kill with signal 0 only checks for existence.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+#[test]
+fn sigterm_stops_agents_and_records_their_exit() {
+    let dir = TempDir::new().unwrap();
+    let mut d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    // Ignores the PTY hangup and SIGTERM: only SIGKILL stops it.
+    let info = c.sh("trap '' HUP TERM; echo \"pid=$$\"; sleep 600");
+    c.attach(info.id);
+    let out = c.output_until(info.id, "\n");
+    let pid: i32 = out
+        .split("pid=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("no pid in {out:?}"));
+    assert!(group_alive(pid));
+
+    let started = Instant::now();
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(d.child.id().to_string())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let deadline = started + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = d.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "fleetd did not exit within 5s");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "fleetd exited with {status}");
+    assert!(!group_alive(pid), "agent group {pid} survived fleetd");
+    assert!(!dir.path().join("fleetd.sock").exists());
+    drop(c);
+    drop(d);
+
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let rec = find(&c.list(), info.id).clone();
+    assert_eq!(rec.state(), AgentState::Exited, "{rec:?}");
+    assert!(rec.exit_code.is_some());
+}

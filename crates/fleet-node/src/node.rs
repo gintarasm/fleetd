@@ -37,7 +37,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, error::TrySendError};
 
@@ -370,6 +370,11 @@ impl AgentPipeline {
         self.lock().term.resize(cols, rows);
     }
 
+    /// The agent's exit code, once it has exited.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.lock().exit_code
+    }
+
     /// The grid's visible text (see [`Terminal::visible_text`]).
     pub fn visible_text(&self) -> Vec<String> {
         self.lock().term.visible_text()
@@ -426,6 +431,11 @@ impl OutputSink for AgentPipeline {
 
 /// Exit events a [`Node`] buffers per receiver before it lags.
 pub const EXIT_EVENT_CAPACITY: usize = 256;
+
+/// How long [`Node::shutdown`] lets agents exit after SIGTERM.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long [`Node::shutdown`] waits for agents after SIGKILL.
+const KILL_WAIT: Duration = Duration::from_millis(500);
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -488,9 +498,20 @@ impl OutputSink for NodeSink {
 pub struct Node {
     host: PtyHost,
     store: Arc<Mutex<Store>>,
-    agents: Mutex<HashMap<u64, LiveAgent>>,
+    agents: Mutex<Agents>,
     exits: broadcast::Sender<AgentExited>,
     scrollback_dir: PathBuf,
+}
+
+#[derive(Default)]
+struct Agents {
+    live: HashMap<u64, LiveAgent>,
+    /// Set by [`Node::shutdown`]: no new agents.
+    closing: bool,
+}
+
+fn shutting_down() -> io::Error {
+    io::Error::other("node is shutting down")
 }
 
 impl Node {
@@ -508,7 +529,7 @@ impl Node {
         Ok(Node {
             host: PtyHost::new(),
             store: Arc::new(Mutex::new(store)),
-            agents: Mutex::new(HashMap::new()),
+            agents: Mutex::new(Agents::default()),
             exits,
             scrollback_dir,
         })
@@ -522,6 +543,9 @@ impl Node {
     /// Spawns an agent. Zero `cols`/`rows` mean 80x24; an empty `cwd` means
     /// the daemon's working directory.
     pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
+        if lock(&self.agents).closing {
+            return Err(shutting_down());
+        }
         if req.program.is_empty() {
             return Err(invalid("program is empty".into()));
         }
@@ -585,7 +609,17 @@ impl Node {
                 return Err(e);
             }
         };
-        lock(&self.agents).insert(id, live);
+        {
+            let mut agents = lock(&self.agents);
+            if agents.closing {
+                // Shutdown began during the spawn and will not signal this
+                // agent; its exit is still recorded and waited for.
+                drop(agents);
+                let _ = self.host.force_kill(live.host_id);
+                return Err(shutting_down());
+            }
+            agents.live.insert(id, live);
+        }
         Ok(AgentInfo {
             id,
             program: new.program,
@@ -608,7 +642,7 @@ impl Node {
     }
 
     fn live(&self, id: u64) -> io::Result<LiveAgent> {
-        lock(&self.agents).get(&id).cloned().ok_or_else(|| {
+        lock(&self.agents).live.get(&id).cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("agent {id} is not live on this node"),
@@ -655,6 +689,41 @@ impl Node {
     pub fn kill(&self, id: u64) -> io::Result<()> {
         let live = self.live(id)?;
         self.host.kill(live.host_id)
+    }
+
+    /// The agent's exit code once it has exited; `None` while it runs or if
+    /// it is not live on this node.
+    pub fn exit_code(&self, id: u64) -> Option<i32> {
+        self.live(id).ok()?.pipeline.exit_code()
+    }
+
+    /// Stops every agent (there is no handoff to a successor daemon, see
+    /// decision 0018): SIGTERM to each process group, [`SHUTDOWN_GRACE`] to
+    /// exit, then SIGKILL. Exits are recorded as usual; an agent that still
+    /// has not reported is left `running` in the store, to be marked lost by
+    /// the next [`Node::open`]. Refuses new spawns from now on.
+    pub fn shutdown(&self) {
+        let host_ids: Vec<AgentId> = {
+            let mut agents = lock(&self.agents);
+            agents.closing = true;
+            agents.live.values().map(|a| a.host_id).collect()
+        };
+        for &id in &host_ids {
+            if let Err(e) = self.host.kill(id) {
+                eprintln!("fleet-node: SIGTERM to agent group: {e}");
+            }
+        }
+        if self.host.wait_all(SHUTDOWN_GRACE).is_ok() {
+            return;
+        }
+        for &id in &host_ids {
+            if let Err(e) = self.host.force_kill(id) {
+                eprintln!("fleet-node: SIGKILL to agent group: {e}");
+            }
+        }
+        if self.host.wait_all(KILL_WAIT).is_err() {
+            eprintln!("fleet-node: some agents did not exit; they will be marked lost");
+        }
     }
 }
 
