@@ -23,6 +23,8 @@ pub enum Outcome {
     Exited,
     Detached,
     Lagged,
+    /// Ended by SIGINT/SIGTERM/SIGHUP (the signal number).
+    Signaled(i32),
 }
 
 /// Restores the terminal when dropped (every exit path, panics included).
@@ -61,8 +63,13 @@ enum Ev {
     Stdin(Vec<u8>),
     StdinEof,
     Winch,
-    Terminate,
+    Terminate(i32),
 }
+
+/// Frames the reader may have queued for the main loop. Beyond this it
+/// blocks, the socket fills and the daemon reports a lag rather than `fleet`
+/// buffering output for a stalled terminal.
+const FRAME_QUEUE: usize = 64;
 
 fn terminal_size() -> (u32, u32) {
     crossterm::terminal::size()
@@ -101,6 +108,7 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
         rows,
     }))?;
 
+    let (permits, released) = mpsc::sync_channel::<()>(FRAME_QUEUE);
     let tx = events.clone();
     thread::spawn(move || {
         loop {
@@ -110,6 +118,9 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
                 Err(e) => Ev::Closed(e.to_string()),
             };
             let last = matches!(ev, Ev::Closed(_));
+            if matches!(ev, Ev::Frame(_)) && permits.send(()).is_err() {
+                return;
+            }
             if tx.send(ev).is_err() || last {
                 return;
             }
@@ -135,7 +146,7 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
             let ev = if sig == SIGWINCH {
                 Ev::Winch
             } else {
-                Ev::Terminate
+                Ev::Terminate(sig)
             };
             if events.send(ev).is_err() {
                 return;
@@ -147,6 +158,9 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
         let Ok(ev) = inbox.recv() else {
             break Outcome::Detached;
         };
+        if matches!(ev, Ev::Frame(_)) {
+            let _ = released.try_recv();
+        }
         match ev {
             Ev::Frame(Frame::Output { agent_id: a, data }) if a == agent_id => {
                 write_stdout(&data)?;
@@ -186,7 +200,8 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
                     break Outcome::Detached;
                 }
             }
-            Ev::StdinEof | Ev::Terminate => break Outcome::Detached,
+            Ev::StdinEof => break Outcome::Detached,
+            Ev::Terminate(sig) => break Outcome::Signaled(sig),
             Ev::Winch => {
                 let (cols, rows) = terminal_size();
                 sender.send(request::Kind::Resize(Resize {
@@ -197,7 +212,7 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
             }
         }
     };
-    if outcome == Outcome::Detached {
+    if matches!(outcome, Outcome::Detached | Outcome::Signaled(_)) {
         let _ = sender.send(request::Kind::Detach(Detach { agent_id }));
     }
     drop(guard);

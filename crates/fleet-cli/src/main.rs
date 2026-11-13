@@ -148,6 +148,7 @@ fn run(cli: Cli) -> Result<u8> {
                 eprintln!("fleet: output lagged behind; re-attach");
                 return Ok(2);
             }
+            attach::Outcome::Signaled(sig) => return Ok(128 + sig as u8),
             attach::Outcome::Exited | attach::Outcome::Detached => {}
         },
     }

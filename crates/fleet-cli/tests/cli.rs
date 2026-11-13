@@ -148,6 +148,97 @@ fn daemon_not_running_message() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("fleetd is not running"));
 }
 
+const RESTORE: &str = "\x1b[!p\x1b[?1049l\x1b[?25h\x1b[?2004l";
+
+/// `fleet attach` running on a pty.
+struct PtyAttach {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    reader: Option<Box<dyn Read + Send>>,
+    rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    seen: Vec<u8>,
+}
+
+impl PtyAttach {
+    /// Starts `fleet attach <id>`; output is only collected after `drain`
+    /// (called here unless `paused`).
+    fn start(d: &Daemon, id: &str, paused: bool) -> Self {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_fleet"));
+        cmd.args(["--state-dir", d.dir.path().to_str().unwrap(), "attach", id]);
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut p = PtyAttach {
+            child,
+            reader: Some(pair.master.try_clone_reader().unwrap()),
+            writer: pair.master.take_writer().unwrap(),
+            master: pair.master,
+            rx: None,
+            seen: Vec::new(),
+        };
+        if !paused {
+            p.drain();
+        }
+        p
+    }
+
+    /// Starts collecting the pty's output.
+    fn drain(&mut self) {
+        let mut reader = self.reader.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        self.rx = Some(rx);
+    }
+
+    fn until(&mut self, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let rx = self.rx.as_ref().unwrap();
+        while !String::from_utf8_lossy(&self.seen).contains(needle) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(chunk) => self.seen.extend(chunk),
+                Err(_) => panic!(
+                    "no {needle:?} in {:?}",
+                    String::from_utf8_lossy(&self.seen).into_owned()
+                ),
+            }
+        }
+    }
+
+    /// Exit code, polled against a deadline.
+    fn exit_code(&mut self) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.exit_code();
+            }
+            assert!(Instant::now() < deadline, "fleet attach did not exit");
+            // Keep the pty drained so the child is never stuck writing.
+            if let Some(rx) = &self.rx {
+                while let Ok(chunk) = rx.try_recv() {
+                    self.seen.extend(chunk);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 /// Drives `fleet attach` on a pty: it enters the alt screen, shows the agent,
 /// forwards typing, detaches on Ctrl-\ and writes the terminal restore
 /// sequence before exiting 0.
@@ -155,54 +246,77 @@ fn daemon_not_running_message() {
 fn attach_on_pty_detaches_and_restores_terminal() {
     let d = Daemon::start();
     let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+    let mut p = PtyAttach::start(&d, &id, false);
+    p.until("\x1b[?1049h\x1b[!p");
+    p.writer.write_all(b"typed-text\r").unwrap();
+    p.until("typed-text");
+    p.writer.write_all(&[0x1c]).unwrap();
+    p.until(RESTORE);
+    assert_eq!(p.exit_code(), 0);
+    // The agent keeps running after a detach.
+    assert!(d.ok(&["ls"]).contains("running"));
+}
 
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
+#[test]
+fn attach_exits_0_and_restores_when_agent_exits() {
+    let d = Daemon::start();
+    let id = d
+        .ok(&["spawn", "--", "sh", "-c", "echo hi; sleep 0.3"])
+        .trim()
+        .to_string();
+    let mut p = PtyAttach::start(&d, &id, false);
+    p.until(RESTORE);
+    assert_eq!(p.exit_code(), 0);
+}
+
+#[test]
+fn sigterm_restores_terminal_and_exits_143() {
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+    let mut p = PtyAttach::start(&d, &id, false);
+    p.until("\x1b[?1049h");
+    let pid = p.child.process_id().unwrap() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    p.until(RESTORE);
+    assert_eq!(p.exit_code(), 128 + libc::SIGTERM as u32);
+    assert!(d.ok(&["ls"]).contains("running"));
+}
+
+#[test]
+fn window_resize_reaches_the_agent() {
+    let d = Daemon::start();
+    let id = d
+        .ok(&["spawn", "--", "sh", "-c", "read x; stty size; sleep 5"])
+        .trim()
+        .to_string();
+    let mut p = PtyAttach::start(&d, &id, false);
+    p.until("\x1b[?1049h");
+    p.master
+        .resize(PtySize {
+            rows: 31,
+            cols: 101,
             pixel_width: 0,
             pixel_height: 0,
         })
         .unwrap();
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_fleet"));
-    cmd.args(["--state-dir", d.dir.path().to_str().unwrap(), "attach", &id]);
-    let mut child = pair.slave.spawn_command(cmd).unwrap();
-    drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let mut writer = pair.master.take_writer().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    p.writer.write_all(b"\r").unwrap();
+    p.until("31 101");
+    p.writer.write_all(&[0x1c]).unwrap();
+    assert_eq!(p.exit_code(), 0);
+}
 
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
-    let mut seen = Vec::new();
-    let until = |seen: &mut Vec<u8>, needle: &str| {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !String::from_utf8_lossy(seen).contains(needle) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match rx.recv_timeout(left) {
-                Ok(chunk) => seen.extend(chunk),
-                Err(_) => panic!(
-                    "no {needle:?} in {:?}",
-                    String::from_utf8_lossy(seen).into_owned()
-                ),
-            }
-        }
-    };
-
-    until(&mut seen, "\x1b[?1049h\x1b[!p");
-    writer.write_all(b"typed-text\r").unwrap();
-    until(&mut seen, "typed-text");
-    writer.write_all(&[0x1c]).unwrap();
-    until(&mut seen, "\x1b[!p\x1b[?1049l\x1b[?25h\x1b[?2004l");
-
-    let status = child.wait().unwrap();
-    assert!(status.success(), "exit {status:?}");
-    // The agent keeps running after a detach.
-    assert!(d.ok(&["ls"]).contains("running"));
+/// A terminal that stops reading must not make `fleet` buffer without bound:
+/// the daemon sees the backlog, reports a lag, and attach exits 2 (once the
+/// terminal drains) with the terminal restored.
+#[test]
+fn stalled_terminal_gets_lagged_exit_2() {
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--", "yes"]).trim().to_string();
+    let mut p = PtyAttach::start(&d, &id, true);
+    std::thread::sleep(Duration::from_secs(3));
+    p.drain();
+    p.until(RESTORE);
+    assert_eq!(p.exit_code(), 2);
+    d.ok(&["kill", &id]);
 }
