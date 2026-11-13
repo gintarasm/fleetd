@@ -93,6 +93,17 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
     // Signals first, so none is missed while the terminal is being set up.
     let mut signals = Signals::new([SIGWINCH, SIGINT, SIGTERM, SIGHUP])?;
 
+    // Resize first, so the snapshot is drawn at this terminal's size. An
+    // exited agent cannot be resized; attaching still shows its last screen.
+    let (cols, rows) = terminal_size();
+    match client.call(request::Kind::Resize(Resize {
+        agent_id,
+        cols,
+        rows,
+    })) {
+        Ok(_) | Err(Error::Server(_)) => {}
+        Err(e) => return Err(e),
+    }
     let ok = match client.call(request::Kind::Attach(Attach { agent_id }))? {
         response::Kind::Attached(ok) => ok,
         _ => return Err(Error::Protocol("unexpected reply to attach".into())),
@@ -101,12 +112,6 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
 
     let guard = TerminalGuard::enter()?;
     write_stdout(&ok.snapshot)?;
-    let (cols, rows) = terminal_size();
-    sender.send(request::Kind::Resize(Resize {
-        agent_id,
-        cols,
-        rows,
-    }))?;
 
     let (permits, released) = mpsc::sync_channel::<()>(FRAME_QUEUE);
     let tx = events.clone();

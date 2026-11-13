@@ -164,10 +164,15 @@ impl PtyAttach {
     /// Starts `fleet attach <id>`; output is only collected after `drain`
     /// (called here unless `paused`).
     fn start(d: &Daemon, id: &str, paused: bool) -> Self {
+        Self::start_sized(d, id, paused, 80, 24)
+    }
+
+    /// [`PtyAttach::start`] on a `cols`x`rows` terminal.
+    fn start_sized(d: &Daemon, id: &str, paused: bool, cols: u16, rows: u16) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -304,6 +309,54 @@ fn window_resize_reaches_the_agent() {
     p.until("31 101");
     p.writer.write_all(&[0x1c]).unwrap();
     assert_eq!(p.exit_code(), 0);
+}
+
+/// Every `ESC [ row ; col H` in `bytes`.
+fn cursor_positions(bytes: &[u8]) -> Vec<(u32, u32)> {
+    let text = String::from_utf8_lossy(bytes);
+    text.split("\x1b[")
+        .skip(1)
+        .filter_map(|seq| {
+            let end = seq.find(|c: char| !(c.is_ascii_digit() || c == ';'))?;
+            if !seq[end..].starts_with('H') {
+                return None;
+            }
+            let (row, col) = seq[..end].split_once(';')?;
+            Some((row.parse().ok()?, col.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Attaching from a smaller terminal than the agent's resizes the agent
+/// first, so the snapshot is drawn at the client's size.
+#[test]
+fn attach_from_smaller_terminal_gets_snapshot_at_its_size() {
+    let d = Daemon::start();
+    let script = "for i in $(seq 1 20); do echo line$i; done; printf '%0150dEND' 0; sleep 30";
+    let id = d
+        .ok(&[
+            "spawn", "--cols", "80", "--rows", "24", "--", "sh", "-c", script,
+        ])
+        .trim()
+        .to_string();
+    wait_for("agent output", || {
+        let out = d.fleet(&["attach", "--snapshot-only", &id]);
+        String::from_utf8_lossy(&out.stdout).contains("END")
+    });
+    let mut p = PtyAttach::start_sized(&d, &id, false, 40, 10);
+    p.until("END");
+    p.writer.write_all(&[0x1c]).unwrap();
+    p.until(RESTORE);
+    assert_eq!(p.exit_code(), 0);
+    let seen = String::from_utf8_lossy(&p.seen).into_owned();
+    let snapshot = &seen[..seen.find(RESTORE).unwrap()];
+    let cups = cursor_positions(snapshot.as_bytes());
+    assert!(!cups.is_empty(), "no cursor position in {snapshot:?}");
+    assert!(
+        cups.iter().all(|&(row, col)| row <= 10 && col <= 40),
+        "{cups:?} outside 40x10 in {snapshot:?}"
+    );
+    d.ok(&["kill", &id]);
 }
 
 /// A terminal that stops reading must not make `fleet` buffer without bound:
