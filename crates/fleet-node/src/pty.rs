@@ -5,6 +5,7 @@
 
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -242,10 +243,22 @@ impl PtyHost {
         self.spawn_with_sink(spec, Box::new(DiscardSink))
     }
 
-    /// Spawns an agent whose output is counted and handed to `sink`.
+    /// Spawns an agent whose output is counted and handed to `sink`. Its
+    /// environment is the daemon's plus `spec.env`.
     pub fn spawn_with_sink(
         &self,
         spec: CommandSpec,
+        sink: Box<dyn OutputSink>,
+    ) -> io::Result<AgentId> {
+        self.spawn_with_base_env(spec, None, sink)
+    }
+
+    /// [`PtyHost::spawn_with_sink`], with `base` (if any) replacing the
+    /// daemon's environment under `spec.env`.
+    pub fn spawn_with_base_env(
+        &self,
+        spec: CommandSpec,
+        base: Option<&[(OsString, OsString)]>,
         mut sink: Box<dyn OutputSink>,
     ) -> io::Result<AgentId> {
         let pair = open_pty(PtySize {
@@ -258,6 +271,12 @@ impl PtyHost {
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
             cmd.cwd(cwd);
+        }
+        if let Some(base) = base {
+            cmd.env_clear();
+            for (k, v) in base {
+                cmd.env(k, v);
+            }
         }
         for (k, v) in &spec.env {
             cmd.env(k, v);

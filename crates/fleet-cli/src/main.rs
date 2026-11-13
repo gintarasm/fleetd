@@ -2,6 +2,7 @@
 
 mod attach;
 mod history;
+mod skill;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,6 +88,8 @@ enum Command {
         #[arg(long, hide = true)]
         snapshot_only: bool,
     },
+    /// Install the agent skill that teaches agents to use `fleet`
+    Skill(skill::SkillArgs),
 }
 
 fn state_dir(cli: &Cli) -> PathBuf {
@@ -166,6 +169,9 @@ fn print_table(agents: &[AgentInfo]) {
 
 /// Exit code of a finished command.
 fn run(cli: Cli) -> Result<u8> {
+    if let Command::Skill(args) = cli.command {
+        return skill::run(args).map(|()| 0);
+    }
     let mut client = Connection::unix(&state_dir(&cli).join("fleetd.sock"))?;
     match cli.command {
         Command::Spawn {
@@ -239,6 +245,7 @@ fn run(cli: Cli) -> Result<u8> {
             attach::Outcome::Signaled(sig) => return Ok(128 + sig as u8),
             attach::Outcome::Exited | attach::Outcome::Detached => {}
         },
+        Command::Skill(_) => unreachable!("handled before connecting"),
     }
     Ok(0)
 }

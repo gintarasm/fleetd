@@ -40,6 +40,8 @@ impl Daemon {
 
     fn start_with(dir: &Path, mut cmd: Command) -> Self {
         let child = cmd
+            // Never the developer's real login shell.
+            .env("FLEETD_LOGIN_ENV", "off")
             .arg("--state-dir")
             .arg(dir)
             .stdout(Stdio::null())

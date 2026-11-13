@@ -2,6 +2,7 @@
 //! unix socket in the state dir.
 
 mod server;
+pub mod stdio;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -11,6 +12,7 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fleet_node::env::{LOGIN_ENV_SWITCH, LOGIN_ENV_TIMEOUT, LoginEnv, login_shell};
 use fleet_node::node::Node;
 
 use fs4::{FileExt, TryLockError};
@@ -196,8 +198,9 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
 }
 
 impl Daemon {
-    /// Open the node's state, then serve protocol connections until
-    /// SIGTERM/SIGINT/SIGHUP. Then stop every agent (v1 has no PTY handoff, decision
+    /// Start capturing the login shell's environment in the background
+    /// unless `FLEETD_LOGIN_ENV=off` (see [`fleet_node::env`]), open the node's state, then serve protocol
+    /// connections until SIGTERM/SIGINT/SIGHUP. Then stop every agent (v1 has no PTY handoff, decision
     /// 0018): SIGTERM to each agent's process group, up to 2 s grace, then
     /// SIGKILL; their exits are recorded. Finally remove the socket file and
     /// return.
@@ -212,9 +215,19 @@ impl Daemon {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        let node = tokio::task::spawn_blocking(move || Node::open(&state_dir))
-            .await
-            .map_err(io::Error::other)??;
+        // In the background, overlapping opening the store; the first spawn
+        // waits for it (bounded), nothing else does. `FLEETD_LOGIN_ENV=off`
+        // skips it.
+        let shell = login_shell(
+            std::env::var_os(LOGIN_ENV_SWITCH).as_deref(),
+            std::env::var_os("SHELL").as_deref(),
+        );
+        let login_env = LoginEnv::capture_in_background(shell, LOGIN_ENV_TIMEOUT);
+        let node = tokio::task::spawn_blocking(move || {
+            Node::open(&state_dir).map(|n| n.with_base_env(login_env))
+        })
+        .await
+        .map_err(io::Error::other)??;
         let node = Arc::new(node);
         let server = server::Server::new(Arc::clone(&node));
         loop {

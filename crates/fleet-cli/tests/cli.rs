@@ -34,6 +34,8 @@ impl Daemon {
     fn start() -> Self {
         let dir = TempDir::new().unwrap();
         let child = Command::new(fleetd_bin())
+            // Never the developer's real login shell.
+            .env("FLEETD_LOGIN_ENV", "off")
             .arg("--state-dir")
             .arg(dir.path())
             .stdout(Stdio::null())
@@ -538,4 +540,229 @@ fn spawn_relative_cwd_is_resolved_against_cli_cwd() {
             .lines()
             .any(|l| l.trim() == want.to_str().unwrap())
     });
+}
+
+// ---- `fleet skill` -------------------------------------------------------------
+
+/// Runs `fleet args…` with `HOME=home` in `cwd`, without a daemon.
+fn fleet_home(home: &Path, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .args(args)
+        .env("HOME", home)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run fleet")
+}
+
+fn assert_ok(out: &Output) -> String {
+    assert!(
+        out.status.success(),
+        "status {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+const SKILL: &str = include_str!("../skill/SKILL.md");
+
+#[test]
+fn skill_install_writes_and_overwrites() {
+    let home = TempDir::new().unwrap();
+    let path = home.path().join(".claude/skills/fleet/SKILL.md");
+    let out = assert_ok(&fleet_home(home.path(), home.path(), &["skill", "install"]));
+    assert_eq!(out.trim(), path.to_str().unwrap());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("---\nname: fleet\n"), "{text:?}");
+    assert_eq!(text, SKILL);
+    std::fs::write(&path, "stale").unwrap();
+    assert_ok(&fleet_home(home.path(), home.path(), &["skill", "install"]));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL);
+}
+
+#[test]
+fn skill_install_project() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let dir = project.path().canonicalize().unwrap();
+    // `--project DIR`
+    let other = TempDir::new().unwrap();
+    let out = assert_ok(&fleet_home(
+        home.path(),
+        other.path(),
+        &["skill", "install", "--project", dir.to_str().unwrap()],
+    ));
+    let path = dir.join(".claude/skills/fleet/SKILL.md");
+    assert_eq!(out.trim(), path.to_str().unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL);
+    // `--project` alone: the cwd.
+    let cwd = TempDir::new().unwrap();
+    let cwd_path = cwd.path().canonicalize().unwrap();
+    assert_ok(&fleet_home(
+        home.path(),
+        &cwd_path,
+        &["skill", "install", "--project"],
+    ));
+    assert!(cwd_path.join(".claude/skills/fleet/SKILL.md").is_file());
+    assert!(!home.path().join(".claude").exists());
+}
+
+#[test]
+fn skill_uninstall_removes() {
+    let home = TempDir::new().unwrap();
+    assert_ok(&fleet_home(home.path(), home.path(), &["skill", "install"]));
+    let dir = home.path().join(".claude/skills/fleet");
+    assert!(dir.is_dir());
+    assert_ok(&fleet_home(
+        home.path(),
+        home.path(),
+        &["skill", "uninstall"],
+    ));
+    assert!(!dir.exists());
+    assert!(
+        home.path().join(".claude/skills").is_dir(),
+        "only fleet/ goes"
+    );
+
+    let project = TempDir::new().unwrap();
+    let p = project.path().to_str().unwrap();
+    assert_ok(&fleet_home(
+        home.path(),
+        home.path(),
+        &["skill", "install", "--project", p],
+    ));
+    assert_ok(&fleet_home(
+        home.path(),
+        home.path(),
+        &["skill", "uninstall", "--project", p],
+    ));
+    assert!(!project.path().join(".claude/skills/fleet").exists());
+}
+
+#[test]
+fn skill_unknown_target_errors() {
+    let home = TempDir::new().unwrap();
+    let out = fleet_home(
+        home.path(),
+        home.path(),
+        &["skill", "install", "--target", "codex"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("M4"), "{err}");
+    assert!(!home.path().join(".claude").exists());
+    assert_ok(&fleet_home(
+        home.path(),
+        home.path(),
+        &["skill", "install", "--target", "claude"],
+    ));
+}
+
+#[test]
+fn skill_print_has_frontmatter() {
+    let home = TempDir::new().unwrap();
+    let out = assert_ok(&fleet_home(home.path(), home.path(), &["skill", "print"]));
+    assert_eq!(out, SKILL);
+    let rest = out.strip_prefix("---\n").expect("opening ---");
+    let (front, body) = rest.split_once("\n---\n").expect("closing ---");
+    let lines: Vec<_> = front.lines().collect();
+    assert_eq!(lines[0], "name: fleet");
+    let desc = lines[1].strip_prefix("description: ").expect("description");
+    for word in ["agent", "fleet", "spawn", "output"] {
+        assert!(desc.contains(word), "description lacks {word:?}: {desc}");
+    }
+    assert_eq!(lines.len(), 2, "{front}");
+    assert!(!body.trim().is_empty());
+    assert!(SKILL.lines().count() < 120);
+    for needle in ["$FLEET_AGENT_ID", "--lines"] {
+        assert!(SKILL.contains(needle), "skill lacks {needle}");
+    }
+}
+
+/// Splits a shell command line: whitespace, '…' and "…" quoting.
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur: Option<String> = None;
+    let mut quote = None;
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.get_or_insert_default().push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                cur.get_or_insert_default();
+            }
+            (None, c) if c.is_whitespace() => words.extend(cur.take()),
+            (None, c) => cur.get_or_insert_default().push(c),
+        }
+    }
+    assert!(quote.is_none(), "unterminated quote in {line:?}");
+    words.extend(cur);
+    words
+}
+
+/// The `fleet …` command lines in the skill's fenced code blocks.
+fn skill_examples() -> Vec<Vec<String>> {
+    let mut fenced = false;
+    let mut out = Vec::new();
+    for line in SKILL.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        } else if fenced && line.trim_start().starts_with("fleet ") {
+            let cmd = line.split(" #").next().unwrap();
+            out.push(shell_words(cmd));
+        }
+    }
+    out
+}
+
+/// Every documented command line runs against a real daemon: `<id>` becomes
+/// a live agent, `DIR` a temp dir, `N` a number and the agent command `cat`.
+#[test]
+fn skill_examples_run() {
+    let examples = skill_examples();
+    let subs: Vec<&str> = examples.iter().map(|e| e[1].as_str()).collect();
+    for (sub, flag) in [
+        ("ls", "--json"),
+        ("screen", ""),
+        ("history", "--lines"),
+        ("history", "--plain"),
+        ("send", "--enter"),
+        ("spawn", "--cwd"),
+        ("kill", ""),
+    ] {
+        assert!(
+            examples
+                .iter()
+                .any(|e| e[1] == sub && (flag.is_empty() || e.iter().any(|w| w == flag))),
+            "no `fleet {sub} {flag}` example"
+        );
+    }
+    assert!(!subs.contains(&"label"), "agents must not write labels");
+
+    let d = Daemon::start();
+    let work = TempDir::new().unwrap();
+    for example in &examples {
+        let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+        let mut args: Vec<String> = Vec::new();
+        for w in &example[1..] {
+            if args.last().is_some_and(|a| a == "--") {
+                args.push("cat".into());
+                break;
+            }
+            args.push(match w.as_str() {
+                "<id>" => id.clone(),
+                "DIR" => work.path().to_string_lossy().into_owned(),
+                "N" => "20".into(),
+                _ => w.clone(),
+            });
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = d.ok(&args);
+        if example[1] == "ls" {
+            let v: serde_json::Value = serde_json::from_str(&out).expect("ls --json");
+            assert!(v.is_array());
+        }
+    }
 }

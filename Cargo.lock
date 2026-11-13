@@ -459,6 +459,7 @@ name = "fleetd"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "fleet-client",
  "fleet-node",
  "fleet-proto",
  "fs4",

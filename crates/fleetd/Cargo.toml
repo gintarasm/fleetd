@@ -17,5 +17,6 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "signal", "m
 tokio-util = { version = "0.7.20", features = ["codec"] }
 
 [dev-dependencies]
+fleet-client = { path = "../fleet-client" }
 libc = "0.2.191"
 tempfile = "3.27.0"

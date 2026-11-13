@@ -1,3 +1,4 @@
+pub mod env;
 pub mod history;
 pub mod node;
 pub mod pty;

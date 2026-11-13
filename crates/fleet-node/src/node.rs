@@ -47,6 +47,7 @@
 //! drops the agent's pending events under that lock before its stream ends,
 //! so no activity follows an agent's exit.
 
+use crate::env::LoginEnv;
 use crate::history::{History, HistoryInfo, Page};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scrollback::{self, Scrollback};
@@ -1272,6 +1273,8 @@ pub struct Node {
     scrollback_dir: PathBuf,
     histories: Arc<Mutex<Histories>>,
     activity: Arc<ActivityHub>,
+    /// The base of every agent's environment.
+    base_env: LoginEnv,
 }
 
 impl Drop for Node {
@@ -1368,7 +1371,15 @@ impl Node {
                 spawning: HashSet::new(),
             })),
             activity,
+            base_env: LoginEnv::daemon(),
         })
+    }
+
+    /// Uses `env` as the base of agents' environments instead of the
+    /// daemon's own. The first spawn waits for a capture still running.
+    pub fn with_base_env(mut self, env: LoginEnv) -> Node {
+        self.base_env = env;
+        self
     }
 
     /// Receives every agent exit from now on.
@@ -1424,6 +1435,9 @@ impl Node {
             return Err(invalid("program is empty".into()));
         }
         check_labels(&req.labels)?;
+        // Waits (bounded) for a login-env capture still running, before
+        // anything is recorded.
+        let base_env = self.base_env.wait();
         let or_default = |v: u32, default: u16| if v == 0 { u32::from(default) } else { v };
         let (cols, rows) = checked_size(
             or_default(req.cols, DEFAULT_COLS),
@@ -1489,7 +1503,11 @@ impl Node {
                     cols,
                     rows,
                 };
-                let host_id = self.host.spawn_with_sink(spec, Box::new(sink))?;
+                let host_id = self.host.spawn_with_base_env(
+                    spec,
+                    base_env.as_deref().map(Vec::as_slice),
+                    Box::new(sink),
+                )?;
                 Ok((LiveAgent { host_id, pipeline }, attached))
             });
         let (live, attached) = match started {
@@ -1707,8 +1725,10 @@ impl Node {
     /// decision 0018): SIGTERM to each process group, [`SHUTDOWN_GRACE`] to
     /// exit, then SIGKILL. Exits are recorded as usual; an agent that still
     /// has not reported is left `running` in the store, to be marked lost by
-    /// the next [`Node::open`]. Refuses new spawns from now on.
+    /// the next [`Node::open`]. Refuses new spawns from now on, and kills a
+    /// login-env capture still running.
     pub fn shutdown(&self) {
+        self.base_env.cancel();
         let host_ids: Vec<AgentId> = {
             let mut agents = lock(&self.agents);
             agents.closing = true;

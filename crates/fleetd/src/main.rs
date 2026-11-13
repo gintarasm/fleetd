@@ -5,18 +5,31 @@ use fleetd::{Config, StartupError, raise_fd_limit, startup};
 
 fn main() -> ExitCode {
     let mut cfg = Config::default();
+    let mut stdio = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--state-dir" {
+        if arg == "--stdio" {
+            stdio = true;
+        } else if arg == "--state-dir" {
             let Some(dir) = args.next() else {
                 eprintln!("fleetd: --state-dir requires a path");
                 return ExitCode::from(64);
             };
             cfg.state_dir = PathBuf::from(dir);
         } else {
-            eprintln!("usage: fleetd [--state-dir <path>]");
+            eprintln!("usage: fleetd [--stdio] [--state-dir <path>]");
             return ExitCode::from(64);
         }
+    }
+
+    if stdio {
+        return match fleetd::stdio::run(&cfg) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("fleetd --stdio: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     if let Err(e) = raise_fd_limit() {
