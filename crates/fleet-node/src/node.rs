@@ -67,6 +67,7 @@ use std::thread::Thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
+use tracing::{debug, info, warn};
 
 /// Chunks a subscriber may fall behind before it is dropped.
 pub const SUBSCRIBER_CAPACITY: usize = 256;
@@ -984,7 +985,7 @@ impl AgentPipeline {
         if let Some(mut history) = state.history.take()
             && let Err(e) = history.flush()
         {
-            eprintln!("fleet-node: flushing agent history: {e}");
+            warn!(error = %e, "flushing agent history at exit failed");
         }
         state.exit_code = Some(code);
         state.input = None;
@@ -1134,7 +1135,7 @@ impl ActivityHub {
         match spawned {
             Ok(handle) => Some(handle.thread().clone()),
             Err(e) => {
-                eprintln!("fleet-node: starting the activity ticker: {e}");
+                warn!(error = %e, "starting the activity ticker failed");
                 None
             }
         }
@@ -1356,6 +1357,7 @@ impl Histories {
     /// Closes and deletes the agent's history.
     fn delete(&mut self, id: u64) {
         self.open.retain(|(i, _)| *i != id);
+        debug!(agent = id, "deleting history: beyond retention");
         remove_history_dir(&self.path(id));
     }
 }
@@ -1364,12 +1366,13 @@ fn remove_history_dir(path: &Path) {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("fleet-node: removing {}: {e}", path.display()),
+        Err(e) => warn!(path = ?path, error = %e, "removing agent history failed"),
     }
 }
 
 /// Deletes the history dirs under `dir` of agents other than `keep`.
 fn prune_history_dirs(dir: &Path, keep: &HashSet<u64>) -> io::Result<()> {
+    let mut pruned = 0usize;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let id = entry
@@ -1378,7 +1381,11 @@ fn prune_history_dirs(dir: &Path, keep: &HashSet<u64>) -> io::Result<()> {
             .and_then(|n| n.parse::<u64>().ok());
         if id.is_some_and(|id| !keep.contains(&id)) {
             remove_history_dir(&entry.path());
+            pruned += 1;
         }
+    }
+    if pruned > 0 {
+        info!(agents = pruned, "deleted history beyond retention");
     }
     Ok(())
 }
@@ -1426,8 +1433,9 @@ impl OutputSink for NodeSink {
 
     fn on_exit(&mut self, code: i32) {
         // The store first, so anyone who sees the exit also lists it.
+        info!(agent = self.id, code, "agent exited");
         if let Err(e) = lock(&self.store).set_exited(self.id, code) {
-            eprintln!("fleet-node: recording exit of agent {}: {e}", self.id);
+            warn!(agent = self.id, error = %e, "recording the exit failed");
         }
         // No activity for the agent after its exit: pending events are
         // dropped before its stream ends, and none are published after.
@@ -1703,8 +1711,9 @@ impl Node {
         let (live, attached) = match started {
             Ok(started) => started,
             Err(e) => {
+                warn!(agent = id, program = ?new.program, error = %e, "spawn failed");
                 if let Err(e) = lock(&self.store).delete_agent(id) {
-                    eprintln!("fleet-node: removing failed agent {id}: {e}");
+                    warn!(agent = id, error = %e, "removing the failed agent's row failed");
                 }
                 let _ = std::fs::remove_file(&path);
                 let mut histories = lock(&self.histories);
@@ -1738,6 +1747,16 @@ impl Node {
             histories.delete(evicted);
         }
         drop(histories);
+        // Label keys only: values, args and env may hold secrets.
+        let mut label_keys: Vec<&str> = new.labels.keys().map(String::as_str).collect();
+        label_keys.sort_unstable();
+        info!(
+            agent = id,
+            program = ?new.program,
+            cwd = ?new.cwd,
+            labels = ?label_keys,
+            "agent spawned"
+        );
         let info = AgentInfo {
             id,
             program: new.program,
@@ -1756,7 +1775,7 @@ impl Node {
     pub fn list(&self) -> io::Result<Vec<AgentInfo>> {
         let (records, bad) = lock(&self.store).list_agents_lossy().map_err(store_err)?;
         for e in bad {
-            eprintln!("fleet-node: skipping unreadable agent row: {e}");
+            warn!(error = %e, "skipping an unreadable agent row");
         }
         Ok(records.into_iter().map(agent_info).collect())
     }
@@ -1890,7 +1909,10 @@ impl Node {
     /// Sends SIGTERM to the agent's process group; a no-op once it exited.
     pub fn kill(&self, id: u64) -> io::Result<()> {
         match self.live(id) {
-            Ok(live) => self.host.kill(live.host_id),
+            Ok(live) => {
+                info!(agent = id, signal = "SIGTERM", "agent killed");
+                self.host.kill(live.host_id)
+            }
             Err(_) if self.exit_code(id).is_some() => Ok(()),
             Err(e) => Err(e),
         }
@@ -1924,21 +1946,23 @@ impl Node {
             agents.closing = true;
             agents.live.values().map(|a| a.host_id).collect()
         };
+        info!(agents = host_ids.len(), "shutdown: SIGTERM to every agent");
         for &id in &host_ids {
             if let Err(e) = self.host.kill(id) {
-                eprintln!("fleet-node: SIGTERM to agent group: {e}");
+                warn!(error = %e, "SIGTERM to an agent's group failed");
             }
         }
         if self.host.wait_all(SHUTDOWN_GRACE).is_ok() {
             return;
         }
+        warn!(grace = ?SHUTDOWN_GRACE, "shutdown: agents still running; SIGKILL");
         for &id in &host_ids {
             if let Err(e) = self.host.force_kill(id) {
-                eprintln!("fleet-node: SIGKILL to agent group: {e}");
+                warn!(error = %e, "SIGKILL to an agent's group failed");
             }
         }
         if self.host.wait_all(KILL_WAIT).is_err() {
-            eprintln!("fleet-node: some agents did not exit; they will be marked lost");
+            warn!("some agents did not exit; they will be marked lost");
         }
     }
 }

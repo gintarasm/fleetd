@@ -23,8 +23,8 @@ use fleet_node::history::HISTORY_PAGE_MAX_LINES;
 use fleet_node::node::{ActivityReceiver, ConnId, Node, StreamItem, Subscription};
 use fleet_proto::{
     Ack, AgentList, AttachOk, AttachRole, Event, Frame, FrameCodec, HandshakeReject, HelloOk,
-    HistoryPage, Lagged, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, Request, Response, SpawnAgent,
-    SpawnedAttached, event, request, response,
+    HistoryPage, Lagged, LogLine, LogLines, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, ReadLogs,
+    Request, Response, SpawnAgent, SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -32,6 +32,9 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tracing::{debug, info, warn};
+
+use crate::logging;
 
 /// Concurrent connections served; more are rejected.
 const MAX_CONNECTIONS: usize = 64;
@@ -74,6 +77,10 @@ impl Server {
                 tokio::spawn(connection(Arc::clone(&self.node), stream, slot));
             }
             Err(_) => {
+                warn!(
+                    max = MAX_CONNECTIONS,
+                    "connection rejected: too many connections"
+                );
                 tokio::spawn(async move {
                     let (_, wr) = stream.into_split();
                     let mut writer = FramedWrite::new(wr, FrameCodec::new());
@@ -89,22 +96,29 @@ async fn reject(writer: &mut Writer, reason: String) {
     let _ = tokio::time::timeout(HANDSHAKE_WRITE_TIMEOUT, writer.send(frame)).await;
 }
 
-/// Reads the `Hello` and answers it; `true` if the connection may proceed.
-async fn handshake(reader: &mut Reader, writer: &mut Writer) -> bool {
+/// Reads the `Hello` and answers it; the client's name if the connection
+/// may proceed.
+async fn handshake(conn: ConnId, reader: &mut Reader, writer: &mut Writer) -> Option<String> {
+    let reject_reason = |reason: &str| {
+        warn!(conn = conn.0, reason, "handshake rejected");
+    };
     let hello = match tokio::time::timeout(HELLO_TIMEOUT, reader.next()).await {
         Err(_) => {
-            eprintln!("fleetd: connection closed: no hello within {HELLO_TIMEOUT:?}");
-            return false;
+            reject_reason(&format!("no hello within {HELLO_TIMEOUT:?}"));
+            return None;
         }
-        Ok(None) => return false,
+        Ok(None) => {
+            debug!(conn = conn.0, "connection closed before its hello");
+            return None;
+        }
         Ok(Some(Err(e))) => {
-            eprintln!("fleetd: connection closed: bad hello: {e}");
-            return false;
+            reject_reason(&format!("bad hello: {e}"));
+            return None;
         }
         Ok(Some(Ok(Frame::Hello(hello)))) => hello,
         Ok(Some(Ok(_))) => {
-            eprintln!("fleetd: connection closed: first frame is not a hello");
-            return false;
+            reject_reason("first frame is not a hello");
+            return None;
         }
     };
     if hello.protocol_version != PROTOCOL_VERSION {
@@ -112,17 +126,21 @@ async fn handshake(reader: &mut Reader, writer: &mut Writer) -> bool {
             "unsupported protocol version {} (server speaks {PROTOCOL_VERSION})",
             hello.protocol_version
         );
+        reject_reason(&reason);
         reject(writer, reason).await;
-        return false;
+        return None;
     }
     let ok = Frame::HelloOk(HelloOk {
         protocol_version: PROTOCOL_VERSION,
         server: "fleetd".into(),
     });
-    matches!(
-        tokio::time::timeout(HANDSHAKE_WRITE_TIMEOUT, writer.send(ok)).await,
-        Ok(Ok(()))
-    )
+    match tokio::time::timeout(HANDSHAKE_WRITE_TIMEOUT, writer.send(ok)).await {
+        Ok(Ok(())) => Some(hello.client),
+        _ => {
+            debug!(conn = conn.0, "connection closed during the handshake");
+            None
+        }
+    }
 }
 
 async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePermit) {
@@ -132,21 +150,25 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
     // Subscribed before `HelloOk`, so no exit after the handshake is missed.
     let exits = node.exit_events();
     let activity = node.activity_events();
-    if !handshake(&mut reader, &mut writer).await {
+    let id = ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
+    let Some(client) = handshake(id, &mut reader, &mut writer).await else {
         return;
-    }
+    };
+    // `?`: the name is the client's, so it is quoted and escaped.
+    info!(conn = id.0, client = ?client, "connection opened");
     reader.decoder_mut().set_max(MAX_FRAME);
 
     let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
     let mut conn = Connection {
         node,
-        id: ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)),
+        id,
         outbox,
         forwarders: HashMap::new(),
         attached: Arc::new(Mutex::new(HashSet::new())),
+        log_follower: None,
     };
     let tasks = Tasks(vec![
-        tokio::spawn(write_frames(writer, rx)),
+        tokio::spawn(write_frames(id, writer, rx)),
         tokio::spawn(forward_exits(
             exits,
             conn.outbox.clone(),
@@ -155,23 +177,19 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
         tokio::spawn(forward_activity(activity, conn.outbox.clone())),
     ]);
 
-    while let Some(frame) = reader.next().await {
-        match frame {
-            Ok(Frame::Request(req)) => {
+    let reason = loop {
+        match reader.next().await {
+            None => break "client closed".to_string(),
+            Some(Ok(Frame::Request(req))) => {
                 if !conn.handle(req).await {
-                    break;
+                    break "write failed".to_string();
                 }
             }
-            Ok(_) => {
-                eprintln!("fleetd: connection closed: unexpected frame from client");
-                break;
-            }
-            Err(e) => {
-                eprintln!("fleetd: connection closed: {e}");
-                break;
-            }
+            Some(Ok(_)) => break "unexpected frame from client".to_string(),
+            Some(Err(e)) => break format!("read error: {e}"),
         }
-    }
+    };
+    info!(conn = id.0, reason, "connection closed");
     // Dropping `conn` and `tasks` aborts the forwarders (dropping their
     // subscriptions) and the writer, closing the socket.
     drop(conn);
@@ -198,11 +216,16 @@ struct Connection {
     /// Agents whose exit event the forwarder delivers (in order after their
     /// output), so the exit-event forwarder skips them.
     attached: Arc<Mutex<HashSet<u64>>>,
+    /// Streams new log lines while the client follows the log.
+    log_follower: Option<JoinHandle<()>>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
         for task in self.forwarders.values() {
+            task.abort();
+        }
+        if let Some(task) = &self.log_follower {
             task.abort();
         }
     }
@@ -277,6 +300,11 @@ impl Connection {
                 n.set_labels(l.agent_id, l.set, &l.remove)
             })
             .await),
+            Some(request::Kind::ReadLogs(r)) => return self.read_logs(req.id, r).await,
+            Some(request::Kind::StopLogs(_)) => {
+                self.stop_logs();
+                response::Kind::Ack(Ack {})
+            }
         };
         self.respond(req.id, kind).await
     }
@@ -292,8 +320,43 @@ impl Connection {
     /// Stops forwarding `agent_id`; once this returns, nothing more of its
     /// stream is queued. Dropping the subscription gives up the role.
     async fn detach(&mut self, agent_id: u64) {
+        if self.forwarders.contains_key(&agent_id) {
+            info!(agent = agent_id, conn = self.id.0, "detached");
+        }
         self.stop_forwarder(agent_id).await;
         lock(&self.attached).remove(&agent_id);
+    }
+
+    /// Answers with the log's tail; with `follow`, then streams new lines
+    /// (replacing an earlier follow).
+    async fn read_logs(&mut self, id: u64, r: ReadLogs) -> bool {
+        let Some(logs) = logging::logs() else {
+            return self
+                .respond(id, error("this fleetd has no log file".into()))
+                .await;
+        };
+        self.stop_logs();
+        let read = tokio::task::spawn_blocking(move || logs.read(r.tail, r.follow)).await;
+        let (lines, follow) = match read {
+            Ok(read) => read,
+            Err(e) => return self.respond(id, error(e.to_string())).await,
+        };
+        if !self
+            .respond(id, response::Kind::LogLines(LogLines { lines }))
+            .await
+        {
+            return false;
+        }
+        if let Some(lines) = follow {
+            self.log_follower = Some(tokio::spawn(forward_logs(lines, self.outbox.clone())));
+        }
+        true
+    }
+
+    fn stop_logs(&mut self) {
+        if let Some(task) = self.log_follower.take() {
+            task.abort();
+        }
     }
 
     /// Stops the agent's forwarder (dropping its subscription), if any.
@@ -340,6 +403,12 @@ impl Connection {
         };
         // A lagging old forwarder may have handed the exit event back.
         lock(&self.attached).insert(agent_id);
+        info!(
+            agent = agent_id,
+            conn = self.id.0,
+            primary = ok.primary,
+            "attached"
+        );
         if !self
             .respond(id, response::Kind::Attached(Box::new(ok)))
             .await
@@ -378,6 +447,12 @@ impl Connection {
             Err(e) => return self.respond(id, error(e.to_string())).await,
         };
         let agent_id = info.id;
+        info!(
+            agent = agent_id,
+            conn = self.id.0,
+            primary = ok.primary,
+            "attached"
+        );
         let reply = response::Kind::SpawnedAttached(Box::new(SpawnedAttached {
             agent: Some(info),
             attached: Some(ok),
@@ -393,6 +468,7 @@ impl Connection {
     fn forward(&mut self, agent_id: u64, sub: Subscription) {
         let task = tokio::spawn(forward_output(
             Arc::clone(&self.node),
+            self.id,
             agent_id,
             sub,
             self.outbox.clone(),
@@ -414,6 +490,7 @@ fn exited_event(agent_id: u64, exit_code: i32) -> Frame {
 /// Streams one agent's output, then its exit or `Event::Lagged`.
 async fn forward_output(
     node: Arc<Node>,
+    conn: ConnId,
     agent_id: u64,
     mut sub: Subscription,
     outbox: mpsc::Sender<Frame>,
@@ -422,9 +499,12 @@ async fn forward_output(
     while let Some(item) = sub.recv().await {
         let frame = match item {
             StreamItem::Output(data) => Frame::Output { agent_id, data },
-            StreamItem::Role(primary) => Frame::Event(Event {
-                kind: Some(event::Kind::Role(AttachRole { agent_id, primary })),
-            }),
+            StreamItem::Role(primary) => {
+                info!(agent = agent_id, conn = conn.0, primary, "role changed");
+                Frame::Event(Event {
+                    kind: Some(event::Kind::Role(AttachRole { agent_id, primary })),
+                })
+            }
             StreamItem::Exited(code) => {
                 let _ = outbox.send(exited_event(agent_id, code)).await;
                 return;
@@ -435,6 +515,11 @@ async fn forward_output(
                 // `Exited` item discarded with the lag), so send it here. An
                 // exit racing this hand-off may be announced twice.
                 lock(&attached).remove(&agent_id);
+                warn!(
+                    agent = agent_id,
+                    conn = conn.0,
+                    "subscription dropped: the client fell behind (Lagged)"
+                );
                 let lagged = Frame::Event(Event {
                     kind: Some(event::Kind::Lagged(Lagged { agent_id })),
                 });
@@ -474,7 +559,7 @@ async fn forward_exits(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                eprintln!("fleetd: client missed {n} exit events");
+                warn!(missed = n, "a connection missed exit events");
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
@@ -504,19 +589,32 @@ async fn forward_activity(activity: ActivityReceiver, outbox: mpsc::Sender<Frame
     }
 }
 
+/// Streams new log lines (a follower that fell behind gets a marker line
+/// from the log writer, see [`logging`]).
+async fn forward_logs(mut lines: mpsc::Receiver<String>, outbox: mpsc::Sender<Frame>) {
+    while let Some(line) = lines.recv().await {
+        let frame = Frame::Event(Event {
+            kind: Some(event::Kind::LogLine(LogLine { line })),
+        });
+        if outbox.send(frame).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Writes queued frames, flushing whenever the queue runs dry.
-async fn write_frames(mut writer: Writer, mut outbox: mpsc::Receiver<Frame>) {
+async fn write_frames(conn: ConnId, mut writer: Writer, mut outbox: mpsc::Receiver<Frame>) {
     while let Some(frame) = outbox.recv().await {
         let mut next = Some(frame);
         while let Some(frame) = next {
             if let Err(e) = writer.feed(frame).await {
-                eprintln!("fleetd: write failed: {e}");
+                debug!(conn = conn.0, error = %e, "write failed");
                 return;
             }
             next = outbox.try_recv().ok();
         }
         if let Err(e) = writer.flush().await {
-            eprintln!("fleetd: write failed: {e}");
+            debug!(conn = conn.0, error = %e, "write failed");
             return;
         }
     }

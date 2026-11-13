@@ -460,6 +460,10 @@ impl History {
     /// accounting back to what is really in the file (truncating any partial
     /// write) and stop writing. Reads past the durable end then error out.
     fn fail(&mut self) {
+        if !self.broken {
+            // Once per store: it stops writing after this.
+            tracing::warn!(dir = ?self.dir, "history disk write failed; keeping only the in-memory tail");
+        }
         self.broken = true;
         let seg = self.segments.last_mut().unwrap();
         let good = seg.bytes - self.pending.len() as u64;
@@ -509,6 +513,9 @@ impl History {
         let path = seg_path(&self.dir, self.next_line);
         let ok = write_meta(&self.dir, self.generation, self.first_line).is_ok();
         self.broken = !ok || create_seg_file(&path).and_then(|f| f.set_len(0)).is_err();
+        if self.broken {
+            tracing::warn!(dir = ?self.dir, "history disk write failed after a clear; keeping only the in-memory tail");
+        }
         self.segments.push(Segment {
             first_line: self.next_line,
             lines: 0,

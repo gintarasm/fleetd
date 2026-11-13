@@ -11,6 +11,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use tracing::{debug, info};
+
 use crate::Config;
 
 /// How long to wait for a daemon this bridge started.
@@ -24,16 +26,24 @@ const ALREADY_RUNNING: i32 = 2;
 /// Bridges stdin/stdout to the daemon on `cfg`, starting it if needed, until
 /// either side closes. Returns an error if no daemon could be reached.
 pub fn run(cfg: &Config) -> Result<(), String> {
+    info!(pid = std::process::id(), state_dir = ?cfg.state_dir, "stdio bridge started");
     let stream = connect_or_start(cfg)?;
-    bridge(stream).map_err(|e| format!("bridge: {e}"))
+    let bridged = bridge(stream).map_err(|e| format!("bridge: {e}"));
+    info!(ok = bridged.is_ok(), "stdio bridge closed");
+    bridged
 }
 
 fn connect_or_start(cfg: &Config) -> Result<UnixStream, String> {
     let sock = cfg.socket_path();
     if let Ok(s) = UnixStream::connect(&sock) {
+        debug!("connected to the running daemon");
         return Ok(s);
     }
     let mut child = start_daemon(cfg).map_err(|e| format!("starting fleetd: {e}"))?;
+    info!(
+        daemon_pid = child.id(),
+        "no daemon answered; auto-started one"
+    );
     let deadline = Instant::now() + START_TIMEOUT;
     let mut reaped = false;
     loop {
@@ -46,6 +56,7 @@ fn connect_or_start(cfg: &Config) -> Result<UnixStream, String> {
             if status.code() != Some(ALREADY_RUNNING) {
                 return Err(format!("fleetd failed to start ({status})"));
             }
+            info!("the auto-started daemon lost the instance lock; waiting for the winner");
         }
         if Instant::now() >= deadline {
             return Err(format!(

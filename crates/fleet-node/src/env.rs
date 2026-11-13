@@ -62,12 +62,32 @@ const CAPTURE_STACK: usize = 128 * 1024;
 /// shell cannot be run, prints no complete environment, or takes longer
 /// than `timeout`; the shell's whole process group is then killed.
 pub fn capture_login_env(shell: &Path, timeout: Duration) -> Option<EnvVars> {
-    capture(shell, timeout, &Mutex::new(None))
+    capture(shell, timeout, &Mutex::new(None)).ok()
+}
+
+/// Why a capture produced no environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureFailure {
+    Timeout,
+    Failed,
+}
+
+impl CaptureFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            CaptureFailure::Timeout => "timeout",
+            CaptureFailure::Failed => "failed",
+        }
+    }
 }
 
 /// [`capture_login_env`], keeping the shell's pid in `running` while it may
 /// be signalled (it is cleared before the shell is reaped).
-fn capture(shell: &Path, timeout: Duration, running: &Mutex<Option<u32>>) -> Option<EnvVars> {
+fn capture(
+    shell: &Path,
+    timeout: Duration,
+    running: &Mutex<Option<u32>>,
+) -> Result<EnvVars, CaptureFailure> {
     let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(shell);
     cmd.arg("-lic")
@@ -87,7 +107,7 @@ fn capture(shell: &Path, timeout: Duration, running: &Mutex<Option<u32>>) -> Opt
             Ok(())
         });
     }
-    let mut child = cmd.spawn().ok()?;
+    let mut child = cmd.spawn().map_err(|_| CaptureFailure::Failed)?;
     *lock(running) = Some(child.id());
     let stdout = child.stdout.take().expect("piped stdout");
     let out = read_until_end(stdout, deadline);
@@ -102,7 +122,11 @@ fn capture(shell: &Path, timeout: Duration, running: &Mutex<Option<u32>>) -> Opt
         *running = None;
     }
     let _ = child.wait();
-    parse_env_dump(&out.ok()?)
+    let out = out.map_err(|e| match e.kind() {
+        io::ErrorKind::TimedOut => CaptureFailure::Timeout,
+        _ => CaptureFailure::Failed,
+    })?;
+    parse_env_dump(&out).ok_or(CaptureFailure::Failed)
 }
 
 /// Reads `stdout` until the end marker, EOF or the deadline. Stops at the
@@ -257,7 +281,25 @@ impl LoginEnv {
             .name("login-env".into())
             .stack_size(CAPTURE_STACK)
             .spawn(move || {
-                let vars = capture(&shell, timeout, &inner.running).map(Arc::new);
+                let begun = Instant::now();
+                let captured = capture(&shell, timeout, &inner.running);
+                let duration_ms = begun.elapsed().as_millis() as u64;
+                // Only the count: values are never logged.
+                match &captured {
+                    Ok(vars) => tracing::info!(
+                        result = "ok",
+                        duration_ms,
+                        vars = vars.len(),
+                        "login env captured"
+                    ),
+                    Err(why) => tracing::warn!(
+                        result = why.as_str(),
+                        duration_ms,
+                        shell = ?shell,
+                        "login env capture failed; agents start from the daemon's env"
+                    ),
+                }
+                let vars = captured.ok().map(Arc::new);
                 let mut state = lock(&inner.state);
                 // A waiter that gave up already settled on the daemon's env.
                 if matches!(*state, State::Pending) {
@@ -267,7 +309,10 @@ impl LoginEnv {
             });
         match started {
             Ok(_) => env,
-            Err(_) => LoginEnv::daemon(),
+            Err(e) => {
+                tracing::warn!(error = %e, "starting the login env capture failed");
+                LoginEnv::daemon()
+            }
         }
     }
 

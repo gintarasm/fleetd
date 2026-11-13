@@ -88,8 +88,35 @@ enum Command {
         #[arg(long, hide = true)]
         snapshot_only: bool,
     },
+    /// Print fleetd's log (on the daemon's host: <state-dir>/logs/fleetd.log)
+    Logs {
+        /// The last N lines (at most 10000)
+        #[arg(short = 'n', long = "lines", default_value_t = 100)]
+        lines: u32,
+        /// Then print new lines as they are logged, until Ctrl-C
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Install the agent skill that teaches agents to use `fleet`
     Skill(skill::SkillArgs),
+}
+
+/// Prints `lines`; `false` once stdout is closed (e.g. piped into `head`).
+fn print_lines(out: &mut impl std::io::Write, lines: &[String]) -> bool {
+    lines.iter().all(|l| writeln!(out, "{l}").is_ok()) && out.flush().is_ok()
+}
+
+fn logs(mut client: Connection, lines: u32, follow: bool) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    if !print_lines(&mut out, &client.read_logs(lines, follow)?) || !follow {
+        return Ok(());
+    }
+    while let Some(line) = client.next_log_line()? {
+        if !print_lines(&mut out, std::slice::from_ref(&line)) {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn state_dir(cli: &Cli) -> PathBuf {
@@ -245,6 +272,7 @@ fn run(cli: Cli) -> Result<u8> {
             attach::Outcome::Signaled(sig) => return Ok(128 + sig as u8),
             attach::Outcome::Exited | attach::Outcome::Detached => {}
         },
+        Command::Logs { lines, follow } => logs(client, lines, follow)?,
         Command::Skill(_) => unreachable!("handled before connecting"),
     }
     Ok(0)

@@ -8,7 +8,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use bytes::BytesMut;
-use fleet_proto::{Frame, FrameCodec, Hello, PROTOCOL_VERSION, Request, request, response};
+use fleet_proto::{
+    Event, Frame, FrameCodec, Hello, PROTOCOL_VERSION, ReadLogs, Request, event, request, response,
+};
 use tokio_util::codec::{Decoder, Encoder};
 
 #[derive(Debug)]
@@ -182,6 +184,30 @@ impl Connection {
                 }
                 Some(_) => {}
                 None => return Err(Error::Protocol("connection closed".into())),
+            }
+        }
+    }
+
+    /// The last `tail` lines of the daemon's log, oldest first (ADR 0027).
+    /// With `follow`, new lines then arrive as `Event::LogLine` frames;
+    /// read them with [`Connection::next_log_line`].
+    pub fn read_logs(&mut self, tail: u32, follow: bool) -> Result<Vec<String>> {
+        match self.call(request::Kind::ReadLogs(ReadLogs { tail, follow }))? {
+            response::Kind::LogLines(l) => Ok(l.lines),
+            _ => Err(Error::Protocol("unexpected reply to read logs".into())),
+        }
+    }
+
+    /// The next followed log line, skipping other frames; `None` when the
+    /// server closed the connection.
+    pub fn next_log_line(&mut self) -> Result<Option<String>> {
+        loop {
+            match self.reader.read_frame()? {
+                Some(Frame::Event(Event {
+                    kind: Some(event::Kind::LogLine(l)),
+                })) => return Ok(Some(l.line)),
+                Some(_) => {}
+                None => return Ok(None),
             }
         }
     }

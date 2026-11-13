@@ -17,6 +17,8 @@ message Request {
     KillAgent kill = 8;
     ReadHistory read_history = 9;
     SetLabels set_labels = 10;
+    ReadLogs read_logs = 11;
+    StopLogs stop_logs = 12;
   }
 }
 
@@ -30,6 +32,7 @@ message Response {
     Error error = 6;
     HistoryPage history = 7;
     SpawnedAttached spawned_attached = 8;
+    LogLines log_lines = 9;
   }
 }
 
@@ -39,6 +42,7 @@ message Event {
     Lagged lagged = 2;
     AgentActivity activity = 3;
     AttachRole role = 4;
+    LogLine log_line = 5;
   }
 }
 
@@ -126,3 +130,13 @@ message Lagged { uint64 agent_id = 1; }
 message AgentActivity { uint64 agent_id = 1; string last_line = 2; int64 last_output_unix_ms = 3; }
 message AttachRole { uint64 agent_id = 1; bool primary = 2; }
 message Ack {}
+
+// The daemon's log (ADR 0027): the last `tail` lines (capped at 10 000) of
+// `fleetd.log.2`, `.1` and `fleetd.log`, oldest first, answered by
+// `LogLines`. With `follow`, each new line then arrives as `LogLine` until
+// `StopLogs` (answered by `Ack`) or disconnect; a follower that falls behind
+// gets a `LogLine` "… N lines dropped" and stays connected.
+message ReadLogs { uint32 tail = 1; bool follow = 2; }
+message StopLogs {}
+message LogLines { repeated string lines = 1; }
+message LogLine { string line = 1; }

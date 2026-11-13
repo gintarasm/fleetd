@@ -62,6 +62,15 @@ The state directory (mode 0700) holds:
 | `state.db` | agent records (SQLite) |
 | `scrollback/` | per-agent raw output (8 MiB ring file each) |
 | `history/` | per-agent history: the lines that scrolled off the screen (up to 64 MiB each) |
+| `logs/` | the daemon's log `fleetd.log` (rotated at 10 MiB into `fleetd.log.1` and `.2`, 30 MiB at most) and the `--stdio` bridges' `fleetd-stdio.log` |
+
+### Logs
+
+The daemon logs to `<state-dir>/logs/fleetd.log` (`~/.fleet/logs/fleetd.log` by default), never to stdout, so a daemon started by `--stdio` or a service manager can still be diagnosed. Each line has a UTC timestamp, the level, where it came from, a message and `key=value` fields. Logged: start and stop, connections, spawns, exits, kills, attaches, lag drops, history problems and the login-env capture result. Never logged: environment values, agent arguments, terminal output, input and label values.
+
+- **`FLEETD_LOG`** sets the level (default `info`), for example `FLEETD_LOG=debug fleetd`. It takes [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directives, such as `fleetd=debug,fleet_node=info`.
+- **`fleet logs`** prints the log over the protocol, so it works for a daemon on another host too (see below).
+- Logging never slows down agents: when the disk cannot keep up, lines are dropped and the log says how many. Design: [0027](docs/decisions/0027-logging.md).
 
 ## CLI: `fleet`
 
@@ -168,6 +177,16 @@ fleet skill print                    # prints the skill
 ```
 
 The skill teaches an agent (Claude Code for now) to use `fleet`: list agents (`ls --json`), read another agent's `screen` or `history`, `send` it input, and `spawn` or `kill` agents when you ask it to. Each agent knows its own id from `$FLEET_AGENT_ID`. The skill is built into the `fleet` binary, so re-running `install` after an upgrade updates it. It does not need a running daemon.
+
+### Read the daemon's log
+
+```sh
+fleet logs                 # the last 100 lines
+fleet logs -n 500          # the last 500 (at most 10000)
+fleet logs -f              # then follow new lines until Ctrl-C
+```
+
+`fleet logs` reads the daemon's log over the protocol, including the rotated files. A follower that falls behind sees `… N lines dropped` and keeps following.
 
 ### Exit codes
 

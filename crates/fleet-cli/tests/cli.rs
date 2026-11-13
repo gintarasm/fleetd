@@ -143,6 +143,60 @@ fn unknown_agent_errors_exit_1() {
 }
 
 #[test]
+fn fleet_logs_prints_tail() {
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+    wait_for("spawn logged", || {
+        d.ok(&["logs"])
+            .contains(&format!("agent spawned agent={id}"))
+    });
+    let all = d.ok(&["logs"]);
+    assert!(all.contains("fleetd started"), "{all}");
+    assert!(all.lines().count() <= 100, "default -n 100");
+    let one = d.ok(&["logs", "-n", "1"]);
+    assert_eq!(one.lines().count(), 1, "{one}");
+}
+
+#[test]
+fn fleet_logs_follow_prints_new_lines() {
+    let d = Daemon::start();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .arg("--state-dir")
+        .arg(d.dir.path())
+        .args(["logs", "-n", "0", "-f"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            if String::from_utf8_lossy(&seen).contains("agent spawned") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&seen).into_owned()
+    });
+    // `-f` is following once its own connection's ReadLogs is answered;
+    // keep spawning until a spawn shows up in the stream.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !reader.is_finished() {
+        assert!(Instant::now() < deadline, "follow printed no spawn");
+        d.ok(&["spawn", "--", "cat"]);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(reader.join().unwrap().contains("agent spawned"));
+}
+
+#[test]
 fn daemon_not_running_message() {
     let dir = TempDir::new().unwrap();
     let out = fleet(dir.path(), &["ls"]);
