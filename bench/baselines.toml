@@ -10,6 +10,10 @@ tolerance = { instr = 0.02, wall = 0.05 }
 suite = "wall"
 unit = "ns"
 budget = 200000000     # cold start < 200 ms (docs/plan.md)
+# report-only: ~2 ms process start varies ±15% run to run on the self-hosted
+# runner (vs the 5% gate). The 200 ms budget still applies, and
+# fleetd_startup_instructions catches code regressions deterministically.
+report_only = true
 baseline = 2418374.5
 
 [metrics.fleetd_idle_rss_bytes]

@@ -31,11 +31,11 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 
 Tolerances: `instr` 2%, `wall` 5%.
 
-`flood50_cpu_ns_per_mib` is `report_only` (see below) until the self-hosted runner is characterised.
+`flood50_cpu_ns_per_mib` is `report_only` (see below) until the self-hosted runner is characterised. `fleetd_cold_start_ns` is `report_only` against its baseline because a ~2 ms process start varies about ±15% run to run on the runner; its 200 ms budget still gates.
 
 ### Report-only metrics
 
-A metric with `report_only = true` is still measured, printed (its status is marked `(report-only)`) and tightened, but a regression or budget breach on it does not fail the gate. Missing, unknown, invalid (non-finite or <= 0) and unit-mismatched values still fail: the measurement must exist and be sane. Turning `report_only` on is a loosening and needs user approval; turning it off is free.
+A metric with `report_only = true` is still measured, printed (its status is marked `(report-only)`) and tightened, but a regression against its baseline does not fail the gate. Its `budget`, if any, still does: the budget is the hard limit. Missing, unknown, invalid (non-finite or <= 0) and unit-mismatched values still fail: the measurement must exist and be sane. Turning `report_only` on is a loosening and needs user approval; turning it off is free.
 
 ## Baselines
 
