@@ -650,9 +650,15 @@ fn sigterm_stops_agents_and_records_their_exit() {
     let mut d = Daemon::start(dir.path());
     let mut c = Client::open(dir.path());
     // Ignores the PTY hangup and SIGTERM: only SIGKILL stops it.
-    let info = c.sh("trap '' HUP TERM; echo \"pid=$$\"; sleep 600");
-    c.attach(info.id);
-    let out = c.output_until(info.id, "\n");
+    let info = c.sh("trap '' HUP TERM; echo \"pid=$$ ready\"; sleep 600");
+    // The echo may land before the attach (then it is in the snapshot, drawn
+    // with cursor moves and no "\n") or after it (then in Output frames).
+    let snapshot = String::from_utf8_lossy(&c.attach(info.id).snapshot).into_owned();
+    let out = if snapshot.contains(" ready") {
+        snapshot
+    } else {
+        c.output_until(info.id, " ready")
+    };
     let pid: i32 = out
         .split("pid=")
         .nth(1)
