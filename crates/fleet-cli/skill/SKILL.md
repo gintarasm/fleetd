@@ -64,7 +64,7 @@ agent is waiting for input, not while it is working.
 
 ```sh
 fleet spawn --cwd DIR -- claude
-fleet spawn --cwd DIR --label role=reviewer -- claude "review the diff"
+fleet spawn --cwd DIR -- claude "review the diff"
 fleet kill <id>
 ```
 

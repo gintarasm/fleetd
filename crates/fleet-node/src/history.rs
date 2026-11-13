@@ -512,8 +512,11 @@ impl History {
         }
         let path = seg_path(&self.dir, self.next_line);
         let ok = write_meta(&self.dir, self.generation, self.first_line).is_ok();
+        let was_broken = self.broken;
         self.broken = !ok || create_seg_file(&path).and_then(|f| f.set_len(0)).is_err();
-        if self.broken {
+        // Only on the healthy -> broken transition (like `fail`): a clear can
+        // run on every agent output chunk, under the pipeline lock.
+        if self.broken && !was_broken {
             tracing::warn!(dir = ?self.dir, "history disk write failed after a clear; keeping only the in-memory tail");
         }
         self.segments.push(Segment {

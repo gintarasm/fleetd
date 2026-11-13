@@ -832,6 +832,12 @@ fn skill_examples_run() {
         );
     }
     assert!(!subs.contains(&"label"), "agents must not write labels");
+    assert!(
+        !examples
+            .iter()
+            .any(|e| e[1] == "spawn" && e.iter().any(|w| w == "--label")),
+        "agents must not write labels, not even at spawn"
+    );
 
     let d = Daemon::start();
     let work = TempDir::new().unwrap();
