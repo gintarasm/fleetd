@@ -398,6 +398,7 @@ dependencies = [
  "fleet-term",
  "libc",
  "portable-pty",
+ "prost",
  "rusqlite",
  "serde_json",
  "tempfile",

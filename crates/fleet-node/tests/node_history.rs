@@ -280,3 +280,27 @@ fn rows_a_shrink_pushes_off_become_history() {
     assert_eq!(numbers(&text), (0..10).collect::<Vec<_>>());
     node.shutdown();
 }
+
+#[test]
+fn blank_lines_keep_attach_bounded() {
+    use prost::Message;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    let id = spawn_sh(&node, "yes '' | head -n 100000; echo DONE; exec sleep 100");
+    let ok = attach_when_shown(&node, id, "DONE");
+    assert!(
+        ok.tail_first_line + ok.history_tail.len() as u64 >= 99_000,
+        "blank lines did not reach history"
+    );
+    assert!(
+        ok.history_tail.len() <= 4096,
+        "{} tail lines",
+        ok.history_tail.len()
+    );
+    let encoded = ok.encoded_len();
+    assert!(
+        encoded <= 256 * 1024 + 64 * 1024,
+        "AttachOk is {encoded} bytes"
+    );
+    node.shutdown();
+}

@@ -140,7 +140,8 @@ fn read_meta(dir: &Path) -> io::Result<(u64, u64)> {
 
 /// The in-memory tail: the most recent lines' bytes back to back in one ring
 /// buffer, plus each line's length. At most `limit` bytes (the `limit` passed
-/// to [`Tail::push`]); a line longer than that empties it.
+/// to [`Tail::push`]) and [`HISTORY_PAGE_MAX_LINES`] lines; a line longer
+/// than `limit` empties it.
 #[derive(Default)]
 struct Tail {
     buf: VecDeque<u8>,
@@ -157,7 +158,11 @@ impl Tail {
             self.clear();
             return;
         }
-        while self.buf.len() + line.len() > limit {
+        // Also capped in lines, like a reopened tail (`rebuild_tail`): blank
+        // rows are 0-byte lines and would otherwise pile up unbounded.
+        while self.buf.len() + line.len() > limit
+            || self.lens.len() >= HISTORY_PAGE_MAX_LINES as usize
+        {
             self.pop_front();
         }
         let need = self.buf.len() + line.len();
@@ -748,6 +753,20 @@ mod tests {
         assert!(total <= HISTORY_PAGE_MAX_BYTES);
         assert_eq!(p.lines.len(), 25);
         assert_eq!(p.first_line, 75);
+    }
+
+    #[test]
+    fn blank_lines_keep_the_tail_bounded_in_lines() {
+        let d = tempfile::tempdir().unwrap();
+        let mut h = History::create(&d.path().join("h")).unwrap();
+        for _ in 0..100_000 {
+            h.push(b"");
+        }
+        h.push(b"last");
+        let (first, lines) = h.tail();
+        assert_eq!(lines.len(), HISTORY_PAGE_MAX_LINES as usize);
+        assert_eq!(first + lines.len() as u64, 100_001);
+        assert_eq!(lines.last().unwrap().as_ref(), b"last");
     }
 
     #[test]
