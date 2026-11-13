@@ -97,8 +97,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::Tighten { baselines, results } => {
             let (text, mut b, r) = load(&baselines, &results)?;
-            tighten(&mut b, &r);
+            let notes = tighten(&mut b, &r);
             write(&baselines, &text, &b)?;
+            for note in notes {
+                eprintln!("fleet-perf: {note}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Run { suite, out, quick } => {
@@ -146,10 +149,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Cmd::BaselineAdd { baselines, results } => {
             let (text, mut b, r) = load(&baselines, &results)?;
-            let added = baseline_add(&mut b, &r);
+            let (added, notes) = baseline_add(&mut b, &r);
             write(&baselines, &text, &b)?;
             for name in added {
                 println!("added {name}");
+            }
+            for note in notes {
+                eprintln!("fleet-perf: {note}");
             }
             Ok(ExitCode::SUCCESS)
         }

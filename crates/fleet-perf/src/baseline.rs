@@ -332,23 +332,52 @@ impl fmt::Display for Report {
 /// improvements beyond tolerance (`Status::Improved`). Never raises, and
 /// leaves within-tolerance noise alone so baselines do not ratchet down on
 /// lucky runs. Only metrics of the results' suite are touched.
-pub fn tighten(b: &mut Baselines, r: &Results) {
+/// Returns notes on baselines it left alone: a `count` metric is never
+/// lowered to 0, since a baseline of 0 means "not yet recorded".
+pub fn tighten(b: &mut Baselines, r: &Results) -> Vec<String> {
     let report = compare(b, r);
+    let mut notes = Vec::new();
     for row in report.rows {
         if matches!(row.status, Status::Improved | Status::Unrecorded)
             && let Some(spec) = b.metrics.get_mut(&row.name)
         {
+            if zero_count(&spec.unit, row.value) {
+                notes.push(zero_count_note(&row.name, spec.baseline));
+                continue;
+            }
             spec.baseline = row.value;
         }
     }
+    notes
+}
+
+fn zero_count(unit: &str, value: f64) -> bool {
+    unit == COUNT_UNIT && value == 0.0
+}
+
+fn zero_count_note(name: &str, kept: f64) -> String {
+    format!(
+        "{name}: count of 0 not written as its baseline (0 means unrecorded); \
+         baseline stays {kept}"
+    )
 }
 
 /// Adds metrics present in the results but not in the baselines, with
-/// `baseline = value` and no budget. Returns the names added.
-pub fn baseline_add(b: &mut Baselines, r: &Results) -> Vec<String> {
+/// `baseline = value` and no budget. Returns the names added, and notes on
+/// those skipped: a `count` of 0 is not added (a baseline of 0 means "not
+/// yet recorded"); add it by hand with a non-zero baseline.
+pub fn baseline_add(b: &mut Baselines, r: &Results) -> (Vec<String>, Vec<String>) {
     let mut added = Vec::new();
+    let mut notes = Vec::new();
     for (name, m) in &r.metrics {
         if !b.metrics.contains_key(name) {
+            if zero_count(&m.unit, m.value) {
+                notes.push(format!(
+                    "{name}: count of 0 not added (0 means unrecorded); add it with a non-zero \
+                     baseline"
+                ));
+                continue;
+            }
             b.metrics.insert(
                 name.clone(),
                 MetricSpec {
@@ -363,7 +392,7 @@ pub fn baseline_add(b: &mut Baselines, r: &Results) -> Vec<String> {
             added.push(name.clone());
         }
     }
-    added
+    (added, notes)
 }
 
 fn number(v: f64) -> Value {
@@ -621,6 +650,41 @@ baseline = 100
     }
 
     #[test]
+    fn tighten_never_writes_a_zero_count_baseline() {
+        let mut b = with_count();
+        let notes = tighten(&mut b, &count_res(0.0));
+        assert_eq!(b.metrics["m_count"].baseline, 5.0);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("m_count:"), "{notes:?}");
+        // Still compares as an improvement, not unrecorded.
+        assert_eq!(
+            status(&b, &count_res(0.0), "m_count"),
+            (Status::Improved, false)
+        );
+        // A non-zero improvement is tightened as before.
+        assert!(tighten(&mut b, &count_res(2.0)).is_empty());
+        assert_eq!(b.metrics["m_count"].baseline, 2.0);
+    }
+
+    #[test]
+    fn baseline_add_skips_a_zero_count() {
+        let mut b = base();
+        let mut r = res(
+            Suite::Wall,
+            &[("zero_c", 0.0), ("one_c", 1.0), ("zero_ns", 0.0)],
+        );
+        for name in ["zero_c", "one_c"] {
+            r.metrics.get_mut(name).unwrap().unit = COUNT_UNIT.into();
+        }
+        let (added, notes) = baseline_add(&mut b, &r);
+        assert_eq!(added, vec!["one_c", "zero_ns"]);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("zero_c:"), "{notes:?}");
+        assert!(!b.metrics.contains_key("zero_c"));
+        assert_eq!(b.metrics["one_c"].baseline, 1.0);
+    }
+
+    #[test]
     fn zero_is_invalid_for_other_units() {
         let b = with_count();
         let r = res(Suite::Wall, &[("m_wall", 0.0)]);
@@ -771,11 +835,12 @@ baseline = 100
     #[test]
     fn baseline_add_adds_unknown_only() {
         let mut b = base();
-        let added = baseline_add(
+        let (added, notes) = baseline_add(
             &mut b,
             &res(Suite::Wall, &[("m_wall", 1.0), ("new_m", 7.0)]),
         );
         assert_eq!(added, vec!["new_m"]);
+        assert!(notes.is_empty());
         assert_eq!(b.metrics["new_m"].baseline, 7.0);
         assert_eq!(b.metrics["new_m"].budget, None);
         assert_eq!(b.metrics["m_wall"].baseline, 100.0);
