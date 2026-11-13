@@ -82,10 +82,15 @@ pub struct History {
     /// Append handle (also used for reads) of the last segment.
     active: File,
     pending: Vec<u8>,
+    /// Records currently in `pending`.
+    pending_lines: u64,
     /// Set after a disk write failure; further pushes only feed the tail.
     broken: bool,
     tail: VecDeque<Bytes>,
     tail_bytes: usize,
+    /// Test-only: make the next flush write half the buffer, then fail.
+    #[cfg(test)]
+    fault: bool,
 }
 
 fn invalid_data(msg: &str) -> io::Error {
@@ -142,6 +147,8 @@ struct SegReader<'a> {
     file: &'a File,
     flushed: u64,
     pending: &'a [u8],
+    /// Logical end of the segment; records may not extend past it.
+    limit: u64,
     pos: u64,
     buf: Vec<u8>,
     buf_start: u64,
@@ -153,6 +160,7 @@ impl<'a> SegReader<'a> {
             file,
             flushed,
             pending,
+            limit: flushed + pending.len() as u64,
             pos,
             buf: Vec::new(),
             buf_start: 0,
@@ -192,14 +200,22 @@ impl<'a> SegReader<'a> {
     fn skip_record(&mut self) -> io::Result<()> {
         let mut len = [0u8; 4];
         self.read_exact(&mut len)?;
-        self.pos += u32::from_le_bytes(len) as u64;
+        let n = u32::from_le_bytes(len) as u64;
+        if self.pos + n > self.limit {
+            return Err(invalid_data("history record overruns segment"));
+        }
+        self.pos += n;
         Ok(())
     }
 
     fn record(&mut self) -> io::Result<Bytes> {
         let mut len = [0u8; 4];
         self.read_exact(&mut len)?;
-        let mut v = vec![0u8; u32::from_le_bytes(len) as usize];
+        let n = u32::from_le_bytes(len) as u64;
+        if self.pos + n > self.limit {
+            return Err(invalid_data("history record overruns segment"));
+        }
+        let mut v = vec![0u8; n as usize];
         self.read_exact(&mut v)?;
         Ok(Bytes::from(v))
     }
@@ -232,7 +248,10 @@ impl History {
             }],
             active,
             pending: Vec::new(),
+            pending_lines: 0,
             broken: false,
+            #[cfg(test)]
+            fault: false,
             tail: VecDeque::new(),
             tail_bytes: 0,
         })
@@ -310,7 +329,10 @@ impl History {
             segments,
             active,
             pending: Vec::new(),
+            pending_lines: 0,
             broken: false,
+            #[cfg(test)]
+            fault: false,
             tail: VecDeque::new(),
             tail_bytes: 0,
         };
@@ -356,8 +378,7 @@ impl History {
         let line = &line[..len];
         let rec = 4 + len as u64;
         if !self.broken && self.try_push_disk(line, rec).is_err() {
-            self.broken = true;
-            self.pending.clear();
+            self.fail();
         }
         self.next_line += 1;
         let b = Bytes::copy_from_slice(line);
@@ -383,7 +404,23 @@ impl History {
         self.pending.extend_from_slice(line);
         seg.lines += 1;
         seg.bytes += rec;
+        self.pending_lines += 1;
         Ok(())
+    }
+
+    /// Give up on the disk after a write error: roll the active segment's
+    /// accounting back to what is really in the file (truncating any partial
+    /// write) and stop writing. Reads past the durable end then error out.
+    fn fail(&mut self) {
+        self.broken = true;
+        let seg = self.segments.last_mut().unwrap();
+        let good = seg.bytes - self.pending.len() as u64;
+        seg.bytes = good;
+        seg.lines -= self.pending_lines;
+        seg.index.retain(|&o| o < good);
+        self.pending.clear();
+        self.pending_lines = 0;
+        let _ = self.active.set_len(good);
     }
 
     fn roll(&mut self) -> io::Result<()> {
@@ -399,7 +436,8 @@ impl History {
         });
         // Enforce the on-disk cap by dropping the oldest whole segments.
         let mut total: u64 = self.segments.iter().map(|s| s.bytes).sum();
-        while total > self.limits.max_bytes && self.segments.len() > 1 {
+        // Leave room for the new segment to fill up, so the total stays <= cap.
+        while total + self.limits.segment_bytes > self.limits.max_bytes && self.segments.len() > 1 {
             let old = self.segments.remove(0);
             total -= old.bytes;
             let _ = fs::remove_file(&old.path);
@@ -411,6 +449,7 @@ impl History {
     /// Drop all history (CSI 3 J): bump the generation, delete segments.
     pub fn clear(&mut self) {
         self.pending.clear();
+        self.pending_lines = 0;
         self.generation += 1;
         self.first_line = self.next_line;
         self.tail.clear();
@@ -436,7 +475,8 @@ impl History {
         });
     }
 
-    /// The in-memory tail: the line number of its first line, and the lines.
+    /// The in-memory tail: the line number of its first line (not the store's
+    /// `first_line`; it maps to `AttachOk.tail_first_line`), and the lines.
     pub fn tail(&self) -> (u64, Vec<Bytes>) {
         (
             self.next_line - self.tail.len() as u64,
@@ -458,9 +498,28 @@ impl History {
             return Ok(());
         }
         use std::io::Write;
-        let r = (&self.active).write_all(&self.pending);
-        self.pending.clear();
-        r
+        #[cfg(test)]
+        if self.fault {
+            let _ = (&self.active).write_all(&self.pending[..self.pending.len() / 2]);
+            self.fail();
+            return Err(io::Error::other("injected write fault"));
+        }
+        match (&self.active).write_all(&self.pending) {
+            Ok(()) => {
+                self.pending.clear();
+                self.pending_lines = 0;
+                Ok(())
+            }
+            Err(e) => {
+                self.fail();
+                Err(e)
+            }
+        }
+    }
+
+    fn disk_end(&self) -> u64 {
+        let last = self.segments.last().unwrap();
+        last.first_line + last.lines
     }
 
     /// The lines immediately before `before_line`, newest last, capped by
@@ -473,6 +532,9 @@ impl History {
             ));
         }
         let end = before_line.min(self.next_line).max(self.first_line);
+        if end > self.disk_end() {
+            return Err(io::Error::other("history unavailable after write error"));
+        }
         let n = max_lines.min(HISTORY_PAGE_MAX_LINES) as u64;
         let start = end.saturating_sub(n).max(self.first_line);
         let mut lines = self.read_range(start, end)?;
@@ -494,6 +556,9 @@ impl History {
         let mut out = Vec::with_capacity((end - start) as usize);
         if start >= end {
             return Ok(out);
+        }
+        if end > self.disk_end() {
+            return Err(io::Error::other("history unavailable after write error"));
         }
         let last = self.segments.len() - 1;
         for (i, seg) in self.segments.iter().enumerate() {
@@ -703,7 +768,7 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
             .map(|e| e.metadata().unwrap().len())
             .sum();
-        assert!(disk <= 2000 + 500, "disk {disk}");
+        assert!(disk <= 2000, "disk {disk}");
         let p = h.read_page(0, 1000, 5000).unwrap();
         assert_eq!(p.first_line, info.first_line);
         assert_eq!(texts(&p)[0], format!("line {}", info.first_line));
@@ -746,5 +811,135 @@ mod tests {
         h.clear();
         assert_eq!(mode(&dir.join("meta")), 0o600);
         assert_eq!(mode(&seg_path(&dir, 10)), 0o600);
+    }
+
+    fn seg_len(dir: &Path, first: u64) -> u64 {
+        fs::metadata(seg_path(dir, first)).unwrap().len()
+    }
+
+    fn assert_labelled(p: &Page) {
+        for (i, l) in p.lines.iter().enumerate() {
+            assert_eq!(
+                l.as_ref(),
+                line(p.first_line + i as u64).as_slice(),
+                "mislabelled line"
+            );
+        }
+    }
+
+    #[test]
+    fn torn_tail_is_truncated_on_reopen() {
+        use std::io::Write;
+        for tail in [vec![1u8, 2], {
+            let mut v = 50u32.to_le_bytes().to_vec();
+            v.extend_from_slice(b"partial!!!");
+            v
+        }] {
+            let d = tempfile::tempdir().unwrap();
+            let dir = d.path().join("h");
+            let mut h = History::create(&dir).unwrap();
+            fill(&mut h, 100);
+            drop(h);
+            let good = seg_len(&dir, 0);
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(seg_path(&dir, 0))
+                .unwrap();
+            f.write_all(&tail).unwrap();
+            drop(f);
+            assert_eq!(seg_len(&dir, 0), good + tail.len() as u64);
+
+            let mut h = History::open(&dir).unwrap();
+            assert_eq!(h.info().next_line, 100);
+            assert_eq!(seg_len(&dir, 0), good);
+            let p = h.read_page(0, 100, 100).unwrap();
+            assert_eq!(p.lines.len(), 100);
+            assert_labelled(&p);
+            // Appending after recovery lands at the right offset.
+            h.push(&line(100));
+            h.flush().unwrap();
+            let p = h.read_page(0, 101, 3).unwrap();
+            assert_eq!(p.first_line, 98);
+            assert_labelled(&p);
+        }
+    }
+
+    #[test]
+    fn corrupt_length_is_an_error_not_an_allocation() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("h");
+        let mut h = History::create(&dir).unwrap();
+        fill(&mut h, 10);
+        h.flush().unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(seg_path(&dir, 0))
+            .unwrap()
+            .write_all_at(&u32::MAX.to_le_bytes(), 0)
+            .unwrap();
+        assert!(h.read_page(0, 10, 10).is_err());
+    }
+
+    #[test]
+    fn write_fault_never_returns_mislabelled_lines() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("h");
+        let mut h = History::create(&dir).unwrap();
+        fill(&mut h, 100);
+        h.flush().unwrap();
+        let good = seg_len(&dir, 0);
+        h.fault = true;
+        for i in 100..150 {
+            h.push(&line(i));
+        }
+        // Public flush fails and rolls accounting back to the durable state.
+        assert!(h.flush().is_err());
+        h.fault = false;
+        for i in 150..200 {
+            h.push(&line(i));
+        }
+        assert_eq!(h.info().next_line, 200);
+        assert_eq!(seg_len(&dir, 0), good);
+        // Durable range still reads correctly.
+        let p = h.read_page(0, 100, 60).unwrap();
+        assert_eq!((p.first_line, p.lines.len()), (40, 60));
+        assert_labelled(&p);
+        // Anything reaching past it errors instead of mislabelling.
+        assert!(h.read_page(0, 150, 60).is_err());
+        assert!(h.read_page(0, 200, 60).is_err());
+        // The tail still serves the recent lines, correctly labelled.
+        let (first, lines) = h.tail();
+        assert_eq!(first + lines.len() as u64, 200);
+        assert_eq!(lines[0].as_ref(), line(first).as_slice());
+        // Reopen sees only what is durable.
+        drop(h);
+        let h = History::open(&dir).unwrap();
+        assert_eq!(h.info().next_line, 100);
+        assert_labelled(&h.read_page(0, 100, 100).unwrap());
+    }
+
+    #[test]
+    fn write_fault_during_push_flush_is_consistent() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("h");
+        let mut h = History::create(&dir).unwrap();
+        fill(&mut h, 100);
+        h.flush().unwrap();
+        h.fault = true;
+        // Overflow the 64 KiB buffer so the flush happens inside push.
+        for i in 100..20_000 {
+            h.push(&line(i));
+        }
+        assert_eq!(h.info().next_line, 20_000);
+        assert!(h.read_page(0, 20_000, 60).is_err());
+        let p = h.read_page(0, 100, 60).unwrap();
+        assert_labelled(&p);
+        // clear() recovers the store.
+        h.fault = false;
+        h.clear();
+        h.push(&line(20_000));
+        let p = h.read_page(1, 20_001, 5).unwrap();
+        assert_eq!(p.first_line, 20_000);
+        assert_labelled(&p);
     }
 }
