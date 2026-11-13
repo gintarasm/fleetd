@@ -204,8 +204,11 @@ impl Terminal {
     ///
     /// Alacritty pushes those rows (and rows a narrower reflow pushes off)
     /// into its scrollback, so the resize runs with the scrollback enabled
-    /// and the rows are collected from it afterwards; while the alt screen is
-    /// active that waits until the primary screen is back (`history::settle`).
+    /// and the rows are collected from it right after (`history::settle`).
+    /// While the alt screen is active that reads the primary screen behind it
+    /// via [`with_primary`]; its saved cursor then becomes its cursor (see
+    /// there), which after such a resize is the saved cursor moved with the
+    /// content.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let size = Size::new(cols, rows);
         let term = self.term.get_mut();
@@ -216,8 +219,12 @@ impl Terminal {
         term.resize(size);
         // `Term::resize` resets the scroll region.
         self.history.region = 0..term.screen_lines() as i32;
-        self.history.staged = true;
-        history::settle(term, &mut self.history);
+        let history = &mut self.history;
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            with_primary(term, |term| history::settle(term, history));
+        } else {
+            history::settle(term, history);
+        }
     }
 
     /// Current size as `(cols, rows)`.
@@ -365,7 +372,7 @@ fn to_u16(n: usize) -> u16 {
 /// the cursor moves with the text, the saved cursor is only clamped). Then the
 /// saved cursor becomes the cursor; the cursor, which `?1049l` shows, is kept.
 /// Selection and damage are not kept (unused here).
-fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&Term<Replies>) -> R) -> R {
+fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&mut Term<Replies>) -> R) -> R {
     debug_assert!(term.mode().contains(TermMode::ALT_SCREEN));
     let alt_grid = term.grid().clone();
     let alt_kitty = *term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL;
@@ -1028,10 +1035,11 @@ mod tests {
 
     #[test]
     fn snapshot_after_resize_on_alt_screen() {
-        // Resizing reflows the inactive primary screen: here its cursor moves
-        // to (1, 1) while its saved cursor stays at (1, 3). The snapshot keeps
-        // the cursor (where `?1049l` lands) and A's saved cursor becomes the
-        // cursor (a documented loss; see `with_primary`); B matches A.
+        // Resizing reflows the inactive primary screen: alacritty moves its
+        // cursor to (1, 1) while its saved cursor stays at (1, 3). The resize
+        // then collects the primary's history through `with_primary`, so the
+        // saved cursor becomes the cursor (a documented loss; see there) on
+        // every terminal, and the snapshot keeps both; B matches A.
         let setup = b"0123456789abc\x1b[?1049halt";
         let mut a = Terminal::new(10, 4);
         let mut twin = Terminal::new(10, 4);
@@ -1051,8 +1059,8 @@ mod tests {
             assert_eq!(a.mode(), twin.mode());
         }
         assert_eq!(a.visible_text()[1], "cZ");
-        assert_eq!(twin.saved_cursor().1, 3);
-        assert_eq!(a.saved_cursor().1, 1, "saved cursor lost to the cursor");
+        assert_eq!(twin.saved_cursor().1, 1, "saved cursor lost to the cursor");
+        assert_eq!(a.saved_cursor().1, 1);
     }
 
     #[test]

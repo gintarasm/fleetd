@@ -26,9 +26,10 @@ pub enum HistoryEvent {
     Cleared,
 }
 
-/// Scrollback rows alacritty may hold while a resize is staged (see
-/// [`History::staged`]). Normally it keeps none: rows are rendered by
-/// [`Recorder`](crate::recorder::Recorder) the moment they scroll off.
+/// Scrollback rows alacritty may hold during [`Terminal::resize`](crate::Terminal::resize),
+/// which collects them right after (see [`settle`]). Otherwise it keeps none:
+/// rows are rendered by [`Recorder`](crate::recorder::Recorder) the moment they
+/// scroll off.
 pub(crate) const RESIZE_SLACK: usize = 10_000;
 
 /// History events not yet drained, plus what [`Recorder`](crate::recorder::Recorder)
@@ -39,11 +40,6 @@ pub(crate) struct History {
     /// screen rows `start..end`. Maintained exactly as `Term` maintains its
     /// own (set by `set_scrolling_region`, reset by resize and RIS).
     pub(crate) region: Range<i32>,
-    /// A resize enabled alacritty's scrollback on the primary screen (to
-    /// collect the rows it pushes off) while the alt screen was active; the
-    /// rows are collected and the scrollback disabled again once the primary
-    /// screen is back (see [`settle`]).
-    pub(crate) staged: bool,
 }
 
 impl History {
@@ -51,7 +47,6 @@ impl History {
         Self {
             events: Vec::new(),
             region: 0..rows as i32,
-            staged: false,
         }
     }
 
@@ -76,13 +71,12 @@ pub(crate) fn config(history: usize) -> Config {
     }
 }
 
-/// Finishes a staged resize once the primary screen is active: renders the
-/// rows the resize pushed into alacritty's scrollback (oldest first), then
-/// disables the scrollback again and frees its row cache.
+/// Collects the rows a resize pushed into the scrollback of `term`'s active
+/// grid (the primary screen: the caller swaps to it first if needed), oldest
+/// first, then disables the scrollback again and frees its row cache, so no
+/// history stays in alacritty between calls.
 pub(crate) fn settle<T: EventListener>(term: &mut Term<T>, history: &mut History) {
-    if !history.staged || term.mode().contains(TermMode::ALT_SCREEN) {
-        return;
-    }
+    debug_assert!(!term.mode().contains(TermMode::ALT_SCREEN));
     let grid = term.grid();
     let n = grid.history_size();
     history.events.reserve(n);
@@ -94,7 +88,6 @@ pub(crate) fn settle<T: EventListener>(term: &mut Term<T>, history: &mut History
     term.grid_mut().clear_history();
     term.set_options(config(0));
     term.grid_mut().truncate();
-    history.staged = false;
 }
 
 /// One row as a self-contained ANSI line (see [`HistoryEvent::Line`]).
@@ -545,21 +538,54 @@ mod tests {
     }
 
     #[test]
-    fn resize_on_alt_screen_is_captured_on_return() {
+    fn resize_on_alt_screen_is_captured_at_once() {
+        let mut t = Terminal::new(20, 10);
+        for i in 0..9 {
+            t.feed(format!("l{i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[?1049halt");
+        t.resize(20, 5);
+        // The rows the shrink pushed off the primary screen behind the alt
+        // screen are history now; alacritty keeps none of them.
+        assert_eq!(texts(&t.drain_history()), ["l0", "l1", "l2", "l3", "l4"]);
+        let primary_history =
+            crate::with_primary(&mut t.term.borrow_mut(), |term| term.grid().history_size());
+        assert_eq!(primary_history, 0);
+        // `?1049h` put the alt cursor on row 9; the shrink scrolled it to 4.
+        assert_eq!(t.visible_text()[4], "alt", "alt screen kept");
+        t.feed(b"\x1b[?1049lnext\r\n");
+        assert_eq!(texts(&t.drain_history()), ["l5"]);
+        assert_eq!(t.visible_text(), ["l6", "l7", "l8", "next", ""]);
+        assert_eq!(t.term.borrow().grid().history_size(), 0);
+    }
+
+    #[test]
+    fn reset_after_alt_screen_resize_keeps_its_rows() {
         let mut t = Terminal::new(20, 10);
         for i in 0..9 {
             t.feed(format!("l{i}\r\n").as_bytes());
         }
         t.feed(b"\x1b[?1049h");
         t.resize(20, 5);
+        t.feed(b"\x1bc");
+        assert_eq!(texts(&t.drain_history()), ["l0", "l1", "l2", "l3", "l4"]);
+    }
+
+    #[test]
+    fn deccolm_set_resets_scroll_region() {
+        // `?3h` resets alacritty's scroll region; rows must still scroll off.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[2;5r\x1b[?3ha\r\nb\r\nc\r\nd\r\ne\r\n\r\n\r\n");
+        assert_eq!(texts(&t.drain_history()), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn deccolm_reset_resets_scroll_region() {
+        // After `?3l` row 3 is no longer a bottom margin: nothing scrolls.
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[1;3r\x1b[?3l\x1b[3;1Hz\n\n");
         assert!(t.drain_history().is_empty());
-        t.feed(b"\x1b[?1049lnext\r\n");
-        assert_eq!(
-            texts(&t.drain_history()),
-            ["l0", "l1", "l2", "l3", "l4", "l5"]
-        );
-        assert_eq!(t.visible_text(), ["l6", "l7", "l8", "next", ""]);
-        assert_eq!(t.term.borrow().grid().history_size(), 0);
+        assert_eq!(t.visible_text()[2], "z");
     }
 
     #[test]

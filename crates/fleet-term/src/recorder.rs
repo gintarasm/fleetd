@@ -17,6 +17,9 @@
 //!   where alacritty would push one blank row);
 //! - shrinking resizes, handled by `Terminal::resize` (see `history::settle`).
 //!
+//! The scroll region mirror follows every place alacritty writes its own:
+//! DECSTBM, resize, RIS and DECCOLM (`?3h`/`?3l`, whose `deccolm` resets it).
+//!
 //! ED 3 (`clear_screen(Saved)`) on the primary screen queues
 //! [`HistoryEvent::Cleared`]. Because these are the parser's callbacks, a
 //! synchronized update's buffered operations are seen when they are applied.
@@ -28,12 +31,12 @@ use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb,
-    ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode,
+    PrivateMode, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::history::{self, History, HistoryEvent};
+use crate::history::{History, HistoryEvent};
 
 /// `Term` plus the history sink, for one call into the parser.
 pub(crate) struct Recorder<'a, T> {
@@ -55,6 +58,11 @@ impl<T: EventListener> Recorder<'_, T> {
         region.start == 0
             && self.term.grid().cursor.point.line.0 + 1 == region.end
             && self.primary()
+    }
+
+    /// Mirrors alacritty resetting its scroll region to the whole screen.
+    fn reset_region(&mut self) {
+        self.history.region = 0..self.term.screen_lines() as i32;
     }
 
     /// Records rows `0..n` (`n` already clamped to the region) as history.
@@ -192,15 +200,21 @@ impl<T: EventListener> Handler for Recorder<'_, T> {
 
     fn reset_state(&mut self) {
         Handler::reset_state(&mut *self.term);
-        self.history.region = 0..self.term.screen_lines() as i32;
-        history::settle(self.term, self.history);
+        self.reset_region();
+    }
+
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        Handler::set_private_mode(&mut *self.term, mode);
+        if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
+            // DECCOLM: alacritty's `deccolm` resets the scroll region itself.
+            self.reset_region();
+        }
     }
 
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         Handler::unset_private_mode(&mut *self.term, mode);
-        // Leaving the alt screen: finish a resize staged while it was active.
-        if self.history.staged {
-            history::settle(self.term, self.history);
+        if mode == PrivateMode::Named(NamedPrivateMode::ColumnMode) {
+            self.reset_region();
         }
     }
 
@@ -387,11 +401,6 @@ impl<T: EventListener> Handler for Recorder<'_, T> {
     }
 
     #[inline]
-    fn set_private_mode(&mut self, mode: PrivateMode) {
-        Handler::set_private_mode(&mut *self.term, mode);
-    }
-
-    #[inline]
     fn report_private_mode(&mut self, mode: PrivateMode) {
         Handler::report_private_mode(&mut *self.term, mode);
     }
@@ -525,7 +534,7 @@ mod tests {
 
     /// Agent-like output plus the operations that scroll or clear: SU, DL,
     /// ED 2, scroll regions, IND/NEL, tabs, wide characters, autowrap and
-    /// LNM toggles and alt screen round trips (no ED 3, no resize).
+    /// LNM toggles, DECCOLM and alt screen round trips (no ED 3, no resize).
     ///
     /// Starts by scrolling 50 rows off: alacritty's ED 2 on a blank screen
     /// pushes one blank row when its scrollback is empty (and none otherwise),
@@ -534,7 +543,7 @@ mod tests {
         let mut rng = Rng(seed | 1);
         let mut out = b"warm\r\n".repeat(50);
         while out.len() < len {
-            let part: Vec<u8> = match rng.below(16) {
+            let part: Vec<u8> = match rng.below(18) {
                 0 => format!("\x1b[{}S", 1 + rng.below(6)).into_bytes(),
                 1 => format!("\x1b[{};1H\x1b[{}M", 1 + rng.below(3), 1 + rng.below(4)).into_bytes(),
                 2 => b"\x1b[2J".to_vec(),
@@ -551,6 +560,9 @@ mod tests {
                 10 => b"\x1b[20h\n\n\x1b[20l".to_vec(),
                 11 => b"\x1b[?1049hx\r\n\r\n\x1b[?1049l".to_vec(),
                 12 => format!("\x1b[{};{}H", 1 + rng.below(16), 1 + rng.below(40)).into_bytes(),
+                // DECCOLM: clears the screen and resets the scroll region.
+                13 => b"\x1b[?3h".to_vec(),
+                14 => b"\x1b[?3l".to_vec(),
                 _ => fake_output(rng.next(), 300),
             };
             out.extend_from_slice(&part);
