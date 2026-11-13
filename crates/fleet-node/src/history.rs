@@ -79,8 +79,6 @@ pub struct History {
     first_line: u64,
     next_line: u64,
     segments: Vec<Segment>,
-    /// Append handle (also used for reads) of the last segment.
-    active: File,
     pending: Vec<u8>,
     /// Records currently in `pending`.
     pending_lines: u64,
@@ -231,8 +229,7 @@ impl History {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         write_meta(dir, 0, 0)?;
         let path = seg_path(dir, 0);
-        let active = create_seg_file(&path)?;
-        active.set_len(0)?;
+        create_seg_file(&path)?.set_len(0)?;
         Ok(History {
             dir: dir.to_path_buf(),
             limits,
@@ -246,7 +243,6 @@ impl History {
                 index: Vec::new(),
                 path,
             }],
-            active,
             pending: Vec::new(),
             pending_lines: 0,
             broken: false,
@@ -319,7 +315,7 @@ impl History {
         let last = segments.last().unwrap();
         let next_line = last.first_line + last.lines;
         let first_line = meta_first.max(segments[0].first_line).min(next_line);
-        let active = create_seg_file(&last.path)?;
+        create_seg_file(&last.path)?;
         let mut h = History {
             dir: dir.to_path_buf(),
             limits,
@@ -327,7 +323,6 @@ impl History {
             first_line,
             next_line,
             segments,
-            active,
             pending: Vec::new(),
             pending_lines: 0,
             broken: false,
@@ -420,13 +415,15 @@ impl History {
         seg.index.retain(|&o| o < good);
         self.pending.clear();
         self.pending_lines = 0;
-        let _ = self.active.set_len(good);
+        if let Ok(f) = OpenOptions::new().write(true).open(&seg.path) {
+            let _ = f.set_len(good);
+        }
     }
 
     fn roll(&mut self) -> io::Result<()> {
         self.flush()?;
         let path = seg_path(&self.dir, self.next_line);
-        self.active = create_seg_file(&path)?;
+        create_seg_file(&path)?;
         self.segments.push(Segment {
             first_line: self.next_line,
             lines: 0,
@@ -459,13 +456,7 @@ impl History {
         }
         let path = seg_path(&self.dir, self.next_line);
         let ok = write_meta(&self.dir, self.generation, self.first_line).is_ok();
-        match create_seg_file(&path).and_then(|f| f.set_len(0).map(|_| f)) {
-            Ok(f) => {
-                self.active = f;
-                self.broken = !ok;
-            }
-            Err(_) => self.broken = true,
-        }
+        self.broken = !ok || create_seg_file(&path).and_then(|f| f.set_len(0)).is_err();
         self.segments.push(Segment {
             first_line: self.next_line,
             lines: 0,
@@ -492,19 +483,24 @@ impl History {
         }
     }
 
-    /// Write the buffer to the active segment (no fsync).
+    /// Write the buffer to the active segment (no fsync). The segment is
+    /// opened for each flush and closed after it: a history holds no fd
+    /// between writes.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
         use std::io::Write;
-        #[cfg(test)]
-        if self.fault {
-            let _ = (&self.active).write_all(&self.pending[..self.pending.len() / 2]);
-            self.fail();
-            return Err(io::Error::other("injected write fault"));
-        }
-        match (&self.active).write_all(&self.pending) {
+        let path = &self.segments.last().unwrap().path;
+        let written = create_seg_file(path).and_then(|mut f| {
+            #[cfg(test)]
+            if self.fault {
+                let _ = f.write_all(&self.pending[..self.pending.len() / 2]);
+                return Err(io::Error::other("injected write fault"));
+            }
+            f.write_all(&self.pending)
+        });
+        match written {
             Ok(()) => {
                 self.pending.clear();
                 self.pending_lines = 0;
@@ -573,18 +569,13 @@ impl History {
                 .index
                 .get((rel / INDEX_STRIDE) as usize)
                 .ok_or_else(|| invalid_data("history index out of range"))?;
-            let opened;
-            let (file, flushed, pending): (&File, u64, &[u8]) = if i == last {
-                (
-                    &self.active,
-                    seg.bytes - self.pending.len() as u64,
-                    &self.pending,
-                )
+            let (flushed, pending): (u64, &[u8]) = if i == last {
+                (seg.bytes - self.pending.len() as u64, &self.pending)
             } else {
-                opened = File::open(&seg.path)?;
-                (&opened, seg.bytes, &[])
+                (seg.bytes, &[])
             };
-            let mut r = SegReader::new(file, flushed, pending, off);
+            let file = File::open(&seg.path)?;
+            let mut r = SegReader::new(&file, flushed, pending, off);
             for _ in 0..(rel % INDEX_STRIDE) {
                 r.skip_record()?;
             }

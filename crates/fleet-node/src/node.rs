@@ -3,10 +3,11 @@
 //!
 //! Per-agent output pipeline: PTY output feeds the agent's [`Terminal`] grid,
 //! is appended to its [`Scrollback`], then broadcast to attached subscribers.
+//! Rows the grid scrolls off become lines of the agent's [`History`].
 //!
-//! Attach is [`AgentPipeline::subscribe`]: the snapshot and the subscription
-//! are taken under the pipeline lock that also covers feeding the grid, so the
-//! stream continues exactly where the snapshot ends.
+//! Attach is [`AgentPipeline::attach`]: the history tail, the snapshot and the
+//! subscription are taken under the pipeline lock that also covers feeding the
+//! grid, so tail, screen and stream are contiguous.
 //!
 //! Subscriptions use a bounded `tokio::sync::mpsc` channel
 //! ([`SUBSCRIBER_CAPACITY`] chunks): the reader thread only ever `try_send`s,
@@ -25,13 +26,14 @@
 //! while no subscriber is attached; otherwise the client's terminal answers.
 //! They are dropped rather than ever blocking the reader thread.
 
+use crate::history::{History, HistoryInfo, Page};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, NewAgent, Store};
-use crate::term::Terminal;
+use crate::term::{HistoryEvent, Terminal};
 use bytes::Bytes;
 use fleet_proto::{AgentExited, AgentInfo, AttachOk, SpawnAgent};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -315,6 +317,49 @@ struct State {
     input: Option<AgentInput>,
     exit_code: Option<i32>,
     partial: PartialSequence,
+    /// `None` without history, and once the agent has exited (flushed and
+    /// closed).
+    history: Option<History>,
+}
+
+impl State {
+    /// Moves the grid's history events into the agent's history. Must follow
+    /// every grid operation that can scroll rows off (feed, sync flush,
+    /// resize): undrained events pile up in the terminal.
+    fn drain_history(&mut self) {
+        let events = self.term.drain_history();
+        if events.is_empty() {
+            return;
+        }
+        let Some(history) = &mut self.history else {
+            return;
+        };
+        for event in events {
+            match event {
+                HistoryEvent::Line(line) => history.push(&line),
+                HistoryEvent::Cleared => history.clear(),
+            }
+        }
+    }
+}
+
+/// The history part of an attach: the in-memory tail and where it sits.
+#[derive(Debug, Clone)]
+pub struct HistoryTail {
+    /// Line number of `lines[0]`.
+    pub tail_first_line: u64,
+    pub lines: Vec<Bytes>,
+    pub info: HistoryInfo,
+}
+
+/// What [`AgentPipeline::attach`] hands out.
+pub struct Attached {
+    pub snapshot: Vec<u8>,
+    /// Grid size `(cols, rows)` the snapshot was taken at.
+    pub size: (u16, u16),
+    /// `None` if the pipeline keeps no history or the agent has exited.
+    pub history: Option<HistoryTail>,
+    pub subscription: Subscription,
 }
 
 /// One agent's pipeline; clones share it. Pass a clone to
@@ -326,7 +371,18 @@ pub struct AgentPipeline {
 }
 
 impl AgentPipeline {
+    /// A pipeline without history (scrolled-off rows are dropped).
     pub fn new(cols: u16, rows: u16, scrollback: Scrollback) -> Self {
+        Self::with_history(cols, rows, scrollback, None)
+    }
+
+    /// A pipeline that appends scrolled-off rows to `history`.
+    pub fn with_history(
+        cols: u16,
+        rows: u16,
+        scrollback: Scrollback,
+        history: Option<History>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
                 term: Terminal::new(cols, rows),
@@ -335,6 +391,7 @@ impl AgentPipeline {
                 input: None,
                 exit_code: None,
                 partial: PartialSequence::new(),
+                history,
             })),
         }
     }
@@ -354,8 +411,24 @@ impl AgentPipeline {
     /// [`AgentPipeline::subscribe`], plus the grid size `(cols, rows)` the
     /// snapshot was taken at.
     pub fn subscribe_sized(&self) -> (Vec<u8>, (u16, u16), Subscription) {
+        let a = self.attach();
+        (a.snapshot, a.size, a.subscription)
+    }
+
+    /// [`AgentPipeline::subscribe_sized`], plus the history tail taken in the
+    /// same critical section: the tail ends where the snapshot's screen
+    /// begins.
+    pub fn attach(&self) -> Attached {
         let mut state = self.lock();
         let snapshot = Self::snapshot_of(&mut state);
+        let history = state.history.as_ref().map(|h| {
+            let (tail_first_line, lines) = h.tail();
+            HistoryTail {
+                tail_first_line,
+                lines,
+                info: h.info(),
+            }
+        });
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
         let lagged = Arc::new(AtomicBool::new(false));
         match state.exit_code {
@@ -368,12 +441,30 @@ impl AgentPipeline {
                 lagged: Arc::clone(&lagged),
             }),
         }
-        let sub = Subscription {
+        let subscription = Subscription {
             rx,
             lagged,
             done: false,
         };
-        (snapshot, state.term.size(), sub)
+        Attached {
+            snapshot,
+            size: state.term.size(),
+            history,
+            subscription,
+        }
+    }
+
+    /// A page of the agent's history (see [`History::read_page`]); `None` if
+    /// the pipeline holds no history (none kept, or the agent exited).
+    pub fn read_history(
+        &self,
+        generation: u64,
+        before_line: u64,
+        max_lines: u32,
+    ) -> Option<io::Result<Page>> {
+        let state = self.lock();
+        let history = state.history.as_ref()?;
+        Some(history.read_page(generation, before_line, max_lines))
     }
 
     /// The current screen as ANSI and the grid size `(cols, rows)`.
@@ -384,6 +475,7 @@ impl AgentPipeline {
 
     fn snapshot_of(state: &mut State) -> Vec<u8> {
         state.term.flush_pending_sync();
+        state.drain_history();
         let mut snapshot = state.term.snapshot();
         snapshot.extend_from_slice(state.partial.tail());
         snapshot
@@ -391,7 +483,9 @@ impl AgentPipeline {
 
     /// Resizes the grid. Call alongside [`PtyHost::resize`](crate::PtyHost::resize).
     pub fn resize(&self, cols: u16, rows: u16) {
-        self.lock().term.resize(cols, rows);
+        let mut state = self.lock();
+        state.term.resize(cols, rows);
+        state.drain_history();
     }
 
     /// The agent's exit code, once it has exited.
@@ -419,6 +513,7 @@ impl OutputSink for AgentPipeline {
         let reply = {
             let mut state = self.lock();
             state.term.feed(bytes);
+            state.drain_history();
             state.partial.feed(bytes);
             let replies = state.term.take_replies();
             // History is best effort: the live grid stays authoritative.
@@ -446,9 +541,15 @@ impl OutputSink for AgentPipeline {
     fn on_exit(&mut self, code: i32) {
         let mut state = self.lock();
         state.term.flush_pending_sync();
+        state.drain_history();
         // Flush, then close: an exited agent holds no fd.
         if let Some(mut scrollback) = state.scrollback.take() {
             let _ = scrollback.flush();
+        }
+        if let Some(mut history) = state.history.take()
+            && let Err(e) = history.flush()
+        {
+            eprintln!("fleet-node: flushing agent history: {e}");
         }
         state.exit_code = Some(code);
         state.input = None;
@@ -533,6 +634,92 @@ struct ExitedAgent {
     exit_code: i32,
 }
 
+/// Histories of agents not running in this node process kept open at a time
+/// (each holds its in-memory tail and index, but no fd).
+const HISTORY_HANDLES: usize = 8;
+
+/// The history directories (`<state-dir>/history/<agent-id>/`) and lazily
+/// opened handles to the histories of agents not running here: exited in
+/// this process, or left by a previous daemon. A running agent's history is
+/// owned by its pipeline.
+struct Histories {
+    dir: PathBuf,
+    /// Most recently used last; at most [`HISTORY_HANDLES`].
+    open: VecDeque<(u64, History)>,
+    /// Agents being spawned: their history is written by a pipeline that is
+    /// not registered yet, and must not be opened from disk meanwhile.
+    spawning: HashSet<u64>,
+}
+
+impl Histories {
+    fn path(&self, id: u64) -> PathBuf {
+        self.dir.join(id.to_string())
+    }
+
+    /// Runs `f` on the agent's history, opening it from disk if needed.
+    /// Only for agents whose history no pipeline writes any more.
+    fn with<T>(&mut self, id: u64, f: impl FnOnce(&History) -> T) -> io::Result<T> {
+        if self.spawning.contains(&id) {
+            return Err(not_live(id));
+        }
+        let history = match self.open.iter().position(|(i, _)| *i == id) {
+            Some(pos) => self.open.remove(pos).expect("position is in range").1,
+            None => History::open(&self.path(id))?,
+        };
+        if self.open.len() >= HISTORY_HANDLES {
+            self.open.pop_front();
+        }
+        self.open.push_back((id, history));
+        Ok(f(&self.open.back().expect("just pushed").1))
+    }
+
+    /// Closes and deletes the agent's history.
+    fn delete(&mut self, id: u64) {
+        self.open.retain(|(i, _)| *i != id);
+        remove_history_dir(&self.path(id));
+    }
+}
+
+fn remove_history_dir(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("fleet-node: removing {}: {e}", path.display()),
+    }
+}
+
+/// Deletes the history dirs under `dir` of agents other than `keep`.
+fn prune_history_dirs(dir: &Path, keep: &HashSet<u64>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let id = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u64>().ok());
+        if id.is_some_and(|id| !keep.contains(&id)) {
+            remove_history_dir(&entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// The agents whose history [`Node::open`] keeps: running ones and the
+/// [`RETAINED_EXITED`] most recently created others.
+fn retained_history(records: &[AgentRecord]) -> HashSet<u64> {
+    let mut stopped: Vec<&AgentRecord> = records
+        .iter()
+        .filter(|r| r.state != store::AgentState::Running)
+        .collect();
+    stopped.sort_by_key(|r| std::cmp::Reverse((r.created_unix_ms, r.id)));
+    stopped.truncate(RETAINED_EXITED);
+    records
+        .iter()
+        .filter(|r| r.state == store::AgentState::Running)
+        .chain(stopped)
+        .map(|r| r.id)
+        .collect()
+}
+
 /// The agent's sink: feeds its pipeline and, on exit, records the exit code,
 /// releases the agent and announces the exit.
 struct NodeSink {
@@ -541,6 +728,7 @@ struct NodeSink {
     store: Arc<Mutex<Store>>,
     host: Arc<PtyHost>,
     agents: Arc<Mutex<Agents>>,
+    histories: Arc<Mutex<Histories>>,
     exits: broadcast::Sender<AgentExited>,
 }
 
@@ -561,10 +749,14 @@ impl OutputSink for NodeSink {
         self.pipeline.on_exit(code);
         // If the spawn has not registered the agent yet, it retires it.
         let mut agents = lock(&self.agents);
-        if let Some(live) = agents.live.remove(&self.id) {
-            agents.retire(&self.host, self.id, &live, code);
-        }
+        let evicted = match agents.live.remove(&self.id) {
+            Some(live) => agents.retire(&self.host, self.id, &live, code),
+            None => None,
+        };
         drop(agents);
+        if let Some(evicted) = evicted {
+            lock(&self.histories).delete(evicted);
+        }
         // No receivers is fine.
         let _ = self.exits.send(AgentExited {
             agent_id: self.id,
@@ -583,6 +775,7 @@ pub struct Node {
     agents: Arc<Mutex<Agents>>,
     exits: broadcast::Sender<AgentExited>,
     scrollback_dir: PathBuf,
+    histories: Arc<Mutex<Histories>>,
 }
 
 #[derive(Default)]
@@ -597,12 +790,16 @@ struct Agents {
 
 impl Agents {
     /// Keeps an exited agent's final screen (evicting the oldest beyond
-    /// [`RETAINED_EXITED`]) and drops everything else it held.
-    fn retire(&mut self, host: &PtyHost, id: u64, live: &LiveAgent, exit_code: i32) {
+    /// [`RETAINED_EXITED`]) and drops everything else it held. Returns the
+    /// evicted agent, whose history the caller deletes.
+    #[must_use]
+    fn retire(&mut self, host: &PtyHost, id: u64, live: &LiveAgent, exit_code: i32) -> Option<u64> {
         let (snapshot, (cols, rows)) = live.pipeline.snapshot_sized();
-        if self.exited.len() >= RETAINED_EXITED {
-            self.exited.pop_front();
-        }
+        let evicted = if self.exited.len() >= RETAINED_EXITED {
+            self.exited.pop_front().map(|a| a.id)
+        } else {
+            None
+        };
         self.exited.push_back(ExitedAgent {
             id,
             snapshot,
@@ -613,6 +810,7 @@ impl Agents {
         // The host recorded the exit before calling `on_exit`, so this
         // cannot fail with "still running".
         let _ = host.remove(live.host_id);
+        evicted
     }
 
     fn exited(&self, id: u64) -> Option<&ExitedAgent> {
@@ -632,16 +830,24 @@ fn shutting_down() -> io::Error {
 }
 
 impl Node {
-    /// Opens the node's state under `state_dir` (`state.db`, `scrollback/`)
-    /// and marks agents left running by a previous daemon as lost.
+    /// Opens the node's state under `state_dir` (`state.db`, `scrollback/`,
+    /// `history/`), marks agents left running by a previous daemon as lost
+    /// and deletes the history of all but the [`RETAINED_EXITED`] most
+    /// recently created of them.
     pub fn open(state_dir: &Path) -> io::Result<Node> {
         let scrollback_dir = state_dir.join("scrollback");
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&scrollback_dir)?;
+        let history_dir = state_dir.join("history");
+        for dir in [&scrollback_dir, &history_dir] {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
         let store = Store::open(&state_dir.join("state.db")).map_err(store_err)?;
         store.mark_running_as_lost().map_err(store_err)?;
+        // A corrupt row's history is not kept (its id is unknown).
+        let (records, _) = store.list_agents_lossy().map_err(store_err)?;
+        prune_history_dirs(&history_dir, &retained_history(&records))?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         Ok(Node {
             host: Arc::new(PtyHost::new()),
@@ -649,6 +855,11 @@ impl Node {
             agents: Arc::new(Mutex::new(Agents::default())),
             exits,
             scrollback_dir,
+            histories: Arc::new(Mutex::new(Histories {
+                dir: history_dir,
+                open: VecDeque::new(),
+                spawning: HashSet::new(),
+            })),
         })
     }
 
@@ -695,16 +906,24 @@ impl Node {
                     .into_owned()
             })
             .map_err(store_err)?;
-
-        let started =
-            Scrollback::create(Path::new(&path), scrollback::DEFAULT_CAPACITY).and_then(|sb| {
-                let pipeline = AgentPipeline::new(cols, rows, sb);
+        // Until the agent is registered, its history must not be opened
+        // from disk (its pipeline may already be writing it).
+        let history_path = {
+            let mut histories = lock(&self.histories);
+            histories.spawning.insert(id);
+            histories.path(id)
+        };
+        let started = Scrollback::create(Path::new(&path), scrollback::DEFAULT_CAPACITY)
+            .and_then(|sb| Ok((sb, History::create(&history_path)?)))
+            .and_then(|(sb, history)| {
+                let pipeline = AgentPipeline::with_history(cols, rows, sb, Some(history));
                 let sink = NodeSink {
                     id,
                     pipeline: pipeline.clone(),
                     store: Arc::clone(&self.store),
                     host: Arc::clone(&self.host),
                     agents: Arc::clone(&self.agents),
+                    histories: Arc::clone(&self.histories),
                     exits: self.exits.clone(),
                 };
                 let spec = CommandSpec {
@@ -725,14 +944,18 @@ impl Node {
                     eprintln!("fleet-node: removing failed agent {id}: {e}");
                 }
                 let _ = std::fs::remove_file(&path);
+                let mut histories = lock(&self.histories);
+                histories.spawning.remove(&id);
+                remove_history_dir(&history_path);
                 return Err(e);
             }
         };
-        {
+        let evicted = {
             let mut agents = lock(&self.agents);
             if agents.closing {
                 // Shutdown began during the spawn and will not signal this
-                // agent; its exit is still recorded and waited for.
+                // agent; its exit is still recorded and waited for. Its
+                // history stays `spawning`: it is never registered.
                 drop(agents);
                 let _ = self.host.force_kill(live.host_id);
                 return Err(shutting_down());
@@ -742,9 +965,16 @@ impl Node {
                 Some(code) => agents.retire(&self.host, id, &live, code),
                 None => {
                     agents.live.insert(id, live);
+                    None
                 }
             }
+        };
+        let mut histories = lock(&self.histories);
+        histories.spawning.remove(&id);
+        if let Some(evicted) = evicted {
+            histories.delete(evicted);
         }
+        drop(histories);
         Ok(AgentInfo {
             id,
             program: new.program,
@@ -774,32 +1004,76 @@ impl Node {
             .ok_or_else(|| not_live(id))
     }
 
-    /// Attaches to an agent (see [`AgentPipeline::subscribe`]). An exited
+    /// Attaches to an agent (see [`AgentPipeline::attach`]). An exited
     /// agent yields its final screen (one of the last [`RETAINED_EXITED`]
     /// exits of this node process) or else an empty snapshot with size 0x0,
-    /// then its exit.
+    /// then its exit. The history fields describe the agent's history if it
+    /// is still kept (and are zero/empty otherwise).
     pub fn attach(&self, id: u64) -> io::Result<(AttachOk, Subscription)> {
-        let ok = |snapshot, cols: u16, rows: u16| AttachOk {
+        let (snapshot, (cols, rows), history, sub) = {
+            let agents = lock(&self.agents);
+            if let Some(live) = agents.live.get(&id) {
+                let a = live.pipeline.attach();
+                (a.snapshot, a.size, a.history, a.subscription)
+            } else if let Some(a) = agents.exited(id) {
+                let sub = Subscription::exited(a.exit_code);
+                (a.snapshot.clone(), (a.cols, a.rows), None, sub)
+            } else {
+                drop(agents);
+                match lock(&self.store).exit_code(id).map_err(store_err)? {
+                    Some(code) => (Vec::new(), (0, 0), None, Subscription::exited(code)),
+                    None => return Err(not_live(id)),
+                }
+            }
+        };
+        // No history from the pipeline: the agent exited, and no pipeline
+        // writes its history any more.
+        let history = history.or_else(|| {
+            lock(&self.histories)
+                .with(id, |h| {
+                    let (tail_first_line, lines) = h.tail();
+                    HistoryTail {
+                        tail_first_line,
+                        lines,
+                        info: h.info(),
+                    }
+                })
+                .ok()
+        });
+        let mut ok = AttachOk {
             agent_id: id,
             snapshot,
             cols: cols.into(),
             rows: rows.into(),
+            ..Default::default()
         };
+        if let Some(h) = history {
+            ok.history_tail = h.lines.iter().map(|l| l.to_vec()).collect();
+            ok.tail_first_line = h.tail_first_line;
+            ok.history_first_line = h.info.first_line;
+            ok.history_generation = h.info.generation;
+        }
+        Ok((ok, sub))
+    }
+
+    /// The lines of the agent's history immediately before `before_line`
+    /// (see [`History::read_page`]), for running agents, retained exited
+    /// ones and those of a previous daemon run. A stale `generation` fails
+    /// with `InvalidInput`.
+    pub fn read_history(
+        &self,
+        id: u64,
+        generation: u64,
+        before_line: u64,
+        max_lines: u32,
+    ) -> io::Result<Page> {
+        let live = lock(&self.agents).live.get(&id).cloned();
+        if let Some(page) =
+            live.and_then(|l| l.pipeline.read_history(generation, before_line, max_lines))
         {
-            let agents = lock(&self.agents);
-            if let Some(live) = agents.live.get(&id) {
-                let (snapshot, (cols, rows), sub) = live.pipeline.subscribe_sized();
-                return Ok((ok(snapshot, cols, rows), sub));
-            }
-            if let Some(a) = agents.exited(id) {
-                let sub = Subscription::exited(a.exit_code);
-                return Ok((ok(a.snapshot.clone(), a.cols, a.rows), sub));
-            }
+            return page;
         }
-        match lock(&self.store).exit_code(id).map_err(store_err)? {
-            Some(code) => Ok((ok(Vec::new(), 0, 0), Subscription::exited(code))),
-            None => Err(not_live(id)),
-        }
+        lock(&self.histories).with(id, |h| h.read_page(generation, before_line, max_lines))?
     }
 
     /// Exited agents whose final screen is kept (at most [`RETAINED_EXITED`]).
