@@ -71,9 +71,10 @@ use tokio::sync::broadcast;
 /// Chunks a subscriber may fall behind before it is dropped.
 pub const SUBSCRIBER_CAPACITY: usize = 256;
 
-/// Output chunks still queued for a subscriber are merged up to this many
-/// bytes, so its queue holds at least [`SUBSCRIBER_CAPACITY`] x this much
-/// output (4 MiB) however small the PTY reads are, not 256 reads.
+/// Output chunks still queued for a subscriber are merged into one buffer of
+/// up to this many bytes, so its queue holds up to [`SUBSCRIBER_CAPACITY`] x
+/// this much output (4 MiB) however small the PTY reads are, not 256 reads.
+/// A queued item never takes more than max(this, one read) plus a constant.
 pub const COALESCE_BYTES: usize = 16 * 1024;
 
 /// Longest unterminated sequence carried into a snapshot. Beyond it (e.g. a
@@ -281,8 +282,11 @@ struct QueueState {
 }
 
 enum Queued {
-    /// Consecutive output chunks and their total length, joined when taken.
-    Output(Vec<Bytes>, usize),
+    /// One output chunk, shared with the other subscribers.
+    Output(Bytes),
+    /// Consecutive output chunks copied into one buffer of capacity
+    /// [`COALESCE_BYTES`] (or one larger read).
+    Merged(BytesMut),
     Other(StreamItem),
 }
 
@@ -310,21 +314,16 @@ impl Queue {
         }
         let was_empty = state.items.is_empty();
         if let StreamItem::Output(chunk) = &item
-            && let Some(Queued::Output(parts, len)) = state.items.back_mut()
-            && *len + chunk.len() <= COALESCE_BYTES
+            && let Some(tail) = state.items.back_mut()
+            && tail.merge(chunk)
         {
-            *len += chunk.len();
-            parts.push(chunk.clone());
             return Offered::Queued;
         }
         if state.items.len() >= SUBSCRIBER_CAPACITY {
             return Offered::Full;
         }
         state.items.push_back(match item {
-            StreamItem::Output(chunk) => {
-                let len = chunk.len();
-                Queued::Output(vec![chunk], len)
-            }
+            StreamItem::Output(chunk) => Queued::Output(chunk),
             other => Queued::Other(other),
         });
         drop(state);
@@ -388,19 +387,41 @@ impl Queue {
 }
 
 impl Queued {
+    /// Appends `chunk` if this is output with room for it; the first merge
+    /// copies the item into a buffer of exactly [`COALESCE_BYTES`], so later
+    /// ones never reallocate.
+    fn merge(&mut self, chunk: &[u8]) -> bool {
+        match self {
+            Queued::Output(first) if first.len() + chunk.len() <= COALESCE_BYTES => {
+                let mut merged = BytesMut::with_capacity(COALESCE_BYTES);
+                merged.extend_from_slice(first);
+                merged.extend_from_slice(chunk);
+                *self = Queued::Merged(merged);
+                true
+            }
+            Queued::Merged(merged) if merged.len() + chunk.len() <= COALESCE_BYTES => {
+                merged.extend_from_slice(chunk);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn into_item(self) -> StreamItem {
         match self {
-            Queued::Output(mut parts, _) if parts.len() == 1 => {
-                StreamItem::Output(parts.pop().unwrap_or_default())
-            }
-            Queued::Output(parts, len) => {
-                let mut joined = BytesMut::with_capacity(len);
-                for part in parts {
-                    joined.extend_from_slice(&part);
-                }
-                StreamItem::Output(joined.freeze())
-            }
+            Queued::Output(chunk) => StreamItem::Output(chunk),
+            Queued::Merged(merged) => StreamItem::Output(merged.freeze()),
             Queued::Other(item) => item,
+        }
+    }
+
+    /// Heap bytes this item holds for its output.
+    #[cfg(test)]
+    fn output_bytes(&self) -> usize {
+        match self {
+            Queued::Output(chunk) => chunk.len(),
+            Queued::Merged(merged) => merged.capacity(),
+            Queued::Other(_) => 0,
         }
     }
 }
@@ -433,6 +454,14 @@ impl Drop for Subscription {
 }
 
 impl Subscription {
+    /// Items queued and the heap bytes their output holds.
+    #[cfg(test)]
+    fn queued(&self) -> (usize, usize) {
+        let state = lock(&self.queue.state);
+        let bytes = state.items.iter().map(Queued::output_bytes).sum();
+        (state.items.len(), bytes)
+    }
+
     /// A stream that holds only [`StreamItem::Exited`].
     fn exited(code: i32) -> Self {
         let queue = Queue::new();
@@ -1987,6 +2016,78 @@ mod tests {
         }
         node.resize(id, ConnId(1), 500, 500).unwrap();
         node.shutdown();
+    }
+
+    /// Queue memory of a subscriber that never reads is bounded by
+    /// `SUBSCRIBER_CAPACITY` x `COALESCE_BYTES` (plus a constant per item),
+    /// however small the reads.
+    const QUEUE_MEMORY_BOUND: usize = SUBSCRIBER_CAPACITY * (COALESCE_BYTES + 1024);
+
+    #[test]
+    fn stalled_subscriber_memory_is_bounded_with_tiny_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let scrollback = Scrollback::create(&dir.path().join("sb"), 1024 * 1024).unwrap();
+        let pipeline = AgentPipeline::new(80, 24, scrollback);
+        let (_, stalled) = pipeline.subscribe();
+        for _ in 0..100_000 {
+            pipeline.feed(b"x");
+        }
+        let (items, bytes) = stalled.queued();
+        // 100 000 bytes fit in ceil(100 000 / 16 KiB) merged buffers.
+        assert_eq!(items, 100_000usize.div_ceil(COALESCE_BYTES));
+        assert!(
+            bytes <= items * COALESCE_BYTES,
+            "{bytes} bytes in {items} items"
+        );
+    }
+
+    #[test]
+    fn full_queue_of_tiny_chunks_stays_within_its_bound() {
+        let queue = Queue::new();
+        let mut offered = 0usize;
+        while matches!(
+            queue.offer(StreamItem::Output(Bytes::from_static(b"x"))),
+            Offered::Queued
+        ) {
+            offered += 1;
+        }
+        assert_eq!(offered, SUBSCRIBER_CAPACITY * COALESCE_BYTES);
+        let state = lock(&queue.state);
+        let bytes: usize = state.items.iter().map(Queued::output_bytes).sum();
+        assert_eq!(state.items.len(), SUBSCRIBER_CAPACITY);
+        assert!(bytes <= QUEUE_MEMORY_BOUND, "{bytes} bytes queued");
+    }
+
+    #[test]
+    fn merged_output_keeps_order_and_bytes() {
+        let queue = Queue::new();
+        for chunk in [&b"ab"[..], b"cd", b"ef"] {
+            assert!(matches!(
+                queue.offer(StreamItem::Output(Bytes::copy_from_slice(chunk))),
+                Offered::Queued
+            ));
+        }
+        assert!(matches!(
+            queue.offer(StreamItem::Role(true)),
+            Offered::Queued
+        ));
+        assert!(matches!(
+            queue.offer(StreamItem::Output(Bytes::from_static(b"gh"))),
+            Offered::Queued
+        ));
+        queue.close_sender();
+        let mut got = Vec::new();
+        while let Some(item) = queue.blocking_recv() {
+            got.push(item);
+        }
+        assert_eq!(
+            got,
+            [
+                StreamItem::Output(Bytes::from_static(b"abcdef")),
+                StreamItem::Role(true),
+                StreamItem::Output(Bytes::from_static(b"gh")),
+            ]
+        );
     }
 
     fn tail_after(chunks: &[&[u8]]) -> Vec<u8> {
