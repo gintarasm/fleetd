@@ -673,13 +673,28 @@ fn lag_event_names_agent() {
     let dir = TempDir::new().unwrap();
     let _d = Daemon::start(dir.path());
     let mut c = Client::open(dir.path());
-    let info = c.spawn("/usr/bin/yes", &[]);
+    // 32 MiB is several times what fleetd buffers for one subscription (256
+    // merged chunks of at most 16 KiB, plus the 256-frame outbox and the
+    // socket). Each line homes the cursor, so the screen never scrolls and
+    // even a debug build parses it quickly. The agent can only finish its
+    // writes once fleetd has read them, so the marker means the output went
+    // through the node while this client was not reading. `cat` then keeps
+    // the agent alive to echo input.
+    let marker = dir.path().join("flooded");
+    let line = format!("\x1b[H{}", "x".repeat(900));
+    let script = format!(
+        "yes \"$(printf '{line}')\" | head -c 33554432; touch '{}'; exec cat",
+        marker.display()
+    );
+    let info = c.sh(&script);
     c.attach(info.id);
-    // Stop reading while the agent floods.
-    std::thread::sleep(Duration::from_secs(1));
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Stop reading until the agent has flooded.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "agent never finished flooding");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     loop {
-        assert!(Instant::now() < deadline, "no lagged event");
         match c.next_frame() {
             Some(Frame::Event(fleet_proto::Event {
                 kind: Some(event::Kind::Lagged(l)),
@@ -692,10 +707,10 @@ fn lag_event_names_agent() {
             None => panic!("closed before lagged event"),
         }
     }
-    // Forwarding stopped: the next response arrives with no output behind it
-    // except what was already queued.
+    // A new subscription streams again.
     c.attach(info.id);
-    c.output_until(info.id, "y\r\ny");
+    c.input(info.id, b"ping");
+    c.output_until(info.id, "ping");
     c.kill(info.id);
 }
 

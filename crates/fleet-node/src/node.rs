@@ -9,12 +9,14 @@
 //! subscription are taken under the pipeline lock that also covers feeding the
 //! grid, so tail, screen and stream are contiguous.
 //!
-//! Subscriptions use a bounded `tokio::sync::mpsc` channel
-//! ([`SUBSCRIBER_CAPACITY`] chunks): the reader thread only ever `try_send`s,
-//! and the receiver can be awaited from a tokio task ([`Subscription::recv`]) or
-//! read from a plain thread ([`Subscription::blocking_recv`]). A subscriber
-//! whose channel is full is dropped and its next item is [`StreamItem::Lagged`];
-//! the client must re-attach.
+//! Subscriptions use a bounded queue ([`SUBSCRIBER_CAPACITY`] chunks): the
+//! reader thread only ever offers to it without waiting, and the receiver can
+//! be awaited from a tokio task ([`Subscription::recv`]) or read from a plain
+//! thread ([`Subscription::blocking_recv`]). Output chunks still queued are
+//! merged up to [`COALESCE_BYTES`], so the queue's depth in output does not
+//! shrink with the PTY's read size (~1 KiB on macOS). A subscriber whose
+//! queue is full is dropped and its next item is [`StreamItem::Lagged`]; the
+//! client must re-attach.
 //!
 //! The snapshot is taken with the parser in ground state, so it covers a
 //! pending synchronized update (applied first) and is followed by the
@@ -53,21 +55,26 @@ use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AttachOk, SpawnAgent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::Thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::{self, error::TrySendError};
 
 /// Chunks a subscriber may fall behind before it is dropped.
 pub const SUBSCRIBER_CAPACITY: usize = 256;
+
+/// Output chunks still queued for a subscriber are merged up to this many
+/// bytes, so its queue holds at least [`SUBSCRIBER_CAPACITY`] x this much
+/// output (4 MiB) however small the PTY reads are, not 256 reads.
+pub const COALESCE_BYTES: usize = 16 * 1024;
 
 /// Longest unterminated sequence carried into a snapshot. Beyond it (e.g. a
 /// huge OSC 52 payload) the tail is dropped and an attaching client may see
@@ -251,9 +258,156 @@ pub enum StreamItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnId(pub u64);
 
+/// One subscription's queue: at most [`SUBSCRIBER_CAPACITY`] items, filled
+/// by the reader thread without ever waiting and drained by one receiver,
+/// either from a tokio task or a plain thread. Consecutive output chunks
+/// still queued are merged up to [`COALESCE_BYTES`], so a slot holds more
+/// than one PTY read (a macOS PTY read returns at most ~1 KiB).
+struct Queue {
+    state: Mutex<QueueState>,
+    /// Wakes an async receiver; stores a permit if it is not waiting yet.
+    wake: Notify,
+    /// Wakes a blocking receiver.
+    wake_blocking: Condvar,
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: VecDeque<Queued>,
+    /// The sending side is gone: the stream ends once `items` is drained.
+    sender_gone: bool,
+    /// The receiver is gone: nothing more is accepted.
+    receiver_gone: bool,
+}
+
+enum Queued {
+    /// Consecutive output chunks and their total length, joined when taken.
+    Output(Vec<Bytes>, usize),
+    Other(StreamItem),
+}
+
+enum Offered {
+    Queued,
+    Full,
+    Closed,
+}
+
+impl Queue {
+    fn new() -> Arc<Queue> {
+        Arc::new(Queue {
+            state: Mutex::new(QueueState::default()),
+            wake: Notify::new(),
+            wake_blocking: Condvar::new(),
+        })
+    }
+
+    /// Queues `item` without waiting; merges output into a queued chunk
+    /// when it fits.
+    fn offer(&self, item: StreamItem) -> Offered {
+        let mut state = lock(&self.state);
+        if state.receiver_gone {
+            return Offered::Closed;
+        }
+        let was_empty = state.items.is_empty();
+        if let StreamItem::Output(chunk) = &item
+            && let Some(Queued::Output(parts, len)) = state.items.back_mut()
+            && *len + chunk.len() <= COALESCE_BYTES
+        {
+            *len += chunk.len();
+            parts.push(chunk.clone());
+            return Offered::Queued;
+        }
+        if state.items.len() >= SUBSCRIBER_CAPACITY {
+            return Offered::Full;
+        }
+        state.items.push_back(match item {
+            StreamItem::Output(chunk) => {
+                let len = chunk.len();
+                Queued::Output(vec![chunk], len)
+            }
+            other => Queued::Other(other),
+        });
+        drop(state);
+        // The receiver waits only on an empty queue.
+        if was_empty {
+            self.wake.notify_one();
+            self.wake_blocking.notify_one();
+        }
+        Offered::Queued
+    }
+
+    fn close_sender(&self) {
+        lock(&self.state).sender_gone = true;
+        self.wake.notify_one();
+        self.wake_blocking.notify_one();
+    }
+
+    fn close_receiver(&self) {
+        let mut state = lock(&self.state);
+        state.receiver_gone = true;
+        state.items.clear();
+    }
+
+    /// `Some(Some(item))`, `Some(None)` once the sender is gone and the
+    /// queue drained, or `None` while it is empty.
+    fn take(state: &mut QueueState) -> Option<Option<Queued>> {
+        match state.items.pop_front() {
+            Some(item) => Some(Some(item)),
+            None if state.sender_gone => Some(None),
+            None => None,
+        }
+    }
+
+    fn try_recv(&self) -> Option<Option<StreamItem>> {
+        let taken = Self::take(&mut lock(&self.state));
+        taken.map(|item| item.map(Queued::into_item))
+    }
+
+    async fn recv(&self) -> Option<StreamItem> {
+        loop {
+            if let Some(item) = self.try_recv() {
+                return item;
+            }
+            self.wake.notified().await;
+        }
+    }
+
+    fn blocking_recv(&self) -> Option<StreamItem> {
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(item) = Self::take(&mut state) {
+                drop(state);
+                return item.map(Queued::into_item);
+            }
+            state = self
+                .wake_blocking
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl Queued {
+    fn into_item(self) -> StreamItem {
+        match self {
+            Queued::Output(mut parts, _) if parts.len() == 1 => {
+                StreamItem::Output(parts.pop().unwrap_or_default())
+            }
+            Queued::Output(parts, len) => {
+                let mut joined = BytesMut::with_capacity(len);
+                for part in parts {
+                    joined.extend_from_slice(&part);
+                }
+                StreamItem::Output(joined.freeze())
+            }
+            Queued::Other(item) => item,
+        }
+    }
+}
+
 /// Receiving end of a subscription; dropping it detaches.
 pub struct Subscription {
-    rx: mpsc::Receiver<StreamItem>,
+    queue: Arc<Queue>,
     lagged: Arc<AtomicBool>,
     done: bool,
     /// The pipeline and this subscriber's key in it, to unsubscribe eagerly
@@ -263,6 +417,7 @@ pub struct Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
+        self.queue.close_receiver();
         if let Some((state, key)) = self.owner.take()
             && let Some(state) = state.upgrade()
         {
@@ -280,11 +435,11 @@ impl Drop for Subscription {
 impl Subscription {
     /// A stream that holds only [`StreamItem::Exited`].
     fn exited(code: i32) -> Self {
-        let (tx, rx) = mpsc::channel(1);
-        // Capacity is 1, so this cannot fail.
-        let _ = tx.try_send(StreamItem::Exited(code));
+        let queue = Queue::new();
+        queue.offer(StreamItem::Exited(code));
+        queue.close_sender();
         Subscription {
-            rx,
+            queue,
             lagged: Arc::new(AtomicBool::new(false)),
             done: false,
             owner: None,
@@ -296,7 +451,7 @@ impl Subscription {
         if let Some(item) = self.check_lagged() {
             return item;
         }
-        let item = self.rx.recv().await;
+        let item = self.queue.recv().await;
         self.after_recv(item)
     }
 
@@ -306,7 +461,7 @@ impl Subscription {
         if let Some(item) = self.check_lagged() {
             return item;
         }
-        let item = self.rx.blocking_recv();
+        let item = self.queue.blocking_recv();
         self.after_recv(item)
     }
 
@@ -326,7 +481,7 @@ impl Subscription {
     fn after_recv(&mut self, item: Option<StreamItem>) -> Option<StreamItem> {
         match item {
             // The sender is dropped right after setting the flag, so a closed
-            // channel may still mean "lagged".
+            // queue may still mean "lagged".
             None if self.lagged.load(Ordering::Acquire) => {
                 self.done = true;
                 Some(StreamItem::Lagged)
@@ -341,7 +496,7 @@ impl Subscription {
 }
 
 struct Subscriber {
-    tx: mpsc::Sender<StreamItem>,
+    queue: Arc<Queue>,
     lagged: Arc<AtomicBool>,
     /// Unique within the pipeline.
     key: u64,
@@ -352,16 +507,22 @@ struct Subscriber {
     seen: u64,
 }
 
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        self.queue.close_sender();
+    }
+}
+
 impl Subscriber {
     /// Delivers `item`; `false` if the subscriber is gone (closed or lagged).
     fn offer(&self, item: StreamItem) -> bool {
-        match self.tx.try_send(item) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => {
+        match self.queue.offer(item) {
+            Offered::Queued => true,
+            Offered::Full => {
                 self.lagged.store(true, Ordering::Release);
                 false
             }
-            Err(TrySendError::Closed(_)) => false,
+            Offered::Closed => false,
         }
     }
 }
@@ -561,14 +722,14 @@ impl AgentPipeline {
                 info: h.info(),
             }
         });
-        let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
+        let queue = Queue::new();
         let lagged = Arc::new(AtomicBool::new(false));
         let mut owner = None;
         let mut primary = false;
         match state.exit_code {
             Some(code) => {
-                // Capacity is at least 1, so this cannot fail.
-                let _ = tx.try_send(StreamItem::Exited(code));
+                queue.offer(StreamItem::Exited(code));
+                queue.close_sender();
             }
             None => {
                 let key = state.tick();
@@ -586,7 +747,7 @@ impl AgentPipeline {
                     primary = true;
                 }
                 state.subscribers.push(Subscriber {
-                    tx,
+                    queue: Arc::clone(&queue),
                     lagged: Arc::clone(&lagged),
                     key,
                     conn,
@@ -596,7 +757,7 @@ impl AgentPipeline {
             }
         }
         let subscription = Subscription {
-            rx,
+            queue,
             lagged,
             done: false,
             owner,

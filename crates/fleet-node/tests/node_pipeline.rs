@@ -157,12 +157,17 @@ fn every_subscriber_gets_the_full_stream_and_exit() {
 fn slow_subscriber_is_dropped_not_blocking() {
     let f = Fixture::new();
     let (_, mut stalled) = f.pipeline.subscribe();
-    let id = f.spawn("head -c 4194304 /dev/zero | tr '\\0' a");
+    // 16 MiB: four times what a subscription can queue (256 chunks merged
+    // up to 16 KiB). Each line homes the cursor, so nothing scrolls.
+    let id = f.spawn(&format!(
+        "yes \"$(printf '\x1b[H{}')\" | head -c 16777216",
+        "x".repeat(900)
+    ));
     // The agent completes although the subscriber never reads.
     f.wait();
     let stats = f.host.stats(id).unwrap();
     assert_eq!(stats.exit_code, Some(0));
-    assert!(stats.bytes_read >= 4 * 1024 * 1024);
+    assert!(stats.bytes_read >= 16 * 1024 * 1024);
     assert_eq!(
         recv(&mut stalled, Duration::from_secs(1)),
         Ok(Some(StreamItem::Lagged))
