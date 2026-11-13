@@ -1711,7 +1711,9 @@ impl Node {
         let (live, attached) = match started {
             Ok(started) => started,
             Err(e) => {
-                warn!(agent = id, program = ?new.program, error = %e, "spawn failed");
+                // Only the kind: the error's text can carry the agent's env
+                // (portable-pty names the PATH it searched).
+                warn!(agent = id, program = ?new.program, error_kind = ?e.kind(), "spawn failed");
                 if let Err(e) = lock(&self.store).delete_agent(id) {
                     warn!(agent = id, error = %e, "removing the failed agent's row failed");
                 }
@@ -1775,7 +1777,9 @@ impl Node {
     pub fn list(&self) -> io::Result<Vec<AgentInfo>> {
         let (records, bad) = lock(&self.store).list_agents_lossy().map_err(store_err)?;
         for e in bad {
-            warn!(error = %e, "skipping an unreadable agent row");
+            // Not the error's text: a decode error may quote the row's data.
+            let _ = e;
+            warn!("skipping an unreadable agent row");
         }
         Ok(records.into_iter().map(agent_info).collect())
     }

@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -6,13 +5,11 @@ use fleetd::logging::{self, DAEMON_LOG, STDIO_LOG};
 use fleetd::{Config, StartupError, raise_fd_limit, startup};
 use tracing::{error, info, warn};
 
-/// Logs a fatal error, and also prints it when a person is watching stderr
-/// (a daemon started by `--stdio` or launchd has it on /dev/null or a file).
+/// Logs a fatal error and prints it to stderr: the log may be unavailable,
+/// and whoever started the daemon may capture stderr.
 fn fatal(msg: &str) {
     error!("{msg}");
-    if std::io::stderr().is_terminal() {
-        eprintln!("fleetd: {msg}");
-    }
+    eprintln!("fleetd: {msg}");
 }
 
 fn main() -> ExitCode {
@@ -63,9 +60,7 @@ fn main() -> ExitCode {
         Ok(d) => d,
         Err(StartupError::AlreadyRunning) => {
             info!(state_dir = ?cfg.state_dir, "another fleetd holds the instance lock; exiting");
-            if std::io::stderr().is_terminal() {
-                eprintln!("fleetd already running");
-            }
+            eprintln!("fleetd already running");
             return ExitCode::from(2);
         }
         Err(e) => {
@@ -75,9 +70,7 @@ fn main() -> ExitCode {
     };
     if let Some(e) = log_error {
         // The daemon runs anyway, unlogged.
-        if std::io::stderr().is_terminal() {
-            eprintln!("fleetd: no log file: {e}");
-        }
+        eprintln!("fleetd: no log file: {e}");
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()

@@ -221,6 +221,29 @@ struct QueueWriter {
     dropped: Arc<AtomicU64>,
 }
 
+/// `line` (one formatted event) with every control character but its
+/// final newline and tabs escaped (`\n`, `\r`, `\xNN`), so no message or
+/// field, whatever its source, can start a line of its own.
+fn escape_controls(line: &[u8]) -> Vec<u8> {
+    let body = line.strip_suffix(b"\n").unwrap_or(line);
+    let is_control = |b: u8| (b < 0x20 && b != b'\t') || b == 0x7f;
+    let mut out = Vec::with_capacity(line.len() + 1);
+    if !body.iter().any(|&b| is_control(b)) {
+        out.extend_from_slice(body);
+    } else {
+        for &b in body {
+            match b {
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b if is_control(b) => out.extend_from_slice(format!("\\x{b:02x}").as_bytes()),
+                b => out.push(b),
+            }
+        }
+    }
+    out.push(b'\n');
+    out
+}
+
 impl QueueWriter {
     /// Queues `line`, preceded by a note of the lines dropped before it.
     fn push(&self, line: &[u8]) {
@@ -233,7 +256,7 @@ impl QueueWriter {
                 return;
             }
         }
-        match self.tx.try_send(Msg::Line(line.to_vec())) {
+        match self.tx.try_send(Msg::Line(escape_controls(line))) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -455,6 +478,17 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        assert_eq!(escape_controls(b"plain\tline\n"), b"plain\tline\n");
+        assert_eq!(
+            escape_controls(b"a\nT ERROR fake\r\x1b[31m\x7f\n"),
+            b"a\\nT ERROR fake\\r\\x1b[31m\\x7f\n"
+        );
+        // A missing final newline is added.
+        assert_eq!(escape_controls(b"x"), b"x\n");
     }
 
     #[test]

@@ -14,7 +14,8 @@ fleetd reported problems with about 26 `eprintln!`s. A daemon started by `fleetd
 
 - **`tracing` + `tracing-subscriber`** with only the `fmt`, `env-filter` and `std` features: no ANSI colours, no `log` bridge, no regex-heavy extras. `fleet-node` depends on `tracing` alone and emits events; only the `fleetd` binary installs a subscriber, so library users and tests without one pay only a disabled-callsite check.
 - **Level:** `FLEETD_LOG` holds an `EnvFilter` directive (for example `debug` or `fleetd=debug,fleet_node=info`). The default is `info`. An invalid directive falls back to `info` and is logged as a warning.
-- **Format:** one line per event: an RFC 3339 UTC timestamp, the level, the target, the message and `key=value` fields. Strings that come from clients (the client name in `Hello`, programs and paths) are logged with `Debug` quoting, so they cannot inject line breaks or fake lines.
+- **Format:** one line per event: an RFC 3339 UTC timestamp, the level, the target, the message and `key=value` fields. Strings that come from clients (the client name in `Hello`, programs and paths) are logged with `Debug` quoting.
+- **No line injection (backstop):** every formatted event goes through `escape_controls` before it is queued. Any `\n`, `\r` or other control character other than tab or the event's final newline becomes `\n`, `\r` or `\xNN`. So no message or field, including the `Display` text of an error, can start a line of its own. Every line in the file begins with a timestamp.
 
   ```
   2026-11-13T21:42:45.974000Z  INFO fleet_node::node: agent spawned agent=1 program="/bin/sh" cwd="/home/u/src" labels=["team"]
@@ -26,6 +27,7 @@ fleetd reported problems with about 26 `eprintln!`s. A daemon started by `fleetd
 - **Size rotation:** before a write would take the file past 10 MiB, `fleetd.log.1` is renamed to `fleetd.log.2`, `fleetd.log` to `fleetd.log.1`, and a new `fleetd.log` is opened. At most 30 MiB is kept.
 - **Several writers.** Each `fleetd --stdio` bridge logs to its own file, `logs/fleetd-stdio.log`, with the same rotation, so a bridge never writes into the daemon's file. Several processes can still append to one file: concurrent bridges, or a daemon that lost the instance lock and logs that before it exits. Files are opened with `O_APPEND`, and a line is written with one `write`, so lines from different processes do not tear. A process rotates only while it holds an exclusive `flock` on `logs/<name>.lock`, and only if the path still names the file it has open (same inode). If another process has already rotated the file, it just reopens the path. So two writers never rotate the same file twice, and no generation is overwritten by mistake. A process that has not noticed a rotation yet keeps appending to `<name>.1` until its own byte count reaches the limit. This is tested in `logging::tests::two_writers_rotating_one_file_lose_no_line_shape`.
 - **`fleetd --stdio` never logs to stdout**, which carries the protocol; nor to stderr, apart from its fatal error, which goes to the remote client as before.
+- **Fatal errors always go to stderr too.** A fatal startup or serve error, and `fleetd already running` (exit 2), are logged *and* always printed to stderr, whether or not stderr is a terminal. The log file may be unavailable, and a script or service manager may be capturing stderr. A daemon auto-started by `--stdio` has stderr on `/dev/null`, so it is unaffected.
 
 ### Never block
 
@@ -39,11 +41,11 @@ fleetd reported problems with about 26 `eprintln!`s. A daemon started by `fleetd
 |---|---|---|
 | daemon start / stopping / stopped | info | version, pid, state dir, protocol; the signal |
 | open-file limit | info / warn | the soft limit in effect, or the error |
-| another daemon holds the lock (race loser) | info | state dir |
-| fatal startup or serve error | error | message (also on stderr when stderr is a terminal) |
+| another daemon holds the lock (race loser) | info | state dir (also `fleetd already running` on stderr) |
+| fatal startup or serve error | error | message (always also printed to stderr) |
 | connection opened / closed | info | conn id, client name, close reason |
 | handshake rejected, too many connections | warn | conn id, reason |
-| spawn / spawn failed | info / warn | agent id, program, cwd, label **keys** |
+| spawn / spawn failed | info / warn | agent id, program, cwd, label **keys**; for a failure only the `io::ErrorKind` |
 | exit, kill | info | agent id, exit code / signal |
 | attach, detach, role change | info | agent id, conn id, primary |
 | subscription dropped as `Lagged` | warn | agent id, conn id |
@@ -51,6 +53,8 @@ fleetd reported problems with about 26 `eprintln!`s. A daemon started by `fleetd
 | history: disk write failure, retention deletions | warn / debug, info | dir; agent id or count |
 | login-env capture | info / warn | result (`ok`, `timeout` or `failed`), duration, variable **count** |
 | `--stdio` bridge start and close, auto-start, auto-started daemon lost the lock | info | pid, state dir, daemon pid |
+
+**Errors whose text can carry env or client data are not logged as text.** portable-pty's spawn error names the `PATH` it searched, which comes from the agent's env. So a failed spawn logs only `error_kind`, and an unreadable agent row only a fixed message. The other logged errors are OS I/O errors, frame-codec errors, parameterised SQLite errors, or text fleetd formats itself. `spawn_failure_logs_no_env_and_cannot_inject_lines` covers this, using a sentinel `PATH` and a program name containing a newline and a forged event.
 
 **Never logged:** environment values (captured or `SpawnAgent.env`), agent arguments, PTY output, input bytes, history lines and label values. Label *keys* are logged. `spawn_and_exit_are_logged_without_env_values` checks this at `FLEETD_LOG=trace`. It uses a sentinel in a fake login shell's environment, an env value, a label value, input bytes and the agent's output.
 

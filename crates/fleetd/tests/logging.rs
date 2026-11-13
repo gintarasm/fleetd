@@ -295,6 +295,41 @@ fn spawn_and_exit_are_logged_without_env_values() {
     }
 }
 
+/// Every line of the log starts with an RFC 3339 timestamp: nothing a client
+/// or an env value controls can start a line of its own.
+fn assert_lines_are_events(log: &str) {
+    for line in log.lines() {
+        let b = line.as_bytes();
+        assert!(
+            b.len() > 20 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && b[10] == b'T',
+            "a line that is not an event: {line:?}\n{log}"
+        );
+    }
+}
+
+#[test]
+fn spawn_failure_logs_no_env_and_cannot_inject_lines() {
+    let dir = TempDir::new().unwrap();
+    let _d = start(dir.path(), &[("FLEETD_LOG", "trace")]);
+    let mut c = Client::open(dir.path());
+    // A relative program not on PATH: the spawn error names the PATH searched.
+    let spawn = SpawnAgent {
+        program: "no-such-prog\n2026-01-01T00:00:00Z ERROR fake: injected\r".into(),
+        env: HashMap::from([("PATH".to_string(), "/opt/sentinel-path-77".to_string())]),
+        ..Default::default()
+    };
+    match c.request(request::Kind::Spawn(Box::new(spawn))) {
+        response::Kind::Error(_) => {}
+        other => panic!("expected a spawn error, got {other:?}"),
+    }
+    let log = wait_log(dir.path(), &["spawn failed"]);
+    assert!(
+        !log.contains("sentinel-path-77"),
+        "env value leaked:\n{log}"
+    );
+    assert_lines_are_events(&log);
+}
+
 #[test]
 fn read_logs_tail_spans_rotated_files() {
     let dir = TempDir::new().unwrap();
