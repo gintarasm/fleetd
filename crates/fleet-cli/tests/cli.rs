@@ -294,6 +294,32 @@ fn attach_detaches_on_encoded_ctrl_backslash() {
 }
 
 #[test]
+fn attach_forwards_a_lone_escape_after_a_short_wait() {
+    // A lone Esc could start an encoded Ctrl-\; it is held back briefly, then
+    // forwarded although nothing follows it.
+    let d = Daemon::start();
+    let id = d
+        .ok(&[
+            "spawn",
+            "--",
+            "sh",
+            "-c",
+            "stty raw -echo; head -c 1 | od -An -tx1; sleep 5",
+        ])
+        .trim()
+        .to_string();
+    let mut p = PtyAttach::start(&d, &id, false);
+    p.until("\x1b[?1049h\x1b[!p");
+    std::thread::sleep(Duration::from_millis(300));
+    p.writer.write_all(b"\x1b").unwrap();
+    p.writer.flush().unwrap();
+    p.until("1b");
+    p.writer.write_all(&[0x1c]).unwrap();
+    p.until(RESTORE);
+    assert_eq!(p.exit_code(), 0);
+}
+
+#[test]
 fn attach_exits_0_and_restores_when_agent_exits() {
     let d = Daemon::start();
     let id = d

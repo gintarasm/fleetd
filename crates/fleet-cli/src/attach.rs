@@ -182,23 +182,25 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
     // When input held back as a possible detach sequence is forwarded anyway.
     let mut flush_at: Option<Instant> = None;
     let outcome = loop {
-        let ev = if let Some(at) = flush_at {
-            match inbox.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                Ok(ev) => ev,
-                Err(RecvTimeoutError::Timeout) => {
-                    input.clear();
-                    detach.flush(&mut input);
-                    send_input(&mut sender, agent_id, &input)?;
-                    flush_at = None;
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => break Outcome::Detached,
+        let ev = match flush_at {
+            // Checked before receiving, so a steady stream of output frames
+            // cannot hold the input back.
+            Some(at) if Instant::now() >= at => {
+                input.clear();
+                detach.flush(&mut input);
+                send_input(&mut sender, agent_id, &input)?;
+                flush_at = None;
+                continue;
             }
-        } else {
-            match inbox.recv() {
+            Some(at) => match inbox.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(ev) => ev,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break Outcome::Detached,
+            },
+            None => match inbox.recv() {
                 Ok(ev) => ev,
                 Err(_) => break Outcome::Detached,
-            }
+            },
         };
         if matches!(ev, Ev::Frame(_)) {
             let _ = released.try_recv();
