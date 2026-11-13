@@ -288,15 +288,18 @@ fn agent_session_env(extra: &[(&str, &str)], remove: &[&str]) -> String {
         "STY",
         "WINDOW",
     ];
-    let script: String = vars
+    // One atomic write: `agent_output` returns once `out` ends with a newline.
+    let echoes: String = vars
         .iter()
-        .map(|v| format!("echo \"{v}=${{{v}-unset}}\" >> out; "))
+        .map(|v| format!("echo \"{v}=${{{v}-unset}}\"; "))
         .collect();
-    agent_output(
+    let got = agent_output(
         dir.path(),
         work.path(),
-        &format!("{script}echo done >> out"),
-    )
+        &format!("{{ {echoes}echo done; }} > out.tmp && mv out.tmp out"),
+    );
+    assert!(got.ends_with("done\n"), "incomplete output: {got}");
+    got
 }
 
 const SSH_ALL: [&str; 5] = [
