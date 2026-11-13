@@ -2,16 +2,19 @@
 //! [`Terminal`]; on (re)attach a client receives [`Terminal::snapshot`] and
 //! then the live stream, so reattach cost is O(screen).
 //!
-//! The snapshot carries the visible grid, the active SGR pen, the cursor and
-//! the terminal modes a client needs to keep interacting (alt screen, input,
-//! mouse, cursor visibility, wrap, origin, insert, LNM). Known limits:
-//! - While an alt-screen app runs, the primary screen's content is not carried
-//!   (alacritty keeps the inactive grid private); on `?1049l` the client shows a
-//!   blank primary screen until the app redraws.
+//! The snapshot carries the visible grid, the active SGR pen, the cursor, the
+//! saved cursor (DECSC), the kitty keyboard flags and the terminal modes a
+//! client needs to keep interacting (alt screen, input, mouse, cursor
+//! visibility, wrap, origin, insert, LNM). While the alt screen is active it
+//! carries the primary screen behind it too, so `?1049l` on the client shows
+//! what it shows on the node. Known limits:
 //! - The scroll region (DECSTBM) is not carried: alacritty keeps it private and
 //!   exposes no accessor, so the client starts with a full-screen region.
-//! - Not carried either: the saved cursor (DECSC), charsets, tab stops, kitty
-//!   keyboard mode stack, hyperlinks and soft-wrap (WRAPLINE) markers.
+//! - Kitty keyboard flags: only the current flags of each screen are carried
+//!   (at most one stack level on the client), not the stack below them;
+//!   alacritty keeps the stacks private.
+//! - Not carried either: charsets (also those in the saved cursor), tab stops,
+//!   hyperlinks and soft-wrap (WRAPLINE) markers.
 //!
 //! Synchronized updates (`?2026h` … `?2026l`) are buffered by the parser; a
 //! frame whose ESU never arrives is applied on the next [`Terminal::feed`] after
@@ -23,16 +26,19 @@
 //! [`Terminal::take_replies`]; the owner decides whether to send them to the
 //! agent.
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Cursor, Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{
+    Color, Handler, KeyboardModes, KeyboardModesApplyBehavior, NamedColor, Processor,
+};
 
 /// Grid size handed to alacritty. Scrollback is disabled: history lives in the
 /// per-agent ring file (Task 3), and keeping it here would cost memory per agent.
@@ -65,12 +71,19 @@ impl Dimensions for Size {
 }
 
 /// Collects the bytes alacritty wants written back to the PTY.
+///
+/// The kitty keyboard query reply (`CSI ? flags u`) is dropped: kitty keyboard
+/// tracking is on only so snapshots can carry the flags, and the node must not
+/// tell an agent that the (unknown) client terminal supports the protocol.
 #[derive(Clone, Default)]
 struct Replies(Arc<Mutex<Vec<u8>>>);
 
 impl EventListener for Replies {
     fn send_event(&self, event: Event) {
         if let Event::PtyWrite(text) = event {
+            if is_kitty_keyboard_report(&text) {
+                return;
+            }
             self.0
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -79,9 +92,20 @@ impl EventListener for Replies {
     }
 }
 
+/// `CSI ? <digits> u`, alacritty's reply to a kitty keyboard flags query.
+fn is_kitty_keyboard_report(text: &str) -> bool {
+    text.strip_prefix("\x1b[?")
+        .and_then(|rest| rest.strip_suffix('u'))
+        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Headless terminal emulator holding the visible screen of one agent.
 pub struct Terminal {
-    term: Term<Replies>,
+    /// In a `RefCell` so [`Terminal::snapshot`] can take `&self`: while the alt
+    /// screen is active it swaps to the primary screen to read it and restores
+    /// the terminal before returning. `&mut self` methods use `get_mut` (no
+    /// runtime check).
+    term: RefCell<Term<Replies>>,
     parser: Processor,
     replies: Replies,
 }
@@ -91,11 +115,13 @@ impl Terminal {
     pub fn new(cols: u16, rows: u16) -> Self {
         let config = Config {
             scrolling_history: 0,
+            // Track the kitty keyboard flags so snapshots can carry them.
+            kitty_keyboard: true,
             ..Config::default()
         };
         let replies = Replies::default();
         Self {
-            term: Term::new(config, &Size::new(cols, rows), replies.clone()),
+            term: RefCell::new(Term::new(config, &Size::new(cols, rows), replies.clone())),
             parser: Processor::new(),
             replies,
         }
@@ -104,7 +130,7 @@ impl Terminal {
     /// Feeds raw PTY output through the VT parser.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.flush_expired_sync();
-        self.parser.advance(&mut self.term, bytes);
+        self.parser.advance(self.term.get_mut(), bytes);
     }
 
     /// Applies a buffered synchronized update now, whether or not its ESU or
@@ -112,7 +138,7 @@ impl Terminal {
     /// mid-frame would otherwise be missing from the snapshot.
     pub fn flush_pending_sync(&mut self) {
         if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.parser.stop_sync(&mut self.term);
+            self.parser.stop_sync(self.term.get_mut());
         }
     }
 
@@ -124,7 +150,7 @@ impl Terminal {
             .sync_timeout()
             .is_some_and(|deadline| deadline <= Instant::now());
         if expired {
-            self.parser.stop_sync(&mut self.term);
+            self.parser.stop_sync(self.term.get_mut());
         }
     }
 
@@ -135,77 +161,72 @@ impl Terminal {
 
     /// Resizes the screen (reflowing the primary screen); zero dimensions are clamped to 1.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.term.resize(Size::new(cols, rows));
+        self.term.get_mut().resize(Size::new(cols, rows));
     }
 
     /// Current size as `(cols, rows)`.
     pub fn size(&self) -> (u16, u16) {
-        let grid = self.term.grid();
+        let term = self.term.borrow();
+        let grid = term.grid();
         (to_u16(grid.columns()), to_u16(grid.screen_lines()))
     }
 
     /// ANSI byte sequence that redraws the visible screen into a fresh terminal of
     /// the same size: text, SGR attributes, the active pen and the cursor position.
     ///
-    /// Starts with `\x1b[0m\x1b[H\x1b[2J` (preceded by `\x1b[?1049h` when the alt
-    /// screen is active), then the grid, the pen, the non-default modes, and ends
-    /// with `\x1b[{row};{col}H`
-    /// (1-based), except when the cursor has a pending autowrap: then the glyph
-    /// under the cursor is re-emitted after the CUP to recreate that state.
+    /// Layout: when the alt screen is active, first the primary screen (as
+    /// below, but without the saved cursor and the modes), then `\x1b[?1049h`.
+    /// Then the active screen:
+    /// `\x1b[0m\x1b[H\x1b[2J`, the grid, the saved cursor (positioned with its
+    /// pen, then `\x1b7`; omitted when it is a fresh terminal's), the pen, the
+    /// kitty keyboard flags, the non-default modes, and `\x1b[{row};{col}H`
+    /// (1-based). A pending autowrap (of the cursor or the saved cursor) is
+    /// recreated by re-emitting the glyph under it after its CUP.
+    ///
+    /// Takes `&self`, but with the alt screen active it swaps to the primary
+    /// screen and back (see [`with_primary`]); the terminal is unchanged
+    /// afterwards.
     pub fn snapshot(&self) -> Vec<u8> {
-        let grid = self.term.grid();
-        let (cols, rows) = (grid.columns(), grid.screen_lines());
-        let mode = *self.term.mode();
-        let mut out = Vec::with_capacity(rows * (cols + 8) + 128);
-        if mode.contains(TermMode::ALT_SCREEN) {
+        let mut term = self.term.borrow_mut();
+        let (cols, rows) = (term.grid().columns(), term.grid().screen_lines());
+        let alt = term.mode().contains(TermMode::ALT_SCREEN);
+        let screens = if alt { 2 } else { 1 };
+        let mut out = Vec::with_capacity(screens * rows * (cols + 8) + 128);
+        let mut pen = Pen::default();
+        let mut kitty_pushed = false;
+        if alt {
+            with_primary(&mut term, |term| {
+                let grid = term.grid();
+                put_grid(&mut out, &mut pen, grid);
+                // No DECSC: the client's `?1049h` overwrites the primary's
+                // saved cursor with its cursor (alacritty; xterm saves it with
+                // DECSC), and the node's equals the cursor (see `with_primary`).
+                pen.transition(&mut out, Pen::of(&grid.cursor.template));
+                kitty_pushed = put_kitty_flags(&mut out, *term.mode(), false);
+                put_cursor(&mut out, &mut pen, grid, &grid.cursor);
+            });
             out.extend_from_slice(b"\x1b[?1049h");
         }
-        out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
-        let mut pen = Pen::default();
-        for row in 0..rows {
-            let line = &grid[Line(row as i32)];
-            let Some(end) = (0..cols).rev().find(|&c| !is_blank(&line[Column(c)])) else {
-                continue;
-            };
-            if row > 0 {
-                cup(&mut out, row, 0);
-            }
-            for col in 0..=end {
-                let cell = &line[Column(col)];
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                pen.transition(&mut out, Pen::of(cell));
-                put_glyph(&mut out, cell);
-            }
+        let grid = term.grid();
+        let mode = *term.mode();
+        put_grid(&mut out, &mut pen, grid);
+        // Before the modes: DECSC/DECRC positions are absolute, so the saved
+        // cursor is placed while origin mode is still off.
+        if !is_fresh_cursor(&grid.saved_cursor) {
+            put_cursor(&mut out, &mut pen, grid, &grid.saved_cursor);
+            out.extend_from_slice(b"\x1b7");
         }
-
-        let cursor = &grid.cursor;
-        let (row, col) = (cursor.point.line.0 as usize, cursor.point.column.0);
-        pen.transition(&mut out, Pen::of(&cursor.template));
+        pen.transition(&mut out, Pen::of(&grid.cursor.template));
+        put_kitty_flags(&mut out, mode, kitty_pushed);
         put_modes(&mut out, mode);
-        cup(&mut out, row, col);
-        if cursor.input_needs_wrap {
-            let line = &grid[cursor.point.line];
-            let start = if line[Column(col)].flags.contains(Flags::WIDE_CHAR_SPACER) {
-                col.saturating_sub(1)
-            } else {
-                col
-            };
-            let cell = &line[Column(start)];
-            if start != col {
-                cup(&mut out, row, start);
-            }
-            pen.transition(&mut out, Pen::of(cell));
-            put_glyph(&mut out, cell);
-            pen.transition(&mut out, Pen::of(&cursor.template));
-        }
+        put_cursor(&mut out, &mut pen, grid, &grid.cursor);
         out
     }
 
     /// Visible screen as one `String` per row, trailing spaces trimmed.
     pub fn visible_text(&self) -> Vec<String> {
-        let grid = self.term.grid();
+        let term = self.term.borrow();
+        let grid = term.grid();
         (0..grid.screen_lines())
             .map(|row| {
                 let line = &grid[Line(row as i32)];
@@ -226,25 +247,196 @@ impl Terminal {
 
     /// Cursor position as 0-based `(row, col)`.
     pub fn cursor(&self) -> (u16, u16) {
-        let point = self.term.grid().cursor.point;
+        let point = self.term.borrow().grid().cursor.point;
         (to_u16(point.line.0.max(0) as usize), to_u16(point.column.0))
     }
 
     /// Rendering attributes of one cell, for roundtrip comparisons in tests.
     #[cfg(test)]
     fn cell_attrs(&self, row: u16, col: u16) -> Pen {
-        Pen::of(&self.term.grid()[Line(i32::from(row))][Column(usize::from(col))])
+        Pen::of(&self.term.borrow().grid()[Line(i32::from(row))][Column(usize::from(col))])
     }
 
     /// Terminal modes, for roundtrip comparisons in tests.
     #[cfg(test)]
     fn mode(&self) -> TermMode {
-        *self.term.mode()
+        *self.term.borrow().mode()
+    }
+
+    /// Saved cursor (DECSC) as `(row, col, pending wrap, pen)`, for roundtrip
+    /// comparisons in tests.
+    #[cfg(test)]
+    fn saved_cursor(&self) -> (i32, usize, bool, Pen) {
+        let term = self.term.borrow();
+        let saved = &term.grid().saved_cursor;
+        (
+            saved.point.line.0,
+            saved.point.column.0,
+            saved.input_needs_wrap,
+            Pen::of(&saved.template),
+        )
+    }
+
+    /// Pending wrap and pen of the cursor, for roundtrip comparisons in tests.
+    #[cfg(test)]
+    fn cursor_state(&self) -> (bool, Pen) {
+        let term = self.term.borrow();
+        let cursor = &term.grid().cursor;
+        (cursor.input_needs_wrap, Pen::of(&cursor.template))
     }
 }
 
 fn to_u16(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// Runs `f` on the primary screen while the alt screen is active, then puts the
+/// terminal back as it was. Relies on what alacritty 0.26's [`Term::swap_alt`]
+/// does (pinned by the test `swap_alt_behaves_as_snapshot_expects`):
+/// - alt -> primary swaps the grids and the kitty keyboard stacks, recomputes
+///   the kitty flags from the primary's stack and flips `ALT_SCREEN`; nothing
+///   is lost.
+/// - primary -> alt also sets the alt grid's cursor to the primary cursor,
+///   overwrites the primary's saved cursor with its cursor, clears the alt
+///   grid, and recomputes the kitty flags from the alt stack's top (losing
+///   flags set with `CSI = … u`, which leaves the stack alone).
+///
+/// So the alt grid (with its cursor and saved cursor) is cloned and put back,
+/// and the alt kitty flags are re-applied. The primary's saved cursor cannot
+/// be kept apart from its cursor: entering the alt screen (`?1049h`, the same
+/// `swap_alt`) already set it to the cursor, and the two differ only after a
+/// resize while the alt screen is active (the inactive primary is reflowed:
+/// the cursor moves with the text, the saved cursor is only clamped). Then the
+/// saved cursor becomes the cursor; the cursor, which `?1049l` shows, is kept.
+/// Selection and damage are not kept (unused here).
+fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&Term<Replies>) -> R) -> R {
+    debug_assert!(term.mode().contains(TermMode::ALT_SCREEN));
+    let alt_grid = term.grid().clone();
+    let alt_kitty = *term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL;
+    term.swap_alt();
+    let result = f(term);
+    term.swap_alt();
+    *term.grid_mut() = alt_grid;
+    if *term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL != alt_kitty {
+        Handler::set_keyboard_mode(
+            term,
+            KeyboardModes::from_bits_truncate(kitty_flags(alt_kitty)),
+            KeyboardModesApplyBehavior::Replace,
+        );
+    }
+    result
+}
+
+/// Clears the screen (`\x1b[0m\x1b[H\x1b[2J`, so `pen` becomes the default)
+/// and draws `grid`'s non-blank cells.
+fn put_grid(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>) {
+    let (cols, rows) = (grid.columns(), grid.screen_lines());
+    out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
+    *pen = Pen::default();
+    for row in 0..rows {
+        let line = &grid[Line(row as i32)];
+        let Some(end) = (0..cols).rev().find(|&c| !is_blank(&line[Column(c)])) else {
+            continue;
+        };
+        if row > 0 {
+            cup(out, row, 0);
+        }
+        for col in 0..=end {
+            let cell = &line[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            pen.transition(out, Pen::of(cell));
+            put_glyph(out, cell);
+        }
+    }
+}
+
+/// Moves to `cursor` and sets its pen. A pending autowrap is recreated by
+/// re-emitting the glyph under the cursor (the whole wide character if the
+/// cursor is on its spacer) with that cell's pen.
+fn put_cursor(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>, cursor: &Cursor<Cell>) {
+    let row = (cursor.point.line.0.max(0) as usize).min(grid.screen_lines() - 1);
+    let col = cursor.point.column.0.min(grid.columns() - 1);
+    cup(out, row, col);
+    if cursor.input_needs_wrap {
+        let line = &grid[Line(row as i32)];
+        let start = if line[Column(col)].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col.saturating_sub(1)
+        } else {
+            col
+        };
+        let cell = &line[Column(start)];
+        if start != col {
+            cup(out, row, start);
+        }
+        pen.transition(out, Pen::of(cell));
+        put_glyph(out, cell);
+    }
+    pen.transition(out, Pen::of(&cursor.template));
+}
+
+/// Whether DECRC in a fresh terminal already restores `cursor`, as far as the
+/// snapshot carries it (position, pending wrap and pen; not charsets).
+fn is_fresh_cursor(cursor: &Cursor<Cell>) -> bool {
+    cursor.point.line.0 == 0
+        && cursor.point.column.0 == 0
+        && !cursor.input_needs_wrap
+        && Pen::of(&cursor.template) == Pen::default()
+}
+
+/// Kitty keyboard flags: the `TermMode` bit and its protocol value.
+const KITTY_FLAGS: [(TermMode, KeyboardModes); 5] = [
+    (
+        TermMode::DISAMBIGUATE_ESC_CODES,
+        KeyboardModes::DISAMBIGUATE_ESC_CODES,
+    ),
+    (
+        TermMode::REPORT_EVENT_TYPES,
+        KeyboardModes::REPORT_EVENT_TYPES,
+    ),
+    (
+        TermMode::REPORT_ALTERNATE_KEYS,
+        KeyboardModes::REPORT_ALTERNATE_KEYS,
+    ),
+    (
+        TermMode::REPORT_ALL_KEYS_AS_ESC,
+        KeyboardModes::REPORT_ALL_KEYS_AS_ESC,
+    ),
+    (
+        TermMode::REPORT_ASSOCIATED_TEXT,
+        KeyboardModes::REPORT_ASSOCIATED_TEXT,
+    ),
+];
+
+/// The kitty keyboard flags (protocol bit values) set in `mode`.
+fn kitty_flags(mode: TermMode) -> u8 {
+    KITTY_FLAGS
+        .iter()
+        .filter(|(flag, _)| mode.contains(*flag))
+        .fold(0, |acc, (_, bits)| acc | bits.bits())
+}
+
+/// Emits `mode`'s kitty keyboard flags; returns whether it pushed a stack level.
+///
+/// Pushes one level (`CSI > flags u`) when the flags are non-zero, so the one
+/// `CSI < u` that `fleet attach` sends on exit pops it. If an earlier screen of
+/// this snapshot already `pushed` (the primary behind an active alt screen), it
+/// sets the flags instead (`CSI = flags ; 1 u`, also when zero): a fresh
+/// terminal enters the alt screen with an empty stack of its own, while a
+/// client that is already on its alt screen (`fleet attach`) ignores `?1049h`
+/// and would otherwise keep the primary's flags or end up two levels deep.
+fn put_kitty_flags(out: &mut Vec<u8>, mode: TermMode, pushed: bool) -> bool {
+    let flags = kitty_flags(mode);
+    if pushed {
+        let _ = write!(out, "\x1b[={flags};1u");
+        false
+    } else if flags != 0 {
+        let _ = write!(out, "\x1b[>{flags}u");
+        true
+    } else {
+        false
+    }
 }
 
 /// The character a cell renders; a leading wide-char spacer renders as blank.
@@ -536,6 +728,8 @@ mod tests {
     fn assert_same_screen(a: &Terminal, b: &Terminal) {
         assert_eq!(a.visible_text(), b.visible_text());
         assert_eq!(a.cursor(), b.cursor());
+        assert_eq!(a.cursor_state(), b.cursor_state(), "cursor wrap/pen");
+        assert_eq!(a.saved_cursor(), b.saved_cursor(), "saved cursor");
         assert_eq!(a.mode(), b.mode());
         let (cols, rows) = a.size();
         for row in 0..rows {
@@ -686,14 +880,345 @@ mod tests {
         let setup = "primary\x1b[?1049h\x1b[2;3Halt \x1b[31mred";
         let mut a = Terminal::new(20, 5);
         a.feed(setup.as_bytes());
-        let b = roundtrip_modes(setup, TermMode::ALT_SCREEN, TermMode::empty());
+        let mut b = roundtrip_modes(setup, TermMode::ALT_SCREEN, TermMode::empty());
         assert_eq!(b.visible_text(), a.visible_text());
         assert_eq!(b.visible_text()[1], "  alt red");
-        assert!(b.snapshot().starts_with(b"\x1b[?1049h\x1b[0m\x1b[H\x1b[2J"));
-        // Leaving the alt screen works on the client (primary content is not carried).
-        let mut b = b;
+        let snap = a.snapshot();
+        assert!(snap.starts_with(b"\x1b[0m\x1b[H\x1b[2Jprimary"));
+        let alt = b"\x1b[?1049h\x1b[0m\x1b[H\x1b[2J";
+        assert_eq!(
+            snap.windows(alt.len()).filter(|w| w == alt).count(),
+            1,
+            "{:?}",
+            String::from_utf8_lossy(&snap)
+        );
+        // Leaving the alt screen shows the primary screen on the client too.
+        a.feed(b"\x1b[?1049l");
         b.feed(b"\x1b[?1049l");
         assert!(!b.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(b.visible_text()[0], "primary");
+        assert_same_screen(&a, &b);
+    }
+
+    /// Feeds `setup` into A, roundtrips into B, checks the screens match, then
+    /// feeds each of `after` into both and checks again after each.
+    fn roundtrip_then(cols: u16, rows: u16, setup: &[u8], after: &[&[u8]]) -> (Terminal, Terminal) {
+        let mut a = Terminal::new(cols, rows);
+        a.feed(setup);
+        let mut b = roundtrip(&a);
+        assert_same_screen(&a, &b);
+        for (i, bytes) in after.iter().enumerate() {
+            a.feed(bytes);
+            b.feed(bytes);
+            assert!(
+                a.visible_text() == b.visible_text() && a.cursor() == b.cursor(),
+                "after step {i} ({:?}): A {:?} at {:?}, B {:?} at {:?}",
+                String::from_utf8_lossy(bytes),
+                a.visible_text(),
+                a.cursor(),
+                b.visible_text(),
+                b.cursor()
+            );
+            assert_same_screen(&a, &b);
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn snapshot_preserves_saved_cursor() {
+        // DECSC with a pen, then elsewhere with another pen; DECRC on both.
+        let (_, b) = roundtrip_then(
+            20,
+            5,
+            b"hello\x1b[2;3H\x1b[1;31;48;5;200m\x1b7\x1b[0m\x1b[4;1Hworld\x1b[32m",
+            &[b"\x1b8X", b"Y\x1b[1;1H\x1b8Z"],
+        );
+        assert_eq!(b.visible_text()[1], "  ZY");
+        // CSI s / CSI u.
+        roundtrip_then(20, 5, b"ab\x1b[3;7H\x1b[s\x1b[H", &[b"\x1b[ux"]);
+        // A saved cursor at the home position with only a pen differs from a
+        // fresh terminal's.
+        roundtrip_then(20, 5, b"\x1b[7m\x1b7\x1b[0m\x1b[3;3H", &[b"\x1b8inv"]);
+        // A saved cursor at the fresh default needs nothing.
+        let mut a = Terminal::new(20, 5);
+        a.feed(b"\x1b7abc");
+        assert!(!a.snapshot().windows(2).any(|w| w == b"\x1b7"));
+    }
+
+    #[test]
+    fn snapshot_preserves_saved_cursor_pending_wrap() {
+        for setup in ["abcde", "abc中", "ab\x1b[1;5H\x1b[4m中\x1b[0m"] {
+            let setup = format!("{setup}\x1b7\x1b[3;1H");
+            let (a, _) = roundtrip_then(5, 4, setup.as_bytes(), &[b"\x1b8f", b"g"]);
+            assert!(
+                a.saved_cursor().2 || setup.contains("中\x1b[0m"),
+                "{setup:?}"
+            );
+        }
+        // Saved with a pending wrap while the cursor sits elsewhere.
+        roundtrip_then(5, 4, b"abcde\x1b7\x1b[3;2Hq", &[b"\x1b8f"]);
+    }
+
+    #[test]
+    fn snapshot_saved_cursor_with_origin_mode() {
+        // DECSC/DECRC positions are absolute; origin mode is applied after the
+        // saved cursor is placed.
+        roundtrip_then(
+            20,
+            6,
+            b"ab\x1b[3;4H\x1b7\x1b[?6h\x1b[2;2H",
+            &[b"\x1b8Z", b"\x1b[1;1HW"],
+        );
+        roundtrip_then(20, 6, b"\x1b[?6h\x1b[4;5H\x1b7\x1b[H", &[b"\x1b8Z"]);
+    }
+
+    #[test]
+    fn snapshot_preserves_kitty_keyboard_flags() {
+        for (setup, flags) in [
+            ("\x1b[>1u", TermMode::DISAMBIGUATE_ESC_CODES),
+            ("\x1b[>31u", TermMode::KITTY_KEYBOARD_PROTOCOL),
+            (
+                "\x1b[>1u\x1b[>5u",
+                TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
+            ),
+            // Set without a push, and changed with union/difference.
+            (
+                "\x1b[=3;1u",
+                TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES,
+            ),
+            (
+                "\x1b[>1u\x1b[=8;2u\x1b[=1;3u",
+                TermMode::REPORT_ALL_KEYS_AS_ESC,
+            ),
+        ] {
+            let b = roundtrip_modes(setup, flags, TermMode::KITTY_KEYBOARD_PROTOCOL - flags);
+            assert_eq!(
+                b.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL,
+                flags,
+                "{setup:?}"
+            );
+        }
+        let mut a = Terminal::new(20, 5);
+        a.feed(b"x\x1b[>9u");
+        let snap = a.snapshot();
+        let push = b"\x1b[>9u";
+        assert!(snap.windows(push.len()).any(|w| w == push));
+        // Popping the one level the snapshot pushed clears the flags on both.
+        roundtrip_then(20, 5, b"\x1b[>1u", &[b"\x1b[<u"]);
+        // No flags: nothing emitted.
+        let mut a = Terminal::new(20, 5);
+        a.feed(b"\x1b[>1u\x1b[<u");
+        assert!(!a.snapshot().ends_with(b"u"));
+        assert!(!a.snapshot().windows(3).any(|w| w == b"\x1b[>"));
+    }
+
+    #[test]
+    fn kitty_keyboard_query_is_not_answered() {
+        let mut t = Terminal::new(20, 5);
+        t.feed(b"\x1b[>1u\x1b[?u\x1b[6n");
+        assert_eq!(t.take_replies(), b"\x1b[1;1R");
+    }
+
+    /// Everything a test can observe about `t`, primary and alt screen alike,
+    /// for checking that a snapshot leaves the terminal untouched.
+    fn observe(t: &Terminal) -> Vec<String> {
+        let (cols, rows) = t.size();
+        let mut seen = t.visible_text();
+        seen.push(format!(
+            "{:?} {:?} {:?} {:?}",
+            t.cursor(),
+            t.cursor_state(),
+            t.saved_cursor(),
+            t.mode()
+        ));
+        for row in 0..rows {
+            for col in 0..cols {
+                seen.push(format!("{:?}", t.cell_attrs(row, col)));
+            }
+        }
+        seen
+    }
+
+    /// A primary screen behind an alt screen, with a pen, saved cursors, kitty
+    /// flags and modes on both.
+    const PRIMARY_AND_ALT: &[u8] = concat!(
+        "prompt$ \x1b[1;34mls\x1b[0m\r\nfile1  \x1b[32mfile2\x1b[0m\r\n",
+        "\x1b[2;3H\x1b[4m\x1b7\x1b[0m\x1b[3;1H\x1b[>1u\x1b[35mrun ",
+        "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[>11u\x1b[=3;1u",
+        "\x1b[44m\x1b[2J\x1b[1;1Htitle\x1b[0m\x1b[3;5H\x1b[7m\x1b7\x1b[0mbody\x1b[31m",
+    )
+    .as_bytes();
+
+    #[test]
+    fn snapshot_carries_primary_screen_behind_alt_screen() {
+        let (a, b) = roundtrip_then(
+            30,
+            6,
+            PRIMARY_AND_ALT,
+            &[
+                b"\x1b8more",
+                b"\x1b[?1049l",
+                b"done\x1b8!",
+                b"\x1b[<u",
+                // Re-entering the alt screen finds A's old alt stack (`>11`, not
+                // carried) on the node; clear it to compare the rest.
+                b"\x1b[?1049h\x1b[<9uagain",
+                b"\x1b[?1049l",
+            ],
+        );
+        assert_eq!(b.visible_text()[0], "prompt$ ls");
+        assert_eq!(b.visible_text()[1], "file1  file2");
+        assert_eq!(
+            a.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL,
+            TermMode::empty()
+        );
+
+        // Primary flags survive the alt screen on the client too.
+        roundtrip_then(30, 6, PRIMARY_AND_ALT, &[b"\x1b[?1049l", b"\x1b[<u"]);
+        // Alt flags zero, primary flags set: the client's alt screen gets 0.
+        roundtrip_then(
+            30,
+            6,
+            b"\x1b[>1uprimary\x1b[?1049halt",
+            &[b"\x1b[?1049l", b"\x1b[<u"],
+        );
+        // Primary flags zero, alt flags set.
+        roundtrip_then(30, 6, b"primary\x1b[?1049h\x1b[>8ualt", &[b"\x1b[?1049l"]);
+        // A blank primary and an alt saved cursor left over from an earlier
+        // alt-screen session.
+        roundtrip_then(
+            30,
+            6,
+            b"\x1b[?1049h\x1b[2;2H\x1b7\x1b[?1049l\x1b[2J\x1b[H\x1b[?1049h",
+            &[b"\x1b8x", b"\x1b[?1049l"],
+        );
+        // Pending wraps on both screens.
+        roundtrip_then(
+            5,
+            3,
+            b"abcde\x1b[?1049hvwxyz",
+            &[b"1", b"\x1b[?1049l", b"2"],
+        );
+    }
+
+    #[test]
+    fn snapshot_leaves_terminal_unchanged() {
+        let setups: [&[u8]; 4] = [
+            PRIMARY_AND_ALT,
+            b"plain\x1b[2;2H\x1b7\x1b[>5u",
+            // Alt flags set without a push (lost by a bare swap_alt round trip).
+            b"x\x1b[?1049h\x1b[=5;1uy",
+            b"abcde\x1b[?1049hvwxyz",
+        ];
+        for setup in setups {
+            let mut a = Terminal::new(5, 3);
+            let mut twin = Terminal::new(5, 3);
+            a.feed(setup);
+            twin.feed(setup);
+            for _ in 0..2 {
+                a.snapshot();
+            }
+            let steps: [&[u8]; 6] = [
+                b"",
+                b"\x1b8q",
+                b"\x1b[?1049l",
+                b"\x1b8r",
+                b"\x1b[?1049h",
+                b"\x1b8s",
+            ];
+            for step in steps {
+                a.feed(step);
+                twin.feed(step);
+                assert_eq!(observe(&a), observe(&twin), "{setup:?} then {step:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_after_resize_on_alt_screen() {
+        // Resizing reflows the inactive primary screen: here its cursor moves
+        // to (1, 1) while its saved cursor stays at (1, 3). The snapshot keeps
+        // the cursor (where `?1049l` lands) and A's saved cursor becomes the
+        // cursor (a documented loss; see `with_primary`); B matches A.
+        let setup = b"0123456789abc\x1b[?1049halt";
+        let mut a = Terminal::new(10, 4);
+        let mut twin = Terminal::new(10, 4);
+        for t in [&mut a, &mut twin] {
+            t.feed(setup);
+            t.resize(6, 3);
+        }
+        let mut b = roundtrip(&a);
+        assert_same_screen(&a, &b);
+        for step in [&b"\x1b[?1049l"[..], b"Z"] {
+            for t in [&mut a, &mut b, &mut twin] {
+                t.feed(step);
+            }
+            assert_same_screen(&a, &b);
+            assert_eq!(a.visible_text(), twin.visible_text());
+            assert_eq!(a.cursor(), twin.cursor());
+            assert_eq!(a.mode(), twin.mode());
+        }
+        assert_eq!(a.visible_text()[1], "cZ");
+        assert_eq!(twin.saved_cursor().1, 3);
+        assert_eq!(a.saved_cursor().1, 1, "saved cursor lost to the cursor");
+    }
+
+    #[test]
+    fn snapshot_roundtrip_random_with_alt_screen() {
+        for (seed, cols, rows) in [(11, 80, 24), (12, 120, 40), (13, 40, 10)] {
+            let mut a = Terminal::new(cols, rows);
+            a.feed(&fake_output(seed, 32 * 1024));
+            a.feed(b"\x1b7\x1b[?1049h");
+            a.feed(&fake_output(seed + 100, 32 * 1024));
+            let mut b = roundtrip(&a);
+            assert_same_screen(&a, &b);
+            a.feed(b"\x1b[?1049l");
+            b.feed(b"\x1b[?1049l");
+            assert_same_screen(&a, &b);
+            assert!(a.visible_text().iter().any(|l| !l.is_empty()));
+        }
+    }
+
+    /// Pins the alacritty `swap_alt` behaviour `with_primary` relies on; if an
+    /// alacritty upgrade changes it, this fails and `with_primary` needs review.
+    #[test]
+    fn swap_alt_behaves_as_snapshot_expects() {
+        let mut t = Terminal::new(10, 4);
+        t.feed(b"prim\x1b[2;2H\x1b[>1u\x1b[?1049h\x1b[H\x1b[>4ualt\x1b[3;3H\x1b7\x1b[4;4H");
+        let term = t.term.get_mut();
+        let kitty = |term: &Term<Replies>| *term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL;
+        let text = |term: &Term<Replies>| -> String {
+            (0..4).map(|c| term.grid()[Line(0)][Column(c)].c).collect()
+        };
+        assert_eq!(text(term), "alt ");
+        assert_eq!(kitty(term), TermMode::REPORT_ALTERNATE_KEYS);
+        let alt_saved = term.grid().saved_cursor.point;
+
+        // alt -> primary: the primary grid with its cursor, saved cursor
+        // (`?1049h` saved it) and kitty flags.
+        term.swap_alt();
+        assert!(!term.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(text(term), "prim");
+        assert_eq!(term.grid().cursor.point, term.grid().saved_cursor.point);
+        assert_eq!(term.grid().cursor.point.line.0, 1);
+        assert_eq!(kitty(term), TermMode::DISAMBIGUATE_ESC_CODES);
+        term.grid_mut().cursor.point.column = Column(7);
+
+        // primary -> alt: the alt grid is cleared and gets the primary cursor,
+        // and the primary's saved cursor is overwritten by its cursor.
+        term.swap_alt();
+        assert!(term.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(text(term), "    ");
+        assert_eq!(term.grid().cursor.point.column, Column(7));
+        assert_eq!(
+            term.grid().saved_cursor.point,
+            alt_saved,
+            "alt saved cursor kept"
+        );
+        assert_eq!(kitty(term), TermMode::REPORT_ALTERNATE_KEYS);
+        term.swap_alt();
+        assert_eq!(term.grid().saved_cursor.point.column, Column(7));
+        assert_eq!(text(term), "prim");
     }
 
     #[test]
