@@ -1,0 +1,25 @@
+[package]
+name = "fleet-perf"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+fleet-node = { version = "0.1.0", path = "../fleet-node" }
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+toml = "1.2.1"
+toml_edit = "0.25.19"
+
+[dev-dependencies]
+fleetd = { path = "../fleetd" }
+gungraun = "=0.20.0"
+
+[[bench]]
+name = "instr"
+harness = false

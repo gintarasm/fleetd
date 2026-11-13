@@ -1,0 +1,63 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: cargo --version
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+  perf-instr:
+    # Pinned: instruction counts depend on arch and libc.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: cargo --version
+      - name: Install valgrind and the gungraun runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          cargo install gungraun-runner --version 0.20.0 --locked
+      # Local Docker runs (rust:1) need --security-opt seccomp=unconfined for valgrind.
+      - run: cargo run -p fleet-perf --release --bin fleet-perf -- run --suite instr --out instr.json
+      - run: cargo run -p fleet-perf --release --bin fleet-perf -- compare --baselines bench/baselines.toml --results instr.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: instr-results
+          path: instr.json
+  perf-wall:
+    runs-on: [self-hosted, macOS, fleet-perf]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Keep target/ between runs on the persistent runner.
+          clean: false
+      - name: Install pinned toolchain
+        run: cargo --version
+      - run: cargo build --release --workspace
+      - run: target/release/fleet-perf run --suite wall --out wall.json
+      - run: target/release/fleet-perf compare --baselines bench/baselines.toml --results wall.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wall-results
+          path: wall.json
+  perf-approval:
+    # A loosened baseline needs the user's Perf-Approved trailer (docs/decisions/0014).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install pinned toolchain
+        run: cargo --version
+      - run: cargo run -p fleet-perf --release --bin fleet-perf -- check-approval --base origin/${{ github.base_ref }}

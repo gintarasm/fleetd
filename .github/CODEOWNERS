@@ -1,0 +1,6 @@
+# Perf gate files: changes need the user (see docs/decisions/0017-perf-approval-enforcement.md).
+/bench/baselines.toml     @gintarasm
+/docs/perf-log.md         @gintarasm
+/.github/workflows/       @gintarasm
+/crates/fleet-perf/       @gintarasm
+/.github/CODEOWNERS       @gintarasm
