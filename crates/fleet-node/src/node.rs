@@ -39,8 +39,13 @@
 //! **Activity.** The output path only marks the agent dirty (a flag and a
 //! timestamp, under the pipeline lock it already holds; the first mark since
 //! the last tick queues the agent for the ticker). A ticker thread (started
-//! by the first output, parked while nothing is queued) reads the queued agents' last non-blank row at
-//! most every [`ACTIVITY_TICK`] and broadcasts [`AgentActivity`] events.
+//! by the first output, parked while nothing is queued) reads the queued
+//! agents' last non-blank row at most every [`ACTIVITY_TICK`] and publishes
+//! [`AgentActivity`] to every [`ActivityReceiver`]. A receiver keeps only the
+//! newest pending event per agent, so a slow one loses nothing but
+//! superseded values. Publishing happens under the pipeline lock, and exit
+//! drops the agent's pending events under that lock before its stream ends,
+//! so no activity follows an agent's exit.
 
 use crate::history::{History, HistoryInfo, Page};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
@@ -642,20 +647,26 @@ impl AgentPipeline {
         }
     }
 
-    /// Clears the activity mark and returns the last non-blank visible row
-    /// (trimmed, at most [`ACTIVITY_LINE_CHARS`] chars) and when output last
-    /// arrived; `None` if there was no output since the last call. With
-    /// `read == false` only the mark is cleared.
-    fn take_activity(&self, read: bool) -> Option<(String, i64)> {
+    /// Clears the activity mark and, if there was output since the last
+    /// call, publishes the agent's activity to `sinks`: its last non-blank
+    /// visible row (trimmed, at most [`ACTIVITY_LINE_CHARS`] chars) and when
+    /// output last arrived. Nothing is published after exit, or while there
+    /// are no receivers. Publishing under the pipeline lock orders it before
+    /// [`AgentPipeline::exit`]'s purge.
+    fn publish_activity(&self, agent_id: u64, sinks: &ActivitySinks) {
         let mut state = self.lock();
-        if !std::mem::take(&mut state.activity_dirty) || !read {
-            return None;
+        if !std::mem::take(&mut state.activity_dirty) || state.exit_code.is_some() || !sinks.any() {
+            return;
         }
-        let mut line = state.term.last_nonblank_line().unwrap_or_default();
-        if let Some((cut, _)) = line.char_indices().nth(ACTIVITY_LINE_CHARS) {
-            line.truncate(cut);
+        let mut last_line = state.term.last_nonblank_line().unwrap_or_default();
+        if let Some((cut, _)) = last_line.char_indices().nth(ACTIVITY_LINE_CHARS) {
+            last_line.truncate(cut);
         }
-        Some((line, state.last_output_unix_ms))
+        sinks.publish(AgentActivity {
+            agent_id,
+            last_line,
+            last_output_unix_ms: state.last_output_unix_ms,
+        });
     }
 
     /// A page of the agent's history (see [`History::read_page`]); `None` if
@@ -762,6 +773,16 @@ impl OutputSink for AgentPipeline {
     }
 
     fn on_exit(&mut self, code: i32) {
+        self.exit(code, || {});
+    }
+}
+
+impl AgentPipeline {
+    /// Records the exit: flushes and closes history and scrollback, then
+    /// runs `before_notify` (after the exit code is set, under the pipeline
+    /// lock) and ends every subscriber's stream with
+    /// [`StreamItem::Exited`].
+    fn exit(&self, code: i32, before_notify: impl FnOnce()) {
         let mut state = self.lock();
         state.term.flush_pending_sync();
         state.drain_history();
@@ -777,6 +798,7 @@ impl OutputSink for AgentPipeline {
         state.exit_code = Some(code);
         state.input = None;
         state.primary = None;
+        before_notify();
         for sub in std::mem::take(&mut state.subscribers) {
             sub.offer(StreamItem::Exited(code));
         }
@@ -786,9 +808,6 @@ impl OutputSink for AgentPipeline {
 /// Exit events a [`Node`] buffers per receiver before it lags.
 pub const EXIT_EVENT_CAPACITY: usize = 256;
 
-/// Activity events a [`Node`] buffers per receiver before it lags (the
-/// buffer is allocated up front, so it is kept small for idle RSS).
-pub const ACTIVITY_EVENT_CAPACITY: usize = 64;
 /// The activity ticker looks at most this often, so each agent yields at
 /// most one [`AgentActivity`] per tick.
 pub const ACTIVITY_TICK: Duration = Duration::from_millis(250);
@@ -803,12 +822,90 @@ fn unix_ms_now() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// One receiver's pending activity: the latest event per agent, so a
+/// receiver that falls behind loses nothing but superseded values.
+struct ActivitySink {
+    pending: Mutex<HashMap<u64, AgentActivity>>,
+    notify: tokio::sync::Notify,
+}
+
+/// Receives agents' activity (see [`Node::activity_events`]). Holds at most
+/// one pending event per running agent; dropping it unsubscribes.
+pub struct ActivityReceiver {
+    sink: Arc<ActivitySink>,
+}
+
+impl ActivityReceiver {
+    /// Waits until activity may be pending (spurious wake-ups possible).
+    pub async fn changed(&self) {
+        self.sink.notify.notified().await;
+    }
+
+    /// Removes one pending event and hands it to `deliver`, with the pending
+    /// set locked: an agent's exit cannot overtake an event delivered here
+    /// (as long as `deliver` enqueues it without waiting). `false` if none
+    /// is pending.
+    pub fn deliver_next(&self, deliver: impl FnOnce(AgentActivity)) -> bool {
+        let mut pending = lock(&self.sink.pending);
+        let Some(&id) = pending.keys().next() else {
+            return false;
+        };
+        let activity = pending.remove(&id).expect("key just seen");
+        deliver(activity);
+        true
+    }
+}
+
+/// The live [`ActivityReceiver`]s.
+#[derive(Default)]
+struct ActivitySinks {
+    list: Mutex<Vec<Weak<ActivitySink>>>,
+}
+
+impl ActivitySinks {
+    fn subscribe(&self) -> ActivityReceiver {
+        let sink = Arc::new(ActivitySink {
+            pending: Mutex::new(HashMap::new()),
+            notify: tokio::sync::Notify::new(),
+        });
+        let mut list = lock(&self.list);
+        list.retain(|s| s.strong_count() > 0);
+        list.push(Arc::downgrade(&sink));
+        ActivityReceiver { sink }
+    }
+
+    /// Whether any receiver is live.
+    fn any(&self) -> bool {
+        lock(&self.list).iter().any(|s| s.strong_count() > 0)
+    }
+
+    /// Replaces the agent's pending event in every receiver.
+    fn publish(&self, activity: AgentActivity) {
+        let mut list = lock(&self.list);
+        list.retain(|s| match s.upgrade() {
+            Some(sink) => {
+                lock(&sink.pending).insert(activity.agent_id, activity.clone());
+                sink.notify.notify_one();
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Drops the agent's pending event from every receiver.
+    fn forget(&self, agent_id: u64) {
+        for sink in lock(&self.list).iter().filter_map(Weak::upgrade) {
+            lock(&sink.pending).remove(&agent_id);
+        }
+    }
+}
+
 /// Agents with output since the activity ticker last looked, and the
 /// ticker's wake-up.
 struct ActivityHub {
     /// Queued by the first output after each tick.
     dirty: Mutex<Vec<(u64, AgentPipeline)>>,
-    events: broadcast::Sender<AgentActivity>,
+    sinks: ActivitySinks,
     /// Started by the first output, so an idle node has no ticker thread;
     /// `None` if it could not be started (no activity events then).
     ticker: OnceLock<Option<Thread>>,
@@ -819,7 +916,7 @@ impl ActivityHub {
     fn new() -> Self {
         ActivityHub {
             dirty: Mutex::new(Vec::new()),
-            events: broadcast::channel(ACTIVITY_EVENT_CAPACITY).0,
+            sinks: ActivitySinks::default(),
             ticker: OnceLock::new(),
             stop: AtomicBool::new(false),
         }
@@ -865,7 +962,7 @@ impl ActivityHub {
 
     /// The ticker: parked while no agent is queued; otherwise, at most once
     /// per [`ACTIVITY_TICK`], reads each queued agent's activity and
-    /// broadcasts it (only the marks are cleared while nobody listens).
+    /// publishes it (only the marks are cleared while nobody listens).
     fn run(&self) {
         let mut last_tick: Option<Instant> = None;
         let mut batch = Vec::new();
@@ -891,16 +988,8 @@ impl ActivityHub {
             }
             std::mem::swap(&mut *lock(&self.dirty), &mut batch);
             last_tick = Some(Instant::now());
-            let listened = self.events.receiver_count() > 0;
             for (agent_id, pipeline) in batch.drain(..) {
-                if let Some((last_line, last_output_unix_ms)) = pipeline.take_activity(listened) {
-                    // No receivers is fine.
-                    let _ = self.events.send(AgentActivity {
-                        agent_id,
-                        last_line,
-                        last_output_unix_ms,
-                    });
-                }
+                pipeline.publish_activity(agent_id, &self.sinks);
             }
         }
     }
@@ -1149,7 +1238,10 @@ impl OutputSink for NodeSink {
         if let Err(e) = lock(&self.store).set_exited(self.id, code) {
             eprintln!("fleet-node: recording exit of agent {}: {e}", self.id);
         }
-        self.pipeline.on_exit(code);
+        // No activity for the agent after its exit: pending events are
+        // dropped before its stream ends, and none are published after.
+        let activity = &self.activity;
+        self.pipeline.exit(code, || activity.sinks.forget(self.id));
         // If the spawn has not registered the agent yet, it retires it.
         let mut agents = lock(&self.agents);
         let evicted = match agents.live.remove(&self.id) {
@@ -1284,11 +1376,13 @@ impl Node {
         self.exits.subscribe()
     }
 
-    /// Receives agents' activity from now on: for each agent with output,
-    /// at most one event per [`ACTIVITY_TICK`] carrying its last non-blank
-    /// visible row. Lossy: a receiver that falls behind skips events.
-    pub fn activity_events(&self) -> broadcast::Receiver<AgentActivity> {
-        self.activity.events.subscribe()
+    /// Receives agents' activity from now on: for each running agent with
+    /// output, at most one event per [`ACTIVITY_TICK`] carrying its last
+    /// non-blank visible row. Latest-value: a receiver that falls behind
+    /// gets each agent's newest event (older ones are superseded), and
+    /// nothing for an agent after its exit.
+    pub fn activity_events(&self) -> ActivityReceiver {
+        self.activity.sinks.subscribe()
     }
 
     /// Spawns an agent. Zero `cols`/`rows` mean 80x24; otherwise the size

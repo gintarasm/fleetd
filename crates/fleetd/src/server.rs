@@ -9,8 +9,9 @@
 //!
 //! Each connection has a [`ConnId`] for the node's primary-client rule; its
 //! role changes arrive in the agent's stream and are sent as
-//! `Event::Role`. Agents' activity is forwarded to every connection (lossy:
-//! a connection that falls behind skips activity events).
+//! `Event::Role`. Agents' activity is forwarded to every connection,
+//! latest value per agent: a connection that falls behind gets each agent's
+//! newest activity once it catches up.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -19,11 +20,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
-use fleet_node::node::{ConnId, Node, StreamItem, Subscription};
+use fleet_node::node::{ActivityReceiver, ConnId, Node, StreamItem, Subscription};
 use fleet_proto::{
-    Ack, AgentActivity, AgentList, AttachOk, AttachRole, Event, Frame, FrameCodec, HandshakeReject,
-    HelloOk, HistoryPage, Lagged, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, Request, Response,
-    SpawnAgent, SpawnedAttached, event, request, response,
+    Ack, AgentList, AttachOk, AttachRole, Event, Frame, FrameCodec, HandshakeReject, HelloOk,
+    HistoryPage, Lagged, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, Request, Response, SpawnAgent,
+    SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -477,24 +478,26 @@ async fn forward_exits(
     }
 }
 
-/// Forwards every agent's activity; skips what the connection fell behind on.
-async fn forward_activity(
-    mut activity: broadcast::Receiver<AgentActivity>,
-    outbox: mpsc::Sender<Frame>,
-) {
+/// Forwards every agent's activity. While the connection is backed up,
+/// events wait in the receiver, which keeps only each agent's newest one.
+/// An event is taken only once an outbox slot is reserved, and queued
+/// without waiting, so it never follows that agent's exit event.
+async fn forward_activity(activity: ActivityReceiver, outbox: mpsc::Sender<Frame>) {
     loop {
-        match activity.recv().await {
-            Ok(a) => {
-                let frame = Frame::Event(Event {
+        loop {
+            let Ok(slot) = outbox.reserve().await else {
+                return;
+            };
+            let delivered = activity.deliver_next(|a| {
+                slot.send(Frame::Event(Event {
                     kind: Some(event::Kind::Activity(a)),
-                });
-                if outbox.send(frame).await.is_err() {
-                    return;
-                }
+                }));
+            });
+            if !delivered {
+                break;
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => {}
-            Err(broadcast::error::RecvError::Closed) => return,
         }
+        activity.changed().await;
     }
 }
 

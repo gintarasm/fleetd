@@ -1,7 +1,7 @@
 //! Protocol server tests: a real `fleetd` binary on a temp state dir, spoken to
 //! over its unix socket with `FrameCodec`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -1441,4 +1441,98 @@ fn agent_sees_its_id() {
         }
         c.kill(info.id);
     }
+}
+
+/// The activity event in `frame`, if any.
+fn activity_of(frame: &Frame) -> Option<&fleet_proto::AgentActivity> {
+    match frame {
+        Frame::Event(fleet_proto::Event {
+            kind: Some(event::Kind::Activity(a)),
+        }) => Some(a),
+        _ => None,
+    }
+}
+
+#[test]
+fn backed_up_client_still_gets_every_agents_final_line() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut slow = Client::open(dir.path());
+    let mut ctl = Client::open(dir.path());
+    // The slow client attaches to a flood and stops reading: its outbox and
+    // socket fill, so its activity forwarder is stuck behind them.
+    let flood = slow.sh("while :; do echo flood-flood-flood-flood; done");
+    slow.attach(flood.id);
+
+    let mut want = HashMap::new();
+    for i in 0..100 {
+        let script = format!(
+            "for s in 1 2 3 4; do echo step-$s; sleep 0.3; done; echo final-{i}; sleep 100"
+        );
+        let id = ctl.sh(&script).id;
+        want.insert(id, format!("final-{i}"));
+    }
+    // Every agent has printed its final line and gone quiet.
+    std::thread::sleep(Duration::from_secs(3));
+    ctl.kill(flood.id);
+
+    let mut latest: HashMap<u64, String> = HashMap::new();
+    let deadline = Instant::now() + TIMEOUT;
+    while latest
+        .iter()
+        .filter(|(id, l)| want.get(id) == Some(l))
+        .count()
+        < want.len()
+    {
+        match slow.frame_before(deadline) {
+            Some(f) => {
+                if let Some(a) = activity_of(&f) {
+                    latest.insert(a.agent_id, a.last_line.clone());
+                }
+            }
+            None => break,
+        }
+    }
+    let stale: Vec<_> = want
+        .iter()
+        .filter(|(id, l)| latest.get(id) != Some(l))
+        .map(|(id, l)| (id, l, latest.get(id)))
+        .collect();
+    assert!(stale.is_empty(), "{} agents stale: {stale:?}", stale.len());
+    for id in want.keys() {
+        ctl.kill(*id);
+    }
+}
+
+#[test]
+fn no_activity_after_exit() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let mut ctl = Client::open(dir.path());
+    let ids: Vec<u64> = (0..5)
+        .map(|_| ctl.sh("while :; do echo busy; done").id)
+        .collect();
+    std::thread::sleep(Duration::from_millis(400));
+    for &id in &ids {
+        ctl.kill(id);
+    }
+    let mut exited = HashSet::new();
+    // Read until well past a tick after the last exit.
+    let mut deadline = Instant::now() + TIMEOUT;
+    while let Some(f) = c.frame_before(deadline) {
+        if let Frame::Event(fleet_proto::Event {
+            kind: Some(event::Kind::Exited(e)),
+        }) = &f
+        {
+            exited.insert(e.agent_id);
+            if exited.len() == ids.len() {
+                deadline = Instant::now() + Duration::from_millis(800);
+            }
+        }
+        if let Some(a) = activity_of(&f) {
+            assert!(!exited.contains(&a.agent_id), "activity after exit: {a:?}");
+        }
+    }
+    assert_eq!(exited.len(), ids.len());
 }
