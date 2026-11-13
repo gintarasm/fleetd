@@ -1,10 +1,17 @@
-//! fleetd: single-instance daemon stub. Protocol arrives in M1.
+//! fleetd: the single-instance node daemon, serving the fleet protocol on a
+//! unix socket in the state dir.
+
+mod server;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use fleet_node::node::Node;
 
 use fs4::{FileExt, TryLockError};
 use tokio::net::UnixListener;
@@ -22,6 +29,40 @@ const EMFILE: i32 = 24;
 
 fn is_fd_exhaustion(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(ENFILE | EMFILE))
+}
+
+/// `OPEN_MAX` from macOS `<sys/syslimits.h>` (not exported by `libc`).
+const MACOS_OPEN_MAX: libc::rlim_t = 10240;
+
+/// Raises the soft limit on open files to the hard limit (on macOS at most
+/// `OPEN_MAX`, which `setrlimit` requires), so ≥ 50 agents fit under a low
+/// default soft limit. Returns the soft limit now in effect. Called by
+/// `main`, not [`startup`], which is benchmarked.
+pub fn raise_fd_limit() -> io::Result<libc::rlim_t> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit with a valid, initialised struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut target = lim.rlim_max;
+    if cfg!(target_os = "macos") {
+        target = target.min(MACOS_OPEN_MAX);
+    }
+    if target > lim.rlim_cur {
+        let raised = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: as above.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        lim.rlim_cur = target;
+    }
+    Ok(lim.rlim_cur)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,10 +131,38 @@ pub struct Daemon {
     socket_path: PathBuf,
 }
 
-/// Synchronous (no tokio runtime needed): create the state dir, take the
-/// instance lock, replace any stale socket, bind.
+/// Makes `dir` (and missing parents) exist with mode 0700. The common case,
+/// an existing 0700 dir, costs one `stat` and no `chmod`.
+fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    let private = || fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    match fs::metadata(dir) {
+        Ok(m) if m.is_dir() => {
+            if m.permissions().mode() & 0o777 != 0o700 {
+                private()?;
+            }
+            Ok(())
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", dir.display()),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+            // The umask may have narrowed the mode.
+            private()
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Synchronous (no tokio runtime needed): create the state dir (mode 0700,
+/// also enforced on an existing one), take the instance lock, replace any
+/// stale socket, bind. The node's state is opened by [`Daemon::serve`].
 pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
-    fs::create_dir_all(&cfg.state_dir)?;
+    ensure_private_dir(&cfg.state_dir)?;
 
     let lock = OpenOptions::new()
         .create(true)
@@ -127,19 +196,34 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
 }
 
 impl Daemon {
-    /// Accept and immediately close connections until SIGTERM/SIGINT, then
-    /// remove the socket file and return.
+    /// Open the node's state, then serve protocol connections until
+    /// SIGTERM/SIGINT/SIGHUP. Then stop every agent (v1 has no PTY handoff, decision
+    /// 0018): SIGTERM to each agent's process group, up to 2 s grace, then
+    /// SIGKILL; their exits are recorded. Finally remove the socket file and
+    /// return.
     pub async fn serve(self) -> io::Result<()> {
         let listener = UnixListener::from_std(self.listener)?;
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
+        let mut hup = signal(SignalKind::hangup())?;
+        // `socket_path` is `<state_dir>/fleetd.sock` (see `Config::socket_path`).
+        let state_dir = self
+            .socket_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let node = tokio::task::spawn_blocking(move || Node::open(&state_dir))
+            .await
+            .map_err(io::Error::other)??;
+        let node = Arc::new(node);
+        let server = server::Server::new(Arc::clone(&node));
         loop {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = int.recv() => break,
+                _ = hup.recv() => break,
                 accepted = listener.accept() => match accepted {
-                    // Protocol arrives in M1: drop the stream, closing it.
-                    Ok(stream) => drop(stream),
+                    Ok((stream, _)) => server.accept(stream),
                     // Accept errors never end `serve`; only a signal does.
                     Err(e) => {
                         eprintln!("fleetd: accept failed: {e}");
@@ -150,6 +234,9 @@ impl Daemon {
                 },
             }
         }
+        tokio::task::spawn_blocking(move || node.shutdown())
+            .await
+            .map_err(io::Error::other)?;
         match fs::remove_file(&self.socket_path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -160,6 +247,21 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_dir_is_created_nested_and_rejects_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a/b");
+        ensure_private_dir(&nested).unwrap();
+        let mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        ensure_private_dir(&nested).unwrap();
+
+        let file = tmp.path().join("f");
+        fs::write(&file, b"").unwrap();
+        let err = ensure_private_dir(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+    }
 
     #[test]
     fn fd_exhaustion_is_detected_and_other_errors_are_not() {

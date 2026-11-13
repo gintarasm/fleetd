@@ -29,8 +29,12 @@ fn wait_ready(dir: &Path) {
 }
 
 fn sigterm(child: &Child) {
+    send_signal(child, "-TERM");
+}
+
+fn send_signal(child: &Child, sig: &str) {
     let status = Command::new("kill")
-        .arg("-TERM")
+        .arg(sig)
         .arg(child.id().to_string())
         .status()
         .expect("run kill");
@@ -114,4 +118,15 @@ fn lock_released_on_exit() {
     assert!(!dir.path().join("fleetd.sock").exists());
     let _second = Reaper(spawn(dir.path()));
     wait_ready(dir.path());
+}
+
+#[test]
+fn sighup_shuts_down_like_sigterm() {
+    let dir = TempDir::new().unwrap();
+    let mut d = Reaper(spawn(dir.path()));
+    wait_ready(dir.path());
+    send_signal(&d.0, "-HUP");
+    let status = wait_exit(&mut d.0);
+    assert!(status.success(), "fleetd exited with {status} after SIGHUP");
+    assert!(!dir.path().join("fleetd.sock").exists());
 }

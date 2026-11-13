@@ -1,4 +1,7 @@
-//! Wall-clock suite: fleetd cold start, idle RSS, and the 50-agent flood.
+//! Wall-clock suite: fleetd cold start, idle RSS, the 50-agent flood, and the
+//! daemon scenarios (flood through the protocol server, reattach).
+
+mod daemon;
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -17,6 +20,11 @@ pub const IDLE_RSS_BYTES: &str = "fleetd_idle_rss_bytes";
 pub const FLOOD_WALL_NS: &str = "flood50_wall_ns";
 pub const FLOOD_CPU_NS_PER_MIB: &str = "flood50_cpu_ns_per_mib";
 pub const FLOOD_PEAK_RSS_BYTES: &str = "flood50_peak_rss_bytes";
+pub const DAEMON_FLOOD_WALL_NS: &str = "daemon_flood50_wall_ns";
+pub const DAEMON_FLOOD_CPU_NS_PER_MIB: &str = "daemon_flood50_cpu_ns_per_mib";
+pub const DAEMON_FLOOD_PEAK_RSS_BYTES: &str = "daemon_flood50_peak_rss_bytes";
+pub const DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS: &str = "daemon_flood50_lagged_subscriptions";
+pub const REATTACH_SNAPSHOT_NS: &str = "reattach_snapshot_ns";
 /// Every metric the wall suite emits.
 pub const METRIC_NAMES: &[&str] = &[
     COLD_START_NS,
@@ -24,11 +32,19 @@ pub const METRIC_NAMES: &[&str] = &[
     FLOOD_WALL_NS,
     FLOOD_CPU_NS_PER_MIB,
     FLOOD_PEAK_RSS_BYTES,
+    DAEMON_FLOOD_WALL_NS,
+    DAEMON_FLOOD_CPU_NS_PER_MIB,
+    DAEMON_FLOOD_PEAK_RSS_BYTES,
+    DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS,
+    REATTACH_SNAPSHOT_NS,
 ];
 
 const FLOOD_AGENTS: usize = 50;
 const FLOOD_BYTES: u64 = 8 * 1024 * 1024;
 const QUICK_FLOOD_BYTES: u64 = 256 * 1024;
+/// Attaches measured by `reattach_snapshot_ns` (median taken).
+const REATTACHES: usize = 50;
+const QUICK_REATTACHES: usize = 5;
 const MIB: f64 = 1024.0 * 1024.0;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const TIGHT_POLL: Duration = Duration::from_millis(50);
@@ -282,6 +298,20 @@ pub fn run(quick: bool) -> Result<Results, String> {
     }
     let pick = |f: fn(&Flood) -> f64| median(floods.iter().map(f).collect());
 
+    let fake_agent = sibling("fake-agent")?;
+    let (daemon_runs, reattaches) = if quick {
+        (1, QUICK_REATTACHES)
+    } else {
+        (3, REATTACHES)
+    };
+    let mut daemon_floods = Vec::new();
+    for _ in 0..daemon_runs {
+        daemon_floods.push(daemon::flood(&fleetd, &fake_agent, FLOOD_AGENTS, bytes)?);
+    }
+    let pick_daemon =
+        |f: fn(&daemon::DaemonFlood) -> f64| median(daemon_floods.iter().map(f).collect());
+    let reattach = daemon::reattach_snapshot_ns(&fleetd, &fake_agent, bytes, reattaches)?;
+
     let m = |value: f64, unit: &str| Measurement {
         value,
         unit: unit.to_string(),
@@ -298,6 +328,23 @@ pub fn run(quick: bool) -> Result<Results, String> {
             FLOOD_PEAK_RSS_BYTES.to_string(),
             m(pick(|f| f.peak_rss_bytes), "bytes"),
         ),
+        (
+            DAEMON_FLOOD_WALL_NS.to_string(),
+            m(pick_daemon(|f| f.wall_ns), "ns"),
+        ),
+        (
+            DAEMON_FLOOD_CPU_NS_PER_MIB.to_string(),
+            m(pick_daemon(|f| f.cpu_ns_per_mib), "ns"),
+        ),
+        (
+            DAEMON_FLOOD_PEAK_RSS_BYTES.to_string(),
+            m(pick_daemon(|f| f.peak_rss_bytes), "bytes"),
+        ),
+        (
+            DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS.to_string(),
+            m(pick_daemon(|f| f.lagged_subscriptions), "count"),
+        ),
+        (REATTACH_SNAPSHOT_NS.to_string(), m(reattach, "ns")),
     ]);
     Ok(Results {
         suite: Suite::Wall,

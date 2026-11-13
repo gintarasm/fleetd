@@ -10,13 +10,17 @@ tolerance = { instr = 0.02, wall = 0.05 }
 suite = "wall"
 unit = "ns"
 budget = 200000000     # cold start < 200 ms (docs/plan.md)
+# report-only: ~2 ms process start varies ±15% run to run on the self-hosted
+# runner (vs the 5% gate). The 200 ms budget still applies, and
+# fleetd_startup_instructions catches code regressions deterministically.
+report_only = true
 baseline = 2418374.5
 
 [metrics.fleetd_idle_rss_bytes]
 suite = "wall"
 unit = "bytes"
 budget = 52428800      # hard ceiling from docs/plan.md
-baseline = 2179072
+baseline = 4227072
 
 [metrics.flood50_cpu_ns_per_mib]
 suite = "wall"
@@ -36,7 +40,58 @@ suite = "wall"
 unit = "ns"
 baseline = 3481542708.5
 
+[metrics.daemon_flood50_cpu_ns_per_mib]
+suite = "wall"
+unit = "ns"
+# report-only like flood50_cpu_ns_per_mib: the self-hosted runner is not yet
+# characterised (cross-session drift ~35%); turning this off is free
+report_only = true
+baseline = 28958941.2
+
+[metrics.daemon_flood50_lagged_subscriptions]
+suite = "wall"
+unit = "count"
+# M1 node cannot stream 50 flooding agents to an attached client; see ADR 0018
+report_only = true
+baseline = 45
+
+[metrics.daemon_flood50_peak_rss_bytes]
+suite = "wall"
+unit = "bytes"
+# report-only until CI variance is characterised
+report_only = true
+baseline = 31965184
+
+[metrics.daemon_flood50_wall_ns]
+suite = "wall"
+unit = "ns"
+# report-only until CI variance is characterised
+report_only = true
+baseline = 3187019709
+
+[metrics.reattach_snapshot_ns]
+suite = "wall"
+unit = "ns"
+# report-only until CI variance is characterised (~60 us, jitter-dominated)
+report_only = true
+baseline = 57833.5
+
 [metrics.fleetd_startup_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 4806
+baseline = 3066
+
+[metrics.frame_decode_output_64x64k_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 17146
+
+[metrics.terminal_feed_64k_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 7591185
+
+[metrics.snapshot_120x40_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 755815

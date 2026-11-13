@@ -1,2 +1,7 @@
+pub mod node;
 pub mod pty;
-pub use pty::{AgentId, AgentStats, CommandSpec, PtyHost, WaitTimeout};
+pub mod scrollback;
+pub mod store;
+pub mod term;
+pub use pty::{AgentId, AgentInput, AgentStats, CommandSpec, OutputSink, PtyHost, WaitTimeout};
+pub use term::Terminal;

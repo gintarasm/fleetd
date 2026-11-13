@@ -1,0 +1,16 @@
+[package]
+name = "fleet-proto"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.12.1"
+prost = "0.14.6"
+tokio-util = { version = "0.7.20", features = ["codec"] }
+
+[build-dependencies]
+prost-build = "0.14.6"
+protox = "0.10.0"
