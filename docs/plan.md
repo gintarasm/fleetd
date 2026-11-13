@@ -79,7 +79,7 @@ Any regression fails CI and requires explicit approval by the user. See [0014](d
 | Kind | Runs on | v1 |
 |---|---|---|
 | Agent adapter | node | yes |
-| Remote provider | controller | yes |
+| Node provider (`node-provider` world, [0026](decisions/0026-node-providers-and-transports.md)) | controller | yes |
 | Lifecycle hooks | where the event fires | yes |
 | UI (declarative) | controller → rendered by GUI | yes |
 | Integrations (GitHub, Linear, Slack) | — | later |
@@ -115,7 +115,7 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 | **M2** | gpui client: sidebar, terminal pane, splits, menu-bar app |
 | **M3** | Labels, node primitives (`Exec`/`ReadFile`/`ListDir`), `RunAction` interface, built-in git-worktree workflow, diff view ([0025](decisions/0025-core-knows-agents-workflows-own-hierarchy.md)) |
 | **M4** | Plugin host (incl. third-party workflows), Claude Code + Codex adapters, hook-based status, notifications |
-| **M5** | Remote nodes: SSH transport, bootstrap, workspace clone, git fetch-back |
+| **M5** | Remote nodes via node providers ([0026](decisions/0026-node-providers-and-transports.md)): `node-provider` world, built-in SSH-host provider, SSH/command transports, bootstrap (systemd optional), keepalive and `on_idle`, history archive before teardown; workspace clone and fetch-back as git-worktree actions |
 | **M6** | Secrets, OAuth reverse-forwarding, ssh-agent forwarding |
 
 ## Licensing

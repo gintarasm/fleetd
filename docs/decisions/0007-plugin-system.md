@@ -2,6 +2,8 @@
 
 **Status:** accepted · 2026-11-13
 
+**Amended by:** [0026](0026-node-providers-and-transports.md) — the remote-provider kind is the `node-provider` WIT world (WASM by default).
+
 **Amended by:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) — adds the `workflow` plugin kind.
 
 **Decision:**

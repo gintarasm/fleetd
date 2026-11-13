@@ -2,6 +2,8 @@
 
 **Status:** accepted · 2026-11-13
 
+**Amended by:** [0026](0026-node-providers-and-transports.md) — the transport is "SSH or a command giving stdio", plus optional port forwards.
+
 **Context:** A "node dials home" design fails because the controller is a laptop behind NAT that sleeps; relays are a major source of Orca bugs.
 
 **Decision:** Controller initiates: `ssh host fleetd --stdio` (or a forwarded unix socket). Reuses SSH keys and config, no open ports, no relay.

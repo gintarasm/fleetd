@@ -2,6 +2,8 @@
 
 **Status:** accepted · 2026-11-13
 
+**Amended by:** [0026](0026-node-providers-and-transports.md) — bootstrap runs over any provider connection; systemd is optional; nodes come from providers.
+
 **Amended by:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) — workspace clone and fetch-back are git-worktree workflow actions.
 
 **Decision:**
