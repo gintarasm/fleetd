@@ -126,14 +126,13 @@ impl Streams {
         match frame {
             Frame::Output { .. } => Ok(None),
             Frame::Event(e) => {
-                if let Some(event::Kind::Exited(x)) = e.kind {
-                    self.exited.insert(x.agent_id, x.exit_code);
+                match e.kind {
+                    Some(event::Kind::Exited(x)) => {
+                        self.exited.insert(x.agent_id, x.exit_code);
+                    }
+                    Some(event::Kind::Lagged(_)) => self.lagged += 1,
+                    _ => {}
                 }
-                Ok(None)
-            }
-            // Unsolicited `lagged: re-attach` notice.
-            Frame::Response(r) if r.id == 0 => {
-                self.lagged += 1;
                 Ok(None)
             }
             Frame::Response(r) => Ok(Some(r)),

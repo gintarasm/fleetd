@@ -1,11 +1,15 @@
 //! SQLite agent store (decision 0010): one WAL-mode DB per node.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+/// An agent's labels (ADR 0025); the node validates them.
+pub type Labels = HashMap<String, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -21,6 +25,7 @@ pub struct NewAgent {
     pub cwd: String,
     pub created_unix_ms: i64,
     pub scrollback_path: String,
+    pub labels: Labels,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +38,7 @@ pub struct AgentRecord {
     pub exit_code: Option<i32>,
     pub created_unix_ms: i64,
     pub scrollback_path: String,
+    pub labels: Labels,
 }
 
 pub struct Store {
@@ -64,7 +70,7 @@ fn conversion_err(col: usize, e: Box<dyn std::error::Error + Send + Sync>) -> ru
 
 impl Store {
     /// Opens (creating with mode 0600 if new) the DB, enables WAL and
-    /// migrates to schema v1. Fails on a DB written by a newer schema.
+    /// migrates to schema v2. Fails on a DB written by a newer schema.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if !path.exists() {
             use std::os::unix::fs::OpenOptionsExt;
@@ -118,10 +124,31 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 2 {
+            self.conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE agent_labels (
+                     agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                     key TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     PRIMARY KEY (agent_id, key)
+                 );
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
+    /// Inserts a running agent and its labels, in one transaction.
     pub fn insert_agent(&self, rec: &NewAgent) -> rusqlite::Result<u64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = self.insert_agent_row(rec)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn insert_agent_row(&self, rec: &NewAgent) -> rusqlite::Result<u64> {
         let args_json = serde_json::to_string(&rec.args)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         self.conn.execute(
@@ -135,7 +162,48 @@ impl Store {
                 &rec.scrollback_path,
             ),
         )?;
-        Ok(self.conn.last_insert_rowid() as u64)
+        let id = self.conn.last_insert_rowid() as u64;
+        self.insert_labels(id, &rec.labels)?;
+        Ok(id)
+    }
+
+    fn insert_labels(&self, id: u64, labels: &Labels) -> rusqlite::Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO agent_labels (agent_id, key, value) VALUES (?1, ?2, ?3)",
+        )?;
+        for (key, value) in labels {
+            stmt.execute((id as i64, key, value))?;
+        }
+        Ok(())
+    }
+
+    /// The agent's labels; `None` if the agent is unknown.
+    pub fn labels(&self, id: u64) -> rusqlite::Result<Option<Labels>> {
+        let known = self
+            .conn
+            .query_row("SELECT 1 FROM agents WHERE id = ?1", (id as i64,), |_| {
+                Ok(())
+            })
+            .optional()?;
+        if known.is_none() {
+            return Ok(None);
+        }
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT key, value FROM agent_labels WHERE agent_id = ?1")?;
+        let labels = stmt
+            .query_map((id as i64,), |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Labels>>()?;
+        Ok(Some(labels))
+    }
+
+    /// Replaces the agent's labels with `labels`, in one transaction.
+    pub fn replace_labels(&self, id: u64, labels: &Labels) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.conn
+            .execute("DELETE FROM agent_labels WHERE agent_id = ?1", (id as i64,))?;
+        self.insert_labels(id, labels)?;
+        tx.commit()
     }
 
     /// Inserts a running agent whose scrollback path is derived from its id
@@ -147,7 +215,7 @@ impl Store {
         scrollback_path: impl FnOnce(u64) -> String,
     ) -> rusqlite::Result<(u64, String)> {
         let tx = self.conn.unchecked_transaction()?;
-        let id = self.insert_agent(rec)?;
+        let id = self.insert_agent_row(rec)?;
         let path = scrollback_path(id);
         self.conn.execute(
             "UPDATE agents SET scrollback_path = ?2 WHERE id = ?1",
@@ -210,12 +278,29 @@ impl Store {
         })
     }
 
+    /// Every agent's labels, by agent id.
+    fn all_labels(&self) -> rusqlite::Result<HashMap<u64, Labels>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT agent_id, key, value FROM agent_labels")?;
+        let mut all: HashMap<u64, Labels> = HashMap::new();
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?))
+        })?;
+        for row in rows {
+            let (id, key, value) = row?;
+            all.entry(id).or_default().insert(key, value);
+        }
+        Ok(all)
+    }
+
     fn query_agents<T>(
         &self,
         collect: impl FnOnce(
             &mut dyn Iterator<Item = rusqlite::Result<AgentRecord>>,
         ) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
+        let mut labels = self.all_labels()?;
         let mut stmt = self.conn.prepare(
             "SELECT id, program, args_json, cwd, state, exit_code, created_unix_ms, scrollback_path
              FROM agents ORDER BY id",
@@ -223,8 +308,9 @@ impl Store {
         let mut rows = stmt.query_map([], |r| {
             let args_json: String = r.get(2)?;
             let state: String = r.get(4)?;
+            let id = r.get::<_, i64>(0)? as u64;
             Ok(AgentRecord {
-                id: r.get::<_, i64>(0)? as u64,
+                id,
                 program: r.get(1)?,
                 args: serde_json::from_str(&args_json)
                     .map_err(|e| conversion_err(2, Box::new(e)))?,
@@ -234,6 +320,7 @@ impl Store {
                 exit_code: r.get(5)?,
                 created_unix_ms: r.get(6)?,
                 scrollback_path: r.get(7)?,
+                labels: labels.remove(&id).unwrap_or_default(),
             })
         })?;
         collect(&mut rows)
@@ -259,6 +346,7 @@ mod tests {
             cwd: "/work".into(),
             created_unix_ms: 1_000 + n,
             scrollback_path: format!("/sb/{n}.log"),
+            labels: Labels::new(),
         }
     }
 
@@ -345,7 +433,7 @@ mod tests {
         let (_d, p, s) = open_tmp();
         drop(s);
         let _s = Store::open(&p).unwrap();
-        assert_eq!(user_version(&p), 1);
+        assert_eq!(user_version(&p), 2);
     }
 
     #[test]
@@ -354,7 +442,7 @@ mod tests {
         drop(s);
         Connection::open(&p)
             .unwrap()
-            .pragma_update(None, "user_version", 2)
+            .pragma_update(None, "user_version", 3)
             .unwrap();
         assert!(Store::open(&p).is_err());
     }
@@ -400,6 +488,87 @@ mod tests {
         assert_eq!(good.len(), 1);
         assert_eq!(good[0].id, b);
         assert_eq!(bad.len(), 1);
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> Labels {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn labels_are_stored_listed_and_replaced() {
+        let (_d, _p, s) = open_tmp();
+        let mut rec = new_agent(1);
+        rec.labels = labels(&[("project", "fleetd"), ("role", "coder")]);
+        let a = s.insert_agent(&rec).unwrap();
+        let b = s.insert_agent(&new_agent(2)).unwrap();
+        let l = s.list_agents().unwrap();
+        assert_eq!(l[0].labels, rec.labels);
+        assert!(l[1].labels.is_empty());
+        assert_eq!(s.labels(a).unwrap(), Some(rec.labels.clone()));
+        assert_eq!(s.labels(b).unwrap(), Some(Labels::new()));
+        assert_eq!(s.labels(999).unwrap(), None);
+
+        s.replace_labels(a, &labels(&[("role", "reviewer")]))
+            .unwrap();
+        assert_eq!(
+            s.list_agents().unwrap()[0].labels,
+            labels(&[("role", "reviewer")])
+        );
+        // Deleting an agent deletes its labels.
+        s.delete_agent(a).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM agent_labels", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.db");
+        // The v1 schema exactly as the M1 store created it.
+        let conn = Connection::open(&p).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE agents (
+                 id INTEGER PRIMARY KEY,
+                 program TEXT NOT NULL,
+                 args_json TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
+                 exit_code INTEGER,
+                 created_unix_ms INTEGER NOT NULL,
+                 scrollback_path TEXT NOT NULL
+             );
+             PRAGMA user_version = 1;
+             COMMIT;
+             INSERT INTO agents (program, args_json, cwd, state, exit_code, created_unix_ms, scrollback_path)
+             VALUES ('claude', '[\"-p\"]', '/w', 'exited', 3, 42, '/sb/1.ring');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let s = Store::open(&p).unwrap();
+        assert_eq!(user_version(&p), 2);
+        let l = s.list_agents().unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].program, "claude");
+        assert_eq!(l[0].args, vec!["-p".to_string()]);
+        assert_eq!(l[0].exit_code, Some(3));
+        assert!(l[0].labels.is_empty());
+        s.replace_labels(l[0].id, &labels(&[("project", "old")]))
+            .unwrap();
+        drop(s);
+        let s = Store::open(&p).unwrap();
+        assert_eq!(
+            s.list_agents().unwrap()[0].labels,
+            labels(&[("project", "old")])
+        );
     }
 
     #[test]

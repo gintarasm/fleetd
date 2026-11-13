@@ -125,7 +125,7 @@ fn run(cli: Cli) -> Result<u8> {
                 _ => return Err(Error::Protocol("unexpected reply to spawn".into())),
             }
         }
-        Command::Ls => match client.call(request::Kind::List(ListAgents {}))? {
+        Command::Ls => match client.call(request::Kind::List(ListAgents::default()))? {
             response::Kind::Agents(list) => print_table(&list.agents),
             _ => return Err(Error::Protocol("unexpected reply to list".into())),
         },

@@ -74,6 +74,8 @@ fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     out.flush()
 }
 
+// Frames are the common case; boxing them would allocate per frame.
+#[allow(clippy::large_enum_variant)]
 enum Ev {
     Frame(Frame),
     /// The server closed the connection or it failed.
@@ -209,20 +211,11 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
             Ev::Frame(Frame::Output { agent_id: a, data }) if a == agent_id => {
                 write_stdout(&data)?;
             }
-            Ev::Frame(Frame::Event(e)) => {
-                if let Some(event::Kind::Exited(x)) = e.kind
-                    && x.agent_id == agent_id
-                {
-                    break Outcome::Exited;
-                }
-            }
-            Ev::Frame(Frame::Response(r)) if r.id == 0 => {
-                if let Some(response::Kind::Error(e)) = r.kind
-                    && e.message.starts_with("lagged")
-                {
-                    break Outcome::Lagged;
-                }
-            }
+            Ev::Frame(Frame::Event(e)) => match e.kind {
+                Some(event::Kind::Exited(x)) if x.agent_id == agent_id => break Outcome::Exited,
+                Some(event::Kind::Lagged(l)) if l.agent_id == agent_id => break Outcome::Lagged,
+                _ => {}
+            },
             // Acks (and errors) for our input and resizes.
             Ev::Frame(_) => {}
             Ev::Closed(msg) => {

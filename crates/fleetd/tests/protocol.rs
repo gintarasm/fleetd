@@ -1,7 +1,7 @@
 //! Protocol server tests: a real `fleetd` binary on a temp state dir, spoken to
 //! over its unix socket with `FrameCodec`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use fleet_proto::{
-    AgentExited, AgentInfo, AgentState, Attach, AttachOk, Frame, FrameCodec, Hello, KillAgent,
-    ListAgents, PROTOCOL_VERSION, Request, Response, SendInput, SpawnAgent, event, request,
-    response,
+    AgentExited, AgentInfo, AgentState, Attach, AttachOk, Frame, FrameCodec, Hello, HistoryPage,
+    KillAgent, ListAgents, PROTOCOL_VERSION, ReadHistory, Request, Response, SendInput, SetLabels,
+    SpawnAgent, event, request, response,
 };
 use tempfile::TempDir;
 use tokio_util::codec::{Decoder, Encoder};
@@ -177,7 +177,14 @@ impl Client {
     }
 
     fn list(&mut self) -> Vec<AgentInfo> {
-        match self.request(request::Kind::List(ListAgents {})) {
+        self.list_selected(&[])
+    }
+
+    /// Lists the agents whose labels contain every `selector` pair.
+    fn list_selected(&mut self, selector: &[(&str, &str)]) -> Vec<AgentInfo> {
+        match self.request(request::Kind::List(ListAgents {
+            selector: labels(selector),
+        })) {
             response::Kind::Agents(list) => list.agents,
             other => panic!("list failed: {other:?}"),
         }
@@ -247,6 +254,41 @@ impl Client {
     }
 }
 
+fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn spawn_labeled(c: &mut Client, pairs: &[(&str, &str)]) -> response::Kind {
+    c.request(request::Kind::Spawn(SpawnAgent {
+        program: "/bin/sleep".into(),
+        args: vec!["100".into()],
+        labels: labels(pairs),
+        ..Default::default()
+    }))
+}
+
+fn set_labels(
+    c: &mut Client,
+    agent_id: u64,
+    set: &[(&str, &str)],
+    remove: &[&str],
+) -> response::Kind {
+    c.request(request::Kind::SetLabels(SetLabels {
+        agent_id,
+        set: labels(set),
+        remove: remove.iter().map(|k| k.to_string()).collect(),
+    }))
+}
+
+fn ids(list: &[AgentInfo]) -> Vec<u64> {
+    let mut ids: Vec<u64> = list.iter().map(|a| a.id).collect();
+    ids.sort_unstable();
+    ids
+}
+
 fn hello(version: u32) -> Frame {
     Frame::Hello(Hello {
         protocol_version: version,
@@ -279,6 +321,19 @@ fn handshake_ok() {
     let _d = Daemon::start(dir.path());
     let mut c = Client::open(dir.path());
     assert!(c.list().is_empty());
+}
+
+#[test]
+fn v1_client_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::connect(dir.path());
+    c.send(hello(1));
+    match c.next_frame() {
+        Some(Frame::Reject(r)) => assert!(r.reason.contains("version 1"), "{}", r.reason),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+    assert!(c.is_closed());
 }
 
 #[test]
@@ -513,7 +568,7 @@ fn request_before_hello_closes_connection() {
     let mut c = Client::connect(dir.path());
     c.send(Frame::Request(Request {
         id: 1,
-        kind: Some(request::Kind::List(ListAgents {})),
+        kind: Some(request::Kind::List(ListAgents::default())),
     }));
     assert!(c.is_closed());
 }
@@ -549,7 +604,7 @@ fn too_many_connections_rejected() {
 }
 
 #[test]
-fn lagging_client_gets_error_and_can_reattach() {
+fn lag_event_names_agent() {
     let dir = TempDir::new().unwrap();
     let _d = Daemon::start(dir.path());
     let mut c = Client::open(dir.path());
@@ -559,17 +614,17 @@ fn lagging_client_gets_error_and_can_reattach() {
     std::thread::sleep(Duration::from_secs(1));
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        assert!(Instant::now() < deadline, "no lagged error");
+        assert!(Instant::now() < deadline, "no lagged event");
         match c.next_frame() {
-            Some(Frame::Response(Response {
-                id: 0,
-                kind: Some(response::Kind::Error(e)),
+            Some(Frame::Event(fleet_proto::Event {
+                kind: Some(event::Kind::Lagged(l)),
             })) => {
-                assert_eq!(e.message, "lagged: re-attach");
+                assert_eq!(l.agent_id, info.id);
                 break;
             }
+            Some(Frame::Response(r)) => panic!("unexpected response {r:?}"),
             Some(_) => {}
-            None => panic!("closed before lagged error"),
+            None => panic!("closed before lagged event"),
         }
     }
     // Forwarding stopped: the next response arrives with no output behind it
@@ -796,4 +851,354 @@ fn agents_get_xterm_256color_unless_term_is_given() {
         }
         c.kill(info.id);
     }
+}
+
+/// The printable text of an ANSI history line (escape sequences dropped).
+fn plain(line: &[u8]) -> String {
+    let mut out = String::new();
+    let mut esc = false;
+    for c in String::from_utf8_lossy(line).chars() {
+        match (esc, c) {
+            (false, '\x1b') => esc = true,
+            (false, c) => out.push(c),
+            (true, c) if c.is_ascii_alphabetic() => esc = false,
+            (true, _) => {}
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn read_history(c: &mut Client, req: ReadHistory) -> response::Kind {
+    c.request(request::Kind::ReadHistory(req))
+}
+
+#[test]
+fn read_history_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let info = c.sh("seq 1 5000; echo seq-done; sleep 100");
+    let deadline = Instant::now() + TIMEOUT;
+    let ok = loop {
+        let ok = c.attach(info.id);
+        if String::from_utf8_lossy(&ok.snapshot).contains("seq-done") {
+            break ok;
+        }
+        assert!(Instant::now() < deadline, "seq never finished");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let end = ok.tail_first_line + ok.history_tail.len() as u64;
+    assert!(end >= 4900, "only {end} history lines");
+
+    // A page ending where the tail ends repeats the tail's last lines.
+    let page = match read_history(
+        &mut c,
+        ReadHistory {
+            agent_id: info.id,
+            generation: ok.history_generation,
+            before_line: end,
+            max_lines: 10,
+        },
+    ) {
+        response::Kind::History(page) => page,
+        other => panic!("read_history failed: {other:?}"),
+    };
+    assert_eq!(page.agent_id, info.id);
+    assert_eq!(page.first_line, end - 10);
+    assert_eq!(page.lines, ok.history_tail[ok.history_tail.len() - 10..]);
+
+    // `max_lines` is capped server-side; every line is the next number.
+    let HistoryPage {
+        first_line, lines, ..
+    } = match read_history(
+        &mut c,
+        ReadHistory {
+            agent_id: info.id,
+            generation: ok.history_generation,
+            before_line: end,
+            max_lines: u32::MAX,
+        },
+    ) {
+        response::Kind::History(page) => page,
+        other => panic!("read_history failed: {other:?}"),
+    };
+    assert_eq!(lines.len(), 4096);
+    assert_eq!(first_line, end - 4096);
+    for (i, line) in lines.iter().enumerate() {
+        // `seq 1 N` prints `n` on line `n - 1`.
+        assert_eq!(plain(line), (first_line + i as u64 + 1).to_string());
+    }
+
+    // A stale generation and an unknown agent are errors.
+    match read_history(
+        &mut c,
+        ReadHistory {
+            agent_id: info.id,
+            generation: ok.history_generation + 1,
+            before_line: end,
+            max_lines: 10,
+        },
+    ) {
+        response::Kind::Error(e) => assert_eq!(e.message, "history cleared"),
+        other => panic!("expected error, got {other:?}"),
+    }
+    match read_history(
+        &mut c,
+        ReadHistory {
+            agent_id: 999,
+            generation: 0,
+            before_line: 10,
+            max_lines: 10,
+        },
+    ) {
+        response::Kind::Error(e) => assert!(!e.message.is_empty()),
+        other => panic!("expected error, got {other:?}"),
+    }
+    c.kill(info.id);
+}
+
+#[test]
+fn spawn_attach_replies_with_snapshot_and_streams_first_output() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    // The very first output, a terminal query included, must be streamed: an
+    // unattached agent's queries are answered by the node instead.
+    let r = c.request(request::Kind::Spawn(SpawnAgent {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "printf 'first-out\\033[6n'; sleep 100".into()],
+        cols: 100,
+        rows: 30,
+        attach: true,
+        labels: labels(&[("project", "fleetd")]),
+        ..Default::default()
+    }));
+    let (agent, attached) = match r {
+        response::Kind::SpawnedAttached(sa) => (sa.agent.unwrap(), sa.attached.unwrap()),
+        other => panic!("expected SpawnedAttached, got {other:?}"),
+    };
+    assert_eq!(agent.state(), AgentState::Running);
+    assert_eq!(agent.labels, labels(&[("project", "fleetd")]));
+    assert_eq!(attached.agent_id, agent.id);
+    assert_eq!((attached.cols, attached.rows), (100, 30));
+    assert!(
+        !String::from_utf8_lossy(&attached.snapshot).contains("first-out"),
+        "the first output landed in the snapshot"
+    );
+    let out = c.output_until(agent.id, "\x1b[6n");
+    assert!(out.contains("first-out"), "{out:?}");
+
+    // The attachment is a normal one: its exit arrives once, after output.
+    c.kill(agent.id);
+    c.exit_event(agent.id);
+    c.list();
+    let dup = c.pending.iter().any(|f| matches!(f, Frame::Event(_)));
+    assert!(!dup, "duplicate exit event: {:?}", c.pending);
+}
+
+#[test]
+fn spawn_attach_of_quickly_exiting_agent_streams_output_then_one_exit() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let r = c.request(request::Kind::Spawn(SpawnAgent {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "echo quick-bye; exit 5".into()],
+        attach: true,
+        ..Default::default()
+    }));
+    let agent = match r {
+        response::Kind::SpawnedAttached(sa) => sa.agent.unwrap(),
+        other => panic!("expected SpawnedAttached, got {other:?}"),
+    };
+    // Nothing of the agent's stream precedes the reply.
+    assert!(
+        c.pending.is_empty(),
+        "frames before the reply: {:?}",
+        c.pending
+    );
+    c.output_until(agent.id, "quick-bye");
+    assert_eq!(c.exit_event(agent.id).exit_code, 5);
+    c.list();
+    let dup = c.pending.iter().any(|f| matches!(f, Frame::Event(_)));
+    assert!(!dup, "duplicate exit event: {:?}", c.pending);
+}
+
+#[test]
+fn labels_set_at_spawn_listed_and_filtered() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let coder = [("project", "fleetd"), ("role", "coder")];
+    let reviewer = [("project", "fleetd"), ("role", "reviewer")];
+    let spawn = |c: &mut Client, pairs: &[(&str, &str)]| match spawn_labeled(c, pairs) {
+        response::Kind::Spawned(info) => {
+            assert_eq!(info.labels, labels(pairs));
+            info.id
+        }
+        other => panic!("spawn failed: {other:?}"),
+    };
+    let a = spawn(&mut c, &coder);
+    let b = spawn(&mut c, &reviewer);
+    let n = spawn(&mut c, &[]);
+
+    let all = c.list();
+    assert_eq!(ids(&all), vec![a, b, n]);
+    assert_eq!(find(&all, a).labels, labels(&coder));
+    assert_eq!(find(&all, b).labels, labels(&reviewer));
+    assert!(find(&all, n).labels.is_empty());
+
+    assert_eq!(ids(&c.list_selected(&[("project", "fleetd")])), vec![a, b]);
+    assert_eq!(ids(&c.list_selected(&reviewer)), vec![b]);
+    assert_eq!(ids(&c.list_selected(&[("role", "coder")])), vec![a]);
+    assert!(c.list_selected(&[("project", "other")]).is_empty());
+    assert!(c.list_selected(&[("missing", "")]).is_empty());
+    for id in [a, b, n] {
+        c.kill(id);
+    }
+}
+
+#[test]
+fn set_labels_updates_and_removes() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let id = match spawn_labeled(&mut c, &[("a", "1"), ("b", "2")]) {
+        response::Kind::Spawned(info) => info.id,
+        other => panic!("spawn failed: {other:?}"),
+    };
+    let r = set_labels(&mut c, id, &[("b", "3"), ("c", "4")], &["a", "absent"]);
+    assert!(
+        matches!(r, response::Kind::Ack(_)),
+        "set_labels failed: {r:?}"
+    );
+    assert_eq!(
+        find(&c.list(), id).labels,
+        labels(&[("b", "3"), ("c", "4")])
+    );
+    assert_eq!(ids(&c.list_selected(&[("b", "3")])), vec![id]);
+    assert!(c.list_selected(&[("a", "1")]).is_empty());
+
+    // A key both set and removed ends up removed.
+    let r = set_labels(&mut c, id, &[("d", "5")], &["d", "c"]);
+    assert!(
+        matches!(r, response::Kind::Ack(_)),
+        "set_labels failed: {r:?}"
+    );
+    assert_eq!(find(&c.list(), id).labels, labels(&[("b", "3")]));
+
+    // Unknown agents are an error; exited ones keep their labels editable.
+    match set_labels(&mut c, 999, &[("x", "y")], &[]) {
+        response::Kind::Error(e) => assert!(!e.message.is_empty()),
+        other => panic!("expected error, got {other:?}"),
+    }
+    c.kill(id);
+    wait_not_running(&mut c, id);
+    let r = set_labels(&mut c, id, &[("done", "yes")], &[]);
+    assert!(
+        matches!(r, response::Kind::Ack(_)),
+        "set_labels failed: {r:?}"
+    );
+    assert_eq!(
+        find(&c.list(), id).labels,
+        labels(&[("b", "3"), ("done", "yes")])
+    );
+}
+
+#[test]
+fn label_limits_and_reserved_prefix_rejected() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let key64 = "k".repeat(64);
+    let key65 = "k".repeat(65);
+    let val256 = "v".repeat(256);
+    let val257 = "v".repeat(257);
+    let many: Vec<(String, String)> = (0..65).map(|i| (format!("k{i}"), "v".into())).collect();
+    let pairs = |n: usize| -> Vec<(&str, &str)> {
+        many[..n]
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    };
+
+    let bad_spawns: Vec<Vec<(&str, &str)>> = vec![
+        vec![("fleet.parent", "1")],
+        vec![("", "v")],
+        vec![(key65.as_str(), "v")],
+        vec![("k", val257.as_str())],
+        pairs(65),
+    ];
+    for bad in &bad_spawns {
+        match spawn_labeled(&mut c, bad) {
+            response::Kind::Error(e) => assert!(!e.message.is_empty()),
+            other => panic!(
+                "spawn with {} labels: expected error, got {other:?}",
+                bad.len()
+            ),
+        }
+    }
+    assert!(c.list().is_empty(), "rejected spawns left rows");
+
+    let mut at_limit = pairs(63);
+    at_limit.push((key64.as_str(), val256.as_str()));
+    let id = match spawn_labeled(&mut c, &at_limit) {
+        response::Kind::Spawned(info) => info.id,
+        other => panic!("spawn at the limits failed: {other:?}"),
+    };
+    assert_eq!(find(&c.list(), id).labels.len(), 64);
+
+    for (set, remove) in [
+        (vec![("fleet.parent", "1")], vec![]),
+        (vec![], vec!["fleet.parent"]),
+        (vec![("", "v")], vec![]),
+        (vec![(key65.as_str(), "v")], vec![]),
+        (vec![("k", val257.as_str())], vec![]),
+        // A 65th label.
+        (vec![("one-more", "v")], vec![]),
+    ] {
+        match set_labels(&mut c, id, &set, &remove) {
+            response::Kind::Error(e) => assert!(!e.message.is_empty()),
+            other => panic!("set {set:?} remove {remove:?}: expected error, got {other:?}"),
+        }
+    }
+    // Rejected changes change nothing.
+    assert_eq!(find(&c.list(), id).labels, labels(&at_limit));
+
+    // The limit applies after the change: replacing one label is fine.
+    let r = set_labels(&mut c, id, &[("one-more", "v")], &["k0"]);
+    assert!(
+        matches!(r, response::Kind::Ack(_)),
+        "set_labels failed: {r:?}"
+    );
+    let listed = find(&c.list(), id).labels.clone();
+    assert_eq!(listed.len(), 64);
+    assert!(listed.contains_key("one-more") && !listed.contains_key("k0"));
+    c.kill(id);
+}
+
+#[test]
+fn labels_survive_daemon_restart() {
+    let dir = TempDir::new().unwrap();
+    let d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let id = match spawn_labeled(&mut c, &[("project", "fleetd"), ("role", "coder")]) {
+        response::Kind::Spawned(info) => info.id,
+        other => panic!("spawn failed: {other:?}"),
+    };
+    let r = set_labels(&mut c, id, &[("role", "reviewer")], &[]);
+    assert!(
+        matches!(r, response::Kind::Ack(_)),
+        "set_labels failed: {r:?}"
+    );
+    drop(c);
+    d.crash();
+
+    let _d = Daemon::start(dir.path());
+    let mut c = Client::open(dir.path());
+    let want = labels(&[("project", "fleetd"), ("role", "reviewer")]);
+    let rec = find(&c.list(), id).clone();
+    assert_eq!(rec.state(), AgentState::Lost);
+    assert_eq!(rec.labels, want);
+    assert_eq!(ids(&c.list_selected(&[("role", "reviewer")])), vec![id]);
 }

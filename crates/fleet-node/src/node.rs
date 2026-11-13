@@ -29,7 +29,7 @@
 use crate::history::{History, HistoryInfo, Page};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scrollback::{self, Scrollback};
-use crate::store::{self, AgentRecord, NewAgent, Store};
+use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
 use bytes::Bytes;
 use fleet_proto::{AgentExited, AgentInfo, AttachOk, SpawnAgent};
@@ -606,6 +606,55 @@ fn checked_size(cols: u32, rows: u32) -> io::Result<(u16, u16)> {
     Ok((c, r))
 }
 
+/// At most this many labels per agent (ADR 0025)...
+pub const MAX_LABELS: usize = 64;
+/// ...with keys of 1 to this many bytes...
+pub const MAX_LABEL_KEY_BYTES: usize = 64;
+/// ...and values of at most this many bytes.
+pub const MAX_LABEL_VALUE_BYTES: usize = 256;
+/// Label keys with this prefix are reserved for the core; clients cannot
+/// set or remove them.
+pub const RESERVED_LABEL_PREFIX: &str = "fleet.";
+
+/// Checks a label key written by a client.
+fn check_label_key(key: &str) -> io::Result<()> {
+    if key.is_empty() || key.len() > MAX_LABEL_KEY_BYTES {
+        return Err(invalid(format!(
+            "label key {key:?} must be 1 to {MAX_LABEL_KEY_BYTES} bytes"
+        )));
+    }
+    if key.starts_with(RESERVED_LABEL_PREFIX) {
+        return Err(invalid(format!(
+            "label key {key:?} is reserved (prefix {RESERVED_LABEL_PREFIX:?})"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks labels written by a client: keys, values and count.
+fn check_labels(labels: &Labels) -> io::Result<()> {
+    for (key, value) in labels {
+        check_label_key(key)?;
+        if value.len() > MAX_LABEL_VALUE_BYTES {
+            return Err(invalid(format!(
+                "label {key:?}: value longer than {MAX_LABEL_VALUE_BYTES} bytes"
+            )));
+        }
+    }
+    if labels.len() > MAX_LABELS {
+        return Err(invalid(format!(
+            "{} labels (at most {MAX_LABELS})",
+            labels.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `labels` contain every pair of `selector`.
+fn labels_match(labels: &Labels, selector: &Labels) -> bool {
+    selector.iter().all(|(k, v)| labels.get(k) == Some(v))
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -871,13 +920,41 @@ impl Node {
     /// Spawns an agent. Zero `cols`/`rows` mean 80x24; otherwise the size
     /// must pass the [`MAX_DIM`]/[`MAX_CELLS`] limits. An empty `cwd` means
     /// the daemon's working directory. `TERM` defaults to `xterm-256color`.
+    /// The labels must pass the label limits, without reserved keys.
+    /// `req.attach` is ignored (see [`Node::spawn_attached`]).
     pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
+        self.start(req, None).map(|(info, _)| info)
+    }
+
+    /// [`Node::spawn`], attached: the subscription is taken before the
+    /// process starts, so it carries all of the agent's output (and its
+    /// terminal queries reach the subscriber, not the node). `before_start`
+    /// runs with the agent's id before the process starts, e.g. to route the
+    /// agent's exit to this subscription.
+    pub fn spawn_attached(
+        &self,
+        req: SpawnAgent,
+        before_start: impl FnOnce(u64),
+    ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
+        let (info, attached) = self.start(req, Some(Box::new(before_start)))?;
+        let (ok, sub) = attached.expect("an attached start returns its attachment");
+        Ok((info, ok, sub))
+    }
+
+    /// Spawns an agent; with `attach`, also attaches to it before the process
+    /// starts, calling `attach` with its id first.
+    fn start(
+        &self,
+        req: SpawnAgent,
+        attach: Option<Box<dyn FnOnce(u64) + '_>>,
+    ) -> io::Result<(AgentInfo, Option<(AttachOk, Subscription)>)> {
         if lock(&self.agents).closing {
             return Err(shutting_down());
         }
         if req.program.is_empty() {
             return Err(invalid("program is empty".into()));
         }
+        check_labels(&req.labels)?;
         let or_default = |v: u32, default: u16| if v == 0 { u32::from(default) } else { v };
         let (cols, rows) = checked_size(
             or_default(req.cols, DEFAULT_COLS),
@@ -897,6 +974,7 @@ impl Node {
             cwd: cwd.to_string_lossy().into_owned(),
             created_unix_ms,
             scrollback_path: String::new(),
+            labels: req.labels,
         };
         let (id, path) = lock(&self.store)
             .insert_agent_with_scrollback(&new, |id| {
@@ -917,6 +995,14 @@ impl Node {
             .and_then(|sb| Ok((sb, History::create(&history_path)?)))
             .and_then(|(sb, history)| {
                 let pipeline = AgentPipeline::with_history(cols, rows, sb, Some(history));
+                // Subscribed before the process exists: nothing it prints
+                // or asks escapes the subscriber.
+                let attached = attach.map(|before_start| {
+                    before_start(id);
+                    let a = pipeline.attach();
+                    let ok = attach_ok(id, a.snapshot, a.size, a.history);
+                    (ok, a.subscription)
+                });
                 let sink = NodeSink {
                     id,
                     pipeline: pipeline.clone(),
@@ -935,10 +1021,10 @@ impl Node {
                     rows,
                 };
                 let host_id = self.host.spawn_with_sink(spec, Box::new(sink))?;
-                Ok(LiveAgent { host_id, pipeline })
+                Ok((LiveAgent { host_id, pipeline }, attached))
             });
-        let live = match started {
-            Ok(live) => live,
+        let (live, attached) = match started {
+            Ok(started) => started,
             Err(e) => {
                 if let Err(e) = lock(&self.store).delete_agent(id) {
                     eprintln!("fleet-node: removing failed agent {id}: {e}");
@@ -975,7 +1061,7 @@ impl Node {
             histories.delete(evicted);
         }
         drop(histories);
-        Ok(AgentInfo {
+        let info = AgentInfo {
             id,
             program: new.program,
             args: new.args,
@@ -983,7 +1069,9 @@ impl Node {
             state: fleet_proto::AgentState::Running.into(),
             exit_code: None,
             created_unix_ms,
-        })
+            labels: new.labels,
+        };
+        Ok((info, attached))
     }
 
     /// Every agent this node knows of, including exited and lost ones. A
@@ -994,6 +1082,34 @@ impl Node {
             eprintln!("fleet-node: skipping unreadable agent row: {e}");
         }
         Ok(records.into_iter().map(agent_info).collect())
+    }
+
+    /// The agents whose labels contain every `selector` pair (all of them
+    /// for an empty selector).
+    pub fn list_matching(&self, selector: &Labels) -> io::Result<Vec<AgentInfo>> {
+        let mut agents = self.list()?;
+        agents.retain(|a| labels_match(&a.labels, selector));
+        Ok(agents)
+    }
+
+    /// Sets, then removes, labels of a known agent (running or not). Keys
+    /// must not be reserved, and the limits hold for the result.
+    pub fn set_labels(&self, id: u64, set: Labels, remove: &[String]) -> io::Result<()> {
+        check_labels(&set)?;
+        for key in remove {
+            check_label_key(key)?;
+        }
+        let store = lock(&self.store);
+        let mut labels = store
+            .labels(id)
+            .map_err(store_err)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no agent {id}")))?;
+        labels.extend(set);
+        for key in remove {
+            labels.remove(key);
+        }
+        check_labels(&labels)?;
+        store.replace_labels(id, &labels).map_err(store_err)
     }
 
     fn live(&self, id: u64) -> io::Result<LiveAgent> {
@@ -1040,20 +1156,7 @@ impl Node {
                 })
                 .ok()
         });
-        let mut ok = AttachOk {
-            agent_id: id,
-            snapshot,
-            cols: cols.into(),
-            rows: rows.into(),
-            ..Default::default()
-        };
-        if let Some(h) = history {
-            ok.history_tail = h.lines;
-            ok.tail_first_line = h.tail_first_line;
-            ok.history_first_line = h.info.first_line;
-            ok.history_generation = h.info.generation;
-        }
-        Ok((ok, sub))
+        Ok((attach_ok(id, snapshot, (cols, rows), history), sub))
     }
 
     /// The lines of the agent's history immediately before `before_line`
@@ -1151,6 +1254,28 @@ impl Node {
     }
 }
 
+fn attach_ok(
+    id: u64,
+    snapshot: Vec<u8>,
+    (cols, rows): (u16, u16),
+    history: Option<HistoryTail>,
+) -> AttachOk {
+    let mut ok = AttachOk {
+        agent_id: id,
+        snapshot,
+        cols: cols.into(),
+        rows: rows.into(),
+        ..Default::default()
+    };
+    if let Some(h) = history {
+        ok.history_tail = h.lines;
+        ok.tail_first_line = h.tail_first_line;
+        ok.history_first_line = h.info.first_line;
+        ok.history_generation = h.info.generation;
+    }
+    ok
+}
+
 fn agent_info(rec: AgentRecord) -> AgentInfo {
     use fleet_proto::AgentState as Wire;
     let state = match rec.state {
@@ -1166,6 +1291,7 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
         state: state.into(),
         exit_code: rec.exit_code,
         created_unix_ms: rec.created_unix_ms,
+        labels: rec.labels,
     }
 }
 

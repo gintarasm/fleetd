@@ -15,6 +15,8 @@ message Request {
     SendInput input = 6;
     Resize resize = 7;
     KillAgent kill = 8;
+    ReadHistory read_history = 9;
+    SetLabels set_labels = 10;
   }
 }
 
@@ -26,11 +28,18 @@ message Response {
     AttachOk attached = 4;
     Ack ack = 5;
     Error error = 6;
+    HistoryPage history = 7;
+    SpawnedAttached spawned_attached = 8;
   }
 }
 
 message Event {
-  oneof kind { AgentExited exited = 1; }
+  oneof kind {
+    AgentExited exited = 1;
+    Lagged lagged = 2;
+    AgentActivity activity = 3;
+    AttachRole role = 4;
+  }
 }
 
 message SpawnAgent {
@@ -40,9 +49,16 @@ message SpawnAgent {
   map<string, string> env = 4;
   uint32 cols = 5;
   uint32 rows = 6;
+  // Attach in the same request: the reply is `SpawnedAttached`, and the
+  // subscription exists before the process starts.
+  bool attach = 7;
+  // Labels (ADR 0025): at most 64, keys 1-64 bytes, values up to 256 bytes;
+  // keys starting with `fleet.` are reserved.
+  map<string, string> labels = 8;
 }
 
-message ListAgents {}
+// Only agents whose labels contain every selector pair; empty means all.
+message ListAgents { map<string, string> selector = 1; }
 
 message AgentList { repeated AgentInfo agents = 1; }
 
@@ -61,6 +77,7 @@ message AgentInfo {
   AgentState state = 5;
   optional int32 exit_code = 6;
   int64 created_unix_ms = 7;
+  map<string, string> labels = 8;
 }
 
 message Attach { uint64 agent_id = 1; }
@@ -76,6 +93,8 @@ message AttachOk {
   // The oldest line still in history, and the generation (bumped by CSI 3 J).
   uint64 history_first_line = 7;
   uint64 history_generation = 8;
+  // Whether this client's resizes apply to the agent.
+  bool primary = 9;
 }
 message SendInput { uint64 agent_id = 1; bytes data = 2; }
 message Resize { uint64 agent_id = 1; uint32 cols = 2; uint32 rows = 3; }
@@ -83,4 +102,27 @@ message KillAgent { uint64 agent_id = 1; }
 message Detach { uint64 agent_id = 1; }
 message AgentExited { uint64 agent_id = 1; int32 exit_code = 2; }
 message Error { string message = 1; }
+
+// A page of history: the lines immediately before `before_line`, at most
+// `max_lines` (capped by the server). A stale `generation` is an error.
+message ReadHistory {
+  uint64 agent_id = 1;
+  uint64 generation = 2;
+  uint64 before_line = 3;
+  uint32 max_lines = 4;
+}
+// `lines[0]` is line `first_line`.
+message HistoryPage { uint64 agent_id = 1; uint64 first_line = 2; repeated bytes lines = 3; }
+message SpawnedAttached { AgentInfo agent = 1; AttachOk attached = 2; }
+// Applies `set`, then `remove`; answered by `Ack`.
+message SetLabels {
+  uint64 agent_id = 1;
+  map<string, string> set = 2;
+  repeated string remove = 3;
+}
+// The connection's subscription to the agent was dropped (it fell behind);
+// re-attach to resume.
+message Lagged { uint64 agent_id = 1; }
+message AgentActivity { uint64 agent_id = 1; string last_line = 2; int64 last_output_unix_ms = 3; }
+message AttachRole { uint64 agent_id = 1; bool primary = 2; }
 message Ack {}

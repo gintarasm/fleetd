@@ -10,6 +10,6 @@ pub use frame::{Frame, FrameCodec, FrameError};
 pub use pb::*;
 
 /// Wire protocol version; a mismatch is answered with `HandshakeReject`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Maximum accepted value of a frame's length prefix.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;

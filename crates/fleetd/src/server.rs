@@ -5,17 +5,19 @@
 //! request loop, the per-agent forwarders and the exit-event forwarder feed it
 //! through a bounded channel. A client that stops reading thus stalls its
 //! forwarders, its subscriptions fill up, and it is told to re-attach
-//! (`lagged: re-attach`) instead of slowing the agent down.
+//! (`Event::Lagged`) instead of slowing the agent down.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use fleet_node::history::HISTORY_PAGE_MAX_LINES;
 use fleet_node::node::{Node, StreamItem, Subscription};
 use fleet_proto::{
-    Ack, AgentList, Event, Frame, FrameCodec, HandshakeReject, HelloOk, MAX_FRAME,
-    PROTOCOL_VERSION, Request, Response, event, request, response,
+    Ack, AgentList, AttachOk, Event, Frame, FrameCodec, HandshakeReject, HelloOk, HistoryPage,
+    Lagged, MAX_FRAME, PROTOCOL_VERSION, ReadHistory, Request, Response, SpawnAgent,
+    SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -34,8 +36,6 @@ const HELLO_MAX_FRAME: usize = 4 * 1024;
 const HANDSHAKE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames queued for a connection's writer.
 const OUTBOX_CAPACITY: usize = 256;
-
-const LAGGED: &str = "lagged: re-attach";
 
 type Writer = FramedWrite<OwnedWriteHalf, FrameCodec>;
 type Reader = FramedRead<OwnedReadHalf, FrameCodec>;
@@ -221,16 +221,21 @@ impl Connection {
     async fn handle(&mut self, req: Request) -> bool {
         let kind = match req.kind {
             None => error("empty request".into()),
+            Some(request::Kind::Spawn(spawn)) if spawn.attach => {
+                return self.spawn_attached(req.id, spawn).await;
+            }
             Some(request::Kind::Spawn(spawn)) => {
                 match blocking(&self.node, move |n| n.spawn(spawn)).await {
                     Ok(info) => response::Kind::Spawned(info),
                     Err(e) => error(e.to_string()),
                 }
             }
-            Some(request::Kind::List(_)) => match blocking(&self.node, |n| n.list()).await {
-                Ok(agents) => response::Kind::Agents(AgentList { agents }),
-                Err(e) => error(e.to_string()),
-            },
+            Some(request::Kind::List(list)) => {
+                match blocking(&self.node, move |n| n.list_matching(&list.selector)).await {
+                    Ok(agents) => response::Kind::Agents(AgentList { agents }),
+                    Err(e) => error(e.to_string()),
+                }
+            }
             Some(request::Kind::Attach(a)) => return self.attach(req.id, a.agent_id).await,
             Some(request::Kind::Detach(d)) => {
                 self.detach(d.agent_id).await;
@@ -245,6 +250,11 @@ impl Connection {
             Some(request::Kind::Kill(k)) => {
                 ack(blocking(&self.node, move |n| n.kill(k.agent_id)).await)
             }
+            Some(request::Kind::ReadHistory(r)) => self.read_history(r).await,
+            Some(request::Kind::SetLabels(l)) => ack(blocking(&self.node, move |n| {
+                n.set_labels(l.agent_id, l.set, &l.remove)
+            })
+            .await),
         };
         self.respond(req.id, kind).await
     }
@@ -267,6 +277,22 @@ impl Connection {
         lock(&self.attached).remove(&agent_id);
     }
 
+    async fn read_history(&self, r: ReadHistory) -> response::Kind {
+        let max_lines = r.max_lines.min(HISTORY_PAGE_MAX_LINES);
+        let page = blocking(&self.node, move |n| {
+            n.read_history(r.agent_id, r.generation, r.before_line, max_lines)
+        })
+        .await;
+        match page {
+            Ok(page) => response::Kind::History(HistoryPage {
+                agent_id: r.agent_id,
+                first_line: page.first_line,
+                lines: page.lines,
+            }),
+            Err(e) => error(e.to_string()),
+        }
+    }
+
     /// Replaces any previous subscription to the agent: `AttachOk` is queued
     /// before any of the new subscription's output.
     async fn attach(&mut self, id: u64, agent_id: u64) -> bool {
@@ -282,6 +308,50 @@ impl Connection {
         if !self.respond(id, response::Kind::Attached(ok)).await {
             return false;
         }
+        self.forward(agent_id, sub);
+        true
+    }
+
+    /// Spawns an agent attached: the reply is `SpawnedAttached`, queued
+    /// before any of the agent's output.
+    async fn spawn_attached(&mut self, id: u64, spawn: SpawnAgent) -> bool {
+        // The agent is marked attached before it starts, so its exit is
+        // announced only by its forwarder, after its output.
+        let attached = Arc::clone(&self.attached);
+        let spawned = blocking(&self.node, move |n| {
+            let mut started = None;
+            let r = n.spawn_attached(spawn, |agent_id| {
+                started = Some(agent_id);
+                lock(&attached).insert(agent_id);
+            });
+            Ok((r, started))
+        })
+        .await;
+        let (info, ok, sub): (_, AttachOk, _) = match spawned {
+            Ok((Ok(spawned), _)) => spawned,
+            Ok((Err(e), started)) => {
+                // A failed spawn's id may be handed out again.
+                if let Some(agent_id) = started {
+                    lock(&self.attached).remove(&agent_id);
+                }
+                return self.respond(id, error(e.to_string())).await;
+            }
+            Err(e) => return self.respond(id, error(e.to_string())).await,
+        };
+        let agent_id = info.id;
+        let reply = response::Kind::SpawnedAttached(SpawnedAttached {
+            agent: Some(info),
+            attached: Some(ok),
+        });
+        if !self.respond(id, reply).await {
+            return false;
+        }
+        self.forward(agent_id, sub);
+        true
+    }
+
+    /// Starts forwarding `sub`, the agent's subscription.
+    fn forward(&mut self, agent_id: u64, sub: Subscription) {
         let task = tokio::spawn(forward_output(
             Arc::clone(&self.node),
             agent_id,
@@ -290,7 +360,6 @@ impl Connection {
             Arc::clone(&self.attached),
         ));
         self.forwarders.insert(agent_id, task);
-        true
     }
 }
 
@@ -303,7 +372,7 @@ fn exited_event(agent_id: u64, exit_code: i32) -> Frame {
     })
 }
 
-/// Streams one agent's output, then its exit or a lag notice.
+/// Streams one agent's output, then its exit or `Event::Lagged`.
 async fn forward_output(
     node: Arc<Node>,
     agent_id: u64,
@@ -324,9 +393,8 @@ async fn forward_output(
                 // `Exited` item discarded with the lag), so send it here. An
                 // exit racing this hand-off may be announced twice.
                 lock(&attached).remove(&agent_id);
-                let lagged = Frame::Response(Response {
-                    id: 0,
-                    kind: Some(error(LAGGED.into())),
+                let lagged = Frame::Event(Event {
+                    kind: Some(event::Kind::Lagged(Lagged { agent_id })),
                 });
                 if outbox.send(lagged).await.is_err() {
                     return;
