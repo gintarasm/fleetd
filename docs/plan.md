@@ -118,7 +118,7 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 | | Milestone |
 |---|---|
 | **M0** | Workspace skeleton, benchmark harness (50 fake agents flooding PTYs), CI perf gate, baselines |
-| **M1** | Local node: PTYs, terminal grid, scrollback, SQLite, protocol, `fleet-cli` |
+| **M1** | Local node: PTYs, terminal grid, scrollback, SQLite, protocol, `fleet-cli` — done 2026-11-13 ([0018](decisions/0018-m1-protocol-and-node.md)); new benchmarks' baselines are recorded from CI |
 | **M2** | gpui client: sidebar, terminal pane, splits, menu-bar app |
 | **M3** | Project/workspace/worktree/task hierarchy, diff view |
 | **M4** | Plugin host, Claude Code + Codex adapters, hook-based status, notifications |
