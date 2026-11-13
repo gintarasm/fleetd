@@ -1,8 +1,8 @@
 # 0019 — Control-plane direction: controller anywhere, agent channel (MCP), pluggable secrets
 
-**Status:** proposed · 2026-11-13 · open questions resolved by the user on PR #3 (see the end of this file)
+**Status:** accepted · 2026-11-13 · open questions resolved by the user on PR #3 (see the end of this file)
 
-**Amends when accepted:** [0003](0003-node-controller-roles.md) (where the controller runs), [0012](0012-credentials.md) (secret storage, OAuth browser host). Builds on [0007](0007-plugin-system.md), [0008](0008-agent-status-detection.md), [0011](0011-remote-nodes.md).
+**Amends:** [0003](0003-node-controller-roles.md) (where the controller runs), [0012](0012-credentials.md) (secret storage, OAuth browser host). Builds on [0007](0007-plugin-system.md), [0008](0008-agent-status-detection.md), [0011](0011-remote-nodes.md).
 
 ## Context
 
