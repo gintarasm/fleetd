@@ -511,3 +511,31 @@ fn screen_prints_visible_text() {
     assert!(!s.contains('\x1b'));
     assert!(!s.ends_with("\n\n"), "trailing blank rows dropped: {s:?}");
 }
+
+#[test]
+fn spawn_relative_cwd_is_resolved_against_cli_cwd() {
+    let d = Daemon::start();
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir(base.join("sub")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .arg("--state-dir")
+        .arg(d.dir.path())
+        .args(["spawn", "--cwd", "sub", "--", "pwd"])
+        .current_dir(&base)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let want = base.join("sub");
+    wait_for("pwd output", || {
+        d.ok(&["screen", &id])
+            .lines()
+            .any(|l| l.trim() == want.to_str().unwrap())
+    });
+}

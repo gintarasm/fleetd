@@ -131,7 +131,7 @@ fn print_json(agents: &[AgentInfo]) {
                 "args": a.args,
                 "cwd": a.cwd,
                 "created_unix_ms": a.created_unix_ms,
-                "labels": a.labels,
+                "labels": a.labels.iter().collect::<std::collections::BTreeMap<_, _>>(),
             })
         })
         .collect();
@@ -178,10 +178,13 @@ fn run(cli: Cli) -> Result<u8> {
             let (tc, tr) = crossterm::terminal::size().unwrap_or((80, 24));
             let program = command.remove(0);
             let labels = parse_labels(&labels)?;
-            let cwd = cwd
-                .or_else(|| std::env::current_dir().ok())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let cwd = match cwd {
+                Some(p) if p.is_absolute() => p,
+                Some(p) => std::env::current_dir()?.join(p),
+                None => std::env::current_dir().unwrap_or_default(),
+            }
+            .to_string_lossy()
+            .into_owned();
             let spawn = SpawnAgent {
                 program,
                 args: command,
