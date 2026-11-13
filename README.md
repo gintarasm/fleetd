@@ -18,12 +18,20 @@ A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Co
 
 Requires the Rust toolchain pinned in `rust-toolchain.toml`; `rustup` installs it automatically. Runs on macOS and Linux.
 
+Install both binaries into `~/.cargo/bin`, which rustup normally puts on your `PATH`:
+
 ```sh
-cargo build --release -p fleetd -p fleet-cli
-# binaries: target/release/fleetd and target/release/fleet
+cargo install --locked --path crates/fleetd      # installs fleetd
+cargo install --locked --path crates/fleet-cli   # installs fleet
+which fleetd fleet                               # check they are on PATH
 ```
 
-Put both on your `PATH`, or call them by path.
+- **Not on `PATH`?** Add `export PATH="$HOME/.cargo/bin:$PATH"` to your shell profile.
+- **Updating:** after pulling, run the same commands again. Add `--force` if cargo says that version is already installed.
+- **Another location:** add `--root <prefix>` to install into `<prefix>/bin`.
+- **Removing:** `cargo uninstall fleetd fleet-cli`.
+
+Or build without installing: `cargo build --release -p fleetd -p fleet-cli` puts them in `target/release/`.
 
 ## Running the daemon
 
@@ -91,7 +99,8 @@ Opens the agent's terminal in your terminal.
 - **Detach:** press **Ctrl-\\**. The agent keeps running. Your terminal is restored on every way out: detach, agent exit, a signal sent to the `fleet` process (SIGINT/SIGTERM/SIGHUP), or an error. While attached, Ctrl-C goes to the agent, not to `fleet`.
 - **Many attachments:** several clients can attach to the same agent at once.
 - **Falling behind:** if your client can't keep up with the agent's output, `fleetd` drops the stream rather than slowing the agent. `fleet attach` then exits with code 2 and `output lagged behind; re-attach`. Run it again to get a fresh snapshot.
-- **Kitty keyboard limit:** when an agent turns on the kitty keyboard protocol, Ctrl-\\ may not detach. A fix is in progress.
+- **Detach key in kitty keyboard mode:** Ctrl-\\ also detaches when an agent has turned on the kitty keyboard protocol or xterm's modifyOtherKeys, which encode the key as an escape sequence. Side effect: a lone Esc keypress reaches the agent up to 20 ms late. On keyboard layouts where `\` isn't a base key, only plain Ctrl-\\ (byte 0x1c) works.
+- **Full-screen apps:** if an agent is in a full-screen app (alternate screen), the snapshot also carries the screen behind it, so leaving the app shows the right content.
 - **Old exited agents:** attaching to an exited agent shows its final screen. Agents older than the 64 kept in memory show an empty screen.
 
 ### Send input without attaching
