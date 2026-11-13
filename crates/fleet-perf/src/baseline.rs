@@ -236,6 +236,10 @@ pub fn compare(b: &Baselines, r: &Results) -> Report {
             Status::UnitMismatch
         } else if spec.budget.is_some_and(|budget| value > budget) {
             Status::OverBudget
+        } else if spec.baseline == 0.0 && spec.unit == COUNT_UNIT && spec.budget.is_some() {
+            // A budgeted count with baseline 0 is gated by its budget alone
+            // (checked above); 0 cannot be recorded as a count baseline.
+            Status::Ok
         } else if spec.baseline == 0.0 {
             Status::Unrecorded
         } else if value > spec.baseline * (1.0 + tol) {
@@ -646,6 +650,44 @@ baseline = 100
         assert_eq!(
             status(&b, &count_res(f64::NAN), "m_count"),
             (Status::Invalid, true)
+        );
+    }
+
+    fn zero_baseline_count(budget: Option<f64>) -> Baselines {
+        let mut b = with_count();
+        let spec = b.metrics.get_mut("m_count").unwrap();
+        spec.baseline = 0.0;
+        spec.budget = budget;
+        b
+    }
+
+    #[test]
+    fn count_with_budget_and_zero_baseline_is_gated_by_budget() {
+        let b = zero_baseline_count(Some(0.0));
+        assert_eq!(status(&b, &count_res(0.0), "m_count"), (Status::Ok, false));
+        assert_eq!(
+            status(&b, &count_res(1.0), "m_count"),
+            (Status::OverBudget, true)
+        );
+        // Within a non-zero budget it passes; beyond it fails.
+        let b = zero_baseline_count(Some(2.0));
+        assert_eq!(status(&b, &count_res(2.0), "m_count"), (Status::Ok, false));
+        assert_eq!(
+            status(&b, &count_res(3.0), "m_count"),
+            (Status::OverBudget, true)
+        );
+    }
+
+    #[test]
+    fn count_without_budget_zero_baseline_is_still_unrecorded() {
+        let b = zero_baseline_count(None);
+        assert_eq!(
+            status(&b, &count_res(0.0), "m_count"),
+            (Status::Unrecorded, true)
+        );
+        assert_eq!(
+            status(&b, &count_res(3.0), "m_count"),
+            (Status::Unrecorded, true)
         );
     }
 

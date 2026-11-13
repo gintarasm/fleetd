@@ -106,8 +106,8 @@ baseline = 755815
 suite = "wall"
 unit = "count"
 # Must stay 0: the budget is the hard limit (any lagged subscription fails).
-# A count baseline of 0 means "unrecorded" and `tighten` never records 0 for
-# a count, so this stays UNRECORDED until the user decides how to gate it.
+# A count with a budget and `baseline = 0` is gated by the budget alone
+# (value <= budget passes); `tighten` never records 0 for a count.
 budget = 0
 baseline = 0
 
