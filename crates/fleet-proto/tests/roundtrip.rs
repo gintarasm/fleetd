@@ -7,8 +7,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 fn roundtrip(frame: Frame) -> Frame {
     let mut buf = BytesMut::new();
-    FrameCodec.encode(frame, &mut buf).unwrap();
-    FrameCodec.decode(&mut buf).unwrap().unwrap()
+    FrameCodec::new().encode(frame, &mut buf).unwrap();
+    FrameCodec::new().decode(&mut buf).unwrap().unwrap()
 }
 
 #[test]

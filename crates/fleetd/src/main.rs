@@ -41,7 +41,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match rt.block_on(daemon.serve()) {
+    let served = rt.block_on(daemon.serve());
+    // Do not wait on blocking calls stuck on an agent (e.g. a full input queue).
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("fleetd: {e}");

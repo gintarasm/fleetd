@@ -138,6 +138,32 @@ impl Store {
         Ok(self.conn.last_insert_rowid() as u64)
     }
 
+    /// Inserts a running agent whose scrollback path is derived from its id
+    /// (`rec.scrollback_path` is replaced by `scrollback_path(id)`), in one
+    /// transaction.
+    pub fn insert_agent_with_scrollback(
+        &self,
+        rec: &NewAgent,
+        scrollback_path: impl FnOnce(u64) -> String,
+    ) -> rusqlite::Result<(u64, String)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id = self.insert_agent(rec)?;
+        let path = scrollback_path(id);
+        self.conn.execute(
+            "UPDATE agents SET scrollback_path = ?2 WHERE id = ?1",
+            (id as i64, &path),
+        )?;
+        tx.commit()?;
+        Ok((id, path))
+    }
+
+    /// Removes an agent's row (e.g. after its spawn failed).
+    pub fn delete_agent(&self, id: u64) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM agents WHERE id = ?1", (id as i64,))?;
+        Ok(())
+    }
+
     /// running -> exited. Errors if the agent is unknown or not running.
     pub fn set_exited(&self, id: u64, code: i32) -> rusqlite::Result<()> {
         let n = self.conn.execute(
@@ -152,11 +178,36 @@ impl Store {
     }
 
     pub fn list_agents(&self) -> rusqlite::Result<Vec<AgentRecord>> {
+        self.query_agents(|rows| rows.collect())
+    }
+
+    /// Like [`Store::list_agents`], but a row that fails to decode is
+    /// returned as an error alongside the good rows instead of failing the
+    /// whole listing.
+    pub fn list_agents_lossy(&self) -> rusqlite::Result<(Vec<AgentRecord>, Vec<rusqlite::Error>)> {
+        self.query_agents(|rows| {
+            let (mut good, mut bad) = (Vec::new(), Vec::new());
+            for row in rows {
+                match row {
+                    Ok(rec) => good.push(rec),
+                    Err(e) => bad.push(e),
+                }
+            }
+            Ok((good, bad))
+        })
+    }
+
+    fn query_agents<T>(
+        &self,
+        collect: impl FnOnce(
+            &mut dyn Iterator<Item = rusqlite::Result<AgentRecord>>,
+        ) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
         let mut stmt = self.conn.prepare(
             "SELECT id, program, args_json, cwd, state, exit_code, created_unix_ms, scrollback_path
              FROM agents ORDER BY id",
         )?;
-        stmt.query_map([], |r| {
+        let mut rows = stmt.query_map([], |r| {
             let args_json: String = r.get(2)?;
             let state: String = r.get(4)?;
             Ok(AgentRecord {
@@ -171,8 +222,8 @@ impl Store {
                 created_unix_ms: r.get(6)?,
                 scrollback_path: r.get(7)?,
             })
-        })?
-        .collect()
+        })?;
+        collect(&mut rows)
     }
 
     /// running -> lost for every agent left running by a previous daemon.
@@ -306,6 +357,36 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
         assert_eq!(jm, "wal");
+    }
+
+    #[test]
+    fn insert_with_scrollback_uses_the_new_id() {
+        let (_d, _p, s) = open_tmp();
+        let (id, path) = s
+            .insert_agent_with_scrollback(&new_agent(1), |id| format!("/sb/{id}.ring"))
+            .unwrap();
+        assert_eq!(path, format!("/sb/{id}.ring"));
+        assert_eq!(s.list_agents().unwrap()[0].scrollback_path, path);
+        s.delete_agent(id).unwrap();
+        assert!(s.list_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lossy_list_skips_corrupt_rows() {
+        let (_d, _p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        let b = s.insert_agent(&new_agent(2)).unwrap();
+        s.conn
+            .execute(
+                "UPDATE agents SET args_json = 'nope' WHERE id = ?1",
+                (a as i64,),
+            )
+            .unwrap();
+        assert!(s.list_agents().is_err());
+        let (good, bad) = s.list_agents_lossy().unwrap();
+        assert_eq!(good.len(), 1);
+        assert_eq!(good[0].id, b);
+        assert_eq!(bad.len(), 1);
     }
 
     #[test]

@@ -1,10 +1,17 @@
-//! fleetd: single-instance daemon stub. Protocol arrives in M1.
+//! fleetd: the single-instance node daemon, serving the fleet protocol on a
+//! unix socket in the state dir.
+
+mod server;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use fleet_node::node::Node;
 
 use fs4::{FileExt, TryLockError};
 use tokio::net::UnixListener;
@@ -88,12 +95,18 @@ pub struct Daemon {
     _lock: File,
     listener: StdUnixListener,
     socket_path: PathBuf,
+    state_dir: PathBuf,
 }
 
-/// Synchronous (no tokio runtime needed): create the state dir, take the
-/// instance lock, replace any stale socket, bind.
+/// Synchronous (no tokio runtime needed): create the state dir (mode 0700,
+/// also enforced on an existing one), take the instance lock, replace any
+/// stale socket, bind. The node's state is opened by [`Daemon::serve`].
 pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
-    fs::create_dir_all(&cfg.state_dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&cfg.state_dir)?;
+    fs::set_permissions(&cfg.state_dir, fs::Permissions::from_mode(0o700))?;
 
     let lock = OpenOptions::new()
         .create(true)
@@ -123,23 +136,28 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
         _lock: lock,
         listener,
         socket_path,
+        state_dir: cfg.state_dir.clone(),
     })
 }
 
 impl Daemon {
-    /// Accept and immediately close connections until SIGTERM/SIGINT, then
-    /// remove the socket file and return.
+    /// Open the node's state, then serve protocol connections until
+    /// SIGTERM/SIGINT; then remove the socket file and return.
     pub async fn serve(self) -> io::Result<()> {
         let listener = UnixListener::from_std(self.listener)?;
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
+        let state_dir = self.state_dir;
+        let node = tokio::task::spawn_blocking(move || Node::open(&state_dir))
+            .await
+            .map_err(io::Error::other)??;
+        let server = server::Server::new(Arc::new(node));
         loop {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = int.recv() => break,
                 accepted = listener.accept() => match accepted {
-                    // Protocol arrives in M1: drop the stream, closing it.
-                    Ok(stream) => drop(stream),
+                    Ok((stream, _)) => server.accept(stream),
                     // Accept errors never end `serve`; only a signal does.
                     Err(e) => {
                         eprintln!("fleetd: accept failed: {e}");

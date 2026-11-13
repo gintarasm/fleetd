@@ -1,3 +1,6 @@
+//! The node: [`Node`] ties the [`PtyHost`](crate::PtyHost), the agent
+//! [`Store`] and one [`AgentPipeline`] per agent together.
+//!
 //! Per-agent output pipeline: PTY output feeds the agent's [`Terminal`] grid,
 //! is appended to its [`Scrollback`], then broadcast to attached subscribers.
 //!
@@ -22,12 +25,20 @@
 //! while no subscriber is attached; otherwise the client's terminal answers.
 //! They are dropped rather than ever blocking the reader thread.
 
-use crate::pty::{AgentInput, OutputSink};
-use crate::scrollback::Scrollback;
+use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
+use crate::scrollback::{self, Scrollback};
+use crate::store::{self, AgentRecord, NewAgent, Store};
 use crate::term::Terminal;
 use bytes::Bytes;
+use fleet_proto::{AgentExited, AgentInfo, AttachOk, SpawnAgent};
+use std::collections::HashMap;
+use std::io;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 /// Chunks a subscriber may fall behind before it is dropped.
@@ -323,6 +334,13 @@ impl AgentPipeline {
     /// stream of everything after it. After exit the stream holds only
     /// [`StreamItem::Exited`].
     pub fn subscribe(&self) -> (Vec<u8>, Subscription) {
+        let (snapshot, _, sub) = self.subscribe_sized();
+        (snapshot, sub)
+    }
+
+    /// [`AgentPipeline::subscribe`], plus the grid size `(cols, rows)` the
+    /// snapshot was taken at.
+    pub fn subscribe_sized(&self) -> (Vec<u8>, (u16, u16), Subscription) {
         let mut state = self.lock();
         state.term.flush_pending_sync();
         let mut snapshot = state.term.snapshot();
@@ -344,7 +362,7 @@ impl AgentPipeline {
             lagged,
             done: false,
         };
-        (snapshot, sub)
+        (snapshot, state.term.size(), sub)
     }
 
     /// Resizes the grid. Call alongside [`PtyHost::resize`](crate::PtyHost::resize).
@@ -403,6 +421,258 @@ impl OutputSink for AgentPipeline {
         for sub in std::mem::take(&mut state.subscribers) {
             sub.offer(StreamItem::Exited(code));
         }
+    }
+}
+
+/// Exit events a [`Node`] buffers per receiver before it lags.
+pub const EXIT_EVENT_CAPACITY: usize = 256;
+
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn store_err(e: rusqlite::Error) -> io::Error {
+    io::Error::other(e)
+}
+
+fn invalid(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// A live agent of this node process.
+#[derive(Clone)]
+struct LiveAgent {
+    host_id: AgentId,
+    pipeline: AgentPipeline,
+}
+
+/// The agent's sink: feeds its pipeline and, on exit, records the exit code
+/// and announces it.
+struct NodeSink {
+    id: u64,
+    pipeline: AgentPipeline,
+    store: Arc<Mutex<Store>>,
+    exits: broadcast::Sender<AgentExited>,
+}
+
+impl OutputSink for NodeSink {
+    fn on_spawn(&mut self, input: AgentInput) {
+        self.pipeline.on_spawn(input);
+    }
+
+    fn on_output(&mut self, bytes: &[u8]) {
+        self.pipeline.on_output(bytes);
+    }
+
+    fn on_exit(&mut self, code: i32) {
+        // The store first, so anyone who sees the exit also lists it.
+        if let Err(e) = lock(&self.store).set_exited(self.id, code) {
+            eprintln!("fleet-node: recording exit of agent {}: {e}", self.id);
+        }
+        self.pipeline.on_exit(code);
+        // No receivers is fine.
+        let _ = self.exits.send(AgentExited {
+            agent_id: self.id,
+            exit_code: code,
+        });
+    }
+}
+
+/// One node: spawns agents, persists them and serves attaches.
+///
+/// Every method may block (SQLite, PTY writes, process spawn); call them off
+/// the async executor.
+pub struct Node {
+    host: PtyHost,
+    store: Arc<Mutex<Store>>,
+    agents: Mutex<HashMap<u64, LiveAgent>>,
+    exits: broadcast::Sender<AgentExited>,
+    scrollback_dir: PathBuf,
+}
+
+impl Node {
+    /// Opens the node's state under `state_dir` (`state.db`, `scrollback/`)
+    /// and marks agents left running by a previous daemon as lost.
+    pub fn open(state_dir: &Path) -> io::Result<Node> {
+        let scrollback_dir = state_dir.join("scrollback");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&scrollback_dir)?;
+        let store = Store::open(&state_dir.join("state.db")).map_err(store_err)?;
+        store.mark_running_as_lost().map_err(store_err)?;
+        let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
+        Ok(Node {
+            host: PtyHost::new(),
+            store: Arc::new(Mutex::new(store)),
+            agents: Mutex::new(HashMap::new()),
+            exits,
+            scrollback_dir,
+        })
+    }
+
+    /// Receives every agent exit from now on.
+    pub fn exit_events(&self) -> broadcast::Receiver<AgentExited> {
+        self.exits.subscribe()
+    }
+
+    /// Spawns an agent. Zero `cols`/`rows` mean 80x24; an empty `cwd` means
+    /// the daemon's working directory.
+    pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
+        if req.program.is_empty() {
+            return Err(invalid("program is empty".into()));
+        }
+        let dim = |v: u32, default: u16, what: &str| match v {
+            0 => Ok(default),
+            v => u16::try_from(v).map_err(|_| invalid(format!("{what} {v} out of range"))),
+        };
+        let cols = dim(req.cols, DEFAULT_COLS, "cols")?;
+        let rows = dim(req.rows, DEFAULT_ROWS, "rows")?;
+        let cwd = if req.cwd.is_empty() {
+            std::env::current_dir()?
+        } else {
+            PathBuf::from(&req.cwd)
+        };
+        let created_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let new = NewAgent {
+            program: req.program.clone(),
+            args: req.args.clone(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            created_unix_ms,
+            scrollback_path: String::new(),
+        };
+        let (id, path) = lock(&self.store)
+            .insert_agent_with_scrollback(&new, |id| {
+                self.scrollback_dir
+                    .join(format!("{id}.ring"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .map_err(store_err)?;
+
+        let started =
+            Scrollback::create(Path::new(&path), scrollback::DEFAULT_CAPACITY).and_then(|sb| {
+                let pipeline = AgentPipeline::new(cols, rows, sb);
+                let sink = NodeSink {
+                    id,
+                    pipeline: pipeline.clone(),
+                    store: Arc::clone(&self.store),
+                    exits: self.exits.clone(),
+                };
+                let spec = CommandSpec {
+                    program: PathBuf::from(&req.program),
+                    args: req.args.clone(),
+                    cwd: Some(cwd),
+                    env: req.env.into_iter().collect(),
+                    cols,
+                    rows,
+                };
+                let host_id = self.host.spawn_with_sink(spec, Box::new(sink))?;
+                Ok(LiveAgent { host_id, pipeline })
+            });
+        let live = match started {
+            Ok(live) => live,
+            Err(e) => {
+                if let Err(e) = lock(&self.store).delete_agent(id) {
+                    eprintln!("fleet-node: removing failed agent {id}: {e}");
+                }
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        };
+        lock(&self.agents).insert(id, live);
+        Ok(AgentInfo {
+            id,
+            program: new.program,
+            args: new.args,
+            cwd: new.cwd,
+            state: fleet_proto::AgentState::Running.into(),
+            exit_code: None,
+            created_unix_ms,
+        })
+    }
+
+    /// Every agent this node knows of, including exited and lost ones. A
+    /// corrupt row is logged and left out.
+    pub fn list(&self) -> io::Result<Vec<AgentInfo>> {
+        let (records, bad) = lock(&self.store).list_agents_lossy().map_err(store_err)?;
+        for e in bad {
+            eprintln!("fleet-node: skipping unreadable agent row: {e}");
+        }
+        Ok(records.into_iter().map(agent_info).collect())
+    }
+
+    fn live(&self, id: u64) -> io::Result<LiveAgent> {
+        lock(&self.agents).get(&id).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("agent {id} is not live on this node"),
+            )
+        })
+    }
+
+    /// Attaches to an agent of this node process (see
+    /// [`AgentPipeline::subscribe`]).
+    pub fn attach(&self, id: u64) -> io::Result<(AttachOk, Subscription)> {
+        let (snapshot, (cols, rows), sub) = self.live(id)?.pipeline.subscribe_sized();
+        let ok = AttachOk {
+            agent_id: id,
+            snapshot,
+            cols: cols.into(),
+            rows: rows.into(),
+        };
+        Ok((ok, sub))
+    }
+
+    /// Writes to the agent's terminal input; blocks while its input queue is
+    /// full.
+    pub fn input(&self, id: u64, bytes: &[u8]) -> io::Result<()> {
+        let live = self.live(id)?;
+        self.host.write_input(live.host_id, bytes)
+    }
+
+    /// Resizes the agent's PTY and grid.
+    pub fn resize(&self, id: u64, cols: u32, rows: u32) -> io::Result<()> {
+        let dim = |v: u32, what: &str| {
+            u16::try_from(v)
+                .ok()
+                .filter(|v| *v > 0)
+                .ok_or_else(|| invalid(format!("{what} {v} out of range")))
+        };
+        let (cols, rows) = (dim(cols, "cols")?, dim(rows, "rows")?);
+        let live = self.live(id)?;
+        self.host.resize(live.host_id, cols, rows)?;
+        live.pipeline.resize(cols, rows);
+        Ok(())
+    }
+
+    /// Sends SIGTERM to the agent's process group; a no-op once it exited.
+    pub fn kill(&self, id: u64) -> io::Result<()> {
+        let live = self.live(id)?;
+        self.host.kill(live.host_id)
+    }
+}
+
+fn agent_info(rec: AgentRecord) -> AgentInfo {
+    use fleet_proto::AgentState as Wire;
+    let state = match rec.state {
+        store::AgentState::Running => Wire::Running,
+        store::AgentState::Exited => Wire::Exited,
+        store::AgentState::Lost => Wire::Lost,
+    };
+    AgentInfo {
+        id: rec.id,
+        program: rec.program,
+        args: rec.args,
+        cwd: rec.cwd,
+        state: state.into(),
+        exit_code: rec.exit_code,
+        created_unix_ms: rec.created_unix_ms,
     }
 }
 

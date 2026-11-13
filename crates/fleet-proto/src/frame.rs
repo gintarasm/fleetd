@@ -44,7 +44,7 @@ pub enum FrameError {
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooLarge(n) => write!(f, "frame of {n} bytes exceeds limit of {MAX_FRAME}"),
+            Self::TooLarge(n) => write!(f, "frame of {n} bytes exceeds the length limit"),
             Self::UnknownKind(k) => write!(f, "unknown frame kind {k}"),
             Self::Decode(e) => write!(f, "protobuf decode error: {e}"),
             Self::Io(e) => write!(f, "io error: {e}"),
@@ -75,8 +75,40 @@ impl From<prost::DecodeError> for FrameError {
 }
 
 /// Codec for [`Frame`]s over a byte stream.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FrameCodec;
+///
+/// Decoding rejects frames longer than the codec's limit ([`MAX_FRAME`] by
+/// default; see [`FrameCodec::with_max`]). Encoding always allows up to
+/// [`MAX_FRAME`].
+#[derive(Debug, Clone, Copy)]
+pub struct FrameCodec {
+    max_len: usize,
+}
+
+impl FrameCodec {
+    /// A codec accepting frames up to [`MAX_FRAME`].
+    pub fn new() -> Self {
+        Self { max_len: MAX_FRAME }
+    }
+
+    /// A codec decoding only frames whose length prefix is at most `max_len`
+    /// (capped at [`MAX_FRAME`]), e.g. a small limit for the handshake.
+    pub fn with_max(max_len: usize) -> Self {
+        Self {
+            max_len: max_len.min(MAX_FRAME),
+        }
+    }
+
+    /// Changes the decode limit (capped at [`MAX_FRAME`]).
+    pub fn set_max(&mut self, max_len: usize) {
+        self.max_len = max_len.min(MAX_FRAME);
+    }
+}
+
+impl Default for FrameCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn put_msg(dst: &mut BytesMut, kind: u8, msg: &impl Message) -> Result<(), FrameError> {
     let len = 1 + msg.encoded_len();
@@ -126,7 +158,7 @@ impl Decoder for FrameCodec {
             return Ok(None);
         }
         let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
-        if len > MAX_FRAME {
+        if len > self.max_len {
             return Err(FrameError::TooLarge(len));
         }
         if len == 0 {
@@ -212,8 +244,8 @@ mod tests {
     fn roundtrip_every_kind() {
         for frame in every_frame() {
             let mut buf = BytesMut::new();
-            FrameCodec.encode(frame.clone(), &mut buf).unwrap();
-            let got = FrameCodec.decode(&mut buf).unwrap().unwrap();
+            FrameCodec::new().encode(frame.clone(), &mut buf).unwrap();
+            let got = FrameCodec::new().decode(&mut buf).unwrap().unwrap();
             assert_eq!(got, frame);
             assert!(buf.is_empty());
         }
@@ -226,7 +258,7 @@ mod tests {
             agent_id: 0x0102,
             data: Bytes::from_static(b"abc"),
         };
-        FrameCodec.encode(frame, &mut buf).unwrap();
+        FrameCodec::new().encode(frame, &mut buf).unwrap();
         assert_eq!(buf.len(), 4 + 1 + 8 + 3);
         assert_eq!(&buf[..4], &12u32.to_be_bytes());
         assert_eq!(buf[4], 7);
@@ -240,7 +272,7 @@ mod tests {
         buf.put_u32((MAX_FRAME + 1) as u32);
         let before = buf.capacity();
         assert!(matches!(
-            FrameCodec.decode(&mut buf),
+            FrameCodec::new().decode(&mut buf),
             Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 1
         ));
         assert_eq!(
@@ -256,7 +288,7 @@ mod tests {
         buf.put_u32(1);
         buf.put_u8(99);
         assert!(matches!(
-            FrameCodec.decode(&mut buf),
+            FrameCodec::new().decode(&mut buf),
             Err(FrameError::UnknownKind(99))
         ));
     }
@@ -274,12 +306,12 @@ mod tests {
             },
         ] {
             let mut wire = BytesMut::new();
-            FrameCodec.encode(frame.clone(), &mut wire).unwrap();
+            FrameCodec::new().encode(frame.clone(), &mut wire).unwrap();
             let mut buf = BytesMut::new();
             let last = wire.len() - 1;
             for (i, b) in wire.iter().enumerate() {
                 buf.put_u8(*b);
-                let got = FrameCodec.decode(&mut buf).unwrap();
+                let got = FrameCodec::new().decode(&mut buf).unwrap();
                 if i < last {
                     assert!(got.is_none(), "frame yielded early at byte {i}");
                 } else {
@@ -297,7 +329,7 @@ mod tests {
         buf.put_u8(KIND_REQUEST);
         buf.put_slice(&[0xff, 0xff, 0xff]);
         assert!(matches!(
-            FrameCodec.decode(&mut buf),
+            FrameCodec::new().decode(&mut buf),
             Err(FrameError::Decode(_))
         ));
     }
@@ -307,7 +339,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u32(0);
         assert!(matches!(
-            FrameCodec.decode(&mut buf),
+            FrameCodec::new().decode(&mut buf),
             Err(FrameError::Io(_))
         ));
     }
@@ -319,7 +351,7 @@ mod tests {
         buf.put_u8(KIND_OUTPUT);
         buf.put_slice(&[0; 7]);
         assert!(matches!(
-            FrameCodec.decode(&mut buf),
+            FrameCodec::new().decode(&mut buf),
             Err(FrameError::Io(_))
         ));
     }
@@ -328,7 +360,7 @@ mod tests {
     fn oversized_output_encode_rejected() {
         let data = Bytes::from(vec![0u8; MAX_FRAME]);
         let mut buf = BytesMut::new();
-        let res = FrameCodec.encode(Frame::Output { agent_id: 1, data }, &mut buf);
+        let res = FrameCodec::new().encode(Frame::Output { agent_id: 1, data }, &mut buf);
         assert!(matches!(res, Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 9));
         assert!(buf.is_empty());
     }
@@ -337,19 +369,23 @@ mod tests {
     fn back_to_back_frames_decode_in_order() {
         let frames = every_frame();
         let mut buf = BytesMut::new();
-        FrameCodec.encode(frames[0].clone(), &mut buf).unwrap();
-        FrameCodec.encode(frames[6].clone(), &mut buf).unwrap();
+        FrameCodec::new()
+            .encode(frames[0].clone(), &mut buf)
+            .unwrap();
+        FrameCodec::new()
+            .encode(frames[6].clone(), &mut buf)
+            .unwrap();
         assert_eq!(
-            FrameCodec.decode(&mut buf).unwrap(),
+            FrameCodec::new().decode(&mut buf).unwrap(),
             Some(frames[0].clone())
         );
         assert!(!buf.is_empty());
         assert_eq!(
-            FrameCodec.decode(&mut buf).unwrap(),
+            FrameCodec::new().decode(&mut buf).unwrap(),
             Some(frames[6].clone())
         );
         assert!(buf.is_empty());
-        assert_eq!(FrameCodec.decode(&mut buf).unwrap(), None);
+        assert_eq!(FrameCodec::new().decode(&mut buf).unwrap(), None);
     }
 
     #[test]
@@ -357,6 +393,30 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u32(MAX_FRAME as u32);
         buf.put_u8(KIND_OUTPUT);
-        assert!(FrameCodec.decode(&mut buf).unwrap().is_none());
+        assert!(FrameCodec::new().decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn custom_limit_rejects_longer_frames() {
+        let mut codec = FrameCodec::with_max(4096);
+        let mut buf = BytesMut::new();
+        buf.put_u32(4097);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::TooLarge(4097))
+        ));
+
+        let mut buf = BytesMut::new();
+        buf.put_u32(4096);
+        buf.put_u8(KIND_OUTPUT);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+
+        codec.set_max(usize::MAX);
+        let mut buf = BytesMut::new();
+        buf.put_u32((MAX_FRAME + 1) as u32);
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::TooLarge(_))
+        ));
     }
 }
