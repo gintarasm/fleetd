@@ -393,9 +393,9 @@ dependencies = [
 name = "fleet-node"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
  "bytes",
  "fleet-proto",
+ "fleet-term",
  "libc",
  "portable-pty",
  "rusqlite",
@@ -432,6 +432,13 @@ dependencies = [
  "prost-build",
  "protox",
  "tokio-util",
+]
+
+[[package]]
+name = "fleet-term"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
 ]
 
 [[package]]
