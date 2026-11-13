@@ -1048,7 +1048,7 @@ impl Node {
             ..Default::default()
         };
         if let Some(h) = history {
-            ok.history_tail = h.lines.iter().map(|l| l.to_vec()).collect();
+            ok.history_tail = h.lines;
             ok.tail_first_line = h.tail_first_line;
             ok.history_first_line = h.info.first_line;
             ok.history_generation = h.info.generation;

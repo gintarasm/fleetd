@@ -84,8 +84,7 @@ pub struct History {
     pending_lines: u64,
     /// Set after a disk write failure; further pushes only feed the tail.
     broken: bool,
-    tail: VecDeque<Bytes>,
-    tail_bytes: usize,
+    tail: Tail,
     /// Test-only: make the next flush write half the buffer, then fail.
     #[cfg(test)]
     fault: bool,
@@ -136,6 +135,69 @@ fn read_meta(dir: &Path) -> io::Result<(u64, u64)> {
         Ok(_) => Err(invalid_data("history meta malformed")),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((0, 0)),
         Err(e) => Err(e),
+    }
+}
+
+/// The in-memory tail: the most recent lines' bytes back to back in one ring
+/// buffer, plus each line's length. At most `limit` bytes (the `limit` passed
+/// to [`Tail::push`]); a line longer than that empties it.
+#[derive(Default)]
+struct Tail {
+    buf: VecDeque<u8>,
+    lens: VecDeque<u32>,
+}
+
+impl Tail {
+    fn lines(&self) -> usize {
+        self.lens.len()
+    }
+
+    fn push(&mut self, line: &[u8], limit: usize) {
+        if line.len() > limit {
+            self.clear();
+            return;
+        }
+        while self.buf.len() + line.len() > limit {
+            self.pop_front();
+        }
+        let need = self.buf.len() + line.len();
+        if need > self.buf.capacity() {
+            // Double up to `limit`, never beyond: the ring never holds more.
+            let want = (self.buf.capacity() * 2).max(4096).min(limit).max(need);
+            self.buf.reserve_exact(want - self.buf.len());
+        }
+        self.buf.extend(line);
+        // `limit` is far below `u32::MAX`, and so is `line.len()`.
+        self.lens.push_back(line.len() as u32);
+    }
+
+    fn pop_front(&mut self) {
+        if let Some(n) = self.lens.pop_front() {
+            self.buf.drain(..n as usize);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.lens.clear();
+    }
+
+    /// The lines, as slices of one copy of the buffer.
+    fn to_lines(&self) -> Vec<Bytes> {
+        let (a, b) = self.buf.as_slices();
+        let mut all = Vec::with_capacity(a.len() + b.len());
+        all.extend_from_slice(a);
+        all.extend_from_slice(b);
+        let all = Bytes::from(all);
+        let mut at = 0;
+        self.lens
+            .iter()
+            .map(|&n| {
+                let line = all.slice(at..at + n as usize);
+                at += n as usize;
+                line
+            })
+            .collect()
     }
 }
 
@@ -248,8 +310,7 @@ impl History {
             broken: false,
             #[cfg(test)]
             fault: false,
-            tail: VecDeque::new(),
-            tail_bytes: 0,
+            tail: Tail::default(),
         })
     }
 
@@ -328,8 +389,7 @@ impl History {
             broken: false,
             #[cfg(test)]
             fault: false,
-            tail: VecDeque::new(),
-            tail_bytes: 0,
+            tail: Tail::default(),
         };
         h.rebuild_tail()?;
         Ok(h)
@@ -342,27 +402,17 @@ impl History {
             .max(self.first_line);
         let lines = self.read_range(start, self.next_line)?;
         for l in lines {
-            self.tail_bytes += l.len();
-            self.tail.push_back(l);
+            self.tail.push(&l, self.limits.tail_bytes);
         }
         self.trim_tail();
         Ok(())
     }
 
+    /// Drops tail lines that precede `first_line` (evicted from disk).
     fn trim_tail(&mut self) {
-        while self.tail_bytes > self.limits.tail_bytes {
-            match self.tail.pop_front() {
-                Some(l) => self.tail_bytes -= l.len(),
-                None => break,
-            }
-        }
-        let tail_first = self.next_line - self.tail.len() as u64;
-        if tail_first < self.first_line {
-            for _ in 0..(self.first_line - tail_first) {
-                if let Some(l) = self.tail.pop_front() {
-                    self.tail_bytes -= l.len();
-                }
-            }
+        let tail_first = self.next_line - self.tail.lines() as u64;
+        for _ in tail_first..self.first_line {
+            self.tail.pop_front();
         }
     }
 
@@ -376,9 +426,7 @@ impl History {
             self.fail();
         }
         self.next_line += 1;
-        let b = Bytes::copy_from_slice(line);
-        self.tail_bytes += b.len();
-        self.tail.push_back(b);
+        self.tail.push(line, self.limits.tail_bytes);
         self.trim_tail();
     }
 
@@ -450,7 +498,6 @@ impl History {
         self.generation += 1;
         self.first_line = self.next_line;
         self.tail.clear();
-        self.tail_bytes = 0;
         for s in self.segments.drain(..) {
             let _ = fs::remove_file(&s.path);
         }
@@ -468,10 +515,12 @@ impl History {
 
     /// The in-memory tail: the line number of its first line (not the store's
     /// `first_line`; it maps to `AttachOk.tail_first_line`), and the lines.
+    ///
+    /// One copy of the tail's bytes; the lines are slices of it.
     pub fn tail(&self) -> (u64, Vec<Bytes>) {
         (
-            self.next_line - self.tail.len() as u64,
-            self.tail.iter().cloned().collect(),
+            self.next_line - self.tail.lines() as u64,
+            self.tail.to_lines(),
         )
     }
 
@@ -699,6 +748,31 @@ mod tests {
         assert!(total <= HISTORY_PAGE_MAX_BYTES);
         assert_eq!(p.lines.len(), 25);
         assert_eq!(p.first_line, 75);
+    }
+
+    #[test]
+    fn tail_ring_wraps_and_stays_within_its_limit() {
+        let mut t = Tail::default();
+        let mut all = Vec::new();
+        for i in 0..5000u32 {
+            let l = vec![b'a' + (i % 26) as u8; (i as usize * 37) % 300];
+            t.push(&l, 1000);
+            all.push(l);
+            assert!(t.buf.len() <= 1000 && t.buf.capacity() <= 1000);
+        }
+        let lines = t.to_lines();
+        let want = &all[all.len() - lines.len()..];
+        assert!(!lines.is_empty());
+        assert!(
+            lines
+                .iter()
+                .zip(want)
+                .all(|(a, b)| a.as_ref() == b.as_slice())
+        );
+        // A line longer than the limit empties it.
+        t.push(&[b'x'; 1001], 1000);
+        assert_eq!(t.lines(), 0);
+        assert!(t.to_lines().is_empty());
     }
 
     #[test]
