@@ -478,6 +478,18 @@ pub const MAX_DIM: u32 = 1000;
 /// Largest accepted `cols * rows`.
 pub const MAX_CELLS: u32 = 250_000;
 
+/// The `TERM` agents get unless the spawn request sets one: the snapshot
+/// and the grid speak xterm, whatever the daemon's own environment says.
+const DEFAULT_TERM: &str = "xterm-256color";
+
+fn with_default_term(env: HashMap<String, String>) -> Vec<(String, String)> {
+    let mut env: Vec<_> = env.into_iter().collect();
+    if !env.iter().any(|(k, _)| k == "TERM") {
+        env.push(("TERM".into(), DEFAULT_TERM.into()));
+    }
+    env
+}
+
 /// Checks a terminal size: each side in `1..=MAX_DIM`, at most `MAX_CELLS`.
 fn checked_size(cols: u32, rows: u32) -> io::Result<(u16, u16)> {
     let side = |v: u32, what: &str| match u16::try_from(v) {
@@ -647,7 +659,7 @@ impl Node {
 
     /// Spawns an agent. Zero `cols`/`rows` mean 80x24; otherwise the size
     /// must pass the [`MAX_DIM`]/[`MAX_CELLS`] limits. An empty `cwd` means
-    /// the daemon's working directory.
+    /// the daemon's working directory. `TERM` defaults to `xterm-256color`.
     pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
         if lock(&self.agents).closing {
             return Err(shutting_down());
@@ -699,7 +711,7 @@ impl Node {
                     program: PathBuf::from(&req.program),
                     args: req.args.clone(),
                     cwd: Some(cwd),
-                    env: req.env.into_iter().collect(),
+                    env: with_default_term(req.env),
                     cols,
                     rows,
                 };

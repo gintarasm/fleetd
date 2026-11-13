@@ -753,3 +753,41 @@ fn out_of_range_sizes_are_error_responses() {
     }
     c.kill(info.id);
 }
+
+#[test]
+fn agents_get_xterm_256color_unless_term_is_given() {
+    let dir = TempDir::new().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetd"));
+    cmd.env("TERM", "daemon-term");
+    let _d = Daemon::start_with(dir.path(), cmd);
+    let mut c = Client::open(dir.path());
+    let script = "echo \"term=$TERM.\"; sleep 100";
+    for (env, want) in [
+        (vec![], "term=xterm-256color."),
+        (
+            vec![("TERM".to_string(), "vt100".to_string())],
+            "term=vt100.",
+        ),
+    ] {
+        let info = match c.request(request::Kind::Spawn(SpawnAgent {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: env.into_iter().collect(),
+            ..Default::default()
+        })) {
+            response::Kind::Spawned(info) => info,
+            other => panic!("spawn failed: {other:?}"),
+        };
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let snap = String::from_utf8_lossy(&c.attach(info.id).snapshot).into_owned();
+            if snap.contains("term=") {
+                assert!(snap.contains(want), "want {want:?} in {snap:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no output in {snap:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        c.kill(info.id);
+    }
+}

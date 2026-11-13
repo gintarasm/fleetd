@@ -157,7 +157,7 @@ docs/decisions/0018-m1-protocol-and-node.md
 **Interfaces / new metrics (all lower-is-better):**
 - wall `daemon_flood50_cpu_ns_per_mib` (report-only, same reason as flood50 CPU), `daemon_flood50_peak_rss_bytes`, `daemon_flood50_wall_ns`: fleetd spawns 50 `fake-agent --ansi --bytes 8388608` via the protocol with one client attached to every agent (snapshot + full stream consumed), measured as daemon-process rusage (`RUSAGE_SELF` reported by fleetd? — no: read fleetd's RSS via `ps`/statm at peak sampling every 50 ms, and CPU via `proc_pid_rusage` on macOS / `/proc/<pid>/stat` on Linux).
 - wall `reattach_snapshot_ns`: median of 50 attaches to an agent that has printed 8 MiB, from `Attach` sent to `AttachOk` received.
-- instr `frame_decode_output_64k_instructions` (decode one 64 KiB Output frame), `terminal_feed_64k_instructions` (feed 64 KiB of deterministic ANSI into a 120×40 `Terminal`), `snapshot_120x40_instructions`.
+- instr `frame_decode_output_64x64k_instructions` (decode 64 back-to-back 64 KiB Output frames), `terminal_feed_64k_instructions` (feed 64 KiB of deterministic ANSI into a 120×40 `Terminal`), `snapshot_120x40_instructions`.
 - Existing metrics' scenarios are NOT changed; flood-host keeps `CountingSink`.
 
 - [ ] **Step 1:** Implement scenarios + metric names constants; update the shipped-baselines test.

@@ -176,7 +176,7 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
 
 impl Daemon {
     /// Open the node's state, then serve protocol connections until
-    /// SIGTERM/SIGINT. Then stop every agent (v1 has no PTY handoff, decision
+    /// SIGTERM/SIGINT/SIGHUP. Then stop every agent (v1 has no PTY handoff, decision
     /// 0018): SIGTERM to each agent's process group, up to 2 s grace, then
     /// SIGKILL; their exits are recorded. Finally remove the socket file and
     /// return.
@@ -184,6 +184,7 @@ impl Daemon {
         let listener = UnixListener::from_std(self.listener)?;
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
+        let mut hup = signal(SignalKind::hangup())?;
         let state_dir = self.state_dir;
         let node = tokio::task::spawn_blocking(move || Node::open(&state_dir))
             .await
@@ -194,6 +195,7 @@ impl Daemon {
             tokio::select! {
                 _ = term.recv() => break,
                 _ = int.recv() => break,
+                _ = hup.recv() => break,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => server.accept(stream),
                     // Accept errors never end `serve`; only a signal does.

@@ -148,7 +148,14 @@ fn daemon_not_running_message() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("fleetd is not running"));
 }
 
-const RESTORE: &str = "\x1b[!p\x1b[?1049l\x1b[?25h\x1b[?2004l";
+/// The whole restore sequence: soft reset, pop the kitty keyboard mode (on
+/// the alt screen, where the agent pushed it), leave the alt screen, then
+/// reset what DECSTR does not (cursor, paste, mouse, focus, keypad, wrap).
+const RESTORE: &str = concat!(
+    "\x1b[!p\x1b[<u\x1b[?1049l\x1b[?25h\x1b[?2004l",
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l",
+    "\x1b[?1l\x1b[?7h",
+);
 
 /// `fleet attach` running on a pty.
 struct PtyAttach {

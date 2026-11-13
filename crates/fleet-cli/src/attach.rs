@@ -15,8 +15,17 @@ const DETACH_KEY: u8 = 0x1c;
 /// Enter the local alternate screen and soft-reset: snapshots assume a fresh
 /// terminal.
 const ENTER: &[u8] = b"\x1b[?1049h\x1b[!p";
-/// Undo everything an agent may have switched on, then leave the alt screen.
-const RESTORE: &[u8] = b"\x1b[!p\x1b[?1049l\x1b[?25h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1l\x1b[?7h";
+/// Undo everything an agent may have switched on: soft reset, pop the kitty
+/// keyboard mode (pushed on the alt screen, whose stack is separate), leave
+/// the alt screen, then reset the modes DECSTR leaves alone (cursor, bracketed
+/// paste, mouse 1000/1002/1003/1005/1006/1015, focus events, application
+/// cursor keys, autowrap).
+const RESTORE: &[u8] = concat!(
+    "\x1b[!p\x1b[<u\x1b[?1049l\x1b[?25h\x1b[?2004l",
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l",
+    "\x1b[?1l\x1b[?7h",
+)
+.as_bytes();
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
