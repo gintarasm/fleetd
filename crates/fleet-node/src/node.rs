@@ -31,7 +31,7 @@ use crate::store::{self, AgentRecord, NewAgent, Store};
 use crate::term::Terminal;
 use bytes::Bytes;
 use fleet_proto::{AgentExited, AgentInfo, AttachOk, SpawnAgent};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -227,6 +227,18 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// A stream that holds only [`StreamItem::Exited`].
+    fn exited(code: i32) -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        // Capacity is 1, so this cannot fail.
+        let _ = tx.try_send(StreamItem::Exited(code));
+        Subscription {
+            rx,
+            lagged: Arc::new(AtomicBool::new(false)),
+            done: false,
+        }
+    }
+
     /// Next item; `None` once the stream has ended.
     pub async fn recv(&mut self) -> Option<StreamItem> {
         if let Some(item) = self.check_lagged() {
@@ -297,7 +309,8 @@ impl Subscriber {
 
 struct State {
     term: Terminal,
-    scrollback: Scrollback,
+    /// `None` once the agent has exited (flushed and closed).
+    scrollback: Option<Scrollback>,
     subscribers: Vec<Subscriber>,
     input: Option<AgentInput>,
     exit_code: Option<i32>,
@@ -317,7 +330,7 @@ impl AgentPipeline {
         Self {
             state: Arc::new(Mutex::new(State {
                 term: Terminal::new(cols, rows),
-                scrollback,
+                scrollback: Some(scrollback),
                 subscribers: Vec::new(),
                 input: None,
                 exit_code: None,
@@ -342,9 +355,7 @@ impl AgentPipeline {
     /// snapshot was taken at.
     pub fn subscribe_sized(&self) -> (Vec<u8>, (u16, u16), Subscription) {
         let mut state = self.lock();
-        state.term.flush_pending_sync();
-        let mut snapshot = state.term.snapshot();
-        snapshot.extend_from_slice(state.partial.tail());
+        let snapshot = Self::snapshot_of(&mut state);
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CAPACITY);
         let lagged = Arc::new(AtomicBool::new(false));
         match state.exit_code {
@@ -363,6 +374,19 @@ impl AgentPipeline {
             done: false,
         };
         (snapshot, state.term.size(), sub)
+    }
+
+    /// The current screen as ANSI and the grid size `(cols, rows)`.
+    fn snapshot_sized(&self) -> (Vec<u8>, (u16, u16)) {
+        let mut state = self.lock();
+        (Self::snapshot_of(&mut state), state.term.size())
+    }
+
+    fn snapshot_of(state: &mut State) -> Vec<u8> {
+        state.term.flush_pending_sync();
+        let mut snapshot = state.term.snapshot();
+        snapshot.extend_from_slice(state.partial.tail());
+        snapshot
     }
 
     /// Resizes the grid. Call alongside [`PtyHost::resize`](crate::PtyHost::resize).
@@ -398,7 +422,9 @@ impl OutputSink for AgentPipeline {
             state.partial.feed(bytes);
             let replies = state.term.take_replies();
             // History is best effort: the live grid stays authoritative.
-            let _ = state.scrollback.append(bytes);
+            if let Some(scrollback) = &mut state.scrollback {
+                let _ = scrollback.append(bytes);
+            }
             if !state.subscribers.is_empty() {
                 let chunk = Bytes::copy_from_slice(bytes);
                 state
@@ -420,7 +446,10 @@ impl OutputSink for AgentPipeline {
     fn on_exit(&mut self, code: i32) {
         let mut state = self.lock();
         state.term.flush_pending_sync();
-        let _ = state.scrollback.flush();
+        // Flush, then close: an exited agent holds no fd.
+        if let Some(mut scrollback) = state.scrollback.take() {
+            let _ = scrollback.flush();
+        }
         state.exit_code = Some(code);
         state.input = None;
         for sub in std::mem::take(&mut state.subscribers) {
@@ -437,6 +466,11 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// How long [`Node::shutdown`] waits for agents after SIGKILL.
 const KILL_WAIT: Duration = Duration::from_millis(500);
 
+/// Exited agents whose final screen a [`Node`] keeps for attaches; beyond
+/// this the oldest exit is evicted and attaching to it yields an empty
+/// snapshot (see decision 0018).
+pub const RETAINED_EXITED: usize = 64;
+
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
@@ -452,19 +486,30 @@ fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-/// A live agent of this node process.
+/// A running agent of this node process.
 #[derive(Clone)]
 struct LiveAgent {
     host_id: AgentId,
     pipeline: AgentPipeline,
 }
 
-/// The agent's sink: feeds its pipeline and, on exit, records the exit code
-/// and announces it.
+/// The final screen of an agent that exited in this node process.
+struct ExitedAgent {
+    id: u64,
+    snapshot: Vec<u8>,
+    cols: u16,
+    rows: u16,
+    exit_code: i32,
+}
+
+/// The agent's sink: feeds its pipeline and, on exit, records the exit code,
+/// releases the agent and announces the exit.
 struct NodeSink {
     id: u64,
     pipeline: AgentPipeline,
     store: Arc<Mutex<Store>>,
+    host: Arc<PtyHost>,
+    agents: Arc<Mutex<Agents>>,
     exits: broadcast::Sender<AgentExited>,
 }
 
@@ -483,6 +528,12 @@ impl OutputSink for NodeSink {
             eprintln!("fleet-node: recording exit of agent {}: {e}", self.id);
         }
         self.pipeline.on_exit(code);
+        // If the spawn has not registered the agent yet, it retires it.
+        let mut agents = lock(&self.agents);
+        if let Some(live) = agents.live.remove(&self.id) {
+            agents.retire(&self.host, self.id, &live, code);
+        }
+        drop(agents);
         // No receivers is fine.
         let _ = self.exits.send(AgentExited {
             agent_id: self.id,
@@ -496,18 +547,53 @@ impl OutputSink for NodeSink {
 /// Every method may block (SQLite, PTY writes, process spawn); call them off
 /// the async executor.
 pub struct Node {
-    host: PtyHost,
+    host: Arc<PtyHost>,
     store: Arc<Mutex<Store>>,
-    agents: Mutex<Agents>,
+    agents: Arc<Mutex<Agents>>,
     exits: broadcast::Sender<AgentExited>,
     scrollback_dir: PathBuf,
 }
 
 #[derive(Default)]
 struct Agents {
+    /// Running agents.
     live: HashMap<u64, LiveAgent>,
+    /// The last [`RETAINED_EXITED`] exits, oldest first.
+    exited: VecDeque<ExitedAgent>,
     /// Set by [`Node::shutdown`]: no new agents.
     closing: bool,
+}
+
+impl Agents {
+    /// Keeps an exited agent's final screen (evicting the oldest beyond
+    /// [`RETAINED_EXITED`]) and drops everything else it held.
+    fn retire(&mut self, host: &PtyHost, id: u64, live: &LiveAgent, exit_code: i32) {
+        let (snapshot, (cols, rows)) = live.pipeline.snapshot_sized();
+        if self.exited.len() >= RETAINED_EXITED {
+            self.exited.pop_front();
+        }
+        self.exited.push_back(ExitedAgent {
+            id,
+            snapshot,
+            cols,
+            rows,
+            exit_code,
+        });
+        // The host recorded the exit before calling `on_exit`, so this
+        // cannot fail with "still running".
+        let _ = host.remove(live.host_id);
+    }
+
+    fn exited(&self, id: u64) -> Option<&ExitedAgent> {
+        self.exited.iter().find(|a| a.id == id)
+    }
+}
+
+fn not_live(id: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("agent {id} is not live on this node"),
+    )
 }
 
 fn shutting_down() -> io::Error {
@@ -527,9 +613,9 @@ impl Node {
         store.mark_running_as_lost().map_err(store_err)?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         Ok(Node {
-            host: PtyHost::new(),
+            host: Arc::new(PtyHost::new()),
             store: Arc::new(Mutex::new(store)),
-            agents: Mutex::new(Agents::default()),
+            agents: Arc::new(Mutex::new(Agents::default())),
             exits,
             scrollback_dir,
         })
@@ -586,6 +672,8 @@ impl Node {
                     id,
                     pipeline: pipeline.clone(),
                     store: Arc::clone(&self.store),
+                    host: Arc::clone(&self.host),
+                    agents: Arc::clone(&self.agents),
                     exits: self.exits.clone(),
                 };
                 let spec = CommandSpec {
@@ -618,7 +706,13 @@ impl Node {
                 let _ = self.host.force_kill(live.host_id);
                 return Err(shutting_down());
             }
-            agents.live.insert(id, live);
+            // An agent that already exited was not found by its sink.
+            match live.pipeline.exit_code() {
+                Some(code) => agents.retire(&self.host, id, &live, code),
+                None => {
+                    agents.live.insert(id, live);
+                }
+            }
         }
         Ok(AgentInfo {
             id,
@@ -642,25 +736,44 @@ impl Node {
     }
 
     fn live(&self, id: u64) -> io::Result<LiveAgent> {
-        lock(&self.agents).live.get(&id).cloned().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("agent {id} is not live on this node"),
-            )
-        })
+        lock(&self.agents)
+            .live
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| not_live(id))
     }
 
-    /// Attaches to an agent of this node process (see
-    /// [`AgentPipeline::subscribe`]).
+    /// Attaches to an agent (see [`AgentPipeline::subscribe`]). An exited
+    /// agent yields its final screen (one of the last [`RETAINED_EXITED`]
+    /// exits of this node process) or else an empty snapshot with size 0x0,
+    /// then its exit.
     pub fn attach(&self, id: u64) -> io::Result<(AttachOk, Subscription)> {
-        let (snapshot, (cols, rows), sub) = self.live(id)?.pipeline.subscribe_sized();
-        let ok = AttachOk {
+        let ok = |snapshot, cols: u16, rows: u16| AttachOk {
             agent_id: id,
             snapshot,
             cols: cols.into(),
             rows: rows.into(),
         };
-        Ok((ok, sub))
+        {
+            let agents = lock(&self.agents);
+            if let Some(live) = agents.live.get(&id) {
+                let (snapshot, (cols, rows), sub) = live.pipeline.subscribe_sized();
+                return Ok((ok(snapshot, cols, rows), sub));
+            }
+            if let Some(a) = agents.exited(id) {
+                let sub = Subscription::exited(a.exit_code);
+                return Ok((ok(a.snapshot.clone(), a.cols, a.rows), sub));
+            }
+        }
+        match lock(&self.store).exit_code(id).map_err(store_err)? {
+            Some(code) => Ok((ok(Vec::new(), 0, 0), Subscription::exited(code))),
+            None => Err(not_live(id)),
+        }
+    }
+
+    /// Exited agents whose final screen is kept (at most [`RETAINED_EXITED`]).
+    pub fn retained_exited_agents(&self) -> usize {
+        lock(&self.agents).exited.len()
     }
 
     /// Writes to the agent's terminal input; blocks while its input queue is
@@ -687,14 +800,26 @@ impl Node {
 
     /// Sends SIGTERM to the agent's process group; a no-op once it exited.
     pub fn kill(&self, id: u64) -> io::Result<()> {
-        let live = self.live(id)?;
-        self.host.kill(live.host_id)
+        match self.live(id) {
+            Ok(live) => self.host.kill(live.host_id),
+            Err(_) if self.exit_code(id).is_some() => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// The agent's exit code once it has exited; `None` while it runs or if
-    /// it is not live on this node.
+    /// it is unknown.
     pub fn exit_code(&self, id: u64) -> Option<i32> {
-        self.live(id).ok()?.pipeline.exit_code()
+        {
+            let agents = lock(&self.agents);
+            if let Some(live) = agents.live.get(&id) {
+                return live.pipeline.exit_code();
+            }
+            if let Some(a) = agents.exited(id) {
+                return Some(a.exit_code);
+            }
+        }
+        lock(&self.store).exit_code(id).ok().flatten()
     }
 
     /// Stops every agent (there is no handoff to a successor daemon, see

@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -175,6 +175,19 @@ impl Store {
         } else {
             Err(rusqlite::Error::StatementChangedRows(n))
         }
+    }
+
+    /// The exit code of an `exited` agent; `None` if it is unknown or not
+    /// exited.
+    pub fn exit_code(&self, id: u64) -> rusqlite::Result<Option<i32>> {
+        self.conn
+            .query_row(
+                "SELECT exit_code FROM agents WHERE id = ?1 AND state = 'exited'",
+                (id as i64,),
+                |r| r.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
     }
 
     pub fn list_agents(&self) -> rusqlite::Result<Vec<AgentRecord>> {
