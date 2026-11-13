@@ -44,6 +44,7 @@ Any regression fails CI and requires explicit approval by the user. See [0014](d
 - **Terminal state:** each node keeps a headless `alacritty_terminal` grid + bounded on-disk scrollback per agent. Reattach = instant snapshot + live stream. ([0005](decisions/0005-terminal-state-on-node.md))
 - **Plugins:** WASM components (wasmtime + WIT), subprocess-over-stdio escape hatch, no native dylibs. UI plugins return a declarative view tree rendered natively. ([0007](decisions/0007-plugin-system.md))
 - **Status detection:** agent CLI hooks first, PTY heuristics fallback; status carries source + confidence. ([0008](decisions/0008-agent-status-detection.md))
+- **Proposed (not accepted):** the controller as a control plane that runs on any host, an MCP channel per agent for messaging and spawning, and credentials split into a core broker plus secret-provider plugins ([0019](decisions/0019-control-plane-direction.md)).
 
 ## Domain model ([0009](decisions/0009-domain-model.md))
 
