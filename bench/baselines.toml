@@ -130,3 +130,24 @@ baseline = 0
 suite = "instr"
 unit = "instructions"
 baseline = 0
+
+# M2b metrics (fleet-gui, macOS window server): `baseline = 0` until
+# recorded from the PR's CI artifacts.
+
+[metrics.gui_cold_start_ns]
+suite = "wall"
+unit = "ns"
+budget = 200000000     # GUI cold start < 200 ms (docs/plan.md)
+baseline = 0
+
+[metrics.input_to_render_ns]
+suite = "wall"
+unit = "ns"
+budget = 16000000      # key to presented frame < 16 ms (docs/plan.md)
+baseline = 0
+
+[metrics.input_to_render_flood50_ns]
+suite = "wall"
+unit = "ns"
+budget = 16000000      # the same while 50 agents flood
+baseline = 0

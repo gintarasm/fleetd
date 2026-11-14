@@ -35,9 +35,13 @@
 //! rows.
 
 mod history;
+mod parse;
 mod recorder;
+mod view;
 
 pub use history::HistoryEvent;
+pub use parse::{cells_text, parse_history_line};
+pub use view::{Cell, CellStyle, Color, CursorShape, CursorView, Modes, Palette};
 
 use history::{History, Pen, glyph, last_non_blank, put_cells, put_glyph};
 use recorder::Recorder;
@@ -50,10 +54,10 @@ use std::time::Instant;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Cursor, Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::cell::{Cell as GridCell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{
-    Handler, KeyboardModes, KeyboardModesApplyBehavior, Processor,
+    Handler, KeyboardModes, KeyboardModesApplyBehavior, Processor, Rgb,
 };
 
 /// Grid size handed to alacritty. Scrollback is disabled: rows are rendered as
@@ -86,33 +90,89 @@ impl Dimensions for Size {
     }
 }
 
-/// Collects the bytes alacritty wants written back to the PTY.
+/// Kitty keyboard flags a client terminal supports (disambiguate escape
+/// codes only); a client's query reply is masked to these.
+pub const KITTY_SUPPORTED_FLAGS: u8 = 0b1;
+
+/// State only a client terminal has: the palette that answers colour queries.
+struct ClientState {
+    palette: Mutex<Palette>,
+}
+
+/// Collects the bytes alacritty wants written back to the PTY, and the window
+/// title.
 ///
-/// The kitty keyboard query reply (`CSI ? flags u`) is dropped: kitty keyboard
-/// tracking is on only so snapshots can carry the flags, and the node must not
-/// tell an agent that the (unknown) client terminal supports the protocol.
+/// The node's listener drops the kitty keyboard query reply (`CSI ? flags u`)
+/// and ignores colour queries: kitty keyboard tracking is on only so snapshots
+/// can carry the flags, and the node must not tell an agent that the (unknown)
+/// client terminal supports the protocol. A client listener (see
+/// [`Terminal::new_client`]) keeps the kitty reply, masked to
+/// [`KITTY_SUPPORTED_FLAGS`], and answers OSC 4/10/11/12 from its palette.
 #[derive(Clone, Default)]
-struct Replies(Arc<Mutex<Vec<u8>>>);
+struct Replies {
+    buf: Arc<Mutex<Vec<u8>>>,
+    title: Arc<Mutex<Option<String>>>,
+    client: Option<Arc<ClientState>>,
+}
+
+impl Replies {
+    fn push(&self, bytes: &[u8]) {
+        self.buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(bytes);
+    }
+}
 
 impl EventListener for Replies {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            if is_kitty_keyboard_report(&text) {
-                return;
+        match event {
+            Event::PtyWrite(text) => {
+                if let Some(digits) = kitty_keyboard_report(&text) {
+                    if self.client.is_none() {
+                        return;
+                    }
+                    let flags =
+                        digits.parse::<u32>().unwrap_or(0) & u32::from(KITTY_SUPPORTED_FLAGS);
+                    self.push(format!("\x1b[?{flags}u").as_bytes());
+                    return;
+                }
+                self.push(text.as_bytes());
             }
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(text.as_bytes());
+            Event::ColorRequest(index, format) => {
+                if let Some(client) = &self.client {
+                    let rgb = client
+                        .palette
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .rgb(index);
+                    self.push(
+                        format(Rgb {
+                            r: rgb.0,
+                            g: rgb.1,
+                            b: rgb.2,
+                        })
+                        .as_bytes(),
+                    );
+                }
+            }
+            Event::Title(title) => {
+                *self.title.lock().unwrap_or_else(|e| e.into_inner()) = Some(title);
+            }
+            Event::ResetTitle => {
+                *self.title.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            _ => {}
         }
     }
 }
 
-/// `CSI ? <digits> u`, alacritty's reply to a kitty keyboard flags query.
-fn is_kitty_keyboard_report(text: &str) -> bool {
+/// The digits of `CSI ? <digits> u`, alacritty's reply to a kitty keyboard
+/// flags query.
+fn kitty_keyboard_report(text: &str) -> Option<&str> {
     text.strip_prefix("\x1b[?")
         .and_then(|rest| rest.strip_suffix('u'))
-        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Headless terminal emulator holding the visible screen of one agent.
@@ -130,7 +190,10 @@ pub struct Terminal {
 impl Terminal {
     /// Creates a blank screen; zero dimensions are clamped to 1.
     pub fn new(cols: u16, rows: u16) -> Self {
-        let replies = Replies::default();
+        Self::with_replies(cols, rows, Replies::default())
+    }
+
+    fn with_replies(cols: u16, rows: u16, replies: Replies) -> Self {
         let size = Size::new(cols, rows);
         let history = History::new(size.rows);
         Self {
@@ -139,6 +202,70 @@ impl Terminal {
             replies,
             history,
         }
+    }
+
+    /// Creates a blank client-side screen: like [`Terminal::new`], but kitty
+    /// keyboard query replies are kept (flags masked to
+    /// [`KITTY_SUPPORTED_FLAGS`]) and OSC 4/10/11/12 colour queries are
+    /// answered from `palette`.
+    pub fn new_client(cols: u16, rows: u16, palette: Palette) -> Self {
+        let replies = Replies {
+            client: Some(Arc::new(ClientState {
+                palette: Mutex::new(palette),
+            })),
+            ..Replies::default()
+        };
+        Self::with_replies(cols, rows, replies)
+    }
+
+    /// Replaces the palette that answers colour queries. No effect on a node
+    /// terminal ([`Terminal::new`]).
+    pub fn set_palette(&mut self, palette: Palette) {
+        if let Some(client) = &self.replies.client {
+            *client.palette.lock().unwrap_or_else(|e| e.into_inner()) = palette;
+        }
+    }
+
+    /// Terminal modes a client needs for input encoding and drawing.
+    pub fn modes(&self) -> Modes {
+        view::modes(*self.term.borrow().mode())
+    }
+
+    /// Cursor position and shape (`Hidden` when `?25l`).
+    pub fn cursor_view(&self) -> CursorView {
+        let term = self.term.borrow();
+        let point = term.grid().cursor.point;
+        let shape = if term.mode().contains(TermMode::SHOW_CURSOR) {
+            view::cursor_shape(term.cursor_style().shape)
+        } else {
+            CursorShape::Hidden
+        };
+        CursorView {
+            row: to_u16(point.line.0.max(0) as usize),
+            col: to_u16(point.column.0),
+            shape,
+        }
+    }
+
+    /// Replaces `out` with the cells of visible row `row` (wide-char spacers
+    /// omitted); empty when `row` is out of range.
+    pub fn row_cells(&self, row: u16, out: &mut Vec<Cell>) {
+        out.clear();
+        let term = self.term.borrow();
+        let grid = term.grid();
+        if usize::from(row) >= grid.screen_lines() {
+            return;
+        }
+        view::push_row(&grid[Line(i32::from(row))], out);
+    }
+
+    /// Window title set by OSC 0/2, `None` if unset or reset.
+    pub fn title(&self) -> Option<String> {
+        self.replies
+            .title
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Feeds raw PTY output through the VT parser.
@@ -195,7 +322,7 @@ impl Terminal {
 
     /// Takes the replies to terminal queries produced since the last call.
     pub fn take_replies(&mut self) -> Vec<u8> {
-        std::mem::take(&mut *self.replies.0.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(&mut *self.replies.buf.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Resizes the screen (reflowing the primary screen); zero dimensions are clamped to 1.
@@ -393,7 +520,7 @@ fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&mut Term<Replies>) 
 /// Clears the screen (`\x1b[0m\x1b[H\x1b[2J`, so `pen` becomes the default)
 /// and draws `grid`'s non-blank cells.
 /// A visible row's text, trailing spaces trimmed.
-fn row_text(grid: &Grid<Cell>, row: usize) -> String {
+fn row_text(grid: &Grid<GridCell>, row: usize) -> String {
     let line = &grid[Line(row as i32)];
     let mut text = String::with_capacity(grid.columns());
     for col in 0..grid.columns() {
@@ -408,7 +535,7 @@ fn row_text(grid: &Grid<Cell>, row: usize) -> String {
     text
 }
 
-fn put_grid(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>) {
+fn put_grid(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<GridCell>) {
     out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
     *pen = Pen::default();
     for row in 0..grid.screen_lines() {
@@ -426,7 +553,7 @@ fn put_grid(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>) {
 /// Moves to `cursor` and sets its pen. A pending autowrap is recreated by
 /// re-emitting the glyph under the cursor (the whole wide character if the
 /// cursor is on its spacer) with that cell's pen.
-fn put_cursor(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>, cursor: &Cursor<Cell>) {
+fn put_cursor(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<GridCell>, cursor: &Cursor<GridCell>) {
     let row = (cursor.point.line.0.max(0) as usize).min(grid.screen_lines() - 1);
     let col = cursor.point.column.0.min(grid.columns() - 1);
     cup(out, row, col);
@@ -449,7 +576,7 @@ fn put_cursor(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>, cursor: &Curs
 
 /// Whether DECRC in a fresh terminal already restores `cursor`, as far as the
 /// snapshot carries it (position, pending wrap and pen; not charsets).
-fn is_fresh_cursor(cursor: &Cursor<Cell>) -> bool {
+fn is_fresh_cursor(cursor: &Cursor<GridCell>) -> bool {
     cursor.point.line.0 == 0
         && cursor.point.column.0 == 0
         && !cursor.input_needs_wrap
@@ -552,6 +679,162 @@ fn cup(out: &mut Vec<u8>, row: usize, col: usize) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn palette() -> Palette {
+        let mut ansi = [(0, 0, 0); 16];
+        for (i, c) in ansi.iter_mut().enumerate() {
+            *c = (i as u8, 0, 0);
+        }
+        Palette {
+            fg: (0xcd, 0xd6, 0xf4),
+            bg: (0x1e, 0x1e, 0x2e),
+            cursor: (0xf5, 0xe0, 0xdc),
+            ansi,
+        }
+    }
+
+    const QUERIES: &[u8] = b"\x1b[>1u\x1b[?u\x1b]11;?\x1b\\\x1b[6n";
+
+    #[test]
+    fn client_terminal_answers_kitty_and_color_queries() {
+        let mut t = Terminal::new_client(80, 24, palette());
+        t.feed(QUERIES);
+        assert_eq!(
+            t.take_replies(),
+            b"\x1b[?1u\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\\x1b[1;1R"
+        );
+    }
+
+    #[test]
+    fn client_color_reply_mirrors_bel_terminator_and_palette_slots() {
+        let mut t = Terminal::new_client(80, 24, palette());
+        t.feed(b"\x1b]10;?\x07\x1b]4;1;?\x07\x1b]4;16;?\x07");
+        assert_eq!(
+            t.take_replies(),
+            b"\x1b]10;rgb:cdcd/d6d6/f4f4\x07\x1b]4;1;rgb:0101/0000/0000\x07\x1b]4;16;rgb:0000/0000/0000\x07"
+        );
+        let mut p = palette();
+        p.bg = (1, 2, 3);
+        t.set_palette(p);
+        t.feed(b"\x1b]11;?\x07");
+        assert_eq!(t.take_replies(), b"\x1b]11;rgb:0101/0202/0303\x07");
+    }
+
+    #[test]
+    fn client_masks_unsupported_kitty_flags() {
+        let mut t = Terminal::new_client(80, 24, palette());
+        t.feed(b"\x1b[>31u\x1b[?u");
+        assert_eq!(t.take_replies(), b"\x1b[?1u");
+    }
+
+    #[test]
+    fn node_terminal_still_drops_kitty_and_color_replies() {
+        let mut t = Terminal::new(80, 24);
+        t.feed(QUERIES);
+        assert_eq!(t.take_replies(), b"\x1b[1;1R");
+    }
+
+    #[test]
+    fn row_cells_reports_style_and_wide_chars() {
+        let mut t = Terminal::new(80, 24);
+        t.feed("\x1b[1;31mA\x1b[0m\u{754c}b".as_bytes());
+        let mut cells = Vec::new();
+        t.row_cells(0, &mut cells);
+        assert_eq!(cells.len(), 79);
+        let bold_red = CellStyle {
+            fg: Color::Named(1),
+            bold: true,
+            ..CellStyle::default()
+        };
+        assert_eq!(
+            (cells[0].ch, cells[0].style, cells[0].wide),
+            ('A', bold_red, false)
+        );
+        assert_eq!(
+            (cells[1].ch, cells[1].style, cells[1].wide),
+            ('\u{754c}', CellStyle::default(), true)
+        );
+        assert_eq!((cells[2].ch, cells[2].wide), ('b', false));
+        assert!(cells[3..].iter().all(|c| *c == Cell::default()));
+        assert_eq!(cells_text(&cells[..3]), "A\u{754c}b");
+        t.row_cells(99, &mut cells);
+        assert!(cells.is_empty());
+    }
+
+    #[test]
+    fn modes_track_bracketed_paste_mouse_and_kitty() {
+        let mut t = Terminal::new(80, 24);
+        assert!(t.modes().show_cursor);
+        t.feed(b"\x1b[?2004h\x1b[?1002h\x1b[?1006h\x1b[>1u");
+        let m = t.modes();
+        assert!(m.bracketed_paste && m.mouse_drag && m.sgr_mouse);
+        assert!(!m.mouse_click && !m.alt_screen);
+        assert_eq!(m.kitty_flags, 1);
+    }
+
+    #[test]
+    fn cursor_view_reports_position_and_shape() {
+        let mut t = Terminal::new(80, 24);
+        t.feed(b"\x1b[3;5H\x1b[6 q");
+        assert_eq!(
+            t.cursor_view(),
+            CursorView {
+                row: 2,
+                col: 4,
+                shape: CursorShape::Beam
+            }
+        );
+        t.feed(b"\x1b[?25l");
+        assert_eq!(t.cursor_view().shape, CursorShape::Hidden);
+    }
+
+    #[test]
+    fn parse_history_line_matches_rendered_rows() {
+        let mut t = Terminal::new(20, 3);
+        let mut rendered: Vec<Vec<Cell>> = Vec::new();
+        let mut parsed: Vec<Vec<Cell>> = Vec::new();
+        let mut row = Vec::new();
+        for i in 0..8 {
+            let line = format!(
+                "\x1b[1;3{}mred{i}\x1b[0m \x1b[48;5;{}m\u{754c}\x1b[38;2;1;2;3;4mx\x1b[0m e\u{301}\r\n",
+                1 + i % 7,
+                20 + i
+            );
+            // Row 0 as drawn before this feed scrolls it off.
+            t.row_cells(0, &mut row);
+            t.feed(line.as_bytes());
+            for ev in t.drain_history() {
+                if let HistoryEvent::Line(l) = ev {
+                    rendered.push(row.clone());
+                    let mut cells = Vec::new();
+                    parse_history_line(&l, &mut cells);
+                    parsed.push(cells);
+                }
+            }
+        }
+        assert!(!parsed.is_empty());
+        assert_eq!(parsed.len(), rendered.len());
+        for (p, r) in parsed.iter().zip(&rendered) {
+            assert!(!p.is_empty());
+            assert_eq!(p[..], r[..p.len()]);
+            assert!(r[p.len()..].iter().all(|c| *c == Cell::default()));
+        }
+    }
+
+    #[test]
+    fn parse_history_line_ignores_non_sgr_escapes() {
+        let mut cells = vec![Cell::default()];
+        parse_history_line(b"a\x1b[2Kb\x1b]0;t\x07c", &mut cells);
+        assert_eq!(cells_text(&cells), "abc");
+    }
+
+    #[test]
+    fn title_follows_osc_2() {
+        let mut t = Terminal::new(80, 24);
+        assert_eq!(t.title(), None);
+        t.feed(b"\x1b]2;hello\x07");
+        assert_eq!(t.title().as_deref(), Some("hello"));
+    }
 
     #[test]
     fn last_nonblank_line_is_the_lowest_non_blank_row_trimmed() {

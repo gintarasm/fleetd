@@ -1,0 +1,48 @@
+[package]
+name = "fleet-gui"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[lib]
+name = "fleet_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fleet-gui"
+path = "src/main.rs"
+
+[features]
+# Test-only hooks (`Session::pause_reader_for_test`, ...), for the
+# integration tests; enabled by the dev-dependency on this crate below.
+test-hooks = []
+
+[dependencies]
+async-channel = "2.5.0"
+clap = { version = "4.6.7", features = ["derive"] }
+fleet-client = { version = "0.1.0", path = "../fleet-client" }
+fleet-proto = { version = "0.1.0", path = "../fleet-proto" }
+fleet-term = { version = "0.1.0", path = "../fleet-term" }
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+shell-words = "1.1.1"
+thiserror = "2.0.21"
+toml = "1.2.1"
+toml_edit = "0.25.19"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = "=0.2.2"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui = { version = "=0.2.2", features = ["test-support"] }
+
+[dev-dependencies]
+bytes = "1.12.1"
+fleet-gui = { path = ".", features = ["test-hooks"] }
+tempfile = "3.27.0"
+tokio-util = { version = "0.7.20", features = ["codec"] }

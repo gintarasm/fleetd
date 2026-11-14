@@ -4,6 +4,8 @@
 
 **Amends:** [0016](0016-crate-layout.md): two library crates join the workspace.
 
+**Amended by** [0028](0028-gui-client.md): `fleet-gui` is a library plus a binary, with a platform-neutral `core` and a macOS-only gpui shell.
+
 ## Context
 
 The GUI (M2b) must parse agent output and render history exactly as the node does, and talk to `fleetd` the same way the CLI does. In M1 the terminal wrapper lived in `fleet-node` and the protocol client in `fleet-cli`, so the GUI would have depended on the node or on a binary crate.

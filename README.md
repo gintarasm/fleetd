@@ -6,14 +6,15 @@
 
 A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Code, Codex, Gemini CLI, …) in terminals that survive client crashes, on your machine and, later, on remote hosts. The design is in [`docs/plan.md`](docs/plan.md) and the decisions behind it are in [`docs/decisions/`](docs/decisions/).
 
-**Status:** M1 (local node) and M2a (the daemon side of the GUI: agent history, protocol v2, labels, `fleetd --stdio`, the agent skill) are done. Today you get a single-machine daemon (`fleetd`) and a command-line client (`fleet`). Anything marked **TBD** below is planned but not implemented yet.
+**Status:** M1 (local node), M2a (the daemon side of the GUI: agent history, protocol v2, labels, `fleetd --stdio`, the agent skill) and M2b (the macOS GUI) are done. Today you get a daemon (`fleetd`), a command-line client (`fleet`) and a macOS app (`fleetd.app`). Anything marked **TBD** below is planned but not implemented yet.
 
 | Milestone | What | Status |
 |---|---|---|
 | M0 | Benchmark harness and CI perf gate | done |
 | M1 | Local node: PTYs, terminal state, scrollback, SQLite, protocol, `fleet` CLI | done |
 | M2a | Daemon side of the GUI: agent history, protocol v2, labels, flood fix, `fleetd --stdio`, login-shell env, agent skill | done |
-| M2b | GUI (gpui): sidebar, terminal pane, splits, menu-bar app | TBD |
+| M2b | GUI (gpui): sidebar, terminal panes, splits, menu-bar app, connect sheet | done |
+| M2c | Daily-drive polish: native-feeling GUI, restart and remove exited agents | TBD |
 | M3 | Projects, workspaces, worktrees, tasks; diff view | TBD |
 | M4 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent MCP channel | TBD |
 | M5 | Remote nodes over SSH | TBD |
@@ -208,7 +209,67 @@ fleet logs -f              # then follow new lines until Ctrl-C
 
 ## GUI
 
-**TBD** (M2b). The daemon side is in place (history, activity events, spawn-and-attach, primary client; [0022](docs/decisions/0022-protocol-v2.md)). Planned: a native gpui app with a menu-bar icon, a fleet sidebar grouped by node and workspace with status badges, terminal panes with up to 4 splits, a command palette and a read-only diff view. See [`docs/plan.md`](docs/plan.md).
+`fleetd.app` is a native macOS app (gpui) and a protocol client like `fleet`: it never reads node files, never starts a daemon unless you click for it, and leaves agents running when it quits or crashes. Design: [0028](docs/decisions/0028-gui-client.md).
+
+### Build and install
+
+Requires macOS 13+, Xcode and its Metal toolchain (gpui's shaders are compiled at build time):
+
+```sh
+xcodebuild -downloadComponent MetalToolchain   # once
+scripts/bundle-macos.sh                        # builds target/release/fleetd.app
+open target/release/fleetd.app
+```
+
+The bundle holds `fleet-gui`, plus `fleetd` and `fleet` as siblings, so "Start fleetd on this Mac" and "Install agent skill" work without anything on `PATH`. Copy `fleetd.app` to `/Applications` if you like.
+
+The bundle is unsigned. A copy that was downloaded (quarantined) is blocked by Gatekeeper on first open: right-click it and choose Open, or run `xattr -d com.apple.quarantine fleetd.app`. A bundle you built yourself is not quarantined. `scripts/bundle-macos.sh --icon-only` regenerates `assets/logo/fleetd.icns` from `assets/logo/fleetd-icon.svg`.
+
+### Connecting
+
+On launch the GUI connects to the saved target. If that fails, or nothing is saved and no local daemon answers, a connect sheet offers:
+- **Start fleetd on this Mac**: starts a detached local daemon, only when you click.
+- **Connect to a remote fleetd**: `user@host`, over `ssh` (your `~/.ssh/config`, keys and agent apply; connections share one ControlMaster). `fleetd` must be installed on the host. ssh runs with `BatchMode=yes` and `ConnectTimeout=10`, so the host must be reachable without a password or host-key prompt (keys or the agent, and a known host). Every reconnect runs `fleetd --stdio` on the host again, which starts the remote daemon if it is not running: a remote daemon you stop comes back within seconds while the GUI is connected to it.
+- **Recent targets.**
+
+Not yet verified by hand: connecting to a remote host over ssh, the "Start fleetd on this Mac" flow from a clean state, and the menu-bar item with Dock hiding (Show fleetd, closing the window). They are covered by tests against fakes but are still on the hand-off checklist.
+
+### Layout and keys
+
+- **Sidebar:** one vertical tab per agent (status dot, title, time since start, last line), grouped by project label or working directory. Right-click a tab for Kill or Open in new split.
+- **Panes:** rounded cards, up to 4 splits, each with header buttons: split right, split down, maximize, close. Close only detaches; only Kill kills.
+
+| Key | Action |
+|---|---|
+| `cmd-d` / `cmd-shift-d` | split right / down |
+| `cmd-w` | close the pane (detach) |
+| `cmd-shift-enter` | maximize or restore the pane |
+| `cmd-alt-arrows` | move focus between panes |
+| `cmd-1` … `cmd-4` | focus pane 1 to 4 |
+| `cmd-n` | new agent |
+| `cmd-c` / `cmd-v` | copy / paste |
+
+### Menu bar
+
+A status item is always present: Show fleetd, the running agents, New agent…, Switch fleetd…, Install agent skill and Quit. The app menu has Switch fleetd…, Install agent skill and Quit too. Closing the window keeps the app resident (the Dock icon hides); Show fleetd brings it back (not yet verified by hand, see above). **Quit only quits the GUI; agents keep running.**
+
+### Configuration
+
+`~/.fleet/config.toml`, table `[gui]` (all optional):
+
+| Key | Default | |
+|---|---|---|
+| `connection` | absent | `"local"` or `"ssh://[user@]host"`; the GUI writes this one |
+| `default_command` | `["claude"]` | what New agent runs |
+| `font_family` | `"Menlo"` | |
+| `font_size` | `13` | |
+| `option_as_meta` | `true` | Option sends Esc-prefixed keys |
+
+The GUI keeps its own state (recent targets and directories, layouts) in `~/.fleet/gui-state.toml`. `--state-dir` and `--target` override both for one launch.
+
+### Performance
+
+Advisory figures from one local wall run on a dev Mac (local wall numbers are advisory; CI is authoritative and records the baselines): cold start (`gui_cold_start_ns`) about 152 ms against a 200 ms budget, input to render (`input_to_render_ns`) about 12.9 ms and under a 50-agent flood (`input_to_render_flood50_ns`) about 11.8 ms, against 16 ms. These metrics need an unlocked, awake GUI session on the perf-wall runner; see [`bench/README.md`](bench/README.md).
 
 ## Remote agents
 

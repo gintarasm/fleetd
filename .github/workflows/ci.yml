@@ -43,13 +43,29 @@ jobs:
       - name: Install pinned toolchain
         run: cargo --version
       - run: cargo build --release --workspace
-      - run: target/release/fleet-perf run --suite wall --out wall.json
+      # caffeinate -d keeps the display awake: a sleeping display or a locked
+      # screen presents no frames, and the GUI metrics then fail.
+      - run: caffeinate -d target/release/fleet-perf run --suite wall --out wall.json
       - run: target/release/fleet-perf compare --baselines bench/baselines.toml --results wall.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: wall-results
           path: wall.json
+  gui-macos:
+    # The macOS GUI shell (crates/fleet-gui/src/app) is compiled out on Linux,
+    # so `check` never lints or tests it. Same single self-hosted runner as
+    # perf-wall: the runner runs one job at a time, so the two never overlap.
+    # The --lib tests use gpui's headless test platform (no window server).
+    runs-on: [self-hosted, macOS, fleet-perf]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - name: Install pinned toolchain
+        run: cargo --version
+      - run: cargo clippy -p fleet-gui --all-targets -- -D warnings
+      - run: cargo test -p fleet-gui --lib
   perf-approval:
     # A loosened baseline needs the user's Perf-Approved trailer (docs/decisions/0014).
     if: github.event_name == 'pull_request'
