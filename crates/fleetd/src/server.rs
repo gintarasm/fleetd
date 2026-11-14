@@ -269,7 +269,10 @@ impl Connection {
             }
             Some(request::Kind::List(list)) => {
                 match blocking(&self.node, move |n| n.list_matching(&list.selector)).await {
-                    Ok(agents) => response::Kind::Agents(AgentList { agents }),
+                    Ok(agents) => response::Kind::Agents(AgentList {
+                        agents,
+                        ..Default::default()
+                    }),
                     Err(e) => error(e.to_string()),
                 }
             }
@@ -306,6 +309,10 @@ impl Connection {
             Some(request::Kind::StopLogs(_)) => {
                 self.stop_logs();
                 response::Kind::Ack(Ack {})
+            }
+            // Temporary: Task 5 implements restart and forget.
+            Some(request::Kind::Restart(_) | request::Kind::Forget(_)) => {
+                error("not implemented".into())
             }
         };
         self.respond(req.id, kind).await

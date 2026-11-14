@@ -19,6 +19,8 @@ message Request {
     SetLabels set_labels = 10;
     ReadLogs read_logs = 11;
     StopLogs stop_logs = 12;
+    RestartAgent restart = 13;
+    ForgetAgents forget = 14;
   }
 }
 
@@ -33,6 +35,8 @@ message Response {
     HistoryPage history = 7;
     SpawnedAttached spawned_attached = 8;
     LogLines log_lines = 9;
+    Restarted restarted = 10;
+    Forgotten forgotten = 11;
   }
 }
 
@@ -44,6 +48,7 @@ message Event {
     AttachRole role = 4;
     LogLine log_line = 5;
     AgentResized agent_resized = 6;
+    AgentRemoved agent_removed = 7;
   }
 }
 
@@ -65,7 +70,29 @@ message SpawnAgent {
 // Only agents whose labels contain every selector pair; empty means all.
 message ListAgents { map<string, string> selector = 1; }
 
-message AgentList { repeated AgentInfo agents = 1; }
+// AgentList gains the durable restart record, so a client that missed
+// AgentRemoved can still follow a restart: old id -> its newest successor
+// (chains are collapsed on write, so one lookup suffices).
+message AgentList { repeated AgentInfo agents = 1; map<uint64, uint64> replaced = 2; }
+
+// Restart an exited or lost agent: same program, args, cwd and labels, new
+// id. The old agent is forgotten once the new one has started. `cols`,
+// `rows` and `attach` mean what they mean in SpawnAgent.
+message RestartAgent { uint64 agent_id = 1; uint32 cols = 2; uint32 rows = 3; bool attach = 4; }
+// `attached` is set when `attach` was.
+message Restarted { uint64 old_id = 1; AgentInfo agent = 2; optional AttachOk attached = 3; }
+
+// Forget exited or lost agents: their list entries, final screens,
+// history and scrollback rings are deleted. `exited_only` = every exited or
+// lost agent whose labels contain every `selector` pair (empty selector:
+// all of them); `ids` must then be empty. Running agents are never touched.
+message ForgetAgents { repeated uint64 ids = 1; bool exited_only = 2; map<string, string> selector = 3; }
+// `refused`: ids that are running or unknown, with nothing done to them.
+message Forgotten { repeated uint64 ids = 1; repeated uint64 refused = 2; }
+
+// Pushed to every connection when an agent is forgotten, after the
+// request that did it is answered. `replaced_by` is set by a restart.
+message AgentRemoved { uint64 agent_id = 1; optional uint64 replaced_by = 2; }
 
 enum AgentState {
   AGENT_STATE_UNSPECIFIED = 0;

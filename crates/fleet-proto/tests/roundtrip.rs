@@ -132,6 +132,7 @@ fn roundtrip_every_kind() {
         response::Kind::Spawned(Box::new(info())),
         response::Kind::Agents(AgentList {
             agents: vec![info(), info()],
+            ..Default::default()
         }),
         response::Kind::Attached(Box::new(attach_ok())),
         response::Kind::Ack(Ack {}),

@@ -255,6 +255,40 @@ mod tests {
     }
 
     #[test]
+    fn restart_and_forget_frames_round_trip() {
+        let frames = vec![
+            Frame::Request(Request {
+                id: 1,
+                kind: Some(request::Kind::Restart(crate::RestartAgent {
+                    agent_id: 5,
+                    cols: 80,
+                    rows: 24,
+                    attach: true,
+                })),
+            }),
+            Frame::Event(Event {
+                kind: Some(crate::event::Kind::AgentRemoved(crate::AgentRemoved {
+                    agent_id: 5,
+                    replaced_by: Some(9),
+                })),
+            }),
+            Frame::Response(Response {
+                id: 2,
+                kind: Some(response::Kind::Agents(crate::AgentList {
+                    agents: vec![],
+                    replaced: [(5u64, 9u64)].into_iter().collect(),
+                })),
+            }),
+        ];
+        for frame in frames {
+            let mut buf = BytesMut::new();
+            FrameCodec::new().encode(frame.clone(), &mut buf).unwrap();
+            let got = FrameCodec::new().decode(&mut buf).unwrap().unwrap();
+            assert_eq!(got, frame);
+        }
+    }
+
+    #[test]
     fn output_frame_is_raw() {
         let mut buf = BytesMut::new();
         let frame = Frame::Output {
