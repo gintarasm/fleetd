@@ -42,6 +42,8 @@ pub enum UiEvent {
     PaneChanged(PaneId),
     /// The control connection's state.
     Connection(ConnState),
+    /// Connecting failed (once per outage); moot once connected again.
+    ConnectionError(String),
     Error(String),
 }
 
@@ -552,7 +554,7 @@ impl ControlReader {
                 Err(e) => {
                     if !reported {
                         reported = true;
-                        self.ctx.notify(UiEvent::Error(e.to_string()));
+                        self.ctx.notify(UiEvent::ConnectionError(e.to_string()));
                     }
                 }
             }

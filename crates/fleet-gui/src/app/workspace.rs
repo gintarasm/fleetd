@@ -750,7 +750,7 @@ mod tests {
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
     use crate::core::pane::PaneModel;
-    use crate::core::session::{AgentRow, PaneId, UiEvent};
+    use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
     use crate::core::state::GuiState;
     use crate::core::target::Target;
 
@@ -1308,6 +1308,40 @@ mod tests {
         let shown = s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
         assert_eq!(shown.as_deref(), Some("spawn failed: no such directory"));
         assert!(s.cx.debug_bounds("error-toast").is_some());
+    }
+
+    #[gpui::test]
+    fn reconnecting_clears_the_connection_error_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let s = setup(cx, &fake, dir.path());
+        let shown = |s: &Setup<'_>| s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
+
+        s.ui.try_send(UiEvent::ConnectionError(
+            "fleetd is not running on this Mac".into(),
+        ))
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(
+            shown(&s).as_deref(),
+            Some("fleetd is not running on this Mac")
+        );
+        s.ui.try_send(UiEvent::Connection(ConnState::Connected))
+            .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&s), None);
+        assert!(s.cx.debug_bounds("error-toast").is_none());
+
+        // Any other error outlives a reconnect.
+        s.ui.try_send(UiEvent::Error("spawn failed: no such directory".into()))
+            .unwrap();
+        s.ui.try_send(UiEvent::Connection(ConnState::Connected))
+            .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(
+            shown(&s).as_deref(),
+            Some("spawn failed: no such directory")
+        );
     }
 
     #[gpui::test]

@@ -195,6 +195,8 @@ pub struct AppState {
     pub(super) agents: Vec<AgentRow>,
     /// The last error, shown until dismissed or replaced.
     pub(super) error: Option<String>,
+    /// `error` is a failure to connect, cleared once connected.
+    error_is_connection: bool,
     /// A config error from launch, still shown after the first connect.
     config_error: Option<String>,
     /// Panes a spawn is on its way into (for the "starting…" text only).
@@ -249,6 +251,7 @@ impl AppState {
             titles: HashMap::new(),
             theme,
             error: None,
+            error_is_connection: false,
             config_error: None,
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
@@ -318,6 +321,7 @@ impl AppState {
         self.titles.clear();
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
+        self.error_is_connection = false;
         self.starting.clear();
         self.spawn_dirs.clear();
         self.requested.clear();
@@ -445,7 +449,18 @@ impl AppState {
                         ConnState::Disconnected { retry_in } => Some(Instant::now() + retry_in),
                         _ => None,
                     };
+                    if state == ConnState::Connected && self.error_is_connection {
+                        self.error = None;
+                        self.error_is_connection = false;
+                        cx.notify();
+                    }
                     chrome = true;
+                }
+                UiEvent::ConnectionError(e) => {
+                    eprintln!("fleet-gui: {e}");
+                    self.error = Some(e);
+                    self.error_is_connection = true;
+                    cx.notify();
                 }
                 UiEvent::Error(e) => {
                     eprintln!("fleet-gui: {e}");
@@ -454,6 +469,7 @@ impl AppState {
                     // adopts its agent.
                     self.starting.clear();
                     self.error = Some(e);
+                    self.error_is_connection = false;
                     chrome = true;
                     cx.notify();
                 }
@@ -765,11 +781,13 @@ impl AppState {
     pub fn set_config_error(&mut self, message: String, cx: &mut Context<Self>) {
         self.config_error = Some(message.clone());
         self.error = Some(message);
+        self.error_is_connection = false;
         cx.notify();
     }
 
     pub(super) fn dismiss_error(&mut self, cx: &mut Context<Self>) {
         self.error = None;
+        self.error_is_connection = false;
         cx.notify();
     }
 
