@@ -12,7 +12,8 @@ pub struct Group {
     pub agents: Vec<AgentRow>,
 }
 
-fn tilde(cwd: &str, home: &Path) -> String {
+/// `cwd` with the home directory shown as `~`.
+pub fn tilde(cwd: &str, home: &Path) -> String {
     match Path::new(cwd).strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Ok(rest) => format!("~/{}", rest.display()),

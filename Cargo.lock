@@ -1964,6 +1964,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "serde",
+ "shell-words",
  "tempfile",
  "thiserror 2.0.21",
  "tokio-util",

@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use fleet_term::{Cell, CursorShape, CursorView};
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, DispatchPhase, Element, ElementId, ElementInputHandler,
-    Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window,
-    fill, outline, point, px, relative, size,
+    Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior,
+    Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextRun,
+    UnderlineStyle, Window, fill, outline, point, px, relative, size,
 };
 
 use super::pane_view::{GridLayout, InputSink, PaneView, grid_size, ime_cell};
@@ -325,7 +325,7 @@ impl IntoElement for TerminalElement {
 
 impl Element for TerminalElement {
     type RequestLayoutState = ();
-    type PrepaintState = Metrics;
+    type PrepaintState = (Metrics, Hitbox);
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -356,7 +356,7 @@ impl Element for TerminalElement {
         _request_layout: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) -> Metrics {
+    ) -> (Metrics, Hitbox) {
         let ts = window.text_system();
         let font_id = ts.resolve_font(&self.font);
         let cell_w = ts
@@ -389,7 +389,9 @@ impl Element for TerminalElement {
                 model.on_resized(cols, rows);
             }
         }
-        Metrics { cell_w, line_h }
+        // Overlays in front (a sheet, a menu) block it.
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        (Metrics { cell_w, line_h }, hitbox)
     }
 
     fn paint(
@@ -398,7 +400,7 @@ impl Element for TerminalElement {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut (),
-        m: &mut Metrics,
+        (m, hitbox): &mut (Metrics, Hitbox),
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -408,7 +410,7 @@ impl Element for TerminalElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
-        self.listen_to_mouse(bounds, window);
+        self.listen_to_mouse(hitbox.clone(), window);
         // The lock is held only for the copy; shaping happens after.
         let snap = self.snapshot();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -572,11 +574,13 @@ impl TerminalElement {
     }
 
     /// Routes this frame's mouse events to the view: presses and the wheel
-    /// inside `bounds`; moves and releases anywhere, for a drag in progress.
-    fn listen_to_mouse(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+    /// over the grid, unless something in front covers it; moves and
+    /// releases anywhere, for a drag in progress.
+    fn listen_to_mouse(&self, hitbox: Hitbox, window: &mut Window) {
         let view = self.view.clone();
+        let down = hitbox.clone();
         window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && bounds.contains(&ev.position) {
+            if phase == DispatchPhase::Bubble && down.is_hovered(window) {
                 view.update(cx, |v, cx| v.mouse_down(ev, window, cx));
             }
         });
@@ -594,7 +598,7 @@ impl TerminalElement {
         });
         let view = self.view.clone();
         window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && bounds.contains(&ev.position) {
+            if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                 view.update(cx, |v, cx| v.scroll_wheel(ev, window, cx));
             }
         });

@@ -1,20 +1,43 @@
 //! App actions, their cmd-key bindings, and the conversion of gpui
 //! keystrokes into [`Key`]s for the PTY encoder.
 
-use gpui::{App, KeyBinding, Keystroke, actions};
+use gpui::{Action, App, KeyBinding, Keystroke, actions};
 
 use crate::core::keys::{Key, KeyCode, KeyMods};
 
 actions!(
     fleet,
     [
-        SplitRight, SplitDown, ClosePane, FocusLeft, FocusRight, FocusUp, FocusDown, FocusPane1,
-        FocusPane2, FocusPane3, FocusPane4, NewAgent, Copy, Paste,
+        SplitRight,
+        SplitDown,
+        ClosePane,
+        FocusLeft,
+        FocusRight,
+        FocusUp,
+        FocusDown,
+        FocusPane1,
+        FocusPane2,
+        FocusPane3,
+        FocusPane4,
+        NewAgent,
+        Copy,
+        Paste,
+        Quit,
+        ToggleMaximize,
     ]
 );
 
+/// Kill an agent, after the user confirms.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = fleet, no_json)]
+pub struct Kill {
+    pub agent_id: u64,
+}
+
 /// Key context of a terminal pane.
 pub const TERMINAL_CONTEXT: &str = "Terminal";
+/// Key context of a text field.
+pub const TEXT_FIELD_CONTEXT: &str = "TextField";
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -30,8 +53,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-3", FocusPane3, None),
         KeyBinding::new("cmd-4", FocusPane4, None),
         KeyBinding::new("cmd-n", NewAgent, None),
+        KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
+        KeyBinding::new("cmd-q", Quit, None),
     ]);
 }
 

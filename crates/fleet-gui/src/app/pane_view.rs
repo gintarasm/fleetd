@@ -3,13 +3,15 @@
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use fleet_term::CursorShape;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, FocusHandle, Font, InteractiveElement, IntoElement,
-    KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, UTF16Selection, Window,
-    div, font, point, px, size,
+    AnyWindowHandle, App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
+    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    UTF16Selection, Window, div, font, point, px, size,
 };
 
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
@@ -18,7 +20,7 @@ use super::theme::Theme;
 use crate::core::config::GuiConfig;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
-use crate::core::pane::{PaneModel, ViewRow};
+use crate::core::pane::{PaneModel, PaneState, ViewRow};
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
 
@@ -115,8 +117,78 @@ enum Drag {
     Report { button: MouseButton, at: (u16, u16) },
 }
 
+/// What the workspace tells a pane about itself, for its header and
+/// banners.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PaneChrome {
+    /// 1-based, in reading order.
+    pub number: usize,
+    /// The layout puts an agent here.
+    pub has_agent: bool,
+    pub program: Option<String>,
+    /// The agent's directory, with `~`.
+    pub cwd: Option<String>,
+    /// A spawn into this pane is on its way.
+    pub starting: bool,
+    /// When the control connection retries, while it is down.
+    pub reconnect_in: Option<Duration>,
+    /// The pane has keyboard focus (drawn in the header).
+    pub focused: bool,
+}
+
+/// The line drawn over the grid, if any.
+pub fn banner(chrome: &PaneChrome, state: PaneState) -> Option<String> {
+    let disconnected = || match chrome.reconnect_in {
+        Some(d) => format!(
+            "disconnected — reconnecting in {}s",
+            d.as_secs_f32().ceil().max(1.0) as u64
+        ),
+        None => "disconnected — reconnecting".to_owned(),
+    };
+    match state {
+        PaneState::Disconnected => Some(disconnected()),
+        _ if !chrome.has_agent => None,
+        PaneState::Exited(code) => Some(format!("exited ({code})")),
+        PaneState::Attaching => Some("attaching…".to_owned()),
+        PaneState::Lost => Some("the agent is gone".to_owned()),
+        PaneState::Live => None,
+    }
+}
+
+/// The text centred in a pane with no agent.
+pub fn empty_message(chrome: &PaneChrome) -> Option<&'static str> {
+    match (chrome.has_agent, chrome.starting) {
+        (true, _) => None,
+        (false, true) => Some("starting…"),
+        (false, false) => Some("Select an agent or press ⌘N"),
+    }
+}
+
+/// The header's title and path: the OSC title if the agent set one, else
+/// the program; and the directory with `~`.
+pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> (String, String) {
+    let title = osc_title
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| chrome.program.clone())
+        .unwrap_or_default();
+    (title, chrome.cwd.clone().unwrap_or_default())
+}
+
+/// A header button, asking the workspace to act on this pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaneEvent {
+    SplitRight,
+    SplitDown,
+    ToggleMaximize,
+    Close,
+}
+
+impl EventEmitter<PaneEvent> for PaneView {}
+
 pub struct PaneView {
     pane: PaneId,
+    pub(crate) chrome: PaneChrome,
     model: Arc<Mutex<PaneModel>>,
     sink: Arc<dyn InputSink>,
     focus: FocusHandle,
@@ -132,7 +204,9 @@ pub struct PaneView {
     wheel_lines: f32,
     /// Where the "new lines" pill was last drawn, if it was.
     pub(crate) pill: Option<Bounds<Pixels>>,
-    _activation: Subscription,
+    /// The window whose activation the cursor follows, and that
+    /// subscription (renewed when the view moves to a new window).
+    activation: Option<(AnyWindowHandle, Subscription)>,
 }
 
 impl PaneView {
@@ -141,13 +215,11 @@ impl PaneView {
         model: Arc<Mutex<PaneModel>>,
         sink: Arc<dyn InputSink>,
         config: &GuiConfig,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // The cursor turns hollow when the window loses activation.
-        let activation = cx.observe_window_activation(window, |_, _, cx| cx.notify());
         PaneView {
             pane,
+            chrome: PaneChrome::default(),
             model,
             sink,
             focus: cx.focus_handle(),
@@ -160,12 +232,41 @@ impl PaneView {
             drag: None,
             wheel_lines: 0.0,
             pill: None,
-            _activation: activation,
+            activation: None,
         }
     }
 
     pub fn pane(&self) -> PaneId {
         self.pane
+    }
+
+    pub fn model_handle(&self) -> &Arc<Mutex<PaneModel>> {
+        &self.model
+    }
+
+    /// The grid size last laid out, if drawn yet.
+    pub fn grid(&self) -> Option<(u16, u16)> {
+        self.layout.map(|l| (l.cols, l.rows))
+    }
+
+    /// Replaces the header and banner facts; redraws if they changed.
+    pub fn set_chrome(&mut self, chrome: PaneChrome, cx: &mut Context<Self>) {
+        if self.chrome != chrome {
+            self.chrome = chrome;
+            cx.notify();
+        }
+    }
+
+    /// The cursor turns hollow when the window loses activation. The view
+    /// outlives its window (the app is resident), so this follows whichever
+    /// window draws it.
+    fn follow_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = window.window_handle();
+        if self.activation.as_ref().is_some_and(|(h, _)| *h == handle) {
+            return;
+        }
+        let sub = cx.observe_window_activation(window, |_, _, cx| cx.notify());
+        self.activation = Some((handle, sub));
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -465,8 +566,15 @@ fn sel_point(model: &PaneModel, (col, row): (u16, u16)) -> SelPoint {
 
 impl Render for PaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.follow_activation(window, cx);
         let theme = theme(cx);
         let focused = window.is_window_active() && self.focus.is_focused(window);
+        let (state, title, observing) = {
+            let model = self.model();
+            let state = model.state();
+            let observing = state == PaneState::Live && !model.is_primary();
+            (state, model.title(), observing)
+        };
         let element = TerminalElement {
             view: cx.entity(),
             pane: self.pane,
@@ -479,6 +587,114 @@ impl Render for PaneView {
             focused,
             marked: self.marked.clone(),
         };
+        let chrome = &self.chrome;
+        let (title_text, path) = header_parts(chrome, title.as_deref());
+        let icon_button = |id: &'static str, glyph: &'static str, event: PaneEvent| {
+            div()
+                .id(id)
+                .debug_selector(move || format!("pane-{}-{id}", chrome.number))
+                .flex_none()
+                .w(px(20.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .text_color(theme.dim_text)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.header_bg).text_color(theme.fg()))
+                .child(glyph)
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
+        };
+        let header = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .h(px(28.))
+            .px(px(10.))
+            .items_center()
+            .gap(px(6.))
+            .text_size(px(12.))
+            .child(div().flex_none().text_color(theme.dim_text).child("❯"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if chrome.focused {
+                                theme.fg()
+                            } else {
+                                theme.dim_text
+                            })
+                            .child(SharedString::from(title_text)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.dim_text)
+                            .child(SharedString::from(path)),
+                    ),
+            )
+            .children(observing.then(|| {
+                div()
+                    .flex_none()
+                    .text_color(theme.dim_text)
+                    .child("observing")
+            }))
+            .children((chrome.number > 0).then(|| {
+                div()
+                    .flex_none()
+                    .text_color(theme.dim_text)
+                    .child(SharedString::from(chrome.number.to_string()))
+            }))
+            .child(icon_button("split-right", "◫", PaneEvent::SplitRight))
+            .child(icon_button("split-down", "⊟", PaneEvent::SplitDown))
+            .child(icon_button("maximize", "⤢", PaneEvent::ToggleMaximize))
+            .child(icon_button("close", "✕", PaneEvent::Close));
+        let mut grid = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .mx(px(8.))
+            .mb(px(6.))
+            .overflow_hidden()
+            .child(element);
+        if let Some(text) = banner(chrome, state) {
+            grid = grid.child(
+                div()
+                    .absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .px(px(8.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .bg(theme.header_bg)
+                    .text_color(theme.fg())
+                    .text_size(px(12.))
+                    .child(SharedString::from(text)),
+            );
+        }
+        if let Some(text) = empty_message(chrome) {
+            grid = grid.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.dim_text)
+                    .child(text),
+            );
+        }
         div()
             .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
@@ -486,8 +702,19 @@ impl Render for PaneView {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .size_full()
+            .flex()
+            .flex_col()
+            .rounded(px(10.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(if chrome.focused {
+                theme.accent.opacity(0.45)
+            } else {
+                theme.border
+            })
             .bg(theme.bg())
-            .child(element)
+            .child(header)
+            .child(grid)
     }
 }
 
@@ -614,13 +841,18 @@ mod tests {
         VisualTestContext, bounds, point, px, size,
     };
 
-    use super::{InputSink, PaneView, grid_size, ime_cell, point_to_cell};
+    use super::{
+        InputSink, PaneChrome, PaneView, banner, empty_message, grid_size, header_parts, ime_cell,
+        point_to_cell,
+    };
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::core::config::GuiConfig;
     use crate::core::pane::PaneModel;
+    use crate::core::pane::PaneState;
     use crate::core::selection::{LineRef, SelPoint};
     use crate::core::session::PaneId;
     use fleet_proto::AttachOk;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct Recorder {
@@ -657,15 +889,8 @@ mod tests {
         let sink = Arc::new(Recorder::default());
         let model = Arc::new(Mutex::new(model));
         let sink_dyn: Arc<dyn InputSink> = sink.clone();
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            PaneView::new(
-                PaneId(1),
-                model,
-                sink_dyn,
-                &GuiConfig::default(),
-                window,
-                cx,
-            )
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            PaneView::new(PaneId(1), model, sink_dyn, &GuiConfig::default(), cx)
         });
         cx.update(|window, cx| window.focus(&view.read(cx).focus_handle().clone()));
         cx.run_until_parked();
@@ -1059,5 +1284,62 @@ mod tests {
         assert_eq!(grid_size(3.0, 2.0, 8.0, 16.0), (1, 1));
         assert_eq!(grid_size(0.0, 0.0, 8.0, 16.0), (1, 1));
         assert_eq!(grid_size(100.0, 100.0, 0.0, 0.0), (1, 1));
+    }
+
+    #[test]
+    fn empty_pane_message_goes_by_the_layout_not_the_pane_state() {
+        let empty = PaneChrome::default();
+        // A pane with no agent is `Attaching`; it still says "select".
+        assert_eq!(banner(&empty, PaneState::Attaching), None);
+        assert_eq!(empty_message(&empty), Some("Select an agent or press ⌘N"));
+        let starting = PaneChrome {
+            starting: true,
+            ..PaneChrome::default()
+        };
+        assert_eq!(empty_message(&starting), Some("starting…"));
+        let shown = PaneChrome {
+            has_agent: true,
+            ..PaneChrome::default()
+        };
+        assert_eq!(empty_message(&shown), None);
+        assert_eq!(
+            banner(&shown, PaneState::Attaching).as_deref(),
+            Some("attaching…")
+        );
+        assert_eq!(
+            banner(&shown, PaneState::Exited(3)).as_deref(),
+            Some("exited (3)")
+        );
+        assert_eq!(banner(&shown, PaneState::Live), None);
+        assert_eq!(
+            banner(&shown, PaneState::Disconnected).as_deref(),
+            Some("disconnected — reconnecting")
+        );
+        let down = PaneChrome {
+            reconnect_in: Some(Duration::from_millis(2500)),
+            ..shown.clone()
+        };
+        assert_eq!(
+            banner(&down, PaneState::Disconnected).as_deref(),
+            Some("disconnected — reconnecting in 3s")
+        );
+    }
+
+    #[test]
+    fn header_prefers_the_osc_title() {
+        let chrome = PaneChrome {
+            program: Some("claude".into()),
+            cwd: Some("~/dev".into()),
+            ..PaneChrome::default()
+        };
+        assert_eq!(
+            header_parts(&chrome, None),
+            ("claude".into(), "~/dev".into())
+        );
+        assert_eq!(
+            header_parts(&chrome, Some("Refactor")),
+            ("Refactor".into(), "~/dev".into())
+        );
+        assert_eq!(header_parts(&chrome, Some("  ")).0, "claude");
     }
 }

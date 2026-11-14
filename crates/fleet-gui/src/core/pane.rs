@@ -47,6 +47,8 @@ pub struct PaneModel {
     term: Terminal,
     scrollback: Scrollback,
     state: PaneState,
+    /// The agent of the last applied attach.
+    agent: Option<u64>,
     primary: bool,
     page_in_flight: bool,
     /// History lines the view is scrolled up by; 0 follows the grid.
@@ -63,6 +65,7 @@ impl PaneModel {
             term: Terminal::new_client(INITIAL_SIZE.0, INITIAL_SIZE.1, palette),
             scrollback: Scrollback::default(),
             state: PaneState::Attaching,
+            agent: None,
             primary: false,
             page_in_flight: false,
             scroll_offset: 0,
@@ -93,6 +96,7 @@ impl PaneModel {
         self.term.drain_history();
         self.term.take_replies();
         self.primary = ok.primary;
+        self.agent = Some(ok.agent_id);
         self.state = PaneState::Live;
         self.page_in_flight = false;
         self.scroll_offset = 0;
@@ -256,6 +260,12 @@ impl PaneModel {
 
     pub fn title(&self) -> Option<String> {
         self.term.title()
+    }
+
+    /// The agent the grid shows (of the last applied attach, which for a
+    /// spawn is the new agent).
+    pub fn agent_id(&self) -> Option<u64> {
+        self.agent
     }
 
     pub fn state(&self) -> PaneState {
@@ -472,8 +482,10 @@ mod tests {
     fn attach_numbers_tail_and_continues_numbering() {
         let mut pane = pane();
         assert_eq!(pane.state(), PaneState::Attaching);
+        assert_eq!(pane.agent_id(), None);
         pane.on_attached(&attach_ok(10, 3, &["t0", "t1", "t2"], 100));
         assert_eq!(pane.state(), PaneState::Live);
+        assert_eq!(pane.agent_id(), Some(1));
         pane.on_output(b"1\r\n2\r\n3\r\n4\r\n5");
         let sb = pane.scrollback();
         assert_eq!((sb.first_line(), sb.end_line()), (100, 105));

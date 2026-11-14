@@ -14,6 +14,12 @@ pub struct Theme {
     pub dim_text: Hsla,
     /// Background of the IME's marked (uncommitted) text.
     pub marked_bg: Hsla,
+    /// Behind the sidebar and the pane cards (cards use `bg`).
+    pub window_bg: Hsla,
+    /// The one accent colour: the focused tab's bar, focus borders.
+    pub accent: Hsla,
+    /// 1 px card borders and separators.
+    pub border: Hsla,
 }
 
 impl Global for Theme {}
@@ -79,6 +85,9 @@ impl Theme {
             header_bg: rgb((0x25, 0x26, 0x2a)),
             dim_text: rgb((0x8a, 0x8f, 0x98)),
             marked_bg: rgb((0x3a, 0x3d, 0x44)),
+            window_bg: rgb((0x13, 0x14, 0x16)),
+            accent: rgb((0x61, 0xaf, 0xef)),
+            border: rgb((0x2c, 0x2e, 0x33)),
         }
     }
 
@@ -94,6 +103,9 @@ impl Theme {
             header_bg: rgb((0xec, 0xec, 0xea)),
             dim_text: rgb((0x6a, 0x73, 0x7d)),
             marked_bg: rgb((0xdd, 0xe4, 0xee)),
+            window_bg: rgb((0xe9, 0xe9, 0xe7)),
+            accent: rgb((0x20, 0x5e, 0xc4)),
+            border: rgb((0xd6, 0xd6, 0xd3)),
         }
     }
 
