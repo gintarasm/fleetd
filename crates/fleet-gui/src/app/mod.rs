@@ -58,10 +58,12 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
         keymap::bind_keys(cx);
         cx.on_action(|_: &keymap::Quit, cx| cx.quit());
         cx.on_action(|_: &keymap::SwitchFleetd, cx| switch_fleetd(cx));
+        cx.on_action(|_: &keymap::InstallSkill, cx| resident::install_agent_skill(cx));
         cx.set_menus(vec![Menu {
             name: "fleet".into(),
             items: vec![
                 MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),
+                MenuItem::action("Install agent skill", keymap::InstallSkill),
                 MenuItem::separator(),
                 MenuItem::action("Quit fleet", keymap::Quit),
             ],

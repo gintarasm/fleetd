@@ -24,7 +24,7 @@ pub enum Target {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("invalid target {0:?}: expected `local` or `ssh://[user@]host`")]
+#[error("invalid target {0:?}: expected `local` or `ssh://[user@]host` (not starting with `-`)")]
 pub struct ParseTargetError(String);
 
 impl FromStr for Target {
@@ -35,7 +35,8 @@ impl FromStr for Target {
             return Ok(Target::Local);
         }
         match s.strip_prefix("ssh://") {
-            Some(dest) if !dest.is_empty() => Ok(Target::Ssh {
+            // A leading `-` would be read as an ssh option.
+            Some(dest) if !dest.is_empty() && !dest.starts_with('-') => Ok(Target::Ssh {
                 dest: dest.to_owned(),
             }),
             _ => Err(ParseTargetError(s.to_owned())),
@@ -71,8 +72,11 @@ pub const SSH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const STDERR_TAIL: usize = 4096;
 
-/// `ssh ... <dest> sh -lc 'exec fleetd --stdio'`, with a shared control
-/// master under `<state_dir>/ssh` (created with mode 0700).
+/// `ssh ... -- <dest> sh -lc 'exec fleetd --stdio'`, with a shared control
+/// master under `<state_dir>/ssh` (created with mode 0700). `BatchMode`
+/// makes a host-key or password prompt fail at once (with ssh's error)
+/// instead of waiting on a terminal; `ConnectTimeout` bounds an
+/// unreachable host.
 pub fn ssh_command(dest: &str, state_dir: &Path) -> std::io::Result<Command> {
     ssh_remote(dest, "exec fleetd --stdio", state_dir)
 }
@@ -89,9 +93,10 @@ pub fn ssh_remote(dest: &str, script: &str, state_dir: &Path) -> std::io::Result
     // An existing directory keeps its old mode otherwise.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let mut cmd = Command::new("ssh");
-    cmd.args(["-o", "ControlMaster=auto", "-o"])
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
+        .args(["-o", "ControlMaster=auto", "-o"])
         .arg(format!("ControlPath={}/%C", dir.display()))
-        .args(["-o", "ControlPersist=60"])
+        .args(["-o", "ControlPersist=60", "--"])
         .arg(dest)
         // One argument: ssh joins them with spaces for the remote shell.
         .arg(format!("sh -lc '{script}'"));
@@ -294,6 +299,13 @@ mod tests {
     }
 
     #[test]
+    fn destination_starting_with_a_dash_is_rejected() {
+        assert!("ssh://-oProxyCommand=x".parse::<Target>().is_err());
+        assert!("ssh://-p".parse::<Target>().is_err());
+        assert!("ssh://me@box-1".parse::<Target>().is_ok());
+    }
+
+    #[test]
     fn ssh_command_argv_is_exact() {
         let dir = tempfile::tempdir().unwrap();
         let cmd = ssh_command("me@box", dir.path()).unwrap();
@@ -306,11 +318,16 @@ mod tests {
             args,
             [
                 "-o".to_owned(),
+                "BatchMode=yes".into(),
+                "-o".into(),
+                "ConnectTimeout=10".into(),
+                "-o".into(),
                 "ControlMaster=auto".into(),
                 "-o".into(),
                 format!("ControlPath={}/ssh/%C", dir.path().display()),
                 "-o".into(),
                 "ControlPersist=60".into(),
+                "--".into(),
                 "me@box".into(),
                 "sh -lc 'exec fleetd --stdio'".into(),
             ]

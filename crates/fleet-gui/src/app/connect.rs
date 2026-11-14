@@ -168,16 +168,15 @@ fn backend(cx: &App) -> Option<Arc<dyn Backend>> {
 }
 
 /// The remote field's target: `user@host` or `host` (an `ssh://` prefix
-/// is allowed); `None` when empty or containing whitespace.
+/// is allowed); `None` when empty, containing whitespace or starting with
+/// `-` (an ssh option).
 pub fn remote_target(text: &str) -> Option<Target> {
     let text = text.trim();
     let dest = text.strip_prefix("ssh://").unwrap_or(text);
-    if dest.is_empty() || dest.contains(char::is_whitespace) {
+    if dest.contains(char::is_whitespace) {
         return None;
     }
-    Some(Target::Ssh {
-        dest: dest.to_owned(),
-    })
+    format!("ssh://{dest}").parse().ok()
 }
 
 fn startup_label(saved: Option<&Target>) -> String {
@@ -1083,6 +1082,8 @@ mod tests {
         assert_eq!(remote_target(""), None);
         assert_eq!(remote_target("   "), None);
         assert_eq!(remote_target("me @box"), None);
+        assert_eq!(remote_target("-oProxyCommand=x"), None);
+        assert_eq!(remote_target("ssh://-p"), None);
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(FakeBackend::default());
         let box_ = Target::Ssh {

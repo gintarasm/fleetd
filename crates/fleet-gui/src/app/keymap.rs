@@ -25,6 +25,7 @@ actions!(
         Quit,
         ToggleMaximize,
         SwitchFleetd,
+        InstallSkill,
     ]
 );
 

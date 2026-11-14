@@ -1,6 +1,8 @@
 //! The resident app: closing the window keeps the app (and every pane
 //! attached) in the menu bar; the status menu and the Dock bring it back.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use gpui::{App, PromptLevel};
 
 use super::app_state::AppState;
@@ -83,10 +85,33 @@ fn with_workspace(
     }
 }
 
+/// Set while one "Install agent skill" runs.
+static SKILL_INSTALL_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Holds `flag` set until dropped; `None` if it already was.
+struct InFlight(&'static AtomicBool);
+
+impl InFlight {
+    fn start(flag: &'static AtomicBool) -> Option<InFlight> {
+        (!flag.swap(true, Ordering::SeqCst)).then_some(InFlight(flag))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Runs `fleet skill install` for the current target off the UI thread,
-/// then shows the installed path or the error in an alert.
-fn install_agent_skill(cx: &mut App) {
+/// then shows the installed path or the error in an alert. Asked again
+/// while one runs, it does nothing.
+pub(super) fn install_agent_skill(cx: &mut App) {
     let Some(app) = AppState::global(cx) else {
+        return;
+    };
+    let Some(running) = InFlight::start(&SKILL_INSTALL_RUNNING) else {
+        eprintln!("fleet-gui: the agent skill install is already running");
         return;
     };
     let (target, state_dir) = {
@@ -100,6 +125,7 @@ fn install_agent_skill(cx: &mut App) {
     });
     cx.spawn(async move |cx| {
         let result = run.await;
+        drop(running);
         let _ = cx.update(|cx| {
             show_window(cx);
             let (level, message, detail) = match &result {
@@ -120,4 +146,21 @@ fn install_agent_skill(cx: &mut App) {
         });
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::InFlight;
+
+    #[test]
+    fn second_install_while_one_runs_is_refused() {
+        static FLAG: AtomicBool = AtomicBool::new(false);
+        let first = InFlight::start(&FLAG);
+        assert!(first.is_some());
+        assert!(InFlight::start(&FLAG).is_none());
+        drop(first);
+        assert!(InFlight::start(&FLAG).is_some());
+    }
 }
