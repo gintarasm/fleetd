@@ -1534,6 +1534,21 @@ struct Agents {
     exited: VecDeque<ExitedAgent>,
     /// Set by [`Node::shutdown`]: no new agents.
     closing: bool,
+    /// Agents being restarted ([`Node::restart`]): neither restarted again
+    /// nor forgotten meanwhile.
+    restarting: HashSet<u64>,
+}
+
+/// Removes an agent from [`Agents::restarting`] when the restart ends.
+struct Restarting<'a> {
+    agents: &'a Mutex<Agents>,
+    id: u64,
+}
+
+impl Drop for Restarting<'_> {
+    fn drop(&mut self) {
+        lock(self.agents).restarting.remove(&self.id);
+    }
 }
 
 impl Agents {
@@ -1631,7 +1646,8 @@ impl Node {
         self.exits.subscribe()
     }
 
-    /// Receives every agent removal ([`Node::forget`]) from now on.
+    /// Receives every agent removal ([`Node::forget`], [`Node::restart`])
+    /// from now on.
     pub fn removed_events(&self) -> broadcast::Receiver<Removed> {
         self.removed.subscribe()
     }
@@ -1651,6 +1667,7 @@ impl Node {
     /// The labels must pass the label limits, without reserved keys.
     /// `req.attach` is ignored (see [`Node::spawn_attached`]).
     pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
+        check_labels(&req.labels)?;
         self.start(req, None).map(|(info, _)| info)
     }
 
@@ -1665,13 +1682,136 @@ impl Node {
         conn: ConnId,
         before_start: impl FnOnce(u64),
     ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
+        check_labels(&req.labels)?;
         let (info, attached) = self.start(req, Some((conn, Box::new(before_start))))?;
         let (ok, sub) = attached.expect("an attached start returns its attachment");
         Ok((info, ok, sub))
     }
 
+    /// Restarts an exited or lost agent: a new agent (new id) runs the same
+    /// program, args and cwd with the same labels, in a fresh environment
+    /// (the base env and its own `FLEET_AGENT_ID`; the old agent's env is
+    /// not kept). Once it started, the old agent is forgotten, recorded as
+    /// replaced by the new one, and a [`Removed`] is announced; if it fails
+    /// to start, the old agent is untouched. Running agents are refused,
+    /// never killed. `cols`/`rows` are as for [`Node::spawn`].
+    pub fn restart(
+        &self,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        origin: Option<ConnId>,
+    ) -> io::Result<AgentInfo> {
+        self.restart_with(id, cols, rows, None, origin)
+            .map(|(info, _)| info)
+    }
+
+    /// [`Node::restart`], with the new agent attached by `conn` as for
+    /// [`Node::spawn_attached`]. The removal's origin is `conn`.
+    pub fn restart_attached(
+        &self,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        conn: ConnId,
+        before_start: impl FnOnce(u64),
+    ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
+        let (info, attached) = self.restart_with(
+            id,
+            cols,
+            rows,
+            Some((conn, Box::new(before_start))),
+            Some(conn),
+        )?;
+        let (ok, sub) = attached.expect("an attached start returns its attachment");
+        Ok((info, ok, sub))
+    }
+
+    fn restart_with(
+        &self,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        attach: Option<(ConnId, BeforeStart<'_>)>,
+        origin: Option<ConnId>,
+    ) -> io::Result<(AgentInfo, Option<(AttachOk, Subscription)>)> {
+        let (old, _restarting) = {
+            let mut agents = lock(&self.agents);
+            if agents.restarting.contains(&id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("agent {id} is being restarted"),
+                ));
+            }
+            // Under the agents lock, as in `forget`: an agent still `live`
+            // (its row may already say exited) or being spawned is running.
+            let busy =
+                agents.live.contains_key(&id) || lock(&self.histories).spawning.contains(&id);
+            let old = lock(&self.store).agent(id).map_err(store_err)?;
+            let old = match old {
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown agent {id}"),
+                    ));
+                }
+                Some(rec) if busy || rec.state == store::AgentState::Running => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("agent {id} is running"),
+                    ));
+                }
+                Some(rec) => rec,
+            };
+            agents.restarting.insert(id);
+            (
+                old,
+                Restarting {
+                    agents: &self.agents,
+                    id,
+                },
+            )
+        };
+        // portable-pty starts a child whose cwd is gone in the home
+        // directory instead; a restart must run where the agent ran.
+        if !Path::new(&old.cwd).is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("working directory {} does not exist", old.cwd),
+            ));
+        }
+        // Stored labels were checked when set; not re-checked here.
+        let req = SpawnAgent {
+            program: old.program,
+            args: old.args,
+            cwd: old.cwd,
+            cols,
+            rows,
+            labels: old.labels,
+            env: HashMap::new(),
+            attach: false,
+        };
+        let (info, attached) = self.start(req, attach)?;
+        if let Err(e) = lock(&self.store).replace_agent(id, info.id) {
+            // Both agents stay known: never neither.
+            warn!(agent = id, replaced_by = info.id, error = %e, "recording the restart failed");
+            return Ok((info, attached));
+        }
+        self.drop_agent_files(id);
+        info!(agent = id, replaced_by = info.id, "agent restarted");
+        // No receivers is fine.
+        let _ = self.removed.send(Removed {
+            event: AgentRemoved {
+                agent_id: id,
+                replaced_by: Some(info.id),
+            },
+            origin,
+        });
+        Ok((info, attached))
+    }
+
     /// Spawns an agent; with `attach`, also attaches to it before the process
-    /// starts, calling `attach` with its id first.
+    /// starts, calling `attach` with its id first. The labels are not checked.
     fn start(
         &self,
         req: SpawnAgent,
@@ -1683,7 +1823,6 @@ impl Node {
         if req.program.is_empty() {
             return Err(invalid("program is empty".into()));
         }
-        check_labels(&req.labels)?;
         // Waits (bounded) for a login-env capture still running, before
         // anything is recorded.
         let base_env = self.base_env.wait();
@@ -1882,8 +2021,9 @@ impl Node {
             // row may already say exited while its pipeline finishes) or
             // still being spawned is refused.
             let agents = lock(&self.agents);
-            let busy =
-                agents.live.contains_key(&id) || lock(&self.histories).spawning.contains(&id);
+            let busy = agents.live.contains_key(&id)
+                || agents.restarting.contains(&id)
+                || lock(&self.histories).spawning.contains(&id);
             let gone = !busy && lock(&self.store).forget_agent(id).map_err(store_err)?;
             drop(agents);
             if !gone {
@@ -2167,6 +2307,37 @@ mod tests {
         assert_eq!(out.refused, vec![id]);
         assert!(out.forgotten.is_empty());
         assert!(node.list().unwrap().iter().any(|a| a.id == id));
+        node.shutdown();
+    }
+
+    #[test]
+    fn restart_refuses_agent_still_live_after_its_row_says_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let id = spawn_sized(&node, 80, 24).unwrap().id;
+        lock(&node.store).set_exited(id, 0).unwrap();
+        let e = node.restart(id, 0, 0, None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(node.list().unwrap().len(), 1);
+        node.shutdown();
+    }
+
+    #[test]
+    fn agent_being_restarted_is_neither_restarted_nor_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let id = spawn_sized(&node, 80, 24).unwrap().id;
+        node.kill(id).unwrap();
+        while node.list().unwrap()[0].state == fleet_proto::AgentState::Running as i32 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        lock(&node.agents).restarting.insert(id);
+        let e = node.restart(id, 0, 0, None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
+        assert_eq!(out.refused, vec![id]);
+        lock(&node.agents).restarting.remove(&id);
+        assert!(node.restart(id, 0, 0, None).is_ok());
         node.shutdown();
     }
 
