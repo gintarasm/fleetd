@@ -344,6 +344,11 @@ impl AppState {
         self.live
     }
 
+    /// The control connection is down and being retried.
+    pub fn is_reconnecting(&self) -> bool {
+        self.reconnect_at.is_some()
+    }
+
     /// Changes whenever the session (and so the layout) is replaced.
     pub fn session_epoch(&self) -> u64 {
         self.session_epoch

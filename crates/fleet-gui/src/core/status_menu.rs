@@ -18,6 +18,8 @@ pub struct StatusMenuState {
     pub target: Target,
     /// A fleetd is connected.
     pub live: bool,
+    /// The control connection is down and being retried.
+    pub reconnecting: bool,
     pub agents: Vec<AgentRow>,
     pub home: PathBuf,
 }
@@ -25,8 +27,9 @@ pub struct StatusMenuState {
 /// One menu line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatusEntry {
-    /// A disabled line: "fleetd: local", "fleetd: me@box", or "…" after
-    /// the last listed agent.
+    /// A disabled line: "fleetd: local", "fleetd: me@box" (either with
+    /// " (reconnecting)" while the connection is down), or "…" after the
+    /// last listed agent.
     Header(String),
     Show,
     Agent {
@@ -58,11 +61,14 @@ impl StatusEntry {
 /// The header, "Show fleetd", the running agents (oldest first, at most
 /// [`MAX_MENU_AGENTS`], then "…") between separators, the commands and Quit.
 pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
-    let header = match (&state.target, state.live) {
+    let mut header = match (&state.target, state.live) {
         (_, false) => "fleetd: not connected".to_owned(),
         (Target::Local, true) => "fleetd: local".to_owned(),
         (Target::Ssh { dest }, true) => format!("fleetd: {dest}"),
     };
+    if state.live && state.reconnecting {
+        header.push_str(" (reconnecting)");
+    }
     let mut menu = vec![
         StatusEntry::Header(header),
         StatusEntry::Show,
@@ -128,6 +134,7 @@ mod tests {
         StatusMenuState {
             target,
             live: true,
+            reconnecting: false,
             agents,
             home: PathBuf::from("/Users/me"),
         }
@@ -230,6 +237,23 @@ mod tests {
         assert_eq!(
             status_menu(&s)[0],
             StatusEntry::Header("fleetd: not connected".into())
+        );
+    }
+
+    #[test]
+    fn menu_says_reconnecting_while_the_control_connection_is_down() {
+        let mut s = state(Target::Local, Vec::new());
+        s.reconnecting = true;
+        assert_eq!(
+            status_menu(&s)[0],
+            StatusEntry::Header("fleetd: local (reconnecting)".into())
+        );
+        s.target = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        assert_eq!(
+            status_menu(&s)[0],
+            StatusEntry::Header("fleetd: me@box (reconnecting)".into())
         );
     }
 }

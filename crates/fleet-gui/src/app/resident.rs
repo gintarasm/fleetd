@@ -30,6 +30,7 @@ pub fn menu_state(app: &AppState) -> StatusMenuState {
     StatusMenuState {
         target: app.target.clone(),
         live: app.is_live(),
+        reconnecting: app.is_reconnecting(),
         agents: app.agents.clone(),
         home: app.home.clone(),
     }
