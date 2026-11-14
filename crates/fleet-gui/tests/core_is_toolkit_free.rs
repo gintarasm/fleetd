@@ -26,5 +26,9 @@ fn core_has_no_gpui_or_appkit_imports() {
         }
     }
     assert!(checked > 0, "no core files found");
-    assert!(offenders.is_empty(), "toolkit use in core:\n{}", offenders.join("\n"));
+    assert!(
+        offenders.is_empty(),
+        "toolkit use in core:\n{}",
+        offenders.join("\n")
+    );
 }

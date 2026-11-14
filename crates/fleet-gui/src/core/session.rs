@@ -62,6 +62,10 @@ pub enum UiEvent {
     },
     /// The pane's model changed (sent at most once per batch of frames).
     PaneChanged(PaneId),
+    /// The pane's connection dropped while a spawn or restart into it was
+    /// unanswered: the pane shows no agent until it is told which (the
+    /// launch may or may not have happened; the control connection says).
+    LaunchDropped(PaneId),
     /// The control connection's state.
     Connection(ConnState),
     /// Connecting failed (once per outage); moot once connected again.
@@ -256,6 +260,8 @@ struct Sidebar {
     list_requested: bool,
     /// A `ListAgents` reply arrived.
     listed: bool,
+    /// How many `ListAgents` replies arrived.
+    lists: u64,
 }
 
 impl Sidebar {
@@ -270,6 +276,7 @@ impl Sidebar {
         });
         self.list_requested = false;
         self.listed = true;
+        self.lists += 1;
     }
 
     /// `old` was removed, restarted as `new` if set: `replaced` keeps
@@ -386,6 +393,11 @@ impl Session {
     /// A `ListAgents` reply arrived: [`Session::agents`] lists them.
     pub fn listed(&self) -> bool {
         lock(&self.inner.sidebar).listed
+    }
+
+    /// How many `ListAgents` replies arrived (on any connection).
+    pub fn lists(&self) -> u64 {
+        lock(&self.inner.sidebar).lists
     }
 
     /// A snapshot of the sidebar rows, by agent id.
@@ -830,6 +842,15 @@ mod tests {
         kept.sort_unstable();
         assert_eq!(kept, [1, 3]);
         assert!(!sb.list_requested);
+    }
+
+    #[test]
+    fn every_list_is_counted() {
+        let mut sb = Sidebar::default();
+        assert_eq!(sb.lists, 0);
+        sb.set_list(vec![info(1)], HashMap::new(), Instant::now());
+        sb.set_list(vec![], HashMap::new(), Instant::now());
+        assert_eq!(sb.lists, 2);
     }
 
     /// A control reader on its own sidebar, and the UI's end of its events.

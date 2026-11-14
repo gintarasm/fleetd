@@ -875,6 +875,7 @@ mod tests {
         models: Mutex<HashMap<PaneId, Arc<Mutex<PaneModel>>>>,
         spawn_error: Mutex<Option<String>>,
         listed: std::sync::atomic::AtomicBool,
+        lists: std::sync::atomic::AtomicU64,
         replaced: Mutex<HashMap<u64, u64>>,
     }
 
@@ -903,6 +904,10 @@ mod tests {
 
         fn listed(&self) -> bool {
             self.listed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn lists(&self) -> u64 {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn spawn(
@@ -1833,6 +1838,74 @@ mod tests {
         assert_eq!(shown(&mut s, PaneId(1)), Some(9));
     }
 
+    /// Pane 1 shows agent 5, exited, and cmd-r restarts it in place.
+    fn restart_in_pane_1(s: &mut Setup<'_>, fake: &Fake) {
+        agents(s, fake, vec![ended(5, "/w", 1, AgentState::Exited)]);
+        click(s, "tab-5");
+        attach_model(fake, PaneId(1), 5);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("cmd-r");
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| matches!(c, Call::RestartInPane { agent_id: 5, .. }))
+        );
+    }
+
+    #[gpui::test]
+    fn pane_whose_restart_reply_was_lost_attaches_the_successor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        restart_in_pane_1(&mut s, &fake);
+        // The control connection names the successor; the pane expects its
+        // own reply to show it, so nothing attaches yet.
+        s.ui.try_send(UiEvent::AgentRemoved {
+            agent_id: 5,
+            replaced_by: Some(9),
+        })
+        .unwrap();
+        s.cx.run_until_parked();
+        assert!(!fake.calls().contains(&Call::Attach(PaneId(1), 9)));
+        // That reply was lost with the pane's connection.
+        s.ui.try_send(UiEvent::LaunchDropped(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::Attach(PaneId(1), 9)));
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
+    #[gpui::test]
+    fn pane_whose_restart_reply_was_lost_follows_a_later_successor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        restart_in_pane_1(&mut s, &fake);
+        let attaches = |f: &Fake| {
+            f.calls()
+                .into_iter()
+                .filter(|c| matches!(c, Call::Attach(PaneId(1), _)))
+                .count()
+        };
+        let before = attaches(&fake);
+        // The reply is lost before the successor is announced: the pane
+        // shows the agent its layout names again...
+        s.ui.try_send(UiEvent::LaunchDropped(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::Attach(PaneId(1), 5)));
+        assert_eq!(attaches(&fake), before + 1);
+        // ...and attaches the successor once it is.
+        s.ui.try_send(UiEvent::AgentRemoved {
+            agent_id: 5,
+            replaced_by: Some(9),
+        })
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::Attach(PaneId(1), 9)));
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
     #[gpui::test]
     fn agent_removed_moves_pane_to_successor(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -1900,6 +1973,80 @@ mod tests {
         assert!(fake.calls().contains(&Call::Attach(PaneId(1), 9)));
         assert_eq!(shown(&mut s, PaneId(2)), None);
         assert_eq!(fake.calls().last(), Some(&Call::Open(PaneId(2), None)));
+    }
+
+    /// A `ListAgents` reply with `rows`.
+    fn list(s: &mut Setup<'_>, fake: &Fake, rows: Vec<AgentRow>) {
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        agents(s, fake, rows);
+    }
+
+    #[gpui::test]
+    fn exited_pane_unlisted_by_two_lists_is_emptied(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        list(&mut s, &fake, vec![ended(8, "/w", 1, AgentState::Exited)]);
+        click(&mut s, "tab-8");
+        attach_model(&fake, PaneId(1), 8);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        // Agent 8 is forgotten while the GUI misses the `AgentRemoved`.
+        // One list without it might just predate it (a new agent that
+        // exited at once): the pane keeps its final screen...
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(8));
+        // ...as it does for events that are not lists.
+        agents(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(8));
+        // The next list confirms it is gone.
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), None);
+        assert_eq!(fake.calls().last(), Some(&Call::Open(PaneId(1), None)));
+    }
+
+    #[gpui::test]
+    fn exited_pane_listed_again_is_kept(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        list(&mut s, &fake, vec![]);
+        // A spawn lands and its agent exits before any list shows it.
+        spawn_via_sheet(&mut s, "/w");
+        attach_model(&fake, PaneId(1), 9);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(0);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+        list(&mut s, &fake, vec![]);
+        list(&mut s, &fake, vec![ended(9, "/w", 1, AgentState::Exited)]);
+        // Absent once, then listed: absent once more is not two in a row.
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
+    #[gpui::test]
+    fn unlisted_pane_with_a_restart_on_its_way_is_kept(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        list(&mut s, &fake, vec![ended(6, "/w", 1, AgentState::Lost)]);
+        s.app.update(s.cx, |a, cx| a.show_agent(6, cx));
+        fake.model(PaneId(1)).lock().unwrap().on_lost();
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("cmd-r");
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| matches!(c, Call::RestartInPane { agent_id: 6, .. }))
+        );
+        // Lists taken before the restart's successor is known.
+        list(&mut s, &fake, vec![]);
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(6));
     }
 
     #[gpui::test]

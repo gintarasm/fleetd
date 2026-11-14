@@ -34,6 +34,10 @@ pub trait SessionApi: InputSink {
     fn listed(&self) -> bool {
         false
     }
+    /// How many `ListAgents` replies arrived.
+    fn lists(&self) -> u64 {
+        0
+    }
     fn spawn(
         &self,
         program: String,
@@ -74,6 +78,10 @@ impl SessionApi for Session {
 
     fn listed(&self) -> bool {
         Session::listed(self)
+    }
+
+    fn lists(&self) -> u64 {
+        Session::lists(self)
     }
 
     fn spawn(
@@ -269,6 +277,11 @@ pub struct AppState {
     /// Panes restarting the agent they show (by its old id) on their own
     /// connection: they show the new agent without attaching to it.
     restarting: HashMap<PaneId, u64>,
+    /// Agents in the layout the latest list left out, with the number
+    /// ([`SessionApi::lists`]) of the first list in a row that did.
+    unlisted: HashMap<u64, u64>,
+    /// [`SessionApi::lists`] when the layout last followed the list.
+    last_list: u64,
     /// When the control connection retries, while it is down.
     reconnect_at: Option<Instant>,
     pub(super) window: Option<WindowHandle<Workspace>>,
@@ -319,6 +332,8 @@ impl AppState {
             spawn_dirs: HashMap::new(),
             requested: HashMap::new(),
             restarting: HashMap::new(),
+            unlisted: HashMap::new(),
+            last_list: 0,
             reconnect_at: None,
             window: None,
             dirty: false,
@@ -389,6 +404,8 @@ impl AppState {
         self.spawn_dirs.clear();
         self.requested.clear();
         self.restarting.clear();
+        self.unlisted.clear();
+        self.last_list = 0;
         self.reconnect_at = None;
         self.agents = self.session.agents();
         for pane in self.layout.panes() {
@@ -515,6 +532,7 @@ impl AppState {
                     agent_id,
                     replaced_by,
                 } => layout |= self.follow_removed(agent_id, replaced_by, cx),
+                UiEvent::LaunchDropped(pane) => self.launch_dropped(pane, cx),
                 UiEvent::Connection(state) => {
                     self.reconnect_at = match state {
                         ConnState::Disconnected { retry_in } => Some(Instant::now() + retry_in),
@@ -613,11 +631,33 @@ impl AppState {
         !panes.is_empty()
     }
 
+    /// `pane`'s connection dropped before its spawn or restart was
+    /// answered: it shows the agent the layout names (the successor, if a
+    /// restart was announced meanwhile; else the old agent, until one is).
+    fn launch_dropped(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if !self.panes.contains_key(&pane) {
+            return;
+        }
+        self.forget_pending(pane);
+        if let Some(agent) = self.layout.agent(pane) {
+            self.requested.insert(pane, agent);
+            self.session.attach(pane, agent);
+        }
+        self.refresh_chrome(cx);
+        cx.notify();
+    }
+
     /// After a list: panes follow restarts they missed, and a pane whose
-    /// agent the node no longer has (and did not replace) becomes empty.
-    /// True if the layout changed.
+    /// agent the node neither lists nor replaced becomes empty, unless a
+    /// spawn, restart or attach is on its way into it. A lost pane is
+    /// emptied at once; an exited one (its final screen) only once two
+    /// lists in a row left its agent out, since an agent spawned after the
+    /// first was taken may have exited already. True if the layout changed.
     fn follow_list(&mut self, cx: &mut Context<Self>) -> bool {
         let replaced = self.session.replaced();
+        let list = self.session.lists();
+        let fresh = std::mem::replace(&mut self.last_list, list) != list;
+        let mut unlisted = HashMap::new();
         let mut changed = false;
         for pane in self.layout.panes() {
             let Some(id) = self.layout.agent(pane) else {
@@ -627,18 +667,47 @@ impl AppState {
                 changed |= self.follow_removed(id, Some(new), cx);
                 continue;
             }
-            let listed = self.agents.iter().any(|r| r.info.id == id);
-            let lost = self
-                .panes
-                .get(&pane)
-                .is_some_and(|v| lock(v.read(cx).model_handle()).state() == PaneState::Lost);
-            if !listed && lost {
+            if self.agents.iter().any(|r| r.info.id == id) {
+                continue;
+            }
+            // `requested` names the layout's agent, so a request for `id`
+            // itself does not count: its failed attach is what `Lost` says.
+            let on_its_way = self.starting.contains(&pane)
+                || self.restarting.contains_key(&pane)
+                || self.requested.get(&pane).is_some_and(|&want| want != id);
+            if on_its_way {
+                continue;
+            }
+            let (state, shown) = match self.panes.get(&pane) {
+                Some(v) => {
+                    let m = lock(v.read(cx).model_handle());
+                    (m.state(), m.agent_id())
+                }
+                None => continue,
+            };
+            let gone = match state {
+                PaneState::Lost => true,
+                PaneState::Exited(_) if shown == Some(id) => {
+                    // Counted from a list, not from events applied to an
+                    // older one (which predates agents spawned since).
+                    let first = match self.unlisted.get(&id) {
+                        Some(&n) => n,
+                        None if fresh => list,
+                        None => continue,
+                    };
+                    unlisted.insert(id, first);
+                    first < list
+                }
+                _ => false,
+            };
+            if gone {
                 self.layout.set_agent(pane, None);
                 self.forget_pending(pane);
                 self.open(pane, None, cx);
                 changed = true;
             }
         }
+        self.unlisted = unlisted;
         changed
     }
 

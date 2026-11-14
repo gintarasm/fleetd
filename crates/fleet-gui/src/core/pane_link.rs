@@ -596,14 +596,26 @@ impl Writer {
                 self.sender = Some(sender);
                 let mut sh = lock(&self.link.shared);
                 sh.subscribed = None;
+                // A launch whose reply was lost with the old connection.
+                let cut_off = sh
+                    .pending
+                    .iter()
+                    .any(|(_, p)| matches!(p, Pending::Launch(_)));
                 sh.pending.clear();
                 sh.page = None;
                 sh.epoch += 1;
                 let idle = sh.agent.is_none();
                 drop(sh);
                 if let Some((launch, _)) = self.deferred_spawn.take() {
+                    // A newer launch supersedes the one cut off.
                     self.launch(launch);
                 } else if idle {
+                    if cut_off {
+                        // The app attaches the agent its layout names
+                        // (the successor, if the control connection
+                        // already announced it).
+                        self.link.ctx.notify(UiEvent::LaunchDropped(self.link.pane));
+                    }
                     // Nothing to attach: back to the neutral state a new
                     // pane starts in, not "disconnected".
                     let mut m = lock(&self.link.model);
@@ -1027,6 +1039,32 @@ mod tests {
             rows: 24,
             attach: true,
         }
+    }
+
+    #[test]
+    fn launch_cut_off_by_a_reconnect_is_reported_to_the_app() {
+        let (ctx, events) = Ctx::for_test_with_events();
+        let l = link_with(ctx);
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, _srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        w.handle(Outgoing::Attach(1));
+        w.handle(Outgoing::Restart(restart_req()));
+        // The connection drops before the reply; whether the node restarted
+        // the agent is unknown to the pane.
+        w.handle(Outgoing::Disconnected);
+        let (sender, _srv2) = connected();
+        w.handle(Outgoing::Connected(sender));
+        let got: Vec<UiEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(got.contains(&UiEvent::LaunchDropped(PaneId(1))), "{got:?}");
+
+        // A reconnect with no launch in flight reports nothing.
+        w.handle(Outgoing::Attach(1));
+        w.handle(Outgoing::Disconnected);
+        let (sender, _srv3) = connected();
+        w.handle(Outgoing::Connected(sender));
+        let got: Vec<UiEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(!got.contains(&UiEvent::LaunchDropped(PaneId(1))), "{got:?}");
     }
 
     #[test]
