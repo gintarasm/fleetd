@@ -34,3 +34,10 @@ M2b adds a native macOS GUI on gpui. It is a protocol client like the CLI: it ne
 ## Consequences
 
 Core logic is testable without a window server. A macOS build needs Xcode and its Metal toolchain; the perf-wall runner already has both. Terminal rendering is our own gpui element; no Zed terminal code is copied (GPL-3.0).
+
+As built:
+- **Measured** on a dev Mac: `gui_cold_start_ns` about 152 ms (minimum of 10, warm), `input_to_render_ns` about 12.9 ms, `input_to_render_flood50_ns` about 11.8 ms. CI records the baselines; budgets are 200 ms and 16 ms.
+- **Wall metrics need a GUI session.** They fail with "the screen is locked" on a locked screen or sleeping display, so the `perf-wall` job runs under `caffeinate -d`; the GUI part of `wall_smoke` is opt-in (`FLEET_PERF_GUI_SMOKE=1`).
+- **Packaging.** `scripts/bundle-macos.sh` builds `fleetd.app` (`dev.fleetd.gui`) with `fleetd` and `fleet` beside `fleet-gui`, so a local daemon start finds the bundled binary. The bundle is unsigned.
+- **Kitty keyboard.** The masking policy above ([0018](0018-m1-protocol-and-node.md)) is unchanged. What Claude Code pushes in a GUI pane was not observed empirically: Claude Code stops at its workspace-trust prompt, which needs interaction.
+- **Parked:** command palette, diff view (M3), code signing and notarisation, light-theme polish, Intel and Linux GUI, a launchd service for the daemon.
