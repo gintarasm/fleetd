@@ -669,6 +669,8 @@ impl Render for Workspace {
                         .occlude()
                         .bg(gpui::black().opacity(0.35))
                         .flex()
+                        // A card sized to its content, not a full-height column.
+                        .items_start()
                         .justify_center()
                         .pt(px(120.))
                         .child(sheet.clone()),
@@ -684,6 +686,7 @@ impl Render for Workspace {
                     .inset_0()
                     .occlude()
                     .flex()
+                    .items_start()
                     .justify_center()
                     .pt(px(80.))
                     .child(sheet.clone()),
@@ -1308,6 +1311,23 @@ mod tests {
         let shown = s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
         assert_eq!(shown.as_deref(), Some("spawn failed: no such directory"));
         assert!(s.cx.debug_bounds("error-toast").is_some());
+    }
+
+    #[gpui::test]
+    fn new_agent_sheet_is_as_tall_as_its_content(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let s = setup(cx, &fake, dir.path());
+        s.cx.simulate_keystrokes("cmd-n");
+        s.cx.run_until_parked();
+        let sheet = s.cx.debug_bounds("new-agent-sheet").unwrap();
+        let window = s.cx.update(|window, _| window.viewport_size());
+        assert!(
+            sheet.size.height < window.height / 2.0,
+            "sheet height {:?} of {:?}",
+            sheet.size.height,
+            window.height
+        );
     }
 
     #[gpui::test]

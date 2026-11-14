@@ -912,6 +912,24 @@ mod tests {
     }
 
     #[gpui::test]
+    fn connect_sheet_is_as_tall_as_its_content(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let mut s = setup(cx, &backend, dir.path());
+        startup(&mut s, None);
+        assert!(shown(&mut s));
+        let sheet = s.cx.debug_bounds("connect-sheet").unwrap();
+        let window = s.cx.update(|window, _| window.viewport_size());
+        // A card under the top, not a column down the whole window.
+        assert!(
+            sheet.size.height < gpui::px(320.),
+            "sheet height {:?}",
+            sheet.size.height
+        );
+        assert!(sheet.bottom() < window.height);
+    }
+
+    #[gpui::test]
     fn no_saved_target_and_no_local_daemon_shows_sheet(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(FakeBackend {
