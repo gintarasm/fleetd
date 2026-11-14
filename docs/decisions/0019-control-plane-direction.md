@@ -2,6 +2,10 @@
 
 **Status:** accepted · 2026-11-13 · open questions resolved by the user on PR #3 (see the end of this file)
 
+**Amended by:** [0026](0026-node-providers-and-transports.md) — `auth-required` errors routed to the client; the controller archives history before the teardowns it starts.
+
+**Amended by:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) — grant/quota scopes are label selectors; placement uses an affinity hint, `NodeInfo` drops workspaces; MCP tools are `list_agents`/`agent_status`/`spawn_agent`.
+
 **Amends:** [0003](0003-node-controller-roles.md) (where the controller runs), [0012](0012-credentials.md) (secret storage, OAuth browser host). Builds on [0007](0007-plugin-system.md), [0008](0008-agent-status-detection.md), [0011](0011-remote-nodes.md).
 
 ## Context

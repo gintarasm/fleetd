@@ -15,6 +15,10 @@ message Request {
     SendInput input = 6;
     Resize resize = 7;
     KillAgent kill = 8;
+    ReadHistory read_history = 9;
+    SetLabels set_labels = 10;
+    ReadLogs read_logs = 11;
+    StopLogs stop_logs = 12;
   }
 }
 
@@ -26,11 +30,21 @@ message Response {
     AttachOk attached = 4;
     Ack ack = 5;
     Error error = 6;
+    HistoryPage history = 7;
+    SpawnedAttached spawned_attached = 8;
+    LogLines log_lines = 9;
   }
 }
 
 message Event {
-  oneof kind { AgentExited exited = 1; }
+  oneof kind {
+    AgentExited exited = 1;
+    Lagged lagged = 2;
+    AgentActivity activity = 3;
+    AttachRole role = 4;
+    LogLine log_line = 5;
+    AgentResized agent_resized = 6;
+  }
 }
 
 message SpawnAgent {
@@ -40,9 +54,16 @@ message SpawnAgent {
   map<string, string> env = 4;
   uint32 cols = 5;
   uint32 rows = 6;
+  // Attach in the same request: the reply is `SpawnedAttached`, and the
+  // subscription exists before the process starts.
+  bool attach = 7;
+  // Labels (ADR 0025): at most 64, keys 1-64 bytes, values up to 256 bytes;
+  // keys starting with `fleet.` are reserved.
+  map<string, string> labels = 8;
 }
 
-message ListAgents {}
+// Only agents whose labels contain every selector pair; empty means all.
+message ListAgents { map<string, string> selector = 1; }
 
 message AgentList { repeated AgentInfo agents = 1; }
 
@@ -61,14 +82,69 @@ message AgentInfo {
   AgentState state = 5;
   optional int32 exit_code = 6;
   int64 created_unix_ms = 7;
+  map<string, string> labels = 8;
 }
 
-message Attach { uint64 agent_id = 1; }
-message AttachOk { uint64 agent_id = 1; bytes snapshot = 2; uint32 cols = 3; uint32 rows = 4; }
+// With `observe`, a read-only attach (ADR 0022): it never takes or changes
+// the primary role (`AttachOk.primary` is false, no `AttachRole` events), and
+// its input does not promote it. Observers must not answer terminal queries.
+message Attach { uint64 agent_id = 1; bool observe = 2; }
+message AttachOk {
+  uint64 agent_id = 1;
+  bytes snapshot = 2;
+  uint32 cols = 3;
+  uint32 rows = 4;
+  // The in-memory history tail: lines that scrolled off above the snapshot,
+  // oldest first; `history_tail[0]` is line `tail_first_line`.
+  repeated bytes history_tail = 5;
+  uint64 tail_first_line = 6;
+  // The oldest line still in history, and the generation (bumped by CSI 3 J).
+  uint64 history_first_line = 7;
+  uint64 history_generation = 8;
+  // Whether this client's resizes apply to the agent.
+  bool primary = 9;
+}
 message SendInput { uint64 agent_id = 1; bytes data = 2; }
 message Resize { uint64 agent_id = 1; uint32 cols = 2; uint32 rows = 3; }
 message KillAgent { uint64 agent_id = 1; }
 message Detach { uint64 agent_id = 1; }
 message AgentExited { uint64 agent_id = 1; int32 exit_code = 2; }
 message Error { string message = 1; }
+
+// A page of history: the lines immediately before `before_line`, at most
+// `max_lines` (capped by the server). A stale `generation` is an error.
+message ReadHistory {
+  uint64 agent_id = 1;
+  uint64 generation = 2;
+  uint64 before_line = 3;
+  uint32 max_lines = 4;
+}
+// `lines[0]` is line `first_line`.
+message HistoryPage { uint64 agent_id = 1; uint64 first_line = 2; repeated bytes lines = 3; }
+message SpawnedAttached { AgentInfo agent = 1; AttachOk attached = 2; }
+// Applies `set`, then `remove`; answered by `Ack`.
+message SetLabels {
+  uint64 agent_id = 1;
+  map<string, string> set = 2;
+  repeated string remove = 3;
+}
+// The connection's subscription to the agent was dropped (it fell behind);
+// re-attach to resume.
+message Lagged { uint64 agent_id = 1; }
+message AgentActivity { uint64 agent_id = 1; string last_line = 2; int64 last_output_unix_ms = 3; }
+message AttachRole { uint64 agent_id = 1; bool primary = 2; }
+// The agent's grid was resized; arrives in the agent's stream, in order with
+// its output, on every subscription (primary or not).
+message AgentResized { uint64 agent_id = 1; uint32 cols = 2; uint32 rows = 3; }
 message Ack {}
+
+// The daemon's log (ADR 0027): the last `tail` lines (capped at 10 000) of
+// `fleetd.log.2`, `.1` and `fleetd.log`, oldest first, answered by
+// `LogLines` (at most 8 MiB of lines: the oldest are dropped; a line is at
+// most 4 KiB, longer ones are cut and end in " …[truncated]"). With `follow`, each new line then arrives as `LogLine` until
+// `StopLogs` (answered by `Ack`) or disconnect; a follower that falls behind
+// gets a `LogLine` "… N lines dropped" and stays connected.
+message ReadLogs { uint32 tail = 1; bool follow = 2; }
+message StopLogs {}
+message LogLines { repeated string lines = 1; }
+message LogLine { string line = 1; }

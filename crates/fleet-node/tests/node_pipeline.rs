@@ -1,4 +1,4 @@
-use fleet_node::node::{AgentPipeline, StreamItem, Subscription};
+use fleet_node::node::{AgentPipeline, ConnId, StreamItem, Subscription};
 use fleet_node::scrollback::Scrollback;
 use fleet_node::{AgentId, CommandSpec, OutputSink, PtyHost, Terminal};
 use std::path::PathBuf;
@@ -157,12 +157,17 @@ fn every_subscriber_gets_the_full_stream_and_exit() {
 fn slow_subscriber_is_dropped_not_blocking() {
     let f = Fixture::new();
     let (_, mut stalled) = f.pipeline.subscribe();
-    let id = f.spawn("head -c 4194304 /dev/zero | tr '\\0' a");
+    // 16 MiB: four times what a subscription can queue (256 chunks merged
+    // up to 16 KiB). Each line homes the cursor, so nothing scrolls.
+    let id = f.spawn(&format!(
+        "yes \"$(printf '\x1b[H{}')\" | head -c 16777216",
+        "x".repeat(900)
+    ));
     // The agent completes although the subscriber never reads.
     f.wait();
     let stats = f.host.stats(id).unwrap();
     assert_eq!(stats.exit_code, Some(0));
-    assert!(stats.bytes_read >= 4 * 1024 * 1024);
+    assert!(stats.bytes_read >= 16 * 1024 * 1024);
     assert_eq!(
         recv(&mut stalled, Duration::from_secs(1)),
         Ok(Some(StreamItem::Lagged))
@@ -293,4 +298,89 @@ fn attach_inside_split_sequence_has_no_gap() {
     assert_attach_has_no_gap(&[b"x\x1b]0;title\x1b"], b"\\after");
     // DCS split mid-payload.
     assert_attach_has_no_gap(&[b"x\x1bP+q54"], b"4e\x1b\\after");
+}
+
+/// The next item, which must arrive within a second.
+fn next_item(sub: &mut Subscription) -> Option<StreamItem> {
+    recv(sub, Duration::from_secs(1)).expect("no item")
+}
+
+fn nothing_queued(sub: &mut Subscription) -> bool {
+    recv(sub, Duration::from_millis(50)).is_err()
+}
+
+#[test]
+fn roles_follow_attach_input_and_departure() {
+    let f = Fixture::new();
+    let agent = f.spawn("sleep 100");
+    let p = &f.pipeline;
+    let (a, b, c) = (ConnId(1), ConnId(2), ConnId(3));
+    // No connection attached: anyone may resize.
+    assert!(p.may_resize(a));
+
+    let mut sa = p.attach(a);
+    assert!(sa.primary);
+    let mut sb = p.attach(b);
+    assert!(sb.primary);
+    assert_eq!(
+        next_item(&mut sa.subscription),
+        Some(StreamItem::Role(false))
+    );
+    assert!(p.may_resize(b) && !p.may_resize(a) && !p.may_resize(c));
+
+    // Anonymous subscribers take no part.
+    let (_, mut anon) = p.subscribe();
+    assert!(nothing_queued(&mut sb.subscription));
+
+    // Input from an unattached connection changes nothing; from A, it moves.
+    p.input_from(c);
+    assert!(nothing_queued(&mut sb.subscription));
+    p.input_from(a);
+    assert_eq!(
+        next_item(&mut sa.subscription),
+        Some(StreamItem::Role(true))
+    );
+    assert_eq!(
+        next_item(&mut sb.subscription),
+        Some(StreamItem::Role(false))
+    );
+    p.input_from(a);
+    assert!(nothing_queued(&mut sa.subscription));
+
+    // A primary re-attaching stays primary without role events.
+    let mut sa2 = p.attach(a);
+    assert!(sa2.primary);
+    assert_eq!(next_item(&mut sa.subscription), None, "old stream ended");
+    assert!(nothing_queued(&mut sb.subscription));
+
+    // The primary leaving promotes the most recent remaining connection.
+    let mut sc = p.attach(c);
+    assert_eq!(
+        next_item(&mut sa2.subscription),
+        Some(StreamItem::Role(false))
+    );
+    p.input_from(b);
+    assert_eq!(
+        next_item(&mut sb.subscription),
+        Some(StreamItem::Role(true))
+    );
+    assert_eq!(
+        next_item(&mut sc.subscription),
+        Some(StreamItem::Role(false))
+    );
+    drop(sb);
+    assert_eq!(
+        next_item(&mut sc.subscription),
+        Some(StreamItem::Role(true))
+    );
+    drop(sc);
+    assert_eq!(
+        next_item(&mut sa2.subscription),
+        Some(StreamItem::Role(true))
+    );
+    drop(sa2);
+    assert!(nothing_queued(&mut anon));
+    assert!(p.may_resize(c), "no connection attached any more");
+    f.host.force_kill(agent).unwrap();
+    f.wait();
 }

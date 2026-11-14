@@ -1,7 +1,9 @@
 //! fleetd: the single-instance node daemon, serving the fleet protocol on a
 //! unix socket in the state dir.
 
+pub mod logging;
 mod server;
+pub mod stdio;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -11,11 +13,14 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fleet_node::env::{LOGIN_ENV_SWITCH, LOGIN_ENV_TIMEOUT, LoginEnv, login_shell};
 use fleet_node::node::Node;
+use fleet_proto::PROTOCOL_VERSION;
 
 use fs4::{FileExt, TryLockError};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tracing::{info, warn};
 
 /// Longest socket path macOS accepts: `sun_path` is 104 bytes including the NUL.
 const MAX_SOCKET_PATH_BYTES: usize = 103;
@@ -196,8 +201,9 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
 }
 
 impl Daemon {
-    /// Open the node's state, then serve protocol connections until
-    /// SIGTERM/SIGINT/SIGHUP. Then stop every agent (v1 has no PTY handoff, decision
+    /// Start capturing the login shell's environment in the background
+    /// unless `FLEETD_LOGIN_ENV=off` (see [`fleet_node::env`]), open the node's state, then serve protocol
+    /// connections until SIGTERM/SIGINT/SIGHUP. Then stop every agent (v1 has no PTY handoff, decision
     /// 0018): SIGTERM to each agent's process group, up to 2 s grace, then
     /// SIGKILL; their exits are recorded. Finally remove the socket file and
     /// return.
@@ -212,28 +218,51 @@ impl Daemon {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        let node = tokio::task::spawn_blocking(move || Node::open(&state_dir))
-            .await
-            .map_err(io::Error::other)??;
+        // In the background, overlapping opening the store; the first spawn
+        // waits for it (bounded), nothing else does. `FLEETD_LOGIN_ENV=off`
+        // skips it.
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            pid = std::process::id(),
+            state_dir = ?state_dir,
+            protocol = PROTOCOL_VERSION,
+            "fleetd started"
+        );
+        let shell = login_shell(
+            std::env::var_os(LOGIN_ENV_SWITCH).as_deref(),
+            std::env::var_os("SHELL").as_deref(),
+        );
+        if shell.is_none() {
+            info!(
+                "login env capture skipped ({LOGIN_ENV_SWITCH}=off or no SHELL); agents start from the daemon's env"
+            );
+        }
+        let login_env = LoginEnv::capture_in_background(shell, LOGIN_ENV_TIMEOUT);
+        let node = tokio::task::spawn_blocking(move || {
+            Node::open(&state_dir).map(|n| n.with_base_env(login_env))
+        })
+        .await
+        .map_err(io::Error::other)??;
         let node = Arc::new(node);
         let server = server::Server::new(Arc::clone(&node));
-        loop {
+        let signal = loop {
             tokio::select! {
-                _ = term.recv() => break,
-                _ = int.recv() => break,
-                _ = hup.recv() => break,
+                _ = term.recv() => break "SIGTERM",
+                _ = int.recv() => break "SIGINT",
+                _ = hup.recv() => break "SIGHUP",
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => server.accept(stream),
                     // Accept errors never end `serve`; only a signal does.
                     Err(e) => {
-                        eprintln!("fleetd: accept failed: {e}");
+                        warn!(error = %e, "accept failed");
                         if is_fd_exhaustion(&e) {
                             tokio::time::sleep(ACCEPT_BACKOFF).await;
                         }
                     }
                 },
             }
-        }
+        };
+        info!(signal, "fleetd stopping: stopping agents");
         tokio::task::spawn_blocking(move || node.shutdown())
             .await
             .map_err(io::Error::other)?;

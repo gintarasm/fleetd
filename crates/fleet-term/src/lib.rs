@@ -25,6 +25,22 @@
 //! Replies to terminal queries (DSR/CPR, DA, …) are collected and returned by
 //! [`Terminal::take_replies`]; the owner decides whether to send them to the
 //! agent.
+//!
+//! Rows that scroll off the top of the primary screen are rendered as ANSI
+//! lines the moment they scroll off and queued with `CSI 3 J` (erase saved
+//! lines) as [`HistoryEvent`]s, which [`Terminal::drain_history`] hands out in
+//! stream order. The parser drives alacritty through a thin handler that does
+//! this (see `recorder`); alacritty itself keeps no scrollback. A row is one
+//! grid row: a long line soft-wrapped by the agent's terminal yields several
+//! rows.
+
+mod history;
+mod recorder;
+
+pub use history::HistoryEvent;
+
+use history::{History, Pen, glyph, last_non_blank, put_cells, put_glyph};
+use recorder::Recorder;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -35,13 +51,13 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Cursor, Dimensions, Grid};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{
-    Color, Handler, KeyboardModes, KeyboardModesApplyBehavior, NamedColor, Processor,
+    Handler, KeyboardModes, KeyboardModesApplyBehavior, Processor,
 };
 
-/// Grid size handed to alacritty. Scrollback is disabled: history lives in the
-/// per-agent ring file (Task 3), and keeping it here would cost memory per agent.
+/// Grid size handed to alacritty. Scrollback is disabled: rows are rendered as
+/// history as they scroll off (see [`recorder`]).
 struct Size {
     cols: usize,
     rows: usize,
@@ -108,29 +124,43 @@ pub struct Terminal {
     term: RefCell<Term<Replies>>,
     parser: Processor,
     replies: Replies,
+    history: History,
 }
 
 impl Terminal {
     /// Creates a blank screen; zero dimensions are clamped to 1.
     pub fn new(cols: u16, rows: u16) -> Self {
-        let config = Config {
-            scrolling_history: 0,
-            // Track the kitty keyboard flags so snapshots can carry them.
-            kitty_keyboard: true,
-            ..Config::default()
-        };
         let replies = Replies::default();
+        let size = Size::new(cols, rows);
+        let history = History::new(size.rows);
         Self {
-            term: RefCell::new(Term::new(config, &Size::new(cols, rows), replies.clone())),
+            term: RefCell::new(Term::new(history::config(0), &size, replies.clone())),
             parser: Processor::new(),
             replies,
+            history,
         }
     }
 
     /// Feeds raw PTY output through the VT parser.
+    ///
+    /// Rows that scroll off the primary screen become [`HistoryEvent::Line`]s
+    /// and `CSI 3 J` on the primary screen a [`HistoryEvent::Cleared`] (see
+    /// [`Terminal::drain_history`]).
     pub fn feed(&mut self, bytes: &[u8]) {
         self.flush_expired_sync();
-        self.parser.advance(self.term.get_mut(), bytes);
+        let mut recorder = Recorder {
+            term: self.term.get_mut(),
+            history: &mut self.history,
+        };
+        self.parser.advance(&mut recorder, bytes);
+    }
+
+    /// Takes the history events produced since the last call, in stream order.
+    ///
+    /// Events accumulate until drained; the owner is expected to drain after
+    /// every [`Terminal::feed`].
+    pub fn drain_history(&mut self) -> Vec<HistoryEvent> {
+        std::mem::take(&mut self.history.events)
     }
 
     /// Applies a buffered synchronized update now, whether or not its ESU or
@@ -138,7 +168,7 @@ impl Terminal {
     /// mid-frame would otherwise be missing from the snapshot.
     pub fn flush_pending_sync(&mut self) {
         if self.parser.sync_timeout().sync_timeout().is_some() {
-            self.parser.stop_sync(self.term.get_mut());
+            self.stop_sync();
         }
     }
 
@@ -150,8 +180,17 @@ impl Terminal {
             .sync_timeout()
             .is_some_and(|deadline| deadline <= Instant::now());
         if expired {
-            self.parser.stop_sync(self.term.get_mut());
+            self.stop_sync();
         }
+    }
+
+    /// Applies the buffered synchronized update.
+    fn stop_sync(&mut self) {
+        let mut recorder = Recorder {
+            term: self.term.get_mut(),
+            history: &mut self.history,
+        };
+        self.parser.stop_sync(&mut recorder);
     }
 
     /// Takes the replies to terminal queries produced since the last call.
@@ -160,8 +199,32 @@ impl Terminal {
     }
 
     /// Resizes the screen (reflowing the primary screen); zero dimensions are clamped to 1.
+    ///
+    /// Rows a shrink pushes off the top of the primary screen become history.
+    ///
+    /// Alacritty pushes those rows (and rows a narrower reflow pushes off)
+    /// into its scrollback, so the resize runs with the scrollback enabled
+    /// and the rows are collected from it right after (`history::settle`).
+    /// While the alt screen is active that reads the primary screen behind it
+    /// via [`with_primary`]; its saved cursor then becomes its cursor (see
+    /// there), which after such a resize is the saved cursor moved with the
+    /// content.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.term.get_mut().resize(Size::new(cols, rows));
+        let size = Size::new(cols, rows);
+        let term = self.term.get_mut();
+        if (term.columns(), term.screen_lines()) == (size.cols, size.rows) {
+            return;
+        }
+        term.set_options(history::config(history::RESIZE_SLACK));
+        term.resize(size);
+        // `Term::resize` resets the scroll region.
+        self.history.region = 0..term.screen_lines() as i32;
+        let history = &mut self.history;
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            with_primary(term, |term| history::settle(term, history));
+        } else {
+            history::settle(term, history);
+        }
     }
 
     /// Current size as `(cols, rows)`.
@@ -228,21 +291,21 @@ impl Terminal {
         let term = self.term.borrow();
         let grid = term.grid();
         (0..grid.screen_lines())
-            .map(|row| {
-                let line = &grid[Line(row as i32)];
-                let mut text = String::with_capacity(grid.columns());
-                for col in 0..grid.columns() {
-                    let cell = &line[Column(col)];
-                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                        continue;
-                    }
-                    text.push(glyph(cell));
-                    text.extend(cell.zerowidth().unwrap_or_default());
-                }
-                text.truncate(text.trim_end_matches(' ').len());
-                text
-            })
+            .map(|row| row_text(grid, row))
             .collect()
+    }
+
+    /// The bottom-most visible row that is not blank, trimmed of
+    /// surrounding whitespace; `None` for a blank screen. Reads rows from the
+    /// bottom up and stops at the first non-blank one.
+    pub fn last_nonblank_line(&self) -> Option<String> {
+        let term = self.term.borrow();
+        let grid = term.grid();
+        (0..grid.screen_lines()).rev().find_map(|row| {
+            let text = row_text(grid, row);
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
     }
 
     /// Cursor position as 0-based `(row, col)`.
@@ -309,7 +372,7 @@ fn to_u16(n: usize) -> u16 {
 /// the cursor moves with the text, the saved cursor is only clamped). Then the
 /// saved cursor becomes the cursor; the cursor, which `?1049l` shows, is kept.
 /// Selection and damage are not kept (unused here).
-fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&Term<Replies>) -> R) -> R {
+fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&mut Term<Replies>) -> R) -> R {
     debug_assert!(term.mode().contains(TermMode::ALT_SCREEN));
     let alt_grid = term.grid().clone();
     let alt_kitty = *term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL;
@@ -329,26 +392,34 @@ fn with_primary<R>(term: &mut Term<Replies>, f: impl FnOnce(&Term<Replies>) -> R
 
 /// Clears the screen (`\x1b[0m\x1b[H\x1b[2J`, so `pen` becomes the default)
 /// and draws `grid`'s non-blank cells.
+/// A visible row's text, trailing spaces trimmed.
+fn row_text(grid: &Grid<Cell>, row: usize) -> String {
+    let line = &grid[Line(row as i32)];
+    let mut text = String::with_capacity(grid.columns());
+    for col in 0..grid.columns() {
+        let cell = &line[Column(col)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        text.push(glyph(cell));
+        text.extend(cell.zerowidth().unwrap_or_default());
+    }
+    text.truncate(text.trim_end_matches(' ').len());
+    text
+}
+
 fn put_grid(out: &mut Vec<u8>, pen: &mut Pen, grid: &Grid<Cell>) {
-    let (cols, rows) = (grid.columns(), grid.screen_lines());
     out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
     *pen = Pen::default();
-    for row in 0..rows {
+    for row in 0..grid.screen_lines() {
         let line = &grid[Line(row as i32)];
-        let Some(end) = (0..cols).rev().find(|&c| !is_blank(&line[Column(c)])) else {
+        let Some(end) = last_non_blank(line) else {
             continue;
         };
         if row > 0 {
             cup(out, row, 0);
         }
-        for col in 0..=end {
-            let cell = &line[Column(col)];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            pen.transition(out, Pen::of(cell));
-            put_glyph(out, cell);
-        }
+        put_cells(out, pen, line, end);
     }
 }
 
@@ -439,30 +510,6 @@ fn put_kitty_flags(out: &mut Vec<u8>, mode: TermMode, pushed: bool) -> bool {
     }
 }
 
-/// The character a cell renders; a leading wide-char spacer renders as blank.
-fn glyph(cell: &Cell) -> char {
-    if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
-        ' '
-    } else {
-        cell.c
-    }
-}
-
-fn put_glyph(out: &mut Vec<u8>, cell: &Cell) {
-    let mut buf = [0; 4];
-    out.extend_from_slice(glyph(cell).encode_utf8(&mut buf).as_bytes());
-    for &c in cell.zerowidth().unwrap_or_default() {
-        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-    }
-}
-
-/// A cell that `\x1b[2J` after `\x1b[0m` already produces.
-fn is_blank(cell: &Cell) -> bool {
-    glyph(cell) == ' '
-        && cell.zerowidth().is_none_or(<[char]>::is_empty)
-        && Pen::of(cell) == Pen::default()
-}
-
 /// Modes restored by the snapshot: `(mode, set sequence, reset sequence)`. A
 /// sequence is emitted when the mode differs from a fresh terminal's default.
 /// ALT_SCREEN is handled separately (it must precede drawing). Origin mode homes
@@ -501,155 +548,33 @@ fn cup(out: &mut Vec<u8>, row: usize, col: usize) {
     let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
 }
 
-/// SGR flags that affect rendering and survive a roundtrip, with their SGR codes.
-const SGR_FLAGS: [(Flags, &str); 11] = [
-    (Flags::BOLD, "1"),
-    (Flags::DIM, "2"),
-    (Flags::ITALIC, "3"),
-    (Flags::UNDERLINE, "4"),
-    (Flags::DOUBLE_UNDERLINE, "4:2"),
-    (Flags::UNDERCURL, "4:3"),
-    (Flags::DOTTED_UNDERLINE, "4:4"),
-    (Flags::DASHED_UNDERLINE, "4:5"),
-    (Flags::INVERSE, "7"),
-    (Flags::HIDDEN, "8"),
-    (Flags::STRIKEOUT, "9"),
-];
-
-fn sgr_mask() -> Flags {
-    SGR_FLAGS
-        .iter()
-        .fold(Flags::empty(), |acc, &(flag, _)| acc | flag)
-}
-
-/// Graphic rendition of a cell (the "pen" that drew it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Pen {
-    fg: Color,
-    bg: Color,
-    flags: Flags,
-    underline: Option<Color>,
-}
-
-impl Default for Pen {
-    fn default() -> Self {
-        Self {
-            fg: Color::Named(NamedColor::Foreground),
-            bg: Color::Named(NamedColor::Background),
-            flags: Flags::empty(),
-            underline: None,
-        }
-    }
-}
-
-impl Pen {
-    fn of(cell: &Cell) -> Self {
-        Self {
-            fg: cell.fg,
-            bg: cell.bg,
-            flags: cell.flags & sgr_mask(),
-            underline: cell.underline_color(),
-        }
-    }
-
-    /// Emits the SGR sequence that changes `self` into `to`, then becomes `to`.
-    /// Turning any flag off resets first; otherwise only the differences are sent.
-    fn transition(&mut self, out: &mut Vec<u8>, to: Pen) {
-        if *self == to {
-            return;
-        }
-        let mut sgr = Sgr::start(out);
-        let mut base = *self;
-        if !(base.flags - to.flags).is_empty()
-            || (base.underline.is_some() && to.underline.is_none())
-        {
-            sgr.param("0");
-            base = Pen::default();
-        }
-        for (flag, code) in SGR_FLAGS {
-            if to.flags.contains(flag) && !base.flags.contains(flag) {
-                sgr.param(code);
-            }
-        }
-        if to.fg != base.fg {
-            sgr.color(to.fg, 30, 90, 38, 39);
-        }
-        if to.bg != base.bg {
-            sgr.color(to.bg, 40, 100, 48, 49);
-        }
-        if to.underline != base.underline
-            && let Some(color) = to.underline
-        {
-            sgr.color(color, 0, 0, 58, 59);
-        }
-        sgr.finish();
-        *self = to;
-    }
-}
-
-/// Writer for a single `CSI ... m` sequence.
-struct Sgr<'a> {
-    out: &'a mut Vec<u8>,
-    first: bool,
-}
-
-impl<'a> Sgr<'a> {
-    fn start(out: &'a mut Vec<u8>) -> Self {
-        out.extend_from_slice(b"\x1b[");
-        Self { out, first: true }
-    }
-
-    fn sep(&mut self) {
-        if !self.first {
-            self.out.push(b';');
-        }
-        self.first = false;
-    }
-
-    fn param(&mut self, code: &str) {
-        self.sep();
-        self.out.extend_from_slice(code.as_bytes());
-    }
-
-    /// `normal`/`bright` are the 8-color bases (unused for underline color, which
-    /// always uses the extended form); `ext` is 38/48/58, `default` 39/49/59.
-    fn color(&mut self, color: Color, normal: u8, bright: u8, ext: u8, default: u8) {
-        self.sep();
-        let _ = match color {
-            Color::Named(named) => match named as usize {
-                n @ 0..8 if normal != 0 => write!(self.out, "{}", usize::from(normal) + n),
-                n @ 8..16 if bright != 0 => write!(self.out, "{}", usize::from(bright) + n - 8),
-                n @ 0..16 => write!(self.out, "{ext};5;{n}"),
-                // Foreground/Background and the renderer-only named colors.
-                _ => write!(self.out, "{default}"),
-            },
-            Color::Indexed(i) => write!(self.out, "{ext};5;{i}"),
-            Color::Spec(rgb) => write!(self.out, "{ext};2;{};{};{}", rgb.r, rgb.g, rgb.b),
-        };
-    }
-
-    fn finish(self) {
-        self.out.push(b'm');
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn last_nonblank_line_is_the_lowest_non_blank_row_trimmed() {
+        let mut t = Terminal::new(20, 5);
+        assert_eq!(t.last_nonblank_line(), None);
+        t.feed(b"first\r\n   second \x1b[1mbold\x1b[0m  \r\n\r\n");
+        assert_eq!(t.last_nonblank_line().as_deref(), Some("second bold"));
+        t.feed(b"\x1b[5;1H  \xe4\xb8\xad  ");
+        assert_eq!(t.last_nonblank_line().as_deref(), Some("\u{4e2d}"));
+    }
+
     /// Deterministic xorshift64* PRNG for fixture generation.
-    struct Rng(u64);
+    pub(crate) struct Rng(pub(crate) u64);
 
     impl Rng {
-        fn next(&mut self) -> u64 {
+        pub(crate) fn next(&mut self) -> u64 {
             self.0 ^= self.0 >> 12;
             self.0 ^= self.0 << 25;
             self.0 ^= self.0 >> 27;
             self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
         }
 
-        fn below(&mut self, n: u64) -> u64 {
+        pub(crate) fn below(&mut self, n: u64) -> u64 {
             self.next() % n
         }
     }
@@ -657,7 +582,7 @@ mod tests {
     /// Agent-like ANSI output of at least `len` bytes: printable text, SGR
     /// colors (16, 256, truecolor), bold/italic/underline/inverse, CRLF,
     /// `\x1b[2K\r` line rewrites and cursor moves.
-    fn fake_output(seed: u64, len: usize) -> Vec<u8> {
+    pub(crate) fn fake_output(seed: u64, len: usize) -> Vec<u8> {
         const WORDS: &[&str] = &[
             "compiling",
             "fleet",
@@ -1136,10 +1061,11 @@ mod tests {
 
     #[test]
     fn snapshot_after_resize_on_alt_screen() {
-        // Resizing reflows the inactive primary screen: here its cursor moves
-        // to (1, 1) while its saved cursor stays at (1, 3). The snapshot keeps
-        // the cursor (where `?1049l` lands) and A's saved cursor becomes the
-        // cursor (a documented loss; see `with_primary`); B matches A.
+        // Resizing reflows the inactive primary screen: alacritty moves its
+        // cursor to (1, 1) while its saved cursor stays at (1, 3). The resize
+        // then collects the primary's history through `with_primary`, so the
+        // saved cursor becomes the cursor (a documented loss; see there) on
+        // every terminal, and the snapshot keeps both; B matches A.
         let setup = b"0123456789abc\x1b[?1049halt";
         let mut a = Terminal::new(10, 4);
         let mut twin = Terminal::new(10, 4);
@@ -1159,8 +1085,8 @@ mod tests {
             assert_eq!(a.mode(), twin.mode());
         }
         assert_eq!(a.visible_text()[1], "cZ");
-        assert_eq!(twin.saved_cursor().1, 3);
-        assert_eq!(a.saved_cursor().1, 1, "saved cursor lost to the cursor");
+        assert_eq!(twin.saved_cursor().1, 1, "saved cursor lost to the cursor");
+        assert_eq!(a.saved_cursor().1, 1);
     }
 
     #[test]

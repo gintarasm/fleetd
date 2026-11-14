@@ -221,7 +221,10 @@ mod tests {
             }),
             Frame::Request(Request {
                 id: 7,
-                kind: Some(request::Kind::Attach(Attach { agent_id: 3 })),
+                kind: Some(request::Kind::Attach(Attach {
+                    agent_id: 3,
+                    observe: false,
+                })),
             }),
             Frame::Response(Response {
                 id: 7,
@@ -298,7 +301,10 @@ mod tests {
         for frame in [
             Frame::Request(Request {
                 id: 1,
-                kind: Some(request::Kind::Attach(Attach { agent_id: 2 })),
+                kind: Some(request::Kind::Attach(Attach {
+                    agent_id: 2,
+                    observe: false,
+                })),
             }),
             Frame::Output {
                 agent_id: 5,

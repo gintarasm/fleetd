@@ -1,5 +1,6 @@
 //! Wall-clock suite: fleetd cold start, idle RSS, the 50-agent flood, and the
-//! daemon scenarios (flood through the protocol server, reattach).
+//! daemon scenarios (flood through the protocol server, the flood with four
+//! attached agents and input echo through it, reattach).
 
 mod daemon;
 
@@ -25,6 +26,8 @@ pub const DAEMON_FLOOD_CPU_NS_PER_MIB: &str = "daemon_flood50_cpu_ns_per_mib";
 pub const DAEMON_FLOOD_PEAK_RSS_BYTES: &str = "daemon_flood50_peak_rss_bytes";
 pub const DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS: &str = "daemon_flood50_lagged_subscriptions";
 pub const REATTACH_SNAPSHOT_NS: &str = "reattach_snapshot_ns";
+pub const FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS: &str = "flood50_attached4_lagged_subscriptions";
+pub const INPUT_ECHO_FLOOD_NS: &str = "input_echo_flood50_ns";
 /// Every metric the wall suite emits.
 pub const METRIC_NAMES: &[&str] = &[
     COLD_START_NS,
@@ -37,6 +40,8 @@ pub const METRIC_NAMES: &[&str] = &[
     DAEMON_FLOOD_PEAK_RSS_BYTES,
     DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS,
     REATTACH_SNAPSHOT_NS,
+    FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS,
+    INPUT_ECHO_FLOOD_NS,
 ];
 
 const FLOOD_AGENTS: usize = 50;
@@ -45,6 +50,14 @@ const QUICK_FLOOD_BYTES: u64 = 256 * 1024;
 /// Attaches measured by `reattach_snapshot_ns` (median taken).
 const REATTACHES: usize = 50;
 const QUICK_REATTACHES: usize = 5;
+/// Agents the client is attached to in the `flood50_attached4` scenarios (a
+/// GUI showing four panes).
+const FLOOD_ATTACHED: usize = 4;
+/// Echo round trips measured by `input_echo_flood50_ns` (median taken), and
+/// the pause between them.
+const ECHO_SAMPLES: usize = 100;
+const QUICK_ECHO_SAMPLES: usize = 10;
+const ECHO_GAP: Duration = Duration::from_millis(5);
 const MIB: f64 = 1024.0 * 1024.0;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const TIGHT_POLL: Duration = Duration::from_millis(50);
@@ -312,6 +325,46 @@ pub fn run(quick: bool) -> Result<Results, String> {
         |f: fn(&daemon::DaemonFlood) -> f64| median(daemon_floods.iter().map(f).collect());
     let reattach = daemon::reattach_snapshot_ns(&fleetd, &fake_agent, bytes, reattaches)?;
 
+    // A client showing four panes must keep them streaming through the
+    // flood: the worst run counts.
+    let mut attached4_lagged = 0.0f64;
+    for _ in 0..daemon_runs {
+        let lagged = daemon::flood_attached_lagged(
+            &fleetd,
+            &fake_agent,
+            FLOOD_AGENTS,
+            FLOOD_ATTACHED,
+            bytes,
+        )?;
+        attached4_lagged = attached4_lagged.max(lagged);
+    }
+    let echo_samples = if quick {
+        QUICK_ECHO_SAMPLES
+    } else {
+        ECHO_SAMPLES
+    };
+    let echo = daemon::input_echo_ns(
+        &fleetd,
+        &fake_agent,
+        FLOOD_AGENTS,
+        FLOOD_ATTACHED,
+        bytes,
+        echo_samples,
+        ECHO_GAP,
+    )?;
+    if echo.during_flood < echo_samples {
+        // The quick flood is over almost at once; a full one must outlast
+        // the samples or they do not measure the flood.
+        let msg = format!(
+            "input echo: only {} of {echo_samples} samples completed during the flood",
+            echo.during_flood
+        );
+        if !quick {
+            return Err(msg);
+        }
+        eprintln!("fleet-perf: {msg}");
+    }
+
     let m = |value: f64, unit: &str| Measurement {
         value,
         unit: unit.to_string(),
@@ -345,6 +398,11 @@ pub fn run(quick: bool) -> Result<Results, String> {
             m(pick_daemon(|f| f.lagged_subscriptions), "count"),
         ),
         (REATTACH_SNAPSHOT_NS.to_string(), m(reattach, "ns")),
+        (
+            FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS.to_string(),
+            m(attached4_lagged, "count"),
+        ),
+        (INPUT_ECHO_FLOOD_NS.to_string(), m(echo.median_ns, "ns")),
     ]);
     Ok(Results {
         suite: Suite::Wall,

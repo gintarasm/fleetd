@@ -1,6 +1,6 @@
 # 0009 — Domain model: project → workspace → worktree → task
 
-**Status:** accepted · 2026-11-13
+**Status:** superseded by [0025](0025-core-knows-agents-workflows-own-hierarchy.md) · 2026-11-13
 
 **Decision:**
 - **Project** groups workspaces. Its workspaces can be on different nodes.

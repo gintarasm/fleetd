@@ -1,0 +1,150 @@
+//! `fleetd --stdio`: a byte bridge between stdin/stdout and the daemon's
+//! socket, so a remote client can run `ssh host fleetd --stdio` (ADR 0019,
+//! 0026). It never takes the instance lock itself: if no daemon answers it
+//! starts one, detached, and the lock (ADR 0013) decides between racing
+//! starters.
+
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use tracing::{debug, info};
+
+use crate::Config;
+
+/// How long to wait for a daemon this bridge started.
+pub const START_TIMEOUT: Duration = Duration::from_secs(5);
+
+const POLL: Duration = Duration::from_millis(5);
+
+/// Exit code of a daemon that lost the instance lock.
+const ALREADY_RUNNING: i32 = 2;
+
+/// Bridges stdin/stdout to the daemon on `cfg`, starting it if needed, until
+/// either side closes. Returns an error if no daemon could be reached.
+pub fn run(cfg: &Config) -> Result<(), String> {
+    info!(pid = std::process::id(), state_dir = ?cfg.state_dir, "stdio bridge started");
+    let stream = connect_or_start(cfg)?;
+    let bridged = bridge(stream).map_err(|e| format!("bridge: {e}"));
+    info!(ok = bridged.is_ok(), "stdio bridge closed");
+    bridged
+}
+
+fn connect_or_start(cfg: &Config) -> Result<UnixStream, String> {
+    let sock = cfg.socket_path();
+    if let Ok(s) = UnixStream::connect(&sock) {
+        debug!("connected to the running daemon");
+        return Ok(s);
+    }
+    let mut child = start_daemon(cfg).map_err(|e| format!("starting fleetd: {e}"))?;
+    info!(
+        daemon_pid = child.id(),
+        "no daemon answered; auto-started one"
+    );
+    let deadline = Instant::now() + START_TIMEOUT;
+    let mut reaped = false;
+    loop {
+        if let Ok(s) = UnixStream::connect(&sock) {
+            return Ok(s);
+        }
+        if !reaped && let Ok(Some(status)) = child.try_wait() {
+            reaped = true;
+            // Losing the lock means another daemon is starting: wait for it.
+            if status.code() != Some(ALREADY_RUNNING) {
+                return Err(format!("fleetd failed to start ({status})"));
+            }
+            info!("the auto-started daemon lost the instance lock; waiting for the winner");
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "fleetd did not come up within {}s at {}",
+                START_TIMEOUT.as_secs(),
+                sock.display()
+            ));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Variables describing the bridge's terminal multiplexer, not the daemon.
+const TERMINAL_VARS: [&str; 4] = ["TMUX", "TMUX_PANE", "STY", "WINDOW"];
+
+/// Variables of the SSH session that ends with the bridge (ADR 0011: agent
+/// forwarding is opt-in).
+const SSH_SESSION_VARS: [&str; 5] = [
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
+];
+
+/// Variables to remove from an auto-started daemon's environment. The SSH
+/// ones go only when the bridge itself runs in an SSH session, so a local
+/// start keeps e.g. the launchd `SSH_AUTH_SOCK`.
+fn scrubbed_vars(from_ssh: bool) -> Vec<&'static str> {
+    let mut v = TERMINAL_VARS.to_vec();
+    if from_ssh {
+        v.extend(SSH_SESSION_VARS);
+    }
+    v
+}
+
+/// Starts this binary as a daemon on `cfg`'s state dir, detached: its own
+/// session (so its own process group, and no controlling terminal), stdio on
+/// `/dev/null`. It outlives this bridge and the SSH session that ran it.
+fn start_daemon(cfg: &Config) -> io::Result<Child> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    let from_ssh = ["SSH_CONNECTION", "SSH_CLIENT"]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
+    for k in scrubbed_vars(from_ssh) {
+        cmd.env_remove(k);
+    }
+    cmd.arg("--state-dir")
+        .arg(&cfg.state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe; nothing else runs in the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+/// Copies stdin to `stream` (half-closing it at EOF) and `stream` to stdout,
+/// returning when the daemon side closes or stdout fails.
+fn bridge(stream: UnixStream) -> io::Result<()> {
+    let mut up = stream.try_clone()?;
+    std::thread::Builder::new()
+        .name("stdin".into())
+        .spawn(move || {
+            let _ = io::copy(&mut io::stdin().lock(), &mut up);
+            // The daemon sees EOF and closes, which ends the other direction.
+            let _ = up.shutdown(Shutdown::Write);
+        })?;
+    let mut down = stream;
+    let mut out = io::stdout().lock();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match down.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        // `stdout` is line-buffered; frames are binary, so flush each read.
+        out.write_all(&buf[..n])?;
+        out.flush()?;
+    }
+}

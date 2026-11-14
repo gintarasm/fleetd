@@ -1,14 +1,19 @@
+<p align="center">
+  <img src="assets/logo/fleetd-wordmark.svg" alt="fleetd" width="360">
+</p>
+
 # fleetd
 
 A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Code, Codex, Gemini CLI, …) in terminals that survive client crashes, on your machine and, later, on remote hosts. The design is in [`docs/plan.md`](docs/plan.md) and the decisions behind it are in [`docs/decisions/`](docs/decisions/).
 
-**Status:** M1 (local node) is done. Today you get a single-machine daemon (`fleetd`) and a command-line client (`fleet`). Anything marked **TBD** below is planned but not implemented yet.
+**Status:** M1 (local node) and M2a (the daemon side of the GUI: agent history, protocol v2, labels, `fleetd --stdio`, the agent skill) are done. Today you get a single-machine daemon (`fleetd`) and a command-line client (`fleet`). Anything marked **TBD** below is planned but not implemented yet.
 
 | Milestone | What | Status |
 |---|---|---|
 | M0 | Benchmark harness and CI perf gate | done |
 | M1 | Local node: PTYs, terminal state, scrollback, SQLite, protocol, `fleet` CLI | done |
-| M2 | GUI (gpui): sidebar, terminal pane, splits, menu-bar app | TBD |
+| M2a | Daemon side of the GUI: agent history, protocol v2, labels, flood fix, `fleetd --stdio`, login-shell env, agent skill | done |
+| M2b | GUI (gpui): sidebar, terminal pane, splits, menu-bar app | TBD |
 | M3 | Projects, workspaces, worktrees, tasks; diff view | TBD |
 | M4 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent MCP channel | TBD |
 | M5 | Remote nodes over SSH | TBD |
@@ -38,12 +43,15 @@ Or build without installing: `cargo build --release -p fleetd -p fleet-cli` puts
 ```sh
 fleetd                      # state in ~/.fleet
 fleetd --state-dir /path    # alternative state directory
+fleetd --stdio              # bridge stdin/stdout to the daemon, starting one if needed
 ```
 
 - **Foreground process.** `fleetd` runs in the foreground and serves clients on `<state-dir>/fleetd.sock`. To keep it running, start it from a terminal multiplexer or a service manager (a launchd/systemd setup is TBD).
 - **One instance per state directory.** A second `fleetd` on the same directory exits with `fleetd already running` (exit code 2).
 - **Stopping.** SIGTERM, SIGINT (Ctrl-C) or SIGHUP stops every agent: each gets SIGTERM, then 2 s later SIGKILL. Their exits are recorded, then the socket is removed.
 - **Crashes.** If `fleetd` is killed hard, the agents it was running are shown as `lost` on the next start.
+- **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M5).
+- **Agent environment.** At startup the daemon asks your login shell (`$SHELL -lic`) for its environment, so agents see the same `PATH` and exports as a terminal would, even when `fleetd` was started by `ssh`, launchd or systemd. The capture runs in the background and gives up after 5 s; if it fails, agents get the daemon's own environment. Set `FLEETD_LOGIN_ENV=off` in the daemon's environment to skip it. Every agent also gets `TERM=xterm-256color` and `FLEET_AGENT_ID=<its id>`.
 
 The state directory (mode 0700) holds:
 
@@ -52,7 +60,17 @@ The state directory (mode 0700) holds:
 | `fleetd.sock` | client socket |
 | `fleetd.lock` | single-instance lock |
 | `state.db` | agent records (SQLite) |
-| `scrollback/` | per-agent output history (8 MiB ring file each) |
+| `scrollback/` | per-agent raw output (8 MiB ring file each) |
+| `history/` | per-agent history: the lines that scrolled off the screen (up to 64 MiB each) |
+| `logs/` | the daemon's log `fleetd.log` (rotated at 10 MiB into `fleetd.log.1` and `.2`, 30 MiB at most) and the `--stdio` bridges' `fleetd-stdio.log` |
+
+### Logs
+
+The daemon logs to `<state-dir>/logs/fleetd.log` (`~/.fleet/logs/fleetd.log` by default), never to stdout, so a daemon started by `--stdio` or a service manager can still be diagnosed. Each line has a UTC timestamp, the level, where it came from, a message and `key=value` fields. Logged: start and stop, connections, spawns, exits, kills, attaches, lag drops, history problems and the login-env capture result. Never logged: environment values, agent arguments, terminal output, input and label values.
+
+- **`FLEETD_LOG`** sets the level (default `info`), for example `FLEETD_LOG=debug fleetd`. It takes [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) directives, such as `fleetd=debug,fleet_node=info`.
+- **`fleet logs`** prints the log over the protocol, so it works for a daemon on another host too (see below).
+- Logging never slows down agents: when the disk cannot keep up, lines are dropped and the log says how many. Design: [0027](docs/decisions/0027-logging.md).
 
 ## CLI: `fleet`
 
@@ -64,10 +82,12 @@ Every command talks to a running `fleetd`. `--state-dir <path>` selects a daemon
 fleet spawn claude
 fleet spawn -- codex --model o4-mini
 fleet spawn --cols 120 --rows 40 bash -lc 'npm test'
+fleet spawn --cwd ~/src/app --label project=app --label role=reviewer -- claude
 ```
 
 `fleet spawn` prints the new agent's ID.
-- **Working directory:** the agent starts in your current directory.
+- **Working directory:** the agent starts in your current directory, or in `--cwd DIR` (a relative `DIR` is taken from your current directory).
+- **Labels:** `--label k=v` (repeatable) attaches labels to the agent; see [Labels](#labels).
 - **Terminal size:** defaults to your terminal's size, or use `--cols`/`--rows`.
 - **`TERM`:** set to `xterm-256color` for the agent.
 - **Size limits:** 1–1000 columns or rows each, and at most 250,000 cells in total.
@@ -88,6 +108,35 @@ States:
 
 `fleetd` keeps the 64 most recent exited agents in memory. Older ones still appear in `fleet ls`.
 
+```sh
+fleet ls --label project=app      # only agents with every given label
+fleet ls --json                   # JSON array: id, state, exit_code, program, args, cwd, created_unix_ms, labels
+```
+
+### Labels
+
+Labels are free-form `key=value` pairs that `fleetd` stores and filters on without interpreting them, for example `project=fleetd` or `role=reviewer`. Set them at spawn (`--label`) or later:
+
+```sh
+fleet label 1 project=fleetd role=reviewer   # set
+fleet label 1 --rm role                      # remove
+```
+
+At most 64 labels per agent, keys up to 64 bytes, values up to 256 bytes. Keys starting with `fleet.` are reserved. Labels of exited agents can still be changed.
+
+### Read an agent's screen and history
+
+```sh
+fleet screen 1                    # the visible text of its current screen
+fleet history 1                   # everything that scrolled off, oldest first, then the current screen
+fleet history 1 --lines 50        # only the last 50 lines
+fleet history 1 --plain           # without colours and other styling
+```
+
+- **History** is kept per agent on disk (up to 64 MiB), for running agents and the 64 most recently created others, and survives `fleetd` restarts.
+- **Clearing:** when an agent clears its scrollback (`CSI 3 J`, as `clear` does), the lines before the clear are no longer served.
+- Full-screen apps (the alternate screen) never add to history, as in a normal terminal. Lines keep the width they had; they are not reflowed after a resize.
+
 ### Attach to an agent
 
 ```sh
@@ -97,7 +146,7 @@ fleet attach 1
 Opens the agent's terminal in your terminal.
 - **Screen:** you immediately see its current screen (a snapshot), then live output. Input goes to the agent, and your terminal size is passed to it.
 - **Detach:** press **Ctrl-\\**. The agent keeps running. Your terminal is restored on every way out: detach, agent exit, a signal sent to the `fleet` process (SIGINT/SIGTERM/SIGHUP), or an error. While attached, Ctrl-C goes to the agent, not to `fleet`.
-- **Many attachments:** several clients can attach to the same agent at once.
+- **Many attachments:** several clients can attach to the same agent at once. The one that attached or typed most recently is *primary*: only its terminal size is applied to the agent.
 - **Falling behind:** if your client can't keep up with the agent's output, `fleetd` drops the stream rather than slowing the agent. `fleet attach` then exits with code 2 and `output lagged behind; re-attach`. Run it again to get a fresh snapshot.
 - **Detach key in kitty keyboard mode:** Ctrl-\\ also detaches when an agent has turned on the kitty keyboard protocol or xterm's modifyOtherKeys, which encode the key as an escape sequence. Side effect: a lone Esc keypress reaches the agent up to 20 ms late. On keyboard layouts where `\` isn't a base key, only plain Ctrl-\\ (byte 0x1c) works.
 - **Full-screen apps:** if an agent is in a full-screen app (alternate screen), the snapshot also carries the screen behind it, so leaving the app shows the right content.
@@ -118,6 +167,27 @@ fleet kill 1
 
 Sends SIGTERM to the agent's process group. There is no SIGKILL follow-up yet, so an agent that ignores SIGTERM keeps running until `fleetd` stops.
 
+### Let agents use the fleet
+
+```sh
+fleet skill install                  # writes ~/.claude/skills/fleet/SKILL.md
+fleet skill install --project        # writes ./.claude/skills/fleet/SKILL.md (or --project DIR)
+fleet skill uninstall                # removes it (add --project to remove the project copy)
+fleet skill print                    # prints the skill
+```
+
+The skill teaches an agent (Claude Code for now) to use `fleet`: list agents (`ls --json`), read another agent's `screen` or `history`, `send` it input, and `spawn` or `kill` agents when you ask it to. Each agent knows its own id from `$FLEET_AGENT_ID`. The skill is built into the `fleet` binary, so re-running `install` after an upgrade updates it. It does not need a running daemon.
+
+### Read the daemon's log
+
+```sh
+fleet logs                 # the last 100 lines
+fleet logs -n 500          # the last 500 (at most 10000)
+fleet logs -f              # then follow new lines until Ctrl-C
+```
+
+`fleet logs` reads the daemon's log over the protocol, including the rotated files. A follower that falls behind sees `… N lines dropped` and keeps following.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -129,7 +199,7 @@ Sends SIGTERM to the agent's process group. There is no SIGKILL follow-up yet, s
 
 ### Not yet in the CLI (TBD)
 
-- Projects, workspaces, worktrees and tasks (`fleet project …`, `fleet task …`): **TBD** (M3)
+- Workflows (git worktree per agent, diff view; `RunAction`): **TBD** (M3, [0025](docs/decisions/0025-core-knows-agents-workflows-own-hierarchy.md))
 - Remote nodes (`fleet node add user@host`): **TBD** (M5)
 - Plugins and agent adapters: **TBD** (M4)
 - Credentials and secret grants: **TBD** (M6)
@@ -138,11 +208,11 @@ Sends SIGTERM to the agent's process group. There is no SIGKILL follow-up yet, s
 
 ## GUI
 
-**TBD** (M2). Planned: a native gpui app with a menu-bar icon, a fleet sidebar grouped by node and workspace with status badges, terminal panes with up to 4 splits, a command palette and a read-only diff view. See [`docs/plan.md`](docs/plan.md).
+**TBD** (M2b). The daemon side is in place (history, activity events, spawn-and-attach, primary client; [0022](docs/decisions/0022-protocol-v2.md)). Planned: a native gpui app with a menu-bar icon, a fleet sidebar grouped by node and workspace with status badges, terminal panes with up to 4 splits, a command palette and a read-only diff view. See [`docs/plan.md`](docs/plan.md).
 
 ## Remote agents
 
-**TBD** (M5). Planned: `fleet node add user@host` installs `fleetd` on a Linux or macOS host over SSH and runs it as a user service. Agents run there and you attach from your machine. See [0011](docs/decisions/0011-remote-nodes.md).
+**TBD** (M5). Today you can already reach a daemon on another host with `ssh host fleetd --stdio`. Planned: `fleet node add user@host` installs `fleetd` on a Linux or macOS host over SSH and runs it as a user service. Agents run there and you attach from your machine. See [0011](docs/decisions/0011-remote-nodes.md).
 
 ## Development
 

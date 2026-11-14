@@ -2,6 +2,8 @@
 
 **Status:** accepted · 2026-11-13
 
+**Amended by:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) — grants are scoped by label selectors instead of project/workspace/task.
+
 **Context:** Nodes and agents sometimes need secrets (API keys, tokens) and remote MCP servers need OAuth.
 
 **Decision:**

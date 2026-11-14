@@ -1,0 +1,11 @@
+[package]
+name = "fleet-term"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+alacritty_terminal = { version = "0.26.0", default-features = false }
+unicode-width = "0.2.3"

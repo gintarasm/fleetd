@@ -98,3 +98,35 @@ baseline = 7591185
 suite = "instr"
 unit = "instructions"
 baseline = 755815
+
+# M2a metrics: `baseline = 0` until recorded from the PR's CI artifacts
+# (bench/README.md, "Recording baselines").
+
+[metrics.flood50_attached4_lagged_subscriptions]
+suite = "wall"
+unit = "count"
+# Must stay 0: the budget is the hard limit (any lagged subscription fails).
+# A count with a budget and `baseline = 0` is gated by the budget alone
+# (value <= budget passes); `tighten` never records 0 for a count.
+budget = 0
+baseline = 0
+
+[metrics.input_echo_flood50_ns]
+suite = "wall"
+unit = "ns"
+baseline = 0
+
+[metrics.terminal_feed_scroll_64k_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 0
+
+[metrics.history_push_1k_lines_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 0
+
+[metrics.history_read_page_instructions]
+suite = "instr"
+unit = "instructions"
+baseline = 0

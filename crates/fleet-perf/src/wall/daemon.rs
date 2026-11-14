@@ -1,5 +1,7 @@
 //! Wall scenarios through the `fleetd` protocol server: the 50-agent flood with
-//! one client attached to every agent, and reattach (snapshot) latency.
+//! one client attached to every agent, the flood with one client attached to
+//! four agents (and input echo latency through it), and reattach (snapshot)
+//! latency.
 //!
 //! The daemon's CPU time and RSS are sampled per process (`proc_pid_rusage` on
 //! macOS, `/proc/<pid>/{stat,statm}` on Linux), so its agents' CPU is excluded.
@@ -14,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use fleet_proto::{
-    Attach, Detach, Frame, FrameCodec, Hello, KillAgent, PROTOCOL_VERSION, Request, SpawnAgent,
-    event, request, response,
+    Attach, Detach, Frame, FrameCodec, Hello, KillAgent, PROTOCOL_VERSION, Request, SendInput,
+    SpawnAgent, event, request, response,
 };
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -126,14 +128,13 @@ impl Streams {
         match frame {
             Frame::Output { .. } => Ok(None),
             Frame::Event(e) => {
-                if let Some(event::Kind::Exited(x)) = e.kind {
-                    self.exited.insert(x.agent_id, x.exit_code);
+                match e.kind {
+                    Some(event::Kind::Exited(x)) => {
+                        self.exited.insert(x.agent_id, x.exit_code);
+                    }
+                    Some(event::Kind::Lagged(_)) => self.lagged += 1,
+                    _ => {}
                 }
-                Ok(None)
-            }
-            // Unsolicited `lagged: re-attach` notice.
-            Frame::Response(r) if r.id == 0 => {
-                self.lagged += 1;
                 Ok(None)
             }
             Frame::Response(r) => Ok(Some(r)),
@@ -362,13 +363,16 @@ pub(super) fn flood(
             rows: ROWS,
             ..SpawnAgent::default()
         };
-        let req = client.request(request::Kind::Spawn(spawn))?;
+        let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
         let agent_id = match streams.wait(&mut client, req)? {
             response::Kind::Spawned(info) => info.id,
             other => return Err(format!("spawn: unexpected {other:?}")),
         };
         ids.insert(agent_id);
-        let req = client.request(request::Kind::Attach(Attach { agent_id }))?;
+        let req = client.request(request::Kind::Attach(Attach {
+            agent_id,
+            observe: false,
+        }))?;
         match streams.wait(&mut client, req)? {
             response::Kind::Attached(_) => {}
             other => return Err(format!("attach: unexpected {other:?}")),
@@ -431,14 +435,17 @@ pub(super) fn reattach_snapshot_ns(
         rows: ROWS,
         ..SpawnAgent::default()
     };
-    let req = client.request(request::Kind::Spawn(spawn))?;
+    let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
     let agent_id = match streams.wait(&mut client, req)? {
         response::Kind::Spawned(info) => info.id,
         other => return Err(format!("spawn: unexpected {other:?}")),
     };
 
     let attach = |client: &mut Client, streams: &mut Streams| -> Result<Vec<u8>, String> {
-        let req = client.request(request::Kind::Attach(Attach { agent_id }))?;
+        let req = client.request(request::Kind::Attach(Attach {
+            agent_id,
+            observe: false,
+        }))?;
         let snapshot = match streams.wait(client, req)? {
             response::Kind::Attached(ok) => ok.snapshot,
             other => return Err(format!("attach: unexpected {other:?}")),
@@ -468,7 +475,10 @@ pub(super) fn reattach_snapshot_ns(
 
     let mut samples = Vec::with_capacity(attaches);
     for _ in 0..attaches {
-        let req = client.request(request::Kind::Attach(Attach { agent_id }))?;
+        let req = client.request(request::Kind::Attach(Attach {
+            agent_id,
+            observe: false,
+        }))?;
         let sent = Instant::now();
         match streams.wait(&mut client, req)? {
             response::Kind::Attached(_) => {}
@@ -482,6 +492,221 @@ pub(super) fn reattach_snapshot_ns(
     let req = client.request(request::Kind::Kill(KillAgent { agent_id }))?;
     streams.wait(&mut client, req)?;
     Ok(median(samples))
+}
+
+/// Spawns one `fake-agent --ansi --bytes <bytes> --seed <seed>`; returns its id.
+fn spawn_fake_agent(
+    client: &mut Client,
+    streams: &mut Streams,
+    fake_agent: &Path,
+    bytes: u64,
+    seed: usize,
+) -> Result<u64, String> {
+    let spawn = SpawnAgent {
+        program: fake_agent.to_string_lossy().into_owned(),
+        args: vec![
+            "--bytes".into(),
+            bytes.to_string(),
+            "--ansi".into(),
+            "--seed".into(),
+            seed.to_string(),
+        ],
+        cols: COLS,
+        rows: ROWS,
+        ..SpawnAgent::default()
+    };
+    let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
+    match streams.wait(client, req)? {
+        response::Kind::Spawned(info) => Ok(info.id),
+        other => Err(format!("spawn: unexpected {other:?}")),
+    }
+}
+
+fn attach_agent(client: &mut Client, streams: &mut Streams, agent_id: u64) -> Result<(), String> {
+    let req = client.request(request::Kind::Attach(Attach {
+        agent_id,
+        observe: false,
+    }))?;
+    match streams.wait(client, req)? {
+        response::Kind::Attached(_) => Ok(()),
+        other => Err(format!("attach: unexpected {other:?}")),
+    }
+}
+
+/// The flood with a few attached agents (a GUI showing panes): `agents` fake
+/// agents spawned on one connection, which attaches only the first
+/// `attached` and consumes everything until all have exited. `spawned` is
+/// set once every agent is spawned and attached, `done` once all have
+/// exited. Returns the subscriptions fleetd dropped as lagged.
+fn flood_attached_on(
+    sock: &Path,
+    fake_agent: &Path,
+    agents: usize,
+    attached: usize,
+    bytes: u64,
+    spawned: &AtomicBool,
+    done: &AtomicBool,
+) -> Result<usize, String> {
+    let mut client = Client::connect(sock)?;
+    let mut streams = Streams::default();
+    let mut ids = HashSet::with_capacity(agents);
+    for i in 0..agents {
+        let agent_id = spawn_fake_agent(&mut client, &mut streams, fake_agent, bytes, i)?;
+        ids.insert(agent_id);
+        if i < attached {
+            attach_agent(&mut client, &mut streams, agent_id)?;
+        }
+    }
+    spawned.store(true, Ordering::Release);
+    while !ids.iter().all(|id| streams.exited.contains_key(id)) {
+        if let Some(r) = streams.take(client.recv()?)? {
+            return Err(format!("unexpected response {r:?}"));
+        }
+    }
+    done.store(true, Ordering::Release);
+    if let Some((id, code)) = streams.exited.iter().find(|(_, code)| **code != 0) {
+        return Err(format!("agent {id} exited with {code}"));
+    }
+    Ok(streams.lagged)
+}
+
+/// `flood50_attached4_lagged_subscriptions`: subscriptions fleetd dropped as
+/// lagged while `agents` agents flood and one client is attached to the
+/// first `attached` of them, consuming everything.
+pub(super) fn flood_attached_lagged(
+    fleetd: &Path,
+    fake_agent: &Path,
+    agents: usize,
+    attached: usize,
+    bytes: u64,
+) -> Result<f64, String> {
+    let daemon = Daemon::start(fleetd)?;
+    let (spawned, done) = (AtomicBool::new(false), AtomicBool::new(false));
+    let lagged = flood_attached_on(
+        &daemon.sock,
+        fake_agent,
+        agents,
+        attached,
+        bytes,
+        &spawned,
+        &done,
+    )?;
+    if lagged > 0 {
+        eprintln!(
+            "fleet-perf: flood with {attached} attached: fleetd dropped {lagged} of {attached} subscriptions as lagged"
+        );
+    }
+    Ok(lagged as f64)
+}
+
+/// Outcome of [`input_echo_ns`].
+pub(super) struct InputEcho {
+    /// Median latency from `SendInput` written to the echo's `Output` read.
+    pub median_ns: f64,
+    /// Samples that completed while the flood was still running.
+    pub during_flood: usize,
+}
+
+/// `input_echo_flood50_ns`: the flood of [`flood_attached_lagged`] on one
+/// connection plus, on its own connection, an attached `cat` agent. Once
+/// every flood agent is spawned, `samples` single-byte `SendInput`s are sent
+/// to `cat` one at a time (`gap` apart); each sample runs from the request
+/// written to the first `Output` of `cat` holding that byte (the PTY's
+/// echo). The flood connection still has to finish cleanly.
+pub(super) fn input_echo_ns(
+    fleetd: &Path,
+    fake_agent: &Path,
+    agents: usize,
+    attached: usize,
+    bytes: u64,
+    samples: usize,
+    gap: Duration,
+) -> Result<InputEcho, String> {
+    let daemon = Daemon::start(fleetd)?;
+    let mut client = Client::connect(&daemon.sock)?;
+    let mut streams = Streams::default();
+    let spawn = SpawnAgent {
+        program: "/bin/cat".into(),
+        cols: COLS,
+        rows: ROWS,
+        ..SpawnAgent::default()
+    };
+    let req = client.request(request::Kind::Spawn(Box::new(spawn)))?;
+    let cat = match streams.wait(&mut client, req)? {
+        response::Kind::Spawned(info) => info.id,
+        other => return Err(format!("spawn cat: unexpected {other:?}")),
+    };
+    attach_agent(&mut client, &mut streams, cat)?;
+
+    let (spawned, done) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let flood = std::thread::spawn({
+        let (sock, fake_agent) = (daemon.sock.clone(), fake_agent.to_path_buf());
+        let (spawned, done) = (Arc::clone(&spawned), Arc::clone(&done));
+        move || {
+            let r = flood_attached_on(&sock, &fake_agent, agents, attached, bytes, &spawned, &done);
+            // Unblock the sampler if the flood failed early.
+            spawned.store(true, Ordering::Release);
+            r
+        }
+    });
+    while !spawned.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut latencies = Vec::with_capacity(samples);
+    let mut during_flood = 0;
+    for i in 0..samples {
+        let byte = b'a' + (i % 26) as u8;
+        let req = client.request(request::Kind::Input(SendInput {
+            agent_id: cat,
+            data: vec![byte],
+        }))?;
+        let sent = Instant::now();
+        let (mut echoed, mut acked) = (false, false);
+        while !(echoed && acked) {
+            match client.recv()? {
+                Frame::Output { agent_id, data } if agent_id == cat => {
+                    if !echoed && data.contains(&byte) {
+                        latencies.push(sent.elapsed().as_nanos() as f64);
+                        echoed = true;
+                    }
+                }
+                frame => {
+                    if let Some(r) = streams.take(frame)? {
+                        match r.kind {
+                            Some(response::Kind::Ack(_)) if r.id == req => acked = true,
+                            other => return Err(format!("input {req}: unexpected {other:?}")),
+                        }
+                    }
+                }
+            }
+            if streams.exited.contains_key(&cat) {
+                return Err("cat exited during the echo samples".into());
+            }
+        }
+        if !done.load(Ordering::Acquire) {
+            during_flood += 1;
+        }
+        std::thread::sleep(gap);
+    }
+    let lagged = flood
+        .join()
+        .map_err(|_| "flood thread panicked".to_string())??;
+    if streams.lagged > 0 {
+        return Err("fleetd dropped the cat subscription as lagged".into());
+    }
+    if lagged > 0 {
+        eprintln!(
+            "fleet-perf: input echo: fleetd dropped {lagged} of {attached} flood subscriptions as lagged"
+        );
+    }
+    Ok(InputEcho {
+        median_ns: median(latencies),
+        during_flood,
+    })
 }
 
 #[cfg(test)]

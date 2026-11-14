@@ -4,3 +4,9 @@ resolver = "3"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# `Terminal::feed` renders every row that scrolls off as ANSI history; unoptimised
+# it is ~20x slower, too slow for the daemon tests that flood a PTY (e.g.
+# `stalled_terminal_gets_lagged_exit_2` needs the subscriber to lag within 3 s).
+[profile.dev.package.fleet-term]
+opt-level = 2

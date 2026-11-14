@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Monochrome mark for the macOS menu bar (template image: black + alpha); three-chevron variant of the app icon -->
+  <g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="9,8 16,14 9,20" stroke-width="5.5" stroke-opacity="0.55"/>
+    <polyline points="9,44 16,50 9,56" stroke-width="5.5" stroke-opacity="0.55"/>
+    <polyline points="25,21 36,32 25,43" stroke-width="6.5"/>
+  </g>
+  <rect x="40" y="39" width="17" height="6" rx="2" fill="#000"/>
+</svg>

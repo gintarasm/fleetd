@@ -10,7 +10,7 @@ use fleet_proto::{Attach, Detach, Frame, Resize, SendInput, event, request, resp
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
-use crate::client::{Client, Error, Result};
+use fleet_client::{Connection, Error, Result, Sender};
 
 /// Ctrl-\ as a legacy control byte.
 const DETACH_KEY: u8 = 0x1c;
@@ -95,9 +95,13 @@ fn terminal_size() -> (u32, u32) {
         .unwrap_or((80, 24))
 }
 
-/// Attaches and prints the snapshot only; no terminal changes.
-pub fn snapshot_only(mut client: Client, agent_id: u64) -> Result<()> {
-    match client.call(request::Kind::Attach(Attach { agent_id }))? {
+/// Attaches read-only (never taking the primary role) and prints the
+/// snapshot only; no terminal changes.
+pub fn snapshot_only(mut client: Connection, agent_id: u64) -> Result<()> {
+    match client.call(request::Kind::Attach(Attach {
+        agent_id,
+        observe: true,
+    }))? {
         response::Kind::Attached(ok) => {
             write_stdout(&ok.snapshot)?;
             Ok(())
@@ -106,26 +110,36 @@ pub fn snapshot_only(mut client: Client, agent_id: u64) -> Result<()> {
     }
 }
 
-pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
+pub fn run(mut client: Connection, agent_id: u64) -> Result<Outcome> {
     let (events, inbox) = mpsc::channel::<Ev>();
     // Signals first, so none is missed while the terminal is being set up.
     let mut signals = Signals::new([SIGWINCH, SIGINT, SIGTERM, SIGHUP])?;
 
-    // Resize first, so the snapshot is drawn at this terminal's size. An
-    // exited agent cannot be resized; attaching still shows its last screen.
-    let (cols, rows) = terminal_size();
-    match client.call(request::Kind::Resize(Resize {
+    // Attach first: only the primary's resizes apply (ADR 0022), and
+    // attaching makes this connection primary. If the agent's size differs,
+    // resize it, then attach again (keeping the role) so the snapshot is
+    // drawn at this terminal's size. An exited agent cannot be resized;
+    // attaching still shows its last screen.
+    let attach = |client: &mut Connection| match client.call(request::Kind::Attach(Attach {
         agent_id,
-        cols,
-        rows,
-    })) {
-        Ok(_) | Err(Error::Server(_)) => {}
-        Err(e) => return Err(e),
-    }
-    let ok = match client.call(request::Kind::Attach(Attach { agent_id }))? {
-        response::Kind::Attached(ok) => ok,
-        _ => return Err(Error::Protocol("unexpected reply to attach".into())),
+        observe: false,
+    }))? {
+        response::Kind::Attached(ok) => Ok(ok),
+        _ => Err(Error::Protocol("unexpected reply to attach".into())),
     };
+    let mut ok = attach(&mut client)?;
+    let (cols, rows) = terminal_size();
+    if (ok.cols, ok.rows) != (cols, rows) {
+        match client.call(request::Kind::Resize(Resize {
+            agent_id,
+            cols,
+            rows,
+        })) {
+            Ok(_) => ok = attach(&mut client)?,
+            Err(Error::Server(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
     let (mut frames, mut sender) = client.split();
 
     let guard = TerminalGuard::enter()?;
@@ -209,20 +223,11 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
             Ev::Frame(Frame::Output { agent_id: a, data }) if a == agent_id => {
                 write_stdout(&data)?;
             }
-            Ev::Frame(Frame::Event(e)) => {
-                if let Some(event::Kind::Exited(x)) = e.kind
-                    && x.agent_id == agent_id
-                {
-                    break Outcome::Exited;
-                }
-            }
-            Ev::Frame(Frame::Response(r)) if r.id == 0 => {
-                if let Some(response::Kind::Error(e)) = r.kind
-                    && e.message.starts_with("lagged")
-                {
-                    break Outcome::Lagged;
-                }
-            }
+            Ev::Frame(Frame::Event(e)) => match e.kind {
+                Some(event::Kind::Exited(x)) if x.agent_id == agent_id => break Outcome::Exited,
+                Some(event::Kind::Lagged(l)) if l.agent_id == agent_id => break Outcome::Lagged,
+                _ => {}
+            },
             // Acks (and errors) for our input and resizes.
             Ev::Frame(_) => {}
             Ev::Closed(msg) => {
@@ -266,7 +271,7 @@ pub fn run(mut client: Client, agent_id: u64) -> Result<Outcome> {
     Ok(outcome)
 }
 
-fn send_input(sender: &mut crate::client::Sender, agent_id: u64, data: &[u8]) -> Result<()> {
+fn send_input(sender: &mut Sender, agent_id: u64, data: &[u8]) -> Result<()> {
     if !data.is_empty() {
         sender.send(request::Kind::Input(SendInput {
             agent_id,

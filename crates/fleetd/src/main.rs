@@ -1,39 +1,77 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use fleetd::logging::{self, DAEMON_LOG, STDIO_LOG};
 use fleetd::{Config, StartupError, raise_fd_limit, startup};
+use tracing::{error, info, warn};
+
+/// Logs a fatal error and prints it to stderr: the log may be unavailable,
+/// and whoever started the daemon may capture stderr.
+fn fatal(msg: &str) {
+    error!("{msg}");
+    eprintln!("fleetd: {msg}");
+}
 
 fn main() -> ExitCode {
     let mut cfg = Config::default();
+    let mut stdio = false;
     let mut args = std::env::args_os().skip(1);
+    // Usage errors go to stderr only: there is no state dir to log to yet.
     while let Some(arg) = args.next() {
-        if arg == "--state-dir" {
+        if arg == "--stdio" {
+            stdio = true;
+        } else if arg == "--state-dir" {
             let Some(dir) = args.next() else {
                 eprintln!("fleetd: --state-dir requires a path");
                 return ExitCode::from(64);
             };
             cfg.state_dir = PathBuf::from(dir);
         } else {
-            eprintln!("usage: fleetd [--state-dir <path>]");
+            eprintln!("usage: fleetd [--stdio] [--state-dir <path>]");
             return ExitCode::from(64);
         }
     }
 
-    if let Err(e) = raise_fd_limit() {
-        eprintln!("fleetd: raising the open-file limit: {e}");
+    if stdio {
+        // Never stdout: it carries the protocol. Without a log file the
+        // bridge still works.
+        let _log = logging::init(&cfg.state_dir, STDIO_LOG).ok();
+        return match fleetd::stdio::run(&cfg) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!("fleetd --stdio: {e}");
+                // The bridge's stderr is the remote client's.
+                eprintln!("fleetd --stdio: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let log = logging::init(&cfg.state_dir, DAEMON_LOG);
+    let log_error = log.as_ref().err().map(ToString::to_string);
+    let _log = log.ok();
+
+    match raise_fd_limit() {
+        Ok(limit) => info!(limit, "open-file limit"),
+        Err(e) => warn!(error = %e, "raising the open-file limit failed"),
     }
 
     let daemon = match startup(&cfg) {
         Ok(d) => d,
         Err(StartupError::AlreadyRunning) => {
+            info!(state_dir = ?cfg.state_dir, "another fleetd holds the instance lock; exiting");
             eprintln!("fleetd already running");
             return ExitCode::from(2);
         }
         Err(e) => {
-            eprintln!("fleetd: {e}");
+            fatal(&e.to_string());
             return ExitCode::FAILURE;
         }
     };
+    if let Some(e) = log_error {
+        // The daemon runs anyway, unlogged.
+        eprintln!("fleetd: no log file: {e}");
+    }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -41,7 +79,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("fleetd: runtime: {e}");
+            fatal(&format!("runtime: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -49,9 +87,12 @@ fn main() -> ExitCode {
     // Do not wait on blocking calls stuck on an agent (e.g. a full input queue).
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
     match served {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            info!("fleetd stopped");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
-            eprintln!("fleetd: {e}");
+            fatal(&e.to_string());
             ExitCode::FAILURE
         }
     }

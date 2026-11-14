@@ -38,7 +38,7 @@ Any regression fails CI and requires explicit approval by the user. See [0014](d
  └──────────────────────────────────────┘
 ```
 
-- **One binary, two roles.** `fleetd` runs as `node` (owns agent processes, PTYs, terminal state, worktrees, SQLite) and/or `controller` (aggregates nodes, runs fleet-level plugins, holds secrets). The Mac runs both in one process; remote boxes run node only. Nodes are autonomous: agents keep running if the laptop sleeps or the GUI crashes. ([0002](decisions/0002-daemon-and-gpui-client.md), [0003](decisions/0003-node-controller-roles.md))
+- **One binary, two roles.** `fleetd` runs as `node` (owns agent processes, PTYs, terminal state, SQLite) and/or `controller` (aggregates nodes, runs fleet-level plugins, holds secrets). The Mac runs both in one process; remote boxes run node only. Nodes are autonomous: agents keep running if the laptop sleeps or the GUI crashes. ([0002](decisions/0002-daemon-and-gpui-client.md), [0003](decisions/0003-node-controller-roles.md))
 - **Transport:** controller → node over SSH (`ssh host fleetd --stdio` / forwarded socket). No open ports, no relay. TLS/QUIC listener later. ([0004](decisions/0004-ssh-transport.md))
 - **Protocol:** protobuf (prost) messages, length-framed over any byte stream, custom light RPC, dedicated binary frames for terminal output, version handshake. Same protocol GUI↔daemon and controller↔node. ([0006](decisions/0006-wire-protocol.md))
 - **Terminal state:** each node keeps a headless `alacritty_terminal` grid + bounded on-disk scrollback per agent. Reattach = instant snapshot + live stream. ([0005](decisions/0005-terminal-state-on-node.md))
@@ -46,27 +46,19 @@ Any regression fails CI and requires explicit approval by the user. See [0014](d
 - **Status detection:** agent CLI hooks first, PTY heuristics fallback; status carries source + confidence. ([0008](decisions/0008-agent-status-detection.md))
 - **Control-plane direction:** the controller as a control plane that runs on any host, an MCP channel per agent for messaging and spawning, and credentials split into a core broker plus secret-provider plugins ([0019](decisions/0019-control-plane-direction.md)).
 
-## Domain model ([0009](decisions/0009-domain-model.md))
+## Domain model ([0025](decisions/0025-core-knows-agents-workflows-own-hierarchy.md), supersedes 0009)
 
-```
-Project ─┬─ Workspace (node + directory)
-         │    ├─ git repo?  ── Worktree (branch, on that node) ── Task*
-         │    │                └─ (or Task* directly on main checkout, explicit opt-in)
-         │    └─ not git?   ── Task*
-         └─ Workspace (another node / directory) …
-```
-
-- **Project** groups workspaces; workspaces may live on different nodes.
-- **Workspace** = any directory on a node. If it is a git repo, worktrees can be created from it.
-- **Worktree** = git worktree on a branch, on the workspace's node. Default target for tasks in git workspaces.
-- **Task** = one agent session. Several tasks may share a worktree (e.g. coder + reviewer); no locking, warning when >1 writer is active ([0009](decisions/0009-domain-model.md)).
-- Comparing agents = multiple worktrees, each with its own task.
-- Diff view: git worktrees/checkouts only in v1; non-git workspaces show "not a git repo" (snapshot diff later).
+- **The core knows nodes and agents only.** An agent is a process on a node with a cwd, env, terminal and history.
+- **Labels:** agents carry opaque key/value labels (`project=fleetd`, `git.worktree=…`). The core stores and filters them without interpreting them. Only user clients and workflows write them; agents cannot.
+- **Workflows:** projects, workspaces, worktrees and tasks are higher-level concepts owned by **workflows**, a controller plugin kind.
+  - Each workflow exposes named actions that any interface (CLI, GUI, iOS, web) calls with `RunAction`.
+  - They are built on generic node primitives (`Exec`, `ReadFile`, `ListDir`) and labels.
+- **The built-in git-worktree workflow** owns worktree-per-agent, the read-only diff, archive, clone and fetch-back.
 
 ## Storage ([0010](decisions/0010-storage-and-layout.md))
 
 - Worktrees: `~/.fleet/worktrees/<repo>/<slug>`, branch `fleet/<slug>`.
-- State: SQLite (WAL) per node. Scrollback: on-disk ring buffers per agent.
+- State: SQLite (WAL) per node. Scrollback: on-disk ring buffers per agent. History: rendered lines, an in-memory tail plus on-disk segments per agent ([0021](decisions/0021-agent-history.md)).
 - Archive cleanup refuses when dirty/unpushed unless forced.
 
 ## Remote nodes ([0011](decisions/0011-remote-nodes.md))
@@ -87,7 +79,7 @@ Project ─┬─ Workspace (node + directory)
 | Kind | Runs on | v1 |
 |---|---|---|
 | Agent adapter | node | yes |
-| Remote provider | controller | yes |
+| Node provider (`node-provider` world, [0026](decisions/0026-node-providers-and-transports.md)) | controller | yes |
 | Lifecycle hooks | where the event fires | yes |
 | UI (declarative) | controller → rendered by GUI | yes |
 | Integrations (GitHub, Linear, Slack) | — | later |
@@ -96,7 +88,7 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 
 ## v1 scope
 
-**In:** spawn/manage CLI agents in PTYs · project/workspace/worktree/task hierarchy · live terminal + fleet sidebar (grouped by node → workspace, status badge, last line) · up to 4 splits · command palette · status detection · native notifications via menu-bar app · read-only diff view · local + remote nodes · plugins (adapters, providers, hooks, declarative UI) · credential forwarding.
+**In:** spawn/manage CLI agents in PTYs · agent labels + workflows (built-in git-worktree) · live terminal + fleet sidebar (grouped by label, status badge, last line) · up to 4 splits · command palette · status detection · native notifications via menu-bar app · read-only diff view · local + remote nodes · plugins (adapters, providers, hooks, declarative UI) · credential forwarding.
 
 **Later:** chat UI · diff line comments → agent · coordinator/sub-agents · built-in browser / computer use · mobile apps · scheduled automations · usage/account tracking · integrations · TLS/QUIC transport · live PTY handoff on upgrade · non-git snapshot diffs · built-in agent runtime · multi-user.
 
@@ -107,7 +99,9 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 | Crate | Purpose |
 |---|---|
 | `fleet-proto` | protobuf messages + framing |
-| `fleet-node` | PTYs, terminal grid, worktrees, SQLite |
+| `fleet-term` | terminal wrapper (alacritty grid, snapshot, history capture and rendering) shared by node, CLI and GUI ([0023](decisions/0023-crates-term-client.md)) |
+| `fleet-node` | PTYs, terminal grid, history, worktrees, SQLite |
+| `fleet-client` | blocking, transport-generic protocol client (unix socket, any stdio command) ([0023](decisions/0023-crates-term-client.md)) |
 | `fleet-controller` | fleet view, SSH transport, bootstrap, secrets |
 | `fleet-plugin-host` | wasmtime host, WIT worlds |
 | `fleetd` | daemon binary wiring roles |
@@ -120,10 +114,11 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 |---|---|
 | **M0** | Workspace skeleton, benchmark harness (50 fake agents flooding PTYs), CI perf gate, baselines |
 | **M1** | Local node: PTYs, terminal grid, scrollback, SQLite, protocol, `fleet-cli` — done 2026-11-13 ([0018](decisions/0018-m1-protocol-and-node.md)); new benchmarks' baselines are recorded from CI |
-| **M2** | gpui client: sidebar, terminal pane, splits, menu-bar app |
-| **M3** | Project/workspace/worktree/task hierarchy, diff view |
-| **M4** | Plugin host, Claude Code + Codex adapters, hook-based status, notifications |
-| **M5** | Remote nodes: SSH transport, bootstrap, workspace clone, git fetch-back |
+| **M2a** | Daemon side of the GUI: agent history (tail + pages), protocol v2 (history, spawn-attach, lag and activity events, primary client, labels), the 50-agent flood fix, `fleet-term` and `fleet-client`, CLI `history`/`screen`/`label`, `fleetd --stdio`, login-shell env, the fleet agent skill — done 2026-11-13 ([0021](decisions/0021-agent-history.md), [0022](decisions/0022-protocol-v2.md), [0023](decisions/0023-crates-term-client.md), [0024](decisions/0024-agent-skill-stdio-env.md)); new benchmarks' baselines are recorded from CI |
+| **M2b** | gpui client: sidebar, terminal pane with history, splits, menu-bar app, connect sheet, GUI benchmarks |
+| **M3** | Node primitives (`Exec`/`ReadFile`/`ListDir`), `RunAction` interface, built-in git-worktree workflow, diff view ([0025](decisions/0025-core-knows-agents-workflows-own-hierarchy.md); core labels landed in M2a) |
+| **M4** | Plugin host (incl. third-party workflows), Claude Code + Codex adapters, hook-based status, notifications |
+| **M5** | Remote nodes via node providers ([0026](decisions/0026-node-providers-and-transports.md)): `node-provider` world, built-in SSH-host provider, SSH/command transports, bootstrap (systemd optional), keepalive and `on_idle`, history archive before teardown; workspace clone and fetch-back as git-worktree actions |
 | **M6** | Secrets, OAuth reverse-forwarding, ssh-agent forwarding |
 
 ## Licensing
