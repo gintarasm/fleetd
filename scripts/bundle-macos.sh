@@ -33,6 +33,6 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp target/release/fleet-gui target/release/fleetd target/release/fleet "$app/Contents/MacOS/"
 [ -f assets/logo/fleetd.icns ] || make_icon
 cp assets/logo/fleetd.icns "$app/Contents/Resources/fleetd.icns"
-version=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"name":"fleet-gui","version":"\([^"]*\)".*/\1/p')
+version=$(grep -m1 '^version' crates/fleet-gui/Cargo.toml | cut -d'"' -f2)
 sed "s/__VERSION__/${version:-0.1.0}/g" crates/fleet-gui/Info.plist > "$app/Contents/Info.plist"
 echo "built $app"

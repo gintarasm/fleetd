@@ -14,6 +14,7 @@ A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Co
 | M1 | Local node: PTYs, terminal state, scrollback, SQLite, protocol, `fleet` CLI | done |
 | M2a | Daemon side of the GUI: agent history, protocol v2, labels, flood fix, `fleetd --stdio`, login-shell env, agent skill | done |
 | M2b | GUI (gpui): sidebar, terminal panes, splits, menu-bar app, connect sheet | done |
+| M2c | Daily-drive polish: native-feeling GUI, restart and remove exited agents | TBD |
 | M3 | Projects, workspaces, worktrees, tasks; diff view | TBD |
 | M4 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent MCP channel | TBD |
 | M5 | Remote nodes over SSH | TBD |
@@ -220,14 +221,18 @@ scripts/bundle-macos.sh                        # builds target/release/fleetd.ap
 open target/release/fleetd.app
 ```
 
-The bundle holds `fleet-gui`, plus `fleetd` and `fleet` as siblings, so "Start fleetd on this Mac" and "Install agent skill" work without anything on `PATH`. Copy `fleetd.app` to `/Applications` if you like. `scripts/bundle-macos.sh --icon-only` regenerates `assets/logo/fleetd.icns` from `assets/logo/fleetd-icon.svg`.
+The bundle holds `fleet-gui`, plus `fleetd` and `fleet` as siblings, so "Start fleetd on this Mac" and "Install agent skill" work without anything on `PATH`. Copy `fleetd.app` to `/Applications` if you like.
+
+The bundle is unsigned. A copy that was downloaded (quarantined) is blocked by Gatekeeper on first open: right-click it and choose Open, or run `xattr -d com.apple.quarantine fleetd.app`. A bundle you built yourself is not quarantined. `scripts/bundle-macos.sh --icon-only` regenerates `assets/logo/fleetd.icns` from `assets/logo/fleetd-icon.svg`.
 
 ### Connecting
 
 On launch the GUI connects to the saved target. If that fails, or nothing is saved and no local daemon answers, a connect sheet offers:
 - **Start fleetd on this Mac**: starts a detached local daemon, only when you click.
-- **Connect to a remote fleetd**: `user@host`, over `ssh` (your `~/.ssh/config`, keys and agent apply; connections share one ControlMaster). `fleetd` must be installed on the host.
+- **Connect to a remote fleetd**: `user@host`, over `ssh` (your `~/.ssh/config`, keys and agent apply; connections share one ControlMaster). `fleetd` must be installed on the host. ssh runs with `BatchMode=yes` and `ConnectTimeout=10`, so the host must be reachable without a password or host-key prompt (keys or the agent, and a known host). Every reconnect runs `fleetd --stdio` on the host again, which starts the remote daemon if it is not running: a remote daemon you stop comes back within seconds while the GUI is connected to it.
 - **Recent targets.**
+
+Not yet verified by hand: connecting to a remote host over ssh, the "Start fleetd on this Mac" flow from a clean state, and the menu-bar item with Dock hiding (Show fleetd, closing the window). They are covered by tests against fakes but are still on the hand-off checklist.
 
 ### Layout and keys
 
@@ -246,7 +251,7 @@ On launch the GUI connects to the saved target. If that fails, or nothing is sav
 
 ### Menu bar
 
-A status item is always present: Show fleetd, the running agents, New agent…, Switch fleetd…, Install agent skill and Quit. Closing the window keeps the app resident (the Dock icon hides); Show fleetd brings it back. **Quit only quits the GUI; agents keep running.**
+A status item is always present: Show fleetd, the running agents, New agent…, Switch fleetd…, Install agent skill and Quit. The app menu has Switch fleetd…, Install agent skill and Quit too. Closing the window keeps the app resident (the Dock icon hides); Show fleetd brings it back (not yet verified by hand, see above). **Quit only quits the GUI; agents keep running.**
 
 ### Configuration
 
@@ -264,7 +269,7 @@ The GUI keeps its own state (recent targets and directories, layouts) in `~/.fle
 
 ### Performance
 
-Measured on a dev Mac: cold start (`gui_cold_start_ns`) about 152 ms against a 200 ms budget, input to render (`input_to_render_ns`) about 12.9 ms and under a 50-agent flood (`input_to_render_flood50_ns`) about 11.8 ms, against 16 ms. CI records the baselines. These metrics need an unlocked, awake GUI session on the perf-wall runner; see [`bench/README.md`](bench/README.md).
+Advisory figures from one local wall run on a dev Mac (local wall numbers are advisory; CI is authoritative and records the baselines): cold start (`gui_cold_start_ns`) about 152 ms against a 200 ms budget, input to render (`input_to_render_ns`) about 12.9 ms and under a 50-agent flood (`input_to_render_flood50_ns`) about 11.8 ms, against 16 ms. These metrics need an unlocked, awake GUI session on the perf-wall runner; see [`bench/README.md`](bench/README.md).
 
 ## Remote agents
 
