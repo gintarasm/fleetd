@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use super::keymap::{Paste, TEXT_FIELD_CONTEXT};
-use super::theme::Theme;
+use super::theme::{Theme, current as theme};
 use crate::core::session::AgentRow;
 
 /// What a spawn needs from the sheet.
@@ -476,12 +476,6 @@ impl Render for NewAgentSheet {
                     ),
             )
     }
-}
-
-fn theme(cx: &App) -> Theme {
-    cx.try_global::<Theme>()
-        .copied()
-        .unwrap_or_else(Theme::dark)
 }
 
 #[cfg(test)]

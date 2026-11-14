@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    UTF16Selection, Window, div, font, point, px, size,
+    AnyWindowHandle, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Font, FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, UTF16Selection, Window, div,
+    font, point, px, size,
 };
 
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
 use super::terminal_element::TerminalElement;
-use super::theme::Theme;
+use super::theme::current as theme;
 use crate::core::config::GuiConfig;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
@@ -636,13 +636,13 @@ impl Render for PaneView {
                             })
                             .child(SharedString::from(title_text)),
                     )
-                    .child(
+                    .children((!path.is_empty()).then(|| {
                         div()
                             .min_w_0()
                             .truncate()
                             .text_color(theme.dim_text)
-                            .child(SharedString::from(path)),
-                    ),
+                            .child(SharedString::from(format!("· {path}")))
+                    })),
             )
             .children(observing.then(|| {
                 div()
@@ -716,12 +716,6 @@ impl Render for PaneView {
             .child(header)
             .child(grid)
     }
-}
-
-fn theme(cx: &App) -> Theme {
-    cx.try_global::<Theme>()
-        .copied()
-        .unwrap_or_else(Theme::dark)
 }
 
 fn utf16_len(s: &str) -> usize {

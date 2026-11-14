@@ -1,550 +1,32 @@
 //! The workspace window: the sidebar, up to four split panes and the
-//! sheets over them. [`AppState`] holds everything that outlives the
-//! window (the app is resident): the session, the layout and the panes.
+//! sheets over them, drawn from [`AppState`].
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use fleet_term::Palette;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Global, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, PromptButton, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, anchored, deferred, div, px, relative, size,
+    App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, PromptButton, PromptLevel, Render,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, anchored, deferred, div, px, relative, size,
 };
 
+use super::app_state::AppState;
 use super::keymap::{
     ClosePane, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
     FocusUp, Kill, NewAgent, SplitDown, SplitRight, ToggleMaximize,
 };
-use super::new_agent::{NewAgentSheet, SheetEvent, SpawnRequest, dir_choices};
-use super::pane_view::{InputSink, PaneChrome, PaneEvent, PaneView};
-use super::sidebar_view::{SidebarData, TabMark, program_name, render_sidebar};
+use super::new_agent::{NewAgentSheet, SheetEvent};
+use super::pane_view::{PaneEvent, PaneView};
+use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
 use super::theme::Theme;
-use crate::core::config::GuiConfig;
-use crate::core::layout::{Axis, Dir, Layout, MAX_PANES, Rect};
-use crate::core::pane::PaneModel;
-use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent};
-use crate::core::sidebar::tilde;
-use crate::core::state::{GuiState, MAX_RECENT_DIRS, push_recent};
+use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
+use crate::core::session::PaneId;
 use crate::core::target::Target;
 
-/// Saved state is written once it has been still this long.
-pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Between pane cards, and around them.
 const PANE_GAP: f32 = 8.0;
-
-/// What the workspace needs from the session: [`Session`], or a recording
-/// fake in tests.
-pub trait SessionApi: InputSink {
-    fn agents(&self) -> Vec<AgentRow>;
-    fn spawn(
-        &self,
-        program: String,
-        args: Vec<String>,
-        cwd: String,
-        cols: u16,
-        rows: u16,
-        pane: PaneId,
-    ) -> Result<(), String>;
-    fn kill(&self, agent_id: u64);
-    fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>>;
-    fn attach(&self, pane: PaneId, agent_id: u64);
-    fn close_pane(&self, pane: PaneId);
-    fn set_palette(&self, palette: Palette);
-}
-
-impl SessionApi for Session {
-    fn agents(&self) -> Vec<AgentRow> {
-        Session::agents(self)
-    }
-
-    fn spawn(
-        &self,
-        program: String,
-        args: Vec<String>,
-        cwd: String,
-        cols: u16,
-        rows: u16,
-        pane: PaneId,
-    ) -> Result<(), String> {
-        Session::spawn(self, program, args, cwd, cols, rows, pane)
-    }
-
-    fn kill(&self, agent_id: u64) {
-        Session::kill(self, agent_id);
-    }
-
-    fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
-        Session::open_pane(self, pane, agent_id)
-    }
-
-    fn attach(&self, pane: PaneId, agent_id: u64) {
-        Session::attach(self, pane, agent_id);
-    }
-
-    fn close_pane(&self, pane: PaneId) {
-        Session::close_pane(self, pane);
-    }
-
-    fn set_palette(&self, palette: Palette) {
-        Session::set_palette(self, palette);
-    }
-}
-
-fn lock(m: &Mutex<PaneModel>) -> MutexGuard<'_, PaneModel> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
-}
-
-/// The process-wide [`AppState`].
-struct AppGlobal(Entity<AppState>);
-
-impl Global for AppGlobal {}
-
-/// Everything that outlives the window: closing it keeps the session and
-/// every pane attached.
-pub struct AppState {
-    session: Arc<dyn SessionApi>,
-    target: Target,
-    state_dir: PathBuf,
-    home: PathBuf,
-    config: GuiConfig,
-    gui_state: GuiState,
-    layout: Layout,
-    panes: HashMap<PaneId, Entity<PaneView>>,
-    focused: PaneId,
-    /// The pane filling the pane area, if any (not saved).
-    maximized: Option<PaneId>,
-    /// OSC titles of the agents shown in panes.
-    titles: HashMap<u64, String>,
-    theme: Theme,
-    agents: Vec<AgentRow>,
-    connection: Option<ConnState>,
-    /// The last error, shown until dismissed or replaced.
-    error: Option<String>,
-    /// Panes a spawn is on its way into, with the agent they showed before.
-    starting: HashMap<PaneId, Option<u64>>,
-    window: Option<WindowHandle<Workspace>>,
-    /// Saved state not yet written.
-    dirty: bool,
-    save_task: Option<Task<()>>,
-    _events: Task<()>,
-}
-
-impl AppState {
-    /// Restores the target's saved layout, opening (and attaching) its
-    /// panes, and follows the session's events from `ui`.
-    pub fn new(
-        session: Arc<dyn SessionApi>,
-        ui: async_channel::Receiver<UiEvent>,
-        target: Target,
-        state_dir: PathBuf,
-        config: GuiConfig,
-        theme: Theme,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let gui_state = GuiState::load(&state_dir);
-        let layout = gui_state
-            .layouts
-            .get(&target.to_string())
-            .map_or_else(Layout::single, Layout::from_saved);
-        session.set_palette(theme.palette);
-        cx.set_global(theme);
-        let events = cx.spawn(async move |this, cx| {
-            while let Ok(first) = ui.recv().await {
-                let batch: Vec<UiEvent> = std::iter::once(first)
-                    .chain(std::iter::from_fn(|| ui.try_recv().ok()))
-                    .collect();
-                if this.update(cx, |s, cx| s.apply_events(batch, cx)).is_err() {
-                    break;
-                }
-            }
-        });
-        let focused = layout.panes()[0];
-        let mut s = AppState {
-            agents: session.agents(),
-            session,
-            target,
-            state_dir,
-            home: home_dir(),
-            config,
-            gui_state,
-            layout,
-            panes: HashMap::new(),
-            focused,
-            maximized: None,
-            titles: HashMap::new(),
-            theme,
-            connection: None,
-            error: None,
-            starting: HashMap::new(),
-            window: None,
-            dirty: false,
-            save_task: None,
-            _events: events,
-        };
-        for pane in s.layout.panes() {
-            let agent = s.layout.agent(pane);
-            s.open(pane, agent, cx);
-        }
-        s.refresh_chrome(cx);
-        s
-    }
-
-    /// Makes `state` the process-wide app state.
-    pub fn install(state: Entity<AppState>, cx: &mut App) {
-        cx.set_global(AppGlobal(state));
-    }
-
-    pub fn global(cx: &App) -> Option<Entity<AppState>> {
-        cx.try_global::<AppGlobal>().map(|g| g.0.clone())
-    }
-
-    pub fn layout(&self) -> &Layout {
-        &self.layout
-    }
-
-    pub fn focused(&self) -> PaneId {
-        self.focused
-    }
-
-    pub fn pane_view(&self, pane: PaneId) -> Option<&Entity<PaneView>> {
-        self.panes.get(&pane)
-    }
-
-    pub fn gui_state(&self) -> &GuiState {
-        &self.gui_state
-    }
-
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
-    }
-
-    fn target_key(&self) -> String {
-        self.target.to_string()
-    }
-
-    fn open(&mut self, pane: PaneId, agent: Option<u64>, cx: &mut Context<Self>) {
-        let model = self.session.open_pane(pane, agent);
-        let sink: Arc<dyn InputSink> = self.session.clone();
-        let config = &self.config;
-        let view = cx.new(|cx| PaneView::new(pane, model, sink, config, cx));
-        self.panes.insert(pane, view);
-    }
-
-    fn apply_events(&mut self, batch: Vec<UiEvent>, cx: &mut Context<Self>) {
-        let mut chrome = false;
-        let mut layout = false;
-        for event in batch {
-            match event {
-                UiEvent::AgentsChanged => {
-                    self.agents = self.session.agents();
-                    chrome = true;
-                    cx.notify();
-                }
-                UiEvent::PaneChanged(pane) => {
-                    let Some(view) = self.panes.get(&pane).cloned() else {
-                        continue;
-                    };
-                    // A spawn landed: the pane now shows the new agent.
-                    if let Some(&before) = self.starting.get(&pane) {
-                        let shown = lock(view.read(cx).model_handle()).agent_id();
-                        if shown.is_some() && shown != before {
-                            self.starting.remove(&pane);
-                            self.layout.set_agent(pane, shown);
-                            layout = true;
-                        }
-                    }
-                    let (agent, title) = {
-                        let model = lock(view.read(cx).model_handle());
-                        (model.agent_id(), model.title())
-                    };
-                    if let Some(id) = agent {
-                        let changed = match title {
-                            Some(t) => self.titles.insert(id, t.clone()).as_ref() != Some(&t),
-                            None => self.titles.remove(&id).is_some(),
-                        };
-                        if changed {
-                            cx.notify();
-                        }
-                    }
-                    view.update(cx, |_, cx| cx.notify());
-                }
-                UiEvent::Connection(state) => {
-                    self.connection = Some(state);
-                    chrome = true;
-                }
-                UiEvent::Error(e) => {
-                    eprintln!("fleet-gui: {e}");
-                    // The spawns on their way may be what failed.
-                    self.starting.clear();
-                    self.error = Some(e);
-                    chrome = true;
-                    cx.notify();
-                }
-            }
-        }
-        if layout {
-            self.layout_changed(cx);
-        } else if chrome {
-            self.refresh_chrome(cx);
-        }
-    }
-
-    /// Tells each pane its number, agent and connection facts.
-    fn refresh_chrome(&mut self, cx: &mut Context<Self>) {
-        let reconnect_in = match self.connection {
-            Some(ConnState::Disconnected { retry_in }) => Some(retry_in),
-            _ => None,
-        };
-        for (i, pane) in self.layout.panes().into_iter().enumerate() {
-            let agent = self.layout.agent(pane);
-            let row = agent.and_then(|id| self.agents.iter().find(|r| r.info.id == id));
-            let chrome = PaneChrome {
-                number: i + 1,
-                has_agent: agent.is_some(),
-                program: match (row, agent) {
-                    (Some(r), _) => Some(program_name(&r.info.program)),
-                    (None, Some(id)) => Some(format!("agent {id}")),
-                    (None, None) => None,
-                },
-                cwd: row.map(|r| tilde(&r.info.cwd, &self.home)),
-                starting: self.starting.contains_key(&pane),
-                reconnect_in,
-                focused: pane == self.focused,
-            };
-            if let Some(view) = self.panes.get(&pane) {
-                view.update(cx, |v, cx| v.set_chrome(chrome, cx));
-            }
-        }
-    }
-
-    /// The layout changed: redraw, and save it after [`SAVE_DEBOUNCE`].
-    fn layout_changed(&mut self, cx: &mut Context<Self>) {
-        let key = self.target_key();
-        self.gui_state.layouts.insert(key, self.layout.to_saved());
-        self.schedule_save(cx);
-        self.refresh_chrome(cx);
-        cx.notify();
-    }
-
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        self.dirty = true;
-        self.save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SAVE_DEBOUNCE).await;
-            let _ = this.update(cx, |s, _| s.save_now());
-        }));
-    }
-
-    /// Writes the saved state if it changed (also at quit).
-    pub fn save_now(&mut self) {
-        if !std::mem::take(&mut self.dirty) {
-            return;
-        }
-        if let Err(e) = self.gui_state.save(&self.state_dir) {
-            eprintln!("fleet-gui: cannot save the GUI state: {e}");
-        }
-    }
-
-    pub fn set_focused(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        if self.focused != pane && self.panes.contains_key(&pane) {
-            self.focused = pane;
-            // Focus moving elsewhere restores the split view.
-            if self.maximized.is_some_and(|m| m != pane) {
-                self.maximized = None;
-            }
-            self.refresh_chrome(cx);
-            cx.notify();
-        }
-    }
-
-    pub fn maximized(&self) -> Option<PaneId> {
-        self.maximized
-    }
-
-    /// Maximizes the focused pane, or restores the split view.
-    pub fn toggle_maximize(&mut self, cx: &mut Context<Self>) {
-        self.maximized = match self.maximized {
-            Some(_) => None,
-            None if self.layout.panes().len() > 1 => Some(self.focused),
-            None => None,
-        };
-        cx.notify();
-    }
-
-    /// How each agent's tab relates to the panes.
-    pub fn tab_marks(&self) -> HashMap<u64, TabMark> {
-        let mut marks = HashMap::new();
-        for pane in self.layout.panes() {
-            if let Some(id) = self.layout.agent(pane) {
-                let mark = if pane == self.focused {
-                    TabMark::Focused
-                } else {
-                    TabMark::Shown
-                };
-                let slot = marks.entry(id).or_insert(mark);
-                if mark == TabMark::Focused {
-                    *slot = mark;
-                }
-            }
-        }
-        marks
-    }
-
-    /// Splits the focused pane; the new, empty pane gets the focus. `None`
-    /// at [`MAX_PANES`].
-    pub fn split(&mut self, axis: Axis, cx: &mut Context<Self>) -> Option<PaneId> {
-        let new = self.layout.split(self.focused, axis)?;
-        self.maximized = None;
-        self.open(new, None, cx);
-        self.focused = new;
-        self.layout_changed(cx);
-        Some(new)
-    }
-
-    /// Closes the focused pane, detaching its agent (never killing it).
-    /// The last pane stays, empty.
-    pub fn close_focused(&mut self, cx: &mut Context<Self>) {
-        let pane = self.focused;
-        let Some(next) = self.layout.close(pane) else {
-            return;
-        };
-        self.session.close_pane(pane);
-        self.panes.remove(&pane);
-        self.maximized = None;
-        self.starting.remove(&pane);
-        if next == pane {
-            // The last pane: a fresh, empty connection in its place.
-            self.open(pane, None, cx);
-        }
-        self.focused = next;
-        self.layout_changed(cx);
-    }
-
-    /// The pane `n` (1-based, reading order).
-    pub fn pane_by_number(&self, n: usize) -> Option<PaneId> {
-        self.layout.panes().get(n.checked_sub(1)?).copied()
-    }
-
-    pub fn neighbour(&self, dir: Dir) -> Option<PaneId> {
-        self.layout.neighbour(self.focused, dir, 1.0, 1.0)
-    }
-
-    /// Shows `agent_id` in the focused pane.
-    pub fn show_agent(&mut self, agent_id: u64, cx: &mut Context<Self>) {
-        let pane = self.focused;
-        if self.layout.agent(pane) == Some(agent_id) {
-            return;
-        }
-        self.starting.remove(&pane);
-        self.layout.set_agent(pane, Some(agent_id));
-        self.session.attach(pane, agent_id);
-        self.layout_changed(cx);
-    }
-
-    /// Splits the focused pane to the right and shows `agent_id` there.
-    pub fn open_in_new_split(&mut self, agent_id: u64, cx: &mut Context<Self>) -> Option<PaneId> {
-        let new = self.layout.split(self.focused, Axis::Horizontal)?;
-        self.maximized = None;
-        self.layout.set_agent(new, Some(agent_id));
-        self.open(new, Some(agent_id), cx);
-        self.focused = new;
-        self.layout_changed(cx);
-        Some(new)
-    }
-
-    /// Spawns into the focused pane at its size, and remembers the
-    /// directory.
-    pub fn spawn(&mut self, req: SpawnRequest, cx: &mut Context<Self>) -> Result<(), String> {
-        let pane = self.focused;
-        let (cols, rows) = self
-            .panes
-            .get(&pane)
-            .and_then(|v| v.read(cx).grid())
-            .unwrap_or((80, 24));
-        let cwd = self.expand(&req.cwd);
-        self.session
-            .spawn(req.program, req.args, cwd.clone(), cols, rows, pane)?;
-        self.starting.insert(pane, self.layout.agent(pane));
-        let dirs = self
-            .gui_state
-            .recent_dirs
-            .entry(self.target.to_string())
-            .or_default();
-        push_recent(dirs, cwd, MAX_RECENT_DIRS);
-        self.schedule_save(cx);
-        self.refresh_chrome(cx);
-        cx.notify();
-        Ok(())
-    }
-
-    /// `~` is the home directory for a local daemon; remote paths are the
-    /// remote host's, passed as typed.
-    fn expand(&self, dir: &str) -> String {
-        if self.target != Target::Local {
-            return dir.to_owned();
-        }
-        match dir.strip_prefix('~') {
-            Some("") => self.home.to_string_lossy().into_owned(),
-            Some(rest) if rest.starts_with('/') => {
-                format!("{}{rest}", self.home.to_string_lossy())
-            }
-            _ => dir.to_owned(),
-        }
-    }
-
-    pub fn kill(&self, agent_id: u64) {
-        self.session.kill(agent_id);
-    }
-
-    /// The New agent sheet's directories.
-    pub fn dir_choices(&self) -> Vec<String> {
-        let recent = self
-            .gui_state
-            .recent_dirs
-            .get(&self.target.to_string())
-            .map_or(&[][..], Vec::as_slice);
-        dir_choices(recent, &self.agents)
-    }
-
-    pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
-        if self.theme == theme {
-            return;
-        }
-        self.theme = theme;
-        self.session.set_palette(theme.palette);
-        cx.set_global(theme);
-        cx.notify();
-    }
-
-    fn dismiss_error(&mut self, cx: &mut Context<Self>) {
-        self.error = None;
-        cx.notify();
-    }
-
-    fn label(&self, agent_id: u64) -> String {
-        match self.agents.iter().find(|r| r.info.id == agent_id) {
-            Some(r) => format!(
-                "{} in {}",
-                program_name(&r.info.program),
-                tilde(&r.info.cwd, &self.home)
-            ),
-            None => format!("agent {agent_id}"),
-        }
-    }
-}
 
 /// Opens the workspace window, or brings the open one to the front.
 pub fn open_main_window(cx: &mut App) {
@@ -591,10 +73,11 @@ pub struct Workspace {
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
     menu: Option<RowMenu>,
     /// Focus-in and header-button subscriptions, by pane.
-    pane_focus: HashMap<PaneId, [Subscription; 2]>,
+    pane_focus: HashMap<PaneId, (EntityId, [Subscription; 2])>,
     /// The panes drawn by the last render.
     drawn: Vec<PaneId>,
     _subscriptions: Vec<Subscription>,
+    _ticker: Task<()>,
 }
 
 impl Workspace {
@@ -607,15 +90,32 @@ impl Workspace {
         });
         let theme = Theme::for_appearance(window.appearance());
         app.update(cx, |a, cx| a.set_theme(theme, cx));
+        // `since` in the sidebar and the reconnect countdown age by the
+        // second; the timer lives as long as the window.
+        let ticker = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let ok = this.update(cx, |this, cx| {
+                    this.app.update(cx, |a, cx| a.tick(cx));
+                    if this.app.read(cx).has_agents() {
+                        cx.notify();
+                    }
+                });
+                if ok.is_err() {
+                    break;
+                }
+            }
+        });
         let ws = Workspace {
             app,
+            _ticker: ticker,
             sheet: None,
             menu: None,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
             _subscriptions: vec![observe, appearance],
         };
-        ws.focus_pane(ws.app.read(cx).focused, window, cx);
+        ws.focus_pane(ws.app.read(cx).focused(), window, cx);
         ws
     }
 
@@ -651,7 +151,7 @@ impl Workspace {
     }
 
     fn focus_current(&self, window: &mut Window, cx: &mut App) {
-        let pane = self.app.read(cx).focused;
+        let pane = self.app.read(cx).focused();
         self.focus_pane(pane, window, cx);
     }
 
@@ -785,25 +285,34 @@ impl Workspace {
 
     /// Keeps the app's focused pane in step with clicks into panes.
     fn follow_pane_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let panes = self.app.read(cx).layout.panes();
-        self.pane_focus.retain(|p, _| panes.contains(p));
-        for pane in panes {
+        let views: Vec<(PaneId, Entity<PaneView>)> = {
+            let app = self.app.read(cx);
+            app.layout
+                .panes()
+                .into_iter()
+                .filter_map(|p| Some((p, app.pane_view(p)?.clone())))
+                .collect()
+        };
+        // A pane id can get a new view (closing the last pane replaces it):
+        // subscriptions follow the view, not the id.
+        self.pane_focus.retain(|p, (id, _)| {
+            views
+                .iter()
+                .any(|(pane, view)| pane == p && view.entity_id() == *id)
+        });
+        for (pane, view) in views {
             if self.pane_focus.contains_key(&pane) {
                 continue;
             }
-            let Some(handle) = self.pane_focus_handle(pane, cx) else {
-                continue;
-            };
+            let handle = view.read(cx).focus_handle().clone();
             let focus = cx.on_focus_in(&handle, window, move |this, _, cx| {
                 this.app.update(cx, |a, cx| a.set_focused(pane, cx));
             });
-            let Some(view) = self.app.read(cx).pane_view(pane).cloned() else {
-                continue;
-            };
             let events = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
                 this.pane_event(pane, *event, window, cx);
             });
-            self.pane_focus.insert(pane, [focus, events]);
+            self.pane_focus
+                .insert(pane, (view.entity_id(), [focus, events]));
         }
     }
 
@@ -1039,6 +548,12 @@ impl Render for Workspace {
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1052,7 +567,8 @@ mod tests {
         TestAppContext, TouchPhase, VisualTestContext, point,
     };
 
-    use super::{AppState, SAVE_DEBOUNCE, SessionApi, Workspace};
+    use super::Workspace;
+    use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
     use crate::app::keymap::{Kill, bind_keys};
     use crate::app::pane_view::InputSink;
     use crate::app::sidebar_view::TabMark;
@@ -1198,21 +714,21 @@ mod tests {
     }
 
     fn setup<'a>(cx: &'a mut TestAppContext, fake: &Arc<Fake>, dir: &Path) -> Setup<'a> {
+        setup_with(cx, fake, dir, GuiConfig::default())
+    }
+
+    fn setup_with<'a>(
+        cx: &'a mut TestAppContext,
+        fake: &Arc<Fake>,
+        dir: &Path,
+        config: GuiConfig,
+    ) -> Setup<'a> {
         cx.update(bind_keys);
         let (ui, rx) = async_channel::unbounded();
         let session: Arc<dyn SessionApi> = fake.clone();
         let dir = dir.to_owned();
-        let app = cx.new(|cx| {
-            AppState::new(
-                session,
-                rx,
-                Target::Local,
-                dir,
-                GuiConfig::default(),
-                Theme::dark(),
-                cx,
-            )
-        });
+        let app =
+            cx.new(|cx| AppState::new(session, rx, Target::Local, dir, config, Theme::dark(), cx));
         cx.update(|cx| AppState::install(app.clone(), cx));
         let state = app.clone();
         let (ws, cx) = cx.add_window_view(|window, cx| Workspace::new(state, window, cx));
@@ -1360,7 +876,15 @@ mod tests {
             .insert("local".into(), vec!["/r1".into(), "/a".into()]);
         state.save(dir.path()).unwrap();
         let fake = Arc::new(Fake::default());
-        let mut s = setup(cx, &fake, dir.path());
+        let config = GuiConfig {
+            default_command: vec![
+                "claude".into(),
+                "--append-system-prompt".into(),
+                "be brief".into(),
+            ],
+            ..GuiConfig::default()
+        };
+        let mut s = setup_with(cx, &fake, dir.path(), config);
         agents(
             &mut s,
             &fake,
@@ -1378,12 +902,26 @@ mod tests {
                 sh.can_choose,
             )
         });
-        assert_eq!(command, GuiConfig::default().default_command.join(" "));
+        // Shell-quoted, so the argument with a space survives the parse.
+        assert_eq!(command, "claude --append-system-prompt 'be brief'");
         assert_eq!(dirs, ["/r1", "/a", "/b", "/c"]);
         assert_eq!(dir_text, "/r1");
         assert!(can_choose);
 
-        // Type a command with quoting into the (focused) command field.
+        s.cx.simulate_keystrokes("enter");
+        assert!(fake.calls().contains(&Call::Spawn {
+            program: "claude".into(),
+            args: vec!["--append-system-prompt".into(), "be brief".into()],
+            cwd: "/r1".into(),
+            size: s.app.read_with(s.cx, |a, cx| {
+                a.pane_view(PaneId(1)).unwrap().read(cx).grid().unwrap()
+            }),
+            pane: PaneId(1),
+        }));
+
+        // Again, typing a command with quoting into the command field.
+        s.cx.simulate_keystrokes("cmd-n");
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
         let field = sheet.read_with(s.cx, |sh, _| sh.command.clone());
         field.update(s.cx, |f, cx| f.set_text(String::new(), cx));
         s.cx.simulate_input("sh -c 'echo hi'");
@@ -1402,10 +940,12 @@ mod tests {
             pane: PaneId(1),
         }));
         assert!(s.ws.read_with(s.cx, |w, _| w.sheet().is_none()));
-        let recent = s
-            .app
-            .read_with(s.cx, |a, _| a.gui_state().recent_dirs["local"].clone());
-        assert_eq!(recent, ["/tmp", "/r1", "/a"]);
+        let recent = |s: &mut Setup<'_>| {
+            s.app
+                .read_with(s.cx, |a, _| a.gui_state().recent_dirs["local"].clone())
+        };
+        // Not yet: the spawn has not landed.
+        assert_eq!(recent(&mut s), ["/r1", "/a"]);
 
         // The spawned agent lands in the pane: the layout records it.
         fake.model(PaneId(1))
@@ -1422,6 +962,106 @@ mod tests {
         s.cx.run_until_parked();
         let shown = s.app.read_with(s.cx, |a, _| a.layout().agent(PaneId(1)));
         assert_eq!(shown, Some(9));
+        assert_eq!(recent(&mut s), ["/tmp", "/r1", "/a"]);
+    }
+
+    fn spawn_via_sheet(s: &mut Setup<'_>, dir: &str) {
+        s.cx.simulate_keystrokes("cmd-n");
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
+        let field = sheet.read_with(s.cx, |sh, _| sh.dir.clone());
+        let dir = dir.to_owned();
+        field.update(s.cx, |f, cx| f.set_text(dir, cx));
+        s.cx.simulate_keystrokes("enter");
+    }
+
+    fn attach_model(fake: &Fake, pane: PaneId, agent_id: u64) {
+        fake.model(pane).lock().unwrap().on_attached(&AttachOk {
+            agent_id,
+            cols: 80,
+            rows: 24,
+            primary: true,
+            ..Default::default()
+        });
+    }
+
+    #[gpui::test]
+    fn spawn_is_adopted_though_another_spawn_failed(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        spawn_via_sheet(&mut s, "/one");
+        s.cx.simulate_keystrokes("cmd-d");
+        spawn_via_sheet(&mut s, "/two");
+        // Pane 1's spawn fails; the error is not pane-specific.
+        s.ui.try_send(UiEvent::Error(
+            "spawn failed: /one: no such directory".into(),
+        ))
+        .unwrap();
+        s.cx.run_until_parked();
+        // Pane 2's spawn lands afterwards.
+        attach_model(&fake, PaneId(2), 9);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(2))).unwrap();
+        s.cx.run_until_parked();
+        let (one, two, recent) = s.app.read_with(s.cx, |a, _| {
+            (
+                a.layout().agent(PaneId(1)),
+                a.layout().agent(PaneId(2)),
+                a.gui_state()
+                    .recent_dirs
+                    .get("local")
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        });
+        assert_eq!((one, two), (None, Some(9)));
+        assert_eq!(recent, ["/two"]);
+        let chrome = s.app.read_with(s.cx, |a, cx| {
+            a.pane_view(PaneId(2)).unwrap().read(cx).chrome.clone()
+        });
+        assert!(chrome.has_agent && !chrome.starting);
+    }
+
+    #[gpui::test]
+    fn requested_attach_is_not_reverted_by_the_old_agent(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1), row(7, "/w", 2)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        click(&mut s, "tab-7");
+        // Output from agent 5 still arrives before the attach reply.
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        let shown = |s: &mut Setup<'_>| s.app.read_with(s.cx, |a, _| a.layout().agent(PaneId(1)));
+        assert_eq!(shown(&mut s), Some(7));
+        attach_model(&fake, PaneId(1), 7);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s), Some(7));
+    }
+
+    #[gpui::test]
+    fn header_buttons_work_after_closing_the_last_pane(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        s.cx.simulate_keystrokes("cmd-w");
+        assert_eq!(panes(&mut s), [PaneId(1)]);
+        assert!(fake.calls().contains(&Call::Close(PaneId(1))));
+        click(&mut s, "pane-1-split-right");
+        assert_eq!(panes(&mut s).len(), 2);
+        // Click-to-focus still follows the new view.
+        let grid = s.app.read_with(s.cx, |a, cx| {
+            a.pane_view(PaneId(1)).unwrap().read(cx).layout.unwrap()
+        });
+        let at = point(
+            grid.origin.x + grid.cell_w * 2.0,
+            grid.origin.y + grid.line_h * 2.0,
+        );
+        s.cx.simulate_click(at, Modifiers::none());
+        s.cx.run_until_parked();
+        assert_eq!(focused(&mut s), PaneId(1));
     }
 
     #[gpui::test]

@@ -3,7 +3,7 @@
 //! `Session::set_palette`).
 
 use fleet_term::{Color, Palette};
-use gpui::{Global, Hsla, Rgba, WindowAppearance};
+use gpui::{App, Global, Hsla, Rgba, WindowAppearance};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
@@ -137,6 +137,13 @@ impl Theme {
             Color::Rgb(r, g, b) => rgb((r, g, b)),
         }
     }
+}
+
+/// The current theme (dark until the window sets one).
+pub fn current(cx: &App) -> Theme {
+    cx.try_global::<Theme>()
+        .copied()
+        .unwrap_or_else(Theme::dark)
 }
 
 pub fn rgb((r, g, b): (u8, u8, u8)) -> Hsla {

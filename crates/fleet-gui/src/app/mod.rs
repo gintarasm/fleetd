@@ -1,5 +1,6 @@
 //! gpui shell (macOS only).
 
+mod app_state;
 mod keymap;
 mod new_agent;
 mod pane_view;
@@ -13,11 +14,12 @@ use std::sync::Arc;
 
 use gpui::{AppContext, Application, Menu, MenuItem};
 
+pub use app_state::{AppState, SessionApi};
 pub use keymap::to_key;
 pub use pane_view::{InputSink, PaneChrome, PaneView, grid_size};
 pub use terminal_element::TerminalElement;
 pub use theme::Theme;
-pub use workspace::{AppState, SessionApi, Workspace, open_main_window};
+pub use workspace::{Workspace, open_main_window};
 
 use crate::core::config::{GuiConfig, load_config};
 use crate::core::session::Session;
