@@ -10,20 +10,22 @@ use std::time::{Duration, Instant};
 
 use fleet_client::Sender;
 use fleet_proto::{
-    Attach, AttachOk, Detach, Frame, ReadHistory, Resize, Response, SendInput, SpawnAgent, event,
-    request, response,
+    AgentInfo, Attach, AttachOk, Detach, Frame, ReadHistory, Resize, Response, RestartAgent,
+    SendInput, SpawnAgent, event, request, response,
 };
 use fleet_term::Palette;
 
 use super::backoff::Backoff;
 use super::pane::{HISTORY_PAGE_LINES, PaneModel, PaneState};
-use super::session::{ConnHandle, Ctx, PaneId, Stop, UiEvent, lock, read_batch};
+use super::session::{
+    ConnHandle, Ctx, DAEMON_TOO_OLD, PaneId, Stop, UiEvent, error_text, lock, read_batch,
+};
 use super::target::connect;
 
 /// Resizes are sent once the size has been still this long.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
-/// A spawn asked for while disconnected is dropped, with an error, if the
-/// connection is not back within this long.
+/// A spawn or restart asked for while disconnected is dropped, with an
+/// error, if the connection is not back within this long.
 const DEFERRED_SPAWN_TTL: Duration = Duration::from_secs(5);
 
 enum Outgoing {
@@ -36,6 +38,9 @@ enum Outgoing {
     /// `Lagged`).
     Reattach,
     Spawn(SpawnAgent),
+    /// Restart an exited agent attached to this pane, in place of the one
+    /// it shows.
+    Restart(RestartAgent),
     /// Typed or pasted input, to the attached agent.
     Input(Vec<u8>),
     /// Terminal query replies, to the agent whose output asked.
@@ -57,12 +62,39 @@ enum Outgoing {
     Close,
 }
 
+/// A request that starts an agent attached to the pane: until its reply
+/// names the new agent, the pane shows none.
+#[derive(Debug)]
+enum Launch {
+    Spawn(SpawnAgent),
+    Restart(RestartAgent),
+}
+
+impl Launch {
+    fn verb(&self) -> &'static str {
+        match self {
+            Launch::Spawn(_) => "spawn",
+            Launch::Restart(_) => "restart",
+        }
+    }
+
+    fn into_request(self) -> request::Kind {
+        match self {
+            Launch::Spawn(s) => request::Kind::Spawn(Box::new(s)),
+            Launch::Restart(r) => request::Kind::Restart(r),
+        }
+    }
+}
+
 /// A request whose response the reader must recognise.
 #[derive(Clone, Copy, Debug)]
 enum Pending {
     Attach(u64),
-    Spawn,
-    Page { generation: u64 },
+    /// A [`Launch`]; the verb names it in an error.
+    Launch(&'static str),
+    Page {
+        generation: u64,
+    },
 }
 
 #[derive(Default)]
@@ -70,8 +102,8 @@ struct Shared {
     /// The agent the pane should show (`None` until the first attach or
     /// spawn reply).
     agent: Option<u64>,
-    /// The agent the pane showed before a spawn on its way into it; shown
-    /// again if the spawn fails.
+    /// The agent the pane showed before a spawn or restart on its way into
+    /// it; shown again if that fails.
     before_spawn: Option<u64>,
     /// The agent the current connection is subscribed to (or attaching).
     subscribed: Option<u64>,
@@ -181,6 +213,10 @@ impl PaneLink {
 
     pub(crate) fn spawn(&self, spawn: SpawnAgent) {
         self.send(Outgoing::Spawn(spawn));
+    }
+
+    pub(crate) fn restart(&self, restart: RestartAgent) {
+        self.send(Outgoing::Restart(restart));
     }
 
     pub(crate) fn input(&self, bytes: Vec<u8>) {
@@ -392,15 +428,9 @@ fn apply_response(
             true
         }
         (_, Some(response::Kind::SpawnedAttached(sa))) => {
-            let (Some(info), Some(ok)) = (sa.agent, sa.attached) else {
-                return false;
-            };
-            sh.agent = Some(info.id);
-            sh.before_spawn = None;
-            sh.subscribed = Some(info.id);
-            attached(&mut sh, model, &ok);
-            true
+            launched(&mut sh, model, sa.agent, sa.attached)
         }
+        (_, Some(response::Kind::Restarted(r))) => launched(&mut sh, model, r.agent, r.attached),
         (Some(Pending::Page { generation }), Some(response::Kind::History(page))) if is_page => {
             drop(sh);
             model.on_page(&page, generation);
@@ -421,15 +451,20 @@ fn apply_response(
             model.on_lost();
             true
         }
-        (Some(Pending::Spawn), Some(response::Kind::Error(e))) => {
+        (Some(Pending::Launch(verb)), Some(response::Kind::Error(e))) => {
             // Back to the agent the pane showed before.
             let restore = sh.agent.is_none() && sh.before_spawn.is_some();
             if restore {
                 sh.agent = sh.before_spawn.take();
             }
             drop(sh);
-            link.ctx
-                .notify(UiEvent::Error(format!("spawn failed: {}", e.message)));
+            let text = error_text(e.message);
+            let text = if text == DAEMON_TOO_OLD {
+                text
+            } else {
+                format!("{verb} failed: {text}")
+            };
+            link.ctx.notify(UiEvent::Error(text));
             if restore {
                 let _ = out.send(Outgoing::Reattach);
             }
@@ -437,6 +472,24 @@ fn apply_response(
         }
         _ => false,
     }
+}
+
+/// Applies the reply to a [`Launch`]: the pane shows the new agent, already
+/// attached. `false` (nothing changed) without both.
+fn launched(
+    sh: &mut Shared,
+    model: &mut PaneModel,
+    agent: Option<AgentInfo>,
+    ok: Option<AttachOk>,
+) -> bool {
+    let (Some(info), Some(ok)) = (agent, ok) else {
+        return false;
+    };
+    sh.agent = Some(info.id);
+    sh.before_spawn = None;
+    sh.subscribed = Some(info.id);
+    attached(sh, model, &ok);
+    true
 }
 
 /// Applies an attach reply: a new epoch, no page in flight.
@@ -452,9 +505,9 @@ fn attached(sh: &mut Shared, model: &mut PaneModel, ok: &AttachOk) {
 struct Writer {
     link: Arc<Link>,
     sender: Option<Sender>,
-    /// A spawn asked for while disconnected, and when: sent on the next
-    /// connection unless older than [`DEFERRED_SPAWN_TTL`].
-    deferred_spawn: Option<(SpawnAgent, Instant)>,
+    /// A spawn or restart asked for while disconnected, and when: sent on
+    /// the next connection unless older than [`DEFERRED_SPAWN_TTL`].
+    deferred_spawn: Option<(Launch, Instant)>,
     size: Option<(u16, u16)>,
     resize_due: Option<Instant>,
 }
@@ -510,7 +563,7 @@ impl Writer {
         self.expire_deferred_spawn();
     }
 
-    /// A spawn deferred for longer than [`DEFERRED_SPAWN_TTL`] is dropped
+    /// A launch deferred for longer than [`DEFERRED_SPAWN_TTL`] is dropped
     /// with an error; the pane shows its old agent again.
     fn expire_deferred_spawn(&mut self) {
         if !self
@@ -520,16 +573,19 @@ impl Writer {
         {
             return;
         }
-        self.deferred_spawn = None;
+        let Some((launch, _)) = self.deferred_spawn.take() else {
+            return;
+        };
         {
             let mut sh = lock(&self.link.shared);
             if sh.agent.is_none() {
                 sh.agent = sh.before_spawn.take();
             }
         }
-        self.link.ctx.notify(UiEvent::Error(
-            "spawn dropped: not connected to fleetd".into(),
-        ));
+        self.link.ctx.notify(UiEvent::Error(format!(
+            "{} dropped: not connected to fleetd",
+            launch.verb()
+        )));
     }
 
     /// `false` once the pane is closed.
@@ -545,8 +601,8 @@ impl Writer {
                 sh.epoch += 1;
                 let idle = sh.agent.is_none();
                 drop(sh);
-                if let Some((spawn, _)) = self.deferred_spawn.take() {
-                    self.spawn(spawn);
+                if let Some((launch, _)) = self.deferred_spawn.take() {
+                    self.launch(launch);
                 } else if idle {
                     // Nothing to attach: back to the neutral state a new
                     // pane starts in, not "disconnected".
@@ -576,22 +632,8 @@ impl Writer {
                     self.attach(agent);
                 }
             }
-            Outgoing::Spawn(spawn) => {
-                // Until `SpawnedAttached` names the new agent, nothing
-                // re-attaches the old one (a reconnect or a late `Lagged`);
-                // a failed spawn shows it again.
-                {
-                    let mut sh = lock(&self.link.shared);
-                    if let Some(old) = sh.agent.take() {
-                        sh.before_spawn = Some(old);
-                    }
-                }
-                if self.sender.is_some() {
-                    self.spawn(spawn);
-                } else {
-                    self.deferred_spawn = Some((spawn, Instant::now()));
-                }
-            }
+            Outgoing::Spawn(spawn) => self.start_launch(Launch::Spawn(spawn)),
+            Outgoing::Restart(restart) => self.start_launch(Launch::Restart(restart)),
             Outgoing::Input(data) => {
                 let agent = lock(&self.link.shared).subscribed;
                 if let Some(agent_id) = agent {
@@ -680,7 +722,24 @@ impl Writer {
         }
     }
 
-    fn spawn(&mut self, spawn: SpawnAgent) {
+    fn start_launch(&mut self, launch: Launch) {
+        // Until `SpawnedAttached` or `Restarted` names the new agent,
+        // nothing re-attaches the old one (a reconnect or a late `Lagged`);
+        // a failed launch shows it again.
+        {
+            let mut sh = lock(&self.link.shared);
+            if let Some(old) = sh.agent.take() {
+                sh.before_spawn = Some(old);
+            }
+        }
+        if self.sender.is_some() {
+            self.launch(launch);
+        } else {
+            self.deferred_spawn = Some((launch, Instant::now()));
+        }
+    }
+
+    fn launch(&mut self, launch: Launch) {
         let old = {
             let mut sh = lock(&self.link.shared);
             sh.agent = None;
@@ -690,15 +749,15 @@ impl Writer {
             self.send(request::Kind::Detach(Detach { agent_id }));
         }
         let Some(id) = self.sender.as_ref().map(Sender::next_id) else {
-            self.deferred_spawn = Some((spawn, Instant::now()));
+            self.deferred_spawn = Some((launch, Instant::now()));
             return;
         };
         lock(&self.link.model).on_attaching();
         self.link.changed();
         lock(&self.link.shared)
             .pending
-            .push_back((id, Pending::Spawn));
-        self.send(request::Kind::Spawn(Box::new(spawn)));
+            .push_back((id, Pending::Launch(launch.verb())));
+        self.send(launch.into_request());
     }
 
     fn send_resize(&mut self) {
@@ -728,7 +787,9 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
     use fleet_client::Connection;
-    use fleet_proto::{Ack, FrameCodec, HelloOk, HistoryPage, PROTOCOL_VERSION};
+    use fleet_proto::{
+        Ack, AgentInfo, FrameCodec, HelloOk, HistoryPage, PROTOCOL_VERSION, Restarted,
+    };
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use tokio_util::codec::{Decoder, Encoder};
@@ -956,6 +1017,111 @@ mod tests {
                 ]
             ),
             "{reqs:?}"
+        );
+    }
+
+    fn restart_req() -> RestartAgent {
+        RestartAgent {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            attach: true,
+        }
+    }
+
+    #[test]
+    fn restart_reply_switches_pane_to_new_agent() {
+        let l = link();
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        w.handle(Outgoing::Attach(1));
+        let attach_id = lock(&l.shared).pending.back().unwrap().0;
+        respond(&l, attached_response(attach_id));
+        w.handle(Outgoing::Restart(restart_req()));
+        let restart_id = lock(&l.shared).pending.back().unwrap().0;
+        // A reconnect or a late `Lagged` for agent 1.
+        w.handle(Outgoing::Reattach);
+        let reqs = srv.requests(SHORT);
+        assert!(
+            matches!(
+                reqs.as_slice(),
+                [
+                    request::Kind::Attach(Attach { agent_id: 1, .. }),
+                    request::Kind::Detach(Detach { agent_id: 1 }),
+                    request::Kind::Restart(RestartAgent {
+                        agent_id: 1,
+                        attach: true,
+                        ..
+                    })
+                ]
+            ),
+            "{reqs:?}"
+        );
+        respond(
+            &l,
+            Response {
+                id: restart_id,
+                kind: Some(response::Kind::Restarted(Box::new(Restarted {
+                    old_id: 1,
+                    agent: Some(AgentInfo {
+                        id: 2,
+                        ..Default::default()
+                    }),
+                    attached: Some(AttachOk {
+                        agent_id: 2,
+                        cols: 80,
+                        rows: 24,
+                        ..Default::default()
+                    }),
+                }))),
+            },
+        );
+        assert_eq!(lock(&l.model).agent_id(), Some(2));
+        let sh = lock(&l.shared);
+        assert_eq!(
+            (sh.agent, sh.subscribed, sh.shown),
+            (Some(2), Some(2), Some(2))
+        );
+    }
+
+    #[test]
+    fn restart_refused_by_an_old_daemon_shows_the_old_agent_again() {
+        let (ctx, events) = Ctx::for_test_with_events();
+        let l = link_with(ctx);
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        w.handle(Outgoing::Attach(1));
+        w.handle(Outgoing::Restart(restart_req()));
+        let restart_id = lock(&l.shared).pending.back().unwrap().0;
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut m = lock(&l.model);
+            let r = Response {
+                id: restart_id,
+                kind: Some(response::Kind::Error(fleet_proto::Error {
+                    message: "empty request".into(),
+                })),
+            };
+            apply_response(&l, &tx, &mut m, r);
+        }
+        for o in rx.try_iter() {
+            w.handle(o);
+        }
+        let reqs = srv.requests(SHORT);
+        assert!(
+            matches!(
+                reqs.last(),
+                Some(request::Kind::Attach(Attach { agent_id: 1, .. }))
+            ),
+            "{reqs:?}"
+        );
+        assert_eq!(lock(&l.shared).agent, Some(1));
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(
+                |e| e == UiEvent::Error("fleetd is too old to restart or remove agents".into())
+            )
         );
     }
 

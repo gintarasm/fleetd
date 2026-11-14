@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use fleet_client::{Closer, Connection, FrameReader, Sender};
 use fleet_proto::{
-    AgentInfo, AgentState, Frame, KillAgent, ListAgents, Response, SpawnAgent, event, request,
-    response,
+    AgentInfo, AgentState, ForgetAgents, Frame, KillAgent, ListAgents, Response, RestartAgent,
+    SpawnAgent, event, request, response,
 };
 use fleet_term::Palette;
 
@@ -26,6 +26,21 @@ use super::target::{Connected, Target, connect};
 
 /// How the control connection introduces itself.
 pub const CLIENT_NAME: &str = "gui";
+
+/// What an old daemon answers a request it does not know with.
+const UNKNOWN_REQUEST: &str = "empty request";
+/// Shown instead of [`UNKNOWN_REQUEST`]: the only requests the GUI sends
+/// that an older fleetd lacks are restart and forget.
+pub(crate) const DAEMON_TOO_OLD: &str = "fleetd is too old to restart or remove agents";
+
+/// The UI's text for an error reply.
+pub(crate) fn error_text(message: String) -> String {
+    if message == UNKNOWN_REQUEST {
+        DAEMON_TOO_OLD.into()
+    } else {
+        message
+    }
+}
 
 /// Sidebar re-list interval.
 const RELIST: Duration = Duration::from_secs(5);
@@ -38,6 +53,13 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(60);
 pub enum UiEvent {
     /// The sidebar rows changed; read [`Session::agents`].
     AgentsChanged,
+    /// `agent_id` was forgotten, or restarted as `replaced_by`: panes and
+    /// saved layouts showing it follow. Sent for the control connection's
+    /// copy of `AgentRemoved` only.
+    AgentRemoved {
+        agent_id: u64,
+        replaced_by: Option<u64>,
+    },
     /// The pane's model changed (sent at most once per batch of frames).
     PaneChanged(PaneId),
     /// The control connection's state.
@@ -227,6 +249,9 @@ struct Sidebar {
     /// Unlisted ids are kept for [`UNLISTED_ACTIVITY_TTL`], so an agent
     /// spawned after a list was taken has its line once it is listed.
     activity: HashMap<u64, (String, i64, Instant)>,
+    /// `AgentList.replaced` from the latest list: old id to its newest
+    /// successor.
+    replaced: HashMap<u64, u64>,
     /// A `ListAgents` was asked for because of an unknown id.
     list_requested: bool,
     /// A `ListAgents` reply arrived.
@@ -236,7 +261,8 @@ struct Sidebar {
 impl Sidebar {
     /// Applies a `ListAgents` reply: the rows are replaced and activity
     /// for ids not listed is dropped unless it is recent.
-    fn set_list(&mut self, agents: Vec<AgentInfo>, now: Instant) {
+    fn set_list(&mut self, agents: Vec<AgentInfo>, replaced: HashMap<u64, u64>, now: Instant) {
+        self.replaced = replaced;
         self.infos = agents.into_iter().map(|a| (a.id, a)).collect();
         let infos = &self.infos;
         self.activity.retain(|id, a| {
@@ -252,6 +278,9 @@ enum ControlCmd {
     Disconnected,
     List,
     Kill(u64),
+    Restart(u64),
+    Forget(Vec<u64>),
+    ClearExited,
     Stop,
 }
 
@@ -388,8 +417,61 @@ impl Session {
         }
     }
 
+    /// `AgentList.replaced` from the latest `ListAgents` reply: an old id
+    /// to its newest successor, for panes that missed the `AgentRemoved`.
+    pub fn replaced(&self) -> HashMap<u64, u64> {
+        lock(&self.inner.sidebar).replaced.clone()
+    }
+
     pub fn kill(&self, agent_id: u64) {
-        let _ = lock(&self.inner.control).send(ControlCmd::Kill(agent_id));
+        self.control(ControlCmd::Kill(agent_id));
+    }
+
+    /// Restarts an exited agent on the control connection, unattached;
+    /// panes showing it follow the `AgentRemoved` that names the new id.
+    pub fn restart(&self, agent_id: u64) {
+        self.control(ControlCmd::Restart(agent_id));
+    }
+
+    /// Restarts an exited agent at `cols`x`rows` on `pane`'s connection,
+    /// attached: the pane shows the new agent once `Restarted` arrives; a
+    /// failure shows the old one again, with a [`UiEvent::Error`].
+    pub fn restart_in_pane(
+        &self,
+        pane: PaneId,
+        agent_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String> {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Err("the session is shut down".into());
+        }
+        match lock(&self.inner.panes).get(&pane) {
+            Some(link) => {
+                link.restart(RestartAgent {
+                    agent_id,
+                    cols: cols.into(),
+                    rows: rows.into(),
+                    attach: true,
+                });
+                Ok(())
+            }
+            None => Err(format!("no pane {}", pane.0)),
+        }
+    }
+
+    /// Forgets these exited agents (running ones are refused by fleetd).
+    pub fn forget(&self, ids: Vec<u64>) {
+        self.control(ControlCmd::Forget(ids));
+    }
+
+    /// Forgets every exited or lost agent on the target.
+    pub fn clear_exited(&self) {
+        self.control(ControlCmd::ClearExited);
+    }
+
+    fn control(&self, cmd: ControlCmd) {
+        let _ = lock(&self.inner.control).send(cmd);
     }
 
     /// Opens `pane` with its own connection (`gui-pane-<n>`), attached to
@@ -581,13 +663,13 @@ impl ControlReader {
                         kind: Some(response::Kind::Agents(list)),
                         ..
                     }) => {
-                        sb.set_list(list.agents, Instant::now());
+                        sb.set_list(list.agents, list.replaced, Instant::now());
                         changed = true;
                     }
                     Frame::Response(Response {
                         kind: Some(response::Kind::Error(e)),
                         ..
-                    }) => self.ctx.notify(UiEvent::Error(e.message)),
+                    }) => self.ctx.notify(UiEvent::Error(error_text(e.message))),
                     Frame::Event(ev) => match ev.kind {
                         Some(event::Kind::Activity(a)) => {
                             let known = sb.infos.contains_key(&a.agent_id);
@@ -606,6 +688,16 @@ impl ControlReader {
                             }
                             None => relist = true,
                         },
+                        Some(event::Kind::AgentRemoved(r)) => {
+                            sb.infos.remove(&r.agent_id);
+                            sb.activity.remove(&r.agent_id);
+                            sb.replaced.remove(&r.agent_id);
+                            changed = true;
+                            self.ctx.notify(UiEvent::AgentRemoved {
+                                agent_id: r.agent_id,
+                                replaced_by: r.replaced_by,
+                            });
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -627,9 +719,19 @@ impl ControlReader {
 }
 
 /// Owns the control connection's [`Sender`]: lists on connect, every
-/// [`RELIST`] and on request, and sends kills.
+/// [`RELIST`] and on request, and sends kills, restarts and forgets.
 fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
     let mut sender: Option<Sender> = None;
+    // A failed write drops the sender (the reader sees the end and
+    // reconnects); with none, the user is told.
+    let send = |sender: &mut Option<Sender>, req: request::Kind| match sender {
+        Some(s) => {
+            if s.send(req).is_err() {
+                *sender = None;
+            }
+        }
+        None => ctx.notify(UiEvent::Error("not connected to fleetd".into())),
+    };
     let mut next_list = Instant::now() + RELIST;
     loop {
         let cmd = match rx.recv_timeout(next_list.saturating_duration_since(Instant::now())) {
@@ -653,14 +755,30 @@ fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
                 list(&mut sender, &mut next_list);
             }
             Some(ControlCmd::Disconnected) => sender = None,
-            Some(ControlCmd::Kill(agent_id)) => match &mut sender {
-                Some(s) => {
-                    if s.send(request::Kind::Kill(KillAgent { agent_id })).is_err() {
-                        sender = None;
-                    }
-                }
-                None => ctx.notify(UiEvent::Error("not connected to fleetd".into())),
-            },
+            Some(ControlCmd::Kill(agent_id)) => {
+                send(&mut sender, request::Kind::Kill(KillAgent { agent_id }));
+            }
+            Some(ControlCmd::Restart(agent_id)) => {
+                let restart = RestartAgent {
+                    agent_id,
+                    ..Default::default()
+                };
+                send(&mut sender, request::Kind::Restart(restart));
+            }
+            Some(ControlCmd::Forget(ids)) => {
+                let forget = ForgetAgents {
+                    ids,
+                    ..Default::default()
+                };
+                send(&mut sender, request::Kind::Forget(forget));
+            }
+            Some(ControlCmd::ClearExited) => {
+                let forget = ForgetAgents {
+                    exited_only: true,
+                    ..Default::default()
+                };
+                send(&mut sender, request::Kind::Forget(forget));
+            }
             Some(ControlCmd::Stop) => return,
         }
     }
@@ -669,6 +787,7 @@ fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_proto::{AgentList, AgentRemoved, Event};
 
     fn info(id: u64) -> AgentInfo {
         AgentInfo {
@@ -686,11 +805,95 @@ mod tests {
         sb.activity.insert(2, ("gone".into(), 1, now - RELIST * 4));
         sb.activity.insert(3, ("new".into(), 1, now));
         sb.list_requested = true;
-        sb.set_list(vec![info(1)], now);
+        sb.set_list(vec![info(1)], HashMap::new(), now);
         let mut kept: Vec<u64> = sb.activity.keys().copied().collect();
         kept.sort_unstable();
         assert_eq!(kept, [1, 3]);
         assert!(!sb.list_requested);
+    }
+
+    /// A control reader on its own sidebar, and the UI's end of its events.
+    fn reader() -> (ControlReader, async_channel::Receiver<UiEvent>) {
+        let (ctx, events) = Ctx::for_test_with_events();
+        let r = ControlReader {
+            first: None,
+            ctx,
+            sidebar: Arc::default(),
+            cmds: mpsc::channel().0,
+            stop: Arc::default(),
+            conn: Arc::default(),
+        };
+        (r, events)
+    }
+
+    fn drain(events: &async_channel::Receiver<UiEvent>) -> Vec<UiEvent> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    fn list_reply(agents: Vec<AgentInfo>, replaced: HashMap<u64, u64>) -> Frame {
+        Frame::Response(Response {
+            id: 1,
+            kind: Some(response::Kind::Agents(AgentList { agents, replaced })),
+        })
+    }
+
+    #[test]
+    fn removed_event_drops_row_and_notifies() {
+        let (r, events) = reader();
+        r.apply(vec![list_reply(vec![info(5), info(6)], HashMap::new())]);
+        lock(&r.sidebar)
+            .activity
+            .insert(5, ("line".into(), 1, Instant::now()));
+        drain(&events);
+        r.apply(vec![Frame::Event(Event {
+            kind: Some(event::Kind::AgentRemoved(AgentRemoved {
+                agent_id: 5,
+                replaced_by: Some(9),
+            })),
+        })]);
+        let sb = lock(&r.sidebar);
+        assert_eq!(sb.infos.keys().copied().collect::<Vec<_>>(), [6]);
+        assert!(!sb.activity.contains_key(&5));
+        drop(sb);
+        let got = drain(&events);
+        assert!(
+            got.contains(&UiEvent::AgentRemoved {
+                agent_id: 5,
+                replaced_by: Some(9)
+            }),
+            "{got:?}"
+        );
+        assert!(got.contains(&UiEvent::AgentsChanged), "{got:?}");
+    }
+
+    #[test]
+    fn list_reply_keeps_replaced_map() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-gui-no-daemon-r-{}", std::process::id()));
+        let (tx, _rx) = async_channel::unbounded();
+        let s = Session::start(Target::Local, dir, tx);
+        let (mut r, _events) = reader();
+        r.sidebar = Arc::clone(&s.inner.sidebar);
+        r.apply(vec![list_reply(vec![info(3)], HashMap::from([(1, 3)]))]);
+        assert_eq!(s.replaced(), HashMap::from([(1, 3)]));
+        s.shutdown();
+    }
+
+    #[test]
+    fn empty_request_error_says_daemon_too_old() {
+        let (r, events) = reader();
+        r.apply(vec![Frame::Response(Response {
+            id: 1,
+            kind: Some(response::Kind::Error(fleet_proto::Error {
+                message: "empty request".into(),
+            })),
+        })]);
+        assert_eq!(
+            drain(&events),
+            [UiEvent::Error(
+                "fleetd is too old to restart or remove agents".into()
+            )]
+        );
     }
 
     #[test]

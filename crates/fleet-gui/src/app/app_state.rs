@@ -445,6 +445,9 @@ impl AppState {
                     }
                     view.update(cx, |_, cx| cx.notify());
                 }
+                // Panes and saved layouts follow it once the app layer is
+                // wired to `Layout::replace_agent`.
+                UiEvent::AgentRemoved { .. } => {}
                 UiEvent::Connection(state) => {
                     self.reconnect_at = match state {
                         ConnState::Disconnected { retry_in } => Some(Instant::now() + retry_in),
