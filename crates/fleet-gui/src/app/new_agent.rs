@@ -14,6 +14,7 @@ use gpui::{
 use super::keymap::{Paste, TEXT_FIELD_CONTEXT};
 use super::theme::{Theme, current as theme};
 use crate::core::session::AgentRow;
+use crate::core::target::Target;
 
 /// What a spawn needs from the sheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +55,18 @@ pub fn dir_choices(recent: &[String], agents: &[AgentRow]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The note under the directory field: a remote daemon's paths are the
+/// remote host's, passed as typed.
+pub fn dir_hint(target: &Target) -> Option<String> {
+    match target {
+        Target::Local => None,
+        Target::Ssh { dest } => {
+            let host = dest.rsplit_once('@').map_or(dest.as_str(), |(_, h)| h);
+            Some(format!("paths on {host}; ~ is not expanded"))
+        }
+    }
 }
 
 /// A one-line text field. Text goes in through the input handler (typing,
@@ -276,6 +289,8 @@ pub struct NewAgentSheet {
     pub(crate) dirs: Vec<String>,
     /// The native folder picker is offered (local daemon only).
     pub(crate) can_choose: bool,
+    /// [`dir_hint`] for the target.
+    pub(crate) hint: Option<String>,
     pub(crate) error: Option<String>,
 }
 
@@ -285,7 +300,7 @@ impl NewAgentSheet {
     pub fn new(
         default_command: &[String],
         dirs: Vec<String>,
-        can_choose: bool,
+        target: &Target,
         cx: &mut Context<Self>,
     ) -> Self {
         let first = dirs.first().cloned().unwrap_or_default();
@@ -294,7 +309,8 @@ impl NewAgentSheet {
             dir: cx.new(|cx| TextField::new(first, "Directory on the fleetd host", cx)),
             command: cx.new(|cx| TextField::new(command, "Command", cx)),
             dirs,
-            can_choose,
+            can_choose: *target == Target::Local,
+            hint: dir_hint(target),
             error: None,
         }
     }
@@ -452,6 +468,13 @@ impl Render for NewAgentSheet {
             .child(div().text_size(px(15.)).child("New agent"))
             .child(label("Directory"))
             .child(dir_row)
+            .children(self.hint.clone().map(|h| {
+                div()
+                    .debug_selector(|| "dir-hint".to_owned())
+                    .text_size(px(11.))
+                    .text_color(theme.dim_text)
+                    .child(SharedString::from(h))
+            }))
             .child(recent)
             .child(label("Command"))
             .child(self.command.clone())
@@ -480,8 +503,9 @@ impl Render for NewAgentSheet {
 
 #[cfg(test)]
 mod tests {
-    use super::{dir_choices, parse_command};
+    use super::{dir_choices, dir_hint, parse_command};
     use crate::core::session::AgentRow;
+    use crate::core::target::Target;
     use fleet_proto::AgentInfo;
 
     fn row(cwd: &str, created: i64) -> AgentRow {
@@ -494,6 +518,18 @@ mod tests {
             last_line: String::new(),
             last_output_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn remote_directories_carry_a_hint() {
+        assert_eq!(dir_hint(&Target::Local), None);
+        let remote = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        assert_eq!(
+            dir_hint(&remote).as_deref(),
+            Some("paths on box; ~ is not expanded")
+        );
     }
 
     #[test]

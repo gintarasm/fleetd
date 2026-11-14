@@ -368,9 +368,9 @@ impl Workspace {
         }
         let app = self.app.read(cx);
         let dirs = app.dir_choices();
-        let can_choose = app.target == Target::Local;
+        let target = app.target.clone();
         let command = app.config.default_command.clone();
-        let sheet = cx.new(|cx| NewAgentSheet::new(&command, dirs, can_choose, cx));
+        let sheet = cx.new(|cx| NewAgentSheet::new(&command, dirs, &target, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::sheet_event);
         sheet.read(cx).focus(window, cx);
         self.sheet = Some((sheet, sub));
