@@ -59,7 +59,7 @@ use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
 use bytes::{Bytes, BytesMut};
-use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AttachOk, SpawnAgent};
+use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AgentRemoved, AttachOk, SpawnAgent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -1382,9 +1382,9 @@ impl Histories {
     }
 
     /// Closes and deletes the agent's history.
-    fn delete(&mut self, id: u64) {
+    fn delete(&mut self, id: u64, reason: &str) {
         self.open.retain(|(i, _)| *i != id);
-        debug!(agent = id, "deleting history: beyond retention");
+        debug!(agent = id, reason, "deleting history");
         remove_history_dir(&self.path(id));
     }
 }
@@ -1476,7 +1476,7 @@ impl OutputSink for NodeSink {
         };
         drop(agents);
         if let Some(evicted) = evicted {
-            lock(&self.histories).delete(evicted);
+            lock(&self.histories).delete(evicted, "beyond retention");
         }
         // No receivers is fine.
         let _ = self.exits.send(AgentExited {
@@ -1495,6 +1495,7 @@ pub struct Node {
     store: Arc<Mutex<Store>>,
     agents: Arc<Mutex<Agents>>,
     exits: broadcast::Sender<AgentExited>,
+    removed: broadcast::Sender<Removed>,
     scrollback_dir: PathBuf,
     histories: Arc<Mutex<Histories>>,
     activity: Arc<ActivityHub>,
@@ -1507,6 +1508,22 @@ impl Drop for Node {
     fn drop(&mut self) {
         self.activity.stop();
     }
+}
+
+/// An agent removed from the node, as announced by [`Node::removed_events`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Removed {
+    pub event: AgentRemoved,
+    /// The connection whose request caused the removal, if any.
+    pub origin: Option<ConnId>,
+}
+
+/// The result of [`Node::forget`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForgetOutcome {
+    pub forgotten: Vec<u64>,
+    /// Running or unknown agents, left untouched.
+    pub refused: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -1583,12 +1600,14 @@ impl Node {
         let (records, _) = store.list_agents_lossy_unlabeled().map_err(store_err)?;
         prune_history_dirs(&history_dir, &retained_history(&records))?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
+        let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
         Ok(Node {
             host: Arc::new(PtyHost::new()),
             store: Arc::new(Mutex::new(store)),
             agents: Arc::new(Mutex::new(Agents::default())),
             exits,
+            removed,
             scrollback_dir,
             histories: Arc::new(Mutex::new(Histories {
                 dir: history_dir,
@@ -1610,6 +1629,11 @@ impl Node {
     /// Receives every agent exit from now on.
     pub fn exit_events(&self) -> broadcast::Receiver<AgentExited> {
         self.exits.subscribe()
+    }
+
+    /// Receives every agent removal ([`Node::forget`]) from now on.
+    pub fn removed_events(&self) -> broadcast::Receiver<Removed> {
+        self.removed.subscribe()
     }
 
     /// Receives agents' activity from now on: for each running agent with
@@ -1773,7 +1797,7 @@ impl Node {
         let mut histories = lock(&self.histories);
         histories.spawning.remove(&id);
         if let Some(evicted) = evicted {
-            histories.delete(evicted);
+            histories.delete(evicted, "beyond retention");
         }
         drop(histories);
         // Label keys only: values, args and env may hold secrets.
@@ -1817,6 +1841,73 @@ impl Node {
         let mut agents = self.list()?;
         agents.retain(|a| labels_match(&a.labels, selector));
         Ok(agents)
+    }
+
+    /// The replacement records: old agent id to the agent that replaced it.
+    pub fn replacements(&self) -> io::Result<HashMap<u64, u64>> {
+        lock(&self.store).replacements().map_err(store_err)
+    }
+
+    /// Forgets exited or lost agents: their record, history and scrollback
+    /// are deleted and a [`Removed`] is announced for each. Running and
+    /// unknown agents are refused, never killed. With `exited_only`, `ids`
+    /// must be empty and every non-running agent matching `selector` is
+    /// forgotten.
+    pub fn forget(
+        &self,
+        ids: &[u64],
+        exited_only: bool,
+        selector: &Labels,
+        origin: Option<ConnId>,
+    ) -> io::Result<ForgetOutcome> {
+        let targets: Vec<u64> = if exited_only {
+            if !ids.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exited_only cannot be combined with agent ids",
+                ));
+            }
+            self.list_matching(selector)?
+                .into_iter()
+                .filter(|a| a.state != fleet_proto::AgentState::Running as i32)
+                .map(|a| a.id)
+                .collect()
+        } else {
+            ids.to_vec()
+        };
+        let mut out = ForgetOutcome::default();
+        for id in targets {
+            let gone = lock(&self.store).forget_agent(id).map_err(store_err)?;
+            if !gone {
+                out.refused.push(id);
+                continue;
+            }
+            self.drop_agent_files(id);
+            info!(agent = id, "agent forgotten");
+            // No receivers is fine.
+            let _ = self.removed.send(Removed {
+                event: AgentRemoved {
+                    agent_id: id,
+                    replaced_by: None,
+                },
+                origin,
+            });
+            out.forgotten.push(id);
+        }
+        Ok(out)
+    }
+
+    /// Drops everything the node keeps of a removed agent besides its row:
+    /// retained final screen, history, scrollback ring and activity sink.
+    fn drop_agent_files(&self, id: u64) {
+        lock(&self.agents).exited.retain(|a| a.id != id);
+        lock(&self.histories).delete(id, "agent removed");
+        match std::fs::remove_file(self.scrollback_dir.join(format!("{id}.ring"))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!(agent = id, error = %e, "removing agent scrollback failed"),
+        }
+        self.activity.sinks.forget(id);
     }
 
     /// Sets, then removes, labels of a known agent (running or not). Keys
