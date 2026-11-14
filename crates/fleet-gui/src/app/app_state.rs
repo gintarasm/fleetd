@@ -168,6 +168,9 @@ pub struct AppState {
     session: Arc<dyn SessionApi>,
     /// A fleetd is connected (false before the first connect).
     live: bool,
+    /// Bumped by every [`AppState::replace_session`]: pane ids from before
+    /// a switch name nothing.
+    session_epoch: u64,
     pub(super) target: Target,
     state_dir: PathBuf,
     pub(super) home: PathBuf,
@@ -223,6 +226,7 @@ impl AppState {
             agents: session.agents(),
             session,
             live: true,
+            session_epoch: 0,
             target,
             state_dir,
             home: home_dir(),
@@ -292,6 +296,7 @@ impl AppState {
         let old = std::mem::replace(&mut self.session, session);
         old.shutdown();
         self.live = true;
+        self.session_epoch += 1;
         self.target = target;
         self.session.set_palette(self.theme.palette);
         self._events = follow(ui, cx);
@@ -329,6 +334,11 @@ impl AppState {
     /// A fleetd is connected.
     pub fn is_live(&self) -> bool {
         self.live
+    }
+
+    /// Changes whenever the session (and so the layout) is replaced.
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch
     }
 
     pub fn target(&self) -> &Target {

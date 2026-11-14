@@ -5,7 +5,9 @@ mod connect;
 mod keymap;
 mod new_agent;
 mod pane_view;
+mod resident;
 mod sidebar_view;
+mod status_item;
 mod terminal_element;
 mod theme;
 mod workspace;
@@ -32,8 +34,9 @@ use crate::core::target::Target;
 /// flow connects to `target` (`--target`), else the saved connection, else
 /// a local fleetd that answers, and otherwise shows the connect sheet. A
 /// daemon is only ever started from the sheet. Closing the window keeps
-/// the app, the session and every pane attached (the Dock icon reopens it);
-/// Quit detaches everything.
+/// the app, the session and every pane attached in the menu bar (no Dock
+/// icon; the status menu reopens it); Quit detaches everything and leaves
+/// the agents running.
 pub fn run(state_dir: PathBuf, target: Option<Target>) {
     let config = load_config(&state_dir).unwrap_or_else(|e| {
         eprintln!("fleet-gui: {e}; using the default settings");
@@ -44,10 +47,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
 
     let app = Application::new();
     // Unconnected, the reopened window asks again.
-    app.on_reopen(|cx| match AppState::global(cx) {
-        Some(a) if !a.read(cx).is_live() => switch_fleetd(cx),
-        _ => open_main_window(cx),
-    });
+    app.on_reopen(resident::show);
     app.run(move |cx| {
         keymap::bind_keys(cx);
         cx.on_action(|_: &keymap::Quit, cx| cx.quit());
@@ -70,7 +70,9 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
         AppState::install(state.clone(), cx);
         open_main_window(cx);
         connect::begin_startup(saved, cx);
+        resident::install(cx);
 
+        // Detach only, well inside gpui's 100 ms quit budget; agents run on.
         cx.on_app_quit(move |cx| {
             state.update(cx, |s, _| {
                 s.save_now();

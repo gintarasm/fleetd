@@ -15,6 +15,7 @@ use gpui::{
 use super::theme::Theme;
 use super::workspace::Workspace;
 use crate::core::session::AgentRow;
+pub use crate::core::sidebar::program_name;
 use crate::core::sidebar::{group_agents, since};
 
 /// Width of the sidebar.
@@ -30,13 +31,6 @@ pub fn state_mark(row: &AgentRow) -> String {
         },
         AgentState::Lost | AgentState::Unspecified => "?".to_owned(),
     }
-}
-
-/// The program's file name (`/bin/sh` shows as `sh`).
-pub fn program_name(program: &str) -> String {
-    Path::new(program)
-        .file_name()
-        .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
 }
 
 /// How a tab relates to the panes.

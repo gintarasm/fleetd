@@ -21,6 +21,13 @@ pub fn tilde(cwd: &str, home: &Path) -> String {
     }
 }
 
+/// The program's file name (`/bin/sh` shows as `sh`).
+pub fn program_name(program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
 fn title_of(row: &AgentRow, home: &Path) -> String {
     match row.info.labels.get("project") {
         Some(p) if !p.is_empty() => p.clone(),

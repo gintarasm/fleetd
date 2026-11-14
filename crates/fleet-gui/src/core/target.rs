@@ -74,6 +74,12 @@ const STDERR_TAIL: usize = 4096;
 /// `ssh ... <dest> sh -lc 'exec fleetd --stdio'`, with a shared control
 /// master under `<state_dir>/ssh` (created with mode 0700).
 pub fn ssh_command(dest: &str, state_dir: &Path) -> std::io::Result<Command> {
+    ssh_remote(dest, "exec fleetd --stdio", state_dir)
+}
+
+/// `ssh ... <dest> sh -lc '<script>'` over the shared control master
+/// (`script` must not contain a single quote).
+pub fn ssh_remote(dest: &str, script: &str, state_dir: &Path) -> std::io::Result<Command> {
     use std::os::unix::fs::PermissionsExt;
     let dir = state_dir.join("ssh");
     std::fs::DirBuilder::new()
@@ -88,7 +94,7 @@ pub fn ssh_command(dest: &str, state_dir: &Path) -> std::io::Result<Command> {
         .args(["-o", "ControlPersist=60"])
         .arg(dest)
         // One argument: ssh joins them with spaces for the remote shell.
-        .arg("sh -lc 'exec fleetd --stdio'");
+        .arg(format!("sh -lc '{script}'"));
     Ok(cmd)
 }
 

@@ -76,6 +76,9 @@ pub struct Workspace {
     /// The connect sheet, over everything else.
     connect: Option<(Entity<ConnectSheet>, [Subscription; 2])>,
     menu: Option<RowMenu>,
+    /// The [`AppState::session_epoch`] last seen; a change closes the
+    /// new-agent sheet and the row menu.
+    epoch: u64,
     /// Focus-in and header-button subscriptions, by pane.
     pane_focus: HashMap<PaneId, (EntityId, [Subscription; 2])>,
     /// The panes drawn by the last render.
@@ -86,7 +89,20 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&app, |_, _, cx| cx.notify());
+        // A switch (from any path) restores another layout: the new-agent
+        // sheet and the row menu would target panes that are gone.
+        let observe = cx.observe_in(&app, window, |this, app, window, cx| {
+            let epoch = app.read(cx).session_epoch();
+            if epoch != this.epoch {
+                this.epoch = epoch;
+                let sheet = this.sheet.take();
+                let menu = this.menu.take();
+                if sheet.is_some() || menu.is_some() {
+                    this.focus_current(window, cx);
+                }
+            }
+            cx.notify();
+        });
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
             let theme = Theme::for_appearance(window.appearance());
             this.app.update(cx, |a, cx| a.set_theme(theme, cx));
@@ -110,12 +126,14 @@ impl Workspace {
                 }
             }
         });
+        let epoch = app.read(cx).session_epoch();
         let ws = Workspace {
             app,
             _ticker: ticker,
             sheet: None,
             connect: None,
             menu: None,
+            epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
             _subscriptions: vec![observe, appearance],
@@ -1302,6 +1320,36 @@ mod tests {
             a.layout().panes().iter().all(|p| a.pane_view(*p).is_some())
         });
         assert!(alive);
+    }
+
+    #[gpui::test]
+    fn switching_target_closes_the_new_agent_sheet_and_the_row_menu(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let s = setup(cx, &fake, dir.path());
+        s.cx.simulate_keystrokes("cmd-d cmd-n");
+        s.ws.update(s.cx, |ws, cx| {
+            ws.open_row_menu(7, Point::default(), cx);
+        });
+        let open =
+            s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some() && ws.menu.is_some());
+        assert!(open);
+        // A direct switch (not through the connect sheet).
+        let other = Arc::new(Fake::default());
+        let session: Arc<dyn SessionApi> = other.clone();
+        let (_tx, rx) = async_channel::unbounded();
+        let target = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        s.app
+            .update(s.cx, |a, cx| a.replace_session(session, rx, target, cx));
+        s.cx.run_until_parked();
+        let closed =
+            s.ws.read_with(s.cx, |ws, _| ws.sheet.is_none() && ws.menu.is_none());
+        assert!(
+            closed,
+            "the sheet and the menu targeted the old layout's panes"
+        );
     }
 
     #[gpui::test]
