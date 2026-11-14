@@ -27,6 +27,11 @@ pub enum Error {
     /// The server did not complete the handshake within
     /// [`HANDSHAKE_TIMEOUT`].
     Timeout,
+    /// The spawned command exited by itself before the handshake finished
+    /// (`None`: killed by a signal).
+    ChildExited {
+        status: Option<i32>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -37,6 +42,8 @@ impl fmt::Display for Error {
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
             Error::Server(m) => write!(f, "{m}"),
             Error::Timeout => write!(f, "fleetd did not answer the handshake in time"),
+            Error::ChildExited { status: Some(c) } => write!(f, "command exited with status {c}"),
+            Error::ChildExited { status: None } => write!(f, "command was killed by a signal"),
         }
     }
 }
@@ -200,10 +207,15 @@ impl Connection {
     /// `client_name` within [`HANDSHAKE_TIMEOUT`] (closing the socket on a
     /// timeout).
     pub fn unix(path: &Path, client_name: &str) -> Result<Connection> {
-        Self::unix_within(path, client_name, HANDSHAKE_TIMEOUT)
+        Self::unix_with_timeout(path, client_name, HANDSHAKE_TIMEOUT)
     }
 
-    fn unix_within(path: &Path, client_name: &str, timeout: Duration) -> Result<Connection> {
+    /// Like [`Connection::unix`] with a caller-chosen handshake timeout.
+    pub fn unix_with_timeout(
+        path: &Path,
+        client_name: &str,
+        timeout: Duration,
+    ) -> Result<Connection> {
         let stream = match UnixStream::connect(path) {
             Ok(s) => s,
             Err(e)
@@ -269,6 +281,20 @@ impl Connection {
         match r {
             Ok(conn) => Ok((conn, child)),
             Err(e) => {
+                // A command that died on its own (ssh: exit 127 = no fleetd)
+                // has a status worth reporting; give it a moment to be reaped.
+                if !matches!(e, Error::Timeout) {
+                    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(st)) => return Err(Error::ChildExited { status: st.code() }),
+                            Ok(None) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            _ => break,
+                        }
+                    }
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 Err(e)
@@ -382,7 +408,7 @@ mod tests {
         // Accepts (via the backlog) but never answers.
         let listener = UnixListener::bind(&path).unwrap();
         let p = path.clone();
-        let (r, _) = within_5s(move || Connection::unix_within(&p, "t", SHORT));
+        let (r, _) = within_5s(move || Connection::unix_with_timeout(&p, "t", SHORT));
         assert!(is_timeout(&r), "{:?}", r.err());
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);

@@ -11,6 +11,8 @@ use fleet_client::Connection;
 use super::target::ConnectError;
 
 const START_DEADLINE: Duration = Duration::from_secs(5);
+/// Per-probe handshake limit, so one stuck probe cannot overshoot the deadline.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const POLL: Duration = Duration::from_millis(20);
 /// The exit code of a fleetd that lost the instance lock to another daemon.
 const LOST_LOCK: i32 = 2;
@@ -56,7 +58,7 @@ pub fn start_local(fleetd: &Path, state_dir: &Path) -> Result<(), ConnectError> 
     let deadline = Instant::now() + START_DEADLINE;
     let mut exited = false;
     let result = loop {
-        if Connection::unix(&sock, "gui-launch").is_ok() {
+        if Connection::unix_with_timeout(&sock, "gui-launch", PROBE_TIMEOUT).is_ok() {
             break Ok(());
         }
         if !exited {

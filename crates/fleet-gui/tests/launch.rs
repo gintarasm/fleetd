@@ -18,6 +18,11 @@ fn fleetd_bin() -> &'static Path {
             cmd.arg("--release");
         }
         assert!(cmd.status().expect("cargo build").success());
+        // Never the developer's real login shell. Set here, once, before
+        // any test starts a daemon (they all call `fleetd_bin()` first).
+        // SAFETY: no other thread of this test binary reads the environment
+        // concurrently: every test is blocked on this OnceLock.
+        unsafe { std::env::set_var("FLEETD_LOGIN_ENV", "off") };
         // The test binary lives in target/<profile>/deps.
         let exe = std::env::current_exe().unwrap();
         exe.parent().unwrap().parent().unwrap().join("fleetd")
@@ -64,9 +69,6 @@ fn agent_count(state_dir: &Path) -> usize {
 }
 
 fn setup() -> (tempfile::TempDir, DaemonCleanup) {
-    // Never the developer's real login shell.
-    // SAFETY: set before any thread of this test starts a daemon.
-    unsafe { std::env::set_var("FLEETD_LOGIN_ENV", "off") };
     let dir = tempfile::tempdir().unwrap();
     let cleanup = DaemonCleanup(dir.path().to_owned());
     (dir, cleanup)

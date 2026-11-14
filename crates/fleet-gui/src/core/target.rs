@@ -73,12 +73,15 @@ const STDERR_TAIL: usize = 4096;
 
 /// `ssh ... <dest> sh -lc 'exec fleetd --stdio'`, with a shared control
 /// master under `<state_dir>/ssh` (created with mode 0700).
-pub fn ssh_command(dest: &str, state_dir: &Path) -> Command {
+pub fn ssh_command(dest: &str, state_dir: &Path) -> std::io::Result<Command> {
+    use std::os::unix::fs::PermissionsExt;
     let dir = state_dir.join("ssh");
-    let _ = std::fs::DirBuilder::new()
+    std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&dir);
+        .create(&dir)?;
+    // An existing directory keeps its old mode otherwise.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "ControlMaster=auto", "-o"])
         .arg(format!("ControlPath={}/%C", dir.display()))
@@ -86,7 +89,7 @@ pub fn ssh_command(dest: &str, state_dir: &Path) -> Command {
         .arg(dest)
         // One argument: ssh joins them with spaces for the remote shell.
         .arg("sh -lc 'exec fleetd --stdio'");
-    cmd
+    Ok(cmd)
 }
 
 /// Why a connection could not be made; the `Display` copy is shown in the
@@ -137,12 +140,10 @@ pub fn connect(
         },
         Target::Ssh { dest } => {
             let host = dest.rsplit_once('@').map_or(dest.as_str(), |(_, h)| h);
-            connect_with(
-                ssh_command(dest, state_dir),
-                host,
-                client_name,
-                SSH_HANDSHAKE_TIMEOUT,
-            )
+            let cmd = ssh_command(dest, state_dir).map_err(|e| {
+                ConnectError::Other(format!("cannot create {}/ssh: {e}", state_dir.display()))
+            })?;
+            connect_with(cmd, host, client_name, SSH_HANDSHAKE_TIMEOUT)
         }
     }
 }
@@ -209,6 +210,11 @@ fn connect_with(
                     host: host.to_owned(),
                 });
             }
+            if matches!(e, fleet_client::Error::ChildExited { status: Some(127) }) {
+                return Err(ConnectError::FleetdNotFound {
+                    host: host.to_owned(),
+                });
+            }
             if matches!(e, fleet_client::Error::Timeout) {
                 return Err(ConnectError::Timeout);
             }
@@ -256,7 +262,7 @@ mod tests {
     #[test]
     fn ssh_command_argv_is_exact() {
         let dir = tempfile::tempdir().unwrap();
-        let cmd = ssh_command("me@box", dir.path());
+        let cmd = ssh_command("me@box", dir.path()).unwrap();
         assert_eq!(cmd.get_program(), "ssh");
         let args: Vec<String> = cmd
             .get_args()
@@ -292,6 +298,34 @@ mod tests {
             .expect("must fail");
         assert_eq!(err, ConnectError::FleetdNotFound { host: "box".into() });
         assert_eq!(err.to_string(), "fleetd is not installed on box");
+    }
+
+    #[test]
+    fn ssh_exit_127_without_stderr_maps_to_fleetd_not_found() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 127"]);
+        let err = connect_with(cmd, "box", "t", Duration::from_secs(5))
+            .err()
+            .expect("must fail");
+        assert_eq!(err, ConnectError::FleetdNotFound { host: "box".into() });
+    }
+
+    #[test]
+    fn ssh_command_fixes_mode_of_existing_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("ssh")).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("ssh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        ssh_command("box", dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join("ssh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[test]
