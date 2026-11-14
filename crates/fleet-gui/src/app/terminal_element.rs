@@ -140,30 +140,16 @@ impl TerminalElement {
             paint_bg(r, default_bg, origin, m, window);
         }
 
-        // Text: one shaped line per stretch of single-width cells, every
-        // glyph forced to the cell width. Wide and combining cells are
-        // shaped alone at their column with natural advances: a forced
-        // advance would misplace what follows them (or push a combining
-        // mark into the next cell).
-        let end = row
-            .cells
-            .iter()
-            .rposition(|c| {
-                (!c.style.hidden && c.ch != ' ') || c.style.underline || c.style.strikeout
-            })
-            .map_or(0, |i| i + 1);
-        let mut seg = Segment::default();
-        for (cell, &(col, _, ref look)) in row.cells[..end].iter().zip(&styled) {
-            if cell.wide || cell.extra.is_some() {
-                seg.flush(self, origin, m, true, window, cx);
-                let mut alone = Segment::default();
-                alone.push(cell, col, look);
-                alone.flush(self, origin, m, false, window, cx);
-            } else {
-                seg.push(cell, col, look);
-            }
+        for piece in row_pieces(&row.cells, &styled) {
+            let line = window.text_system().shape_line(
+                SharedString::from(piece.text),
+                self.font_size,
+                &piece.runs,
+                piece.grid.then_some(m.cell_w),
+            );
+            let at = point(origin.x + m.cell_w * f32::from(piece.start_col), origin.y);
+            let _ = line.paint(at, m.line_h, window, cx);
         }
-        seg.flush(self, origin, m, true, window, cx);
     }
 
     /// Resolved colours and font of a cell.
@@ -230,7 +216,50 @@ impl CellLook {
     }
 }
 
-/// Cells collected for one `shape_line`.
+/// Text for one `shape_line` call, drawn from `start_col`.
+struct Piece {
+    start_col: u16,
+    text: String,
+    runs: Vec<TextRun>,
+    /// Every glyph's advance forced to the cell width.
+    grid: bool,
+}
+
+/// Splits a row's text into shaped pieces: one per stretch of
+/// single-width cells in one font, every glyph forced to the cell width.
+/// Wide and combining cells are shaped alone at their column with natural
+/// advances: a forced advance would misplace what follows them (or push a
+/// combining mark into the next cell).
+///
+/// A piece never mixes fonts: gpui 0.2.2's `layout_line` merges a run into
+/// the previous font run whenever colour and decorations match, without
+/// looking at the run's font, so bold or italic next to a same-coloured
+/// run would take that run's font.
+fn row_pieces(cells: &[Cell], styled: &[(u16, u16, CellLook)]) -> Vec<Piece> {
+    let end = cells
+        .iter()
+        .rposition(|c| (!c.style.hidden && c.ch != ' ') || c.style.underline || c.style.strikeout)
+        .map_or(0, |i| i + 1);
+    let mut out = Vec::new();
+    let mut seg = Segment::default();
+    for (cell, &(col, _, ref look)) in cells[..end].iter().zip(styled) {
+        if cell.wide || cell.extra.is_some() {
+            seg.flush(true, &mut out);
+            let mut alone = Segment::default();
+            alone.push(cell, col, look);
+            alone.flush(false, &mut out);
+        } else {
+            if seg.last.as_ref().is_some_and(|l| l.font != look.font) {
+                seg.flush(true, &mut out);
+            }
+            seg.push(cell, col, look);
+        }
+    }
+    seg.flush(true, &mut out);
+    out
+}
+
+/// Cells collected for one [`Piece`].
 #[derive(Default)]
 struct Segment {
     start_col: u16,
@@ -269,29 +298,19 @@ impl Segment {
         }
     }
 
-    /// Shapes and paints the segment at its column; `grid` forces every
-    /// glyph's advance to the cell width.
-    fn flush(
-        &mut self,
-        el: &TerminalElement,
-        origin: Point<Pixels>,
-        m: Metrics,
-        grid: bool,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    /// Ends the segment as a piece in `out`; `grid` forces every glyph's
+    /// advance to the cell width.
+    fn flush(&mut self, grid: bool, out: &mut Vec<Piece>) {
+        self.last = None;
         if self.text.is_empty() {
             return;
         }
-        let text = SharedString::from(std::mem::take(&mut self.text));
-        let runs = std::mem::take(&mut self.runs);
-        self.last = None;
-        let line =
-            window
-                .text_system()
-                .shape_line(text, el.font_size, &runs, grid.then_some(m.cell_w));
-        let at = point(origin.x + m.cell_w * f32::from(self.start_col), origin.y);
-        let _ = line.paint(at, m.line_h, window, cx);
+        out.push(Piece {
+            start_col: self.start_col,
+            text: std::mem::take(&mut self.text),
+            runs: std::mem::take(&mut self.runs),
+            grid,
+        });
     }
 }
 
@@ -607,5 +626,86 @@ impl TerminalElement {
                 view.update(cx, |v, cx| v.scroll_wheel(ev, window, cx));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fleet_term::{Cell, CellStyle};
+    use gpui::{FontStyle, FontWeight, font, hsla};
+
+    use super::{CellLook, row_pieces};
+
+    fn look(bold: bool, italic: bool) -> CellLook {
+        let mut f = font("Menlo");
+        if bold {
+            f.weight = FontWeight::BOLD;
+        }
+        if italic {
+            f.style = FontStyle::Italic;
+        }
+        CellLook {
+            fg: hsla(0., 0., 1., 1.),
+            bg: hsla(0., 0., 0., 1.),
+            font: f,
+            underline: false,
+            strikeout: false,
+        }
+    }
+
+    /// Cells for `text`, styled per char by `styles` (`b`, `i`, `B` = both, else plain).
+    fn row(text: &str, styles: &str) -> (Vec<Cell>, Vec<(u16, u16, CellLook)>) {
+        let mut cells = Vec::new();
+        let mut styled = Vec::new();
+        for (i, (ch, st)) in text.chars().zip(styles.chars()).enumerate() {
+            let (bold, italic) = match st {
+                'b' => (true, false),
+                'i' => (false, true),
+                'B' => (true, true),
+                _ => (false, false),
+            };
+            cells.push(Cell {
+                ch,
+                extra: None,
+                style: CellStyle {
+                    bold,
+                    italic,
+                    ..CellStyle::default()
+                },
+                wide: false,
+            });
+            styled.push((i as u16, 1, look(bold, italic)));
+        }
+        (cells, styled)
+    }
+
+    #[test]
+    fn same_coloured_runs_in_other_fonts_are_shaped_apart() {
+        // `\e[3mit\e[0m pl` and `pl \e[1mbo\e[0m`: one colour throughout.
+        let (cells, styled) = row("it pl bo BI", "ii....bb.BB");
+        let pieces = row_pieces(&cells, &styled);
+        let got: Vec<(u16, &str, FontWeight, FontStyle)> = pieces
+            .iter()
+            .map(|p| {
+                assert_eq!(p.runs.len(), 1, "one font per shaped line: {:?}", p.text);
+                (
+                    p.start_col,
+                    p.text.as_str(),
+                    p.runs[0].font.weight,
+                    p.runs[0].font.style,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, "it", FontWeight::NORMAL, FontStyle::Italic),
+                (2, " pl ", FontWeight::NORMAL, FontStyle::Normal),
+                (6, "bo", FontWeight::BOLD, FontStyle::Normal),
+                (8, " ", FontWeight::NORMAL, FontStyle::Normal),
+                (9, "BI", FontWeight::BOLD, FontStyle::Italic),
+            ]
+        );
+        assert!(pieces.iter().all(|p| p.grid));
     }
 }
