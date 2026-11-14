@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use fleet_proto::AgentState;
 use fleet_term::Palette;
 use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle};
 
@@ -547,6 +548,9 @@ impl AppState {
             let chrome = PaneChrome {
                 number: i + 1,
                 has_agent: agent.is_some(),
+                agent_ended: row.is_some_and(|r| {
+                    matches!(r.info.state(), AgentState::Exited | AgentState::Lost)
+                }),
                 program: match (row, agent) {
                     (Some(r), _) => Some(program_name(&r.info.program)),
                     (None, Some(id)) => Some(format!("agent {id}")),

@@ -126,6 +126,8 @@ pub struct PaneChrome {
     pub number: usize,
     /// The layout puts an agent here.
     pub has_agent: bool,
+    /// The agent list says that agent exited or is lost.
+    pub agent_ended: bool,
     pub program: Option<String>,
     /// The agent's directory, with `~`.
     pub cwd: Option<String>,
@@ -168,7 +170,9 @@ pub fn empty_message(chrome: &PaneChrome) -> Option<&'static str> {
 /// Whether the grid draws a cursor: only for an agent that may still
 /// take input (none in an empty pane, or once the agent exited or is gone).
 pub fn draws_cursor(chrome: &PaneChrome, state: PaneState) -> bool {
-    chrome.has_agent && !matches!(state, PaneState::Exited(_) | PaneState::Lost)
+    chrome.has_agent
+        && !chrome.agent_ended
+        && !matches!(state, PaneState::Exited(_) | PaneState::Lost)
 }
 
 /// The header's title and path: the OSC title if the agent set one, else
@@ -1347,6 +1351,12 @@ mod tests {
         assert!(draws_cursor(&shown, PaneState::Disconnected));
         assert!(!draws_cursor(&shown, PaneState::Exited(0)));
         assert!(!draws_cursor(&shown, PaneState::Lost));
+        // Known to have ended, it gets none while disconnected either.
+        let ended = PaneChrome {
+            agent_ended: true,
+            ..shown
+        };
+        assert!(!draws_cursor(&ended, PaneState::Disconnected));
     }
 
     #[test]
