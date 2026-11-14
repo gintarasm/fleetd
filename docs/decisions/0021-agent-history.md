@@ -4,6 +4,8 @@
 
 **Amends:** [0005](0005-terminal-state-on-node.md). The node still keeps one headless grid per agent and reattach still costs one screen. It now also keeps, and serves, the lines that scrolled off that grid. The raw-output scrollback ring of [0018](0018-m1-protocol-and-node.md) is unchanged.
 
+**Amended by [0030](0030-agent-restart-and-forget.md):** forgetting an agent deletes its history early; retention never prunes store rows.
+
 ## Context
 
 M2's client must show a whole long session (a Claude Code conversation), also after a GUI restart or a re-attach. 0005 gave clients only the visible screen. Keeping alacritty's scrollback in node memory and shipping it with the snapshot was rejected: about 24 bytes per cell (a 10k x 120 session is ~29 MB, times 50 agents), attach cost that grows with history, and history that dies with the daemon.

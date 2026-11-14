@@ -4,6 +4,8 @@
 
 **Amends:** [0018](0018-m1-protocol-and-node.md). Framing, the handshake, request ordering, terminal sizes, snapshots, exited-agent release and the scrollback ring are unchanged. Implements the label part of [0025](0025-core-knows-agents-workflows-own-hierarchy.md) and serves the history of [0021](0021-agent-history.md).
 
+**Amended by [0030](0030-agent-restart-and-forget.md):** adds `RestartAgent`, `ForgetAgents`, `Restarted`, `Forgotten`, `Event::AgentRemoved` and `AgentList.replaced`, and store schema v3, without a version bump.
+
 ## Context
 
 The M2 client needs history, a way to spawn an agent with the GUI's terminal answering its startup queries, per-agent lag notices, a cheap sidebar feed (last line per agent), a rule for who sizes an agent's terminal when several clients attach, and labels to group by. All are additions to `fleet.v1`; the removal of the id-0 lag notice is not, so the version is bumped.
