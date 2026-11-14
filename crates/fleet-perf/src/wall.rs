@@ -1,8 +1,10 @@
-//! Wall-clock suite: fleetd cold start, idle RSS, the 50-agent flood, and the
+//! Wall-clock suite: fleetd cold start, idle RSS, the 50-agent flood, the
 //! daemon scenarios (flood through the protocol server, the flood with four
-//! attached agents and input echo through it, reattach).
+//! attached agents and input echo through it, reattach), and the GUI
+//! scenarios (fleet-gui cold start and input to render; macOS only).
 
 mod daemon;
+mod gui;
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -28,6 +30,15 @@ pub const DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS: &str = "daemon_flood50_lagged_subsc
 pub const REATTACH_SNAPSHOT_NS: &str = "reattach_snapshot_ns";
 pub const FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS: &str = "flood50_attached4_lagged_subscriptions";
 pub const INPUT_ECHO_FLOOD_NS: &str = "input_echo_flood50_ns";
+pub const GUI_COLD_START_NS: &str = "gui_cold_start_ns";
+pub const INPUT_TO_RENDER_NS: &str = "input_to_render_ns";
+pub const INPUT_TO_RENDER_FLOOD_NS: &str = "input_to_render_flood50_ns";
+/// The metrics of the GUI scenarios, which need fleet-gui (macOS).
+pub const GUI_METRIC_NAMES: &[&str] = &[
+    GUI_COLD_START_NS,
+    INPUT_TO_RENDER_NS,
+    INPUT_TO_RENDER_FLOOD_NS,
+];
 /// Every metric the wall suite emits.
 pub const METRIC_NAMES: &[&str] = &[
     COLD_START_NS,
@@ -42,6 +53,9 @@ pub const METRIC_NAMES: &[&str] = &[
     REATTACH_SNAPSHOT_NS,
     FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS,
     INPUT_ECHO_FLOOD_NS,
+    GUI_COLD_START_NS,
+    INPUT_TO_RENDER_NS,
+    INPUT_TO_RENDER_FLOOD_NS,
 ];
 
 const FLOOD_AGENTS: usize = 50;
@@ -58,6 +72,9 @@ const FLOOD_ATTACHED: usize = 4;
 const ECHO_SAMPLES: usize = 100;
 const QUICK_ECHO_SAMPLES: usize = 10;
 const ECHO_GAP: Duration = Duration::from_millis(5);
+/// GUI launches measured by `gui_cold_start_ns` (minimum taken).
+const GUI_COLD_RUNS: usize = 10;
+const QUICK_GUI_COLD_RUNS: usize = 1;
 const MIB: f64 = 1024.0 * 1024.0;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const TIGHT_POLL: Duration = Duration::from_millis(50);
@@ -365,11 +382,46 @@ pub fn run(quick: bool) -> Result<Results, String> {
         eprintln!("fleet-perf: {msg}");
     }
 
+    // fleet-gui is macOS-only (it exits 1 elsewhere); missing or unable to
+    // open a window, these metrics fail.
+    let gui_metrics = if cfg!(target_os = "macos") {
+        let gui = sibling("fleet-gui")?;
+        let cold_runs = if quick {
+            QUICK_GUI_COLD_RUNS
+        } else {
+            GUI_COLD_RUNS
+        };
+        vec![
+            (
+                GUI_COLD_START_NS,
+                gui::cold_start_ns(&fleetd, &gui, cold_runs)?,
+            ),
+            (INPUT_TO_RENDER_NS, gui::input_to_render_ns(&fleetd, &gui)?),
+            (
+                INPUT_TO_RENDER_FLOOD_NS,
+                gui::input_to_render_flood_ns(
+                    &fleetd,
+                    &gui,
+                    &fake_agent,
+                    FLOOD_AGENTS,
+                    bytes,
+                    quick,
+                )?,
+            ),
+        ]
+    } else {
+        eprintln!(
+            "fleet-perf: skipping {}: fleet-gui is macOS-only",
+            GUI_METRIC_NAMES.join(", ")
+        );
+        vec![]
+    };
+
     let m = |value: f64, unit: &str| Measurement {
         value,
         unit: unit.to_string(),
     };
-    let metrics = BTreeMap::from([
+    let mut metrics = BTreeMap::from([
         (COLD_START_NS.to_string(), m(cold, "ns")),
         (IDLE_RSS_BYTES.to_string(), m(rss, "bytes")),
         (FLOOD_WALL_NS.to_string(), m(pick(|f| f.wall_ns), "ns")),
@@ -404,6 +456,9 @@ pub fn run(quick: bool) -> Result<Results, String> {
         ),
         (INPUT_ECHO_FLOOD_NS.to_string(), m(echo.median_ns, "ns")),
     ]);
+    for (name, value) in gui_metrics {
+        metrics.insert(name.to_string(), m(value, "ns"));
+    }
     Ok(Results {
         suite: Suite::Wall,
         metrics,
@@ -467,6 +522,27 @@ mod tests {
     #[test]
     fn median_of_even_count_is_mean_of_the_two_middle_values() {
         assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]), 2.5);
+    }
+
+    #[test]
+    fn gui_metrics_are_listed() {
+        let text = include_str!("../../../bench/baselines.toml");
+        let b = crate::baseline::Baselines::parse(text).unwrap();
+        for (name, budget) in [
+            ("gui_cold_start_ns", 200_000_000.0),
+            ("input_to_render_ns", 16_000_000.0),
+            ("input_to_render_flood50_ns", 16_000_000.0),
+        ] {
+            assert!(super::METRIC_NAMES.contains(&name), "{name} not emitted");
+            let spec = b
+                .metrics
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} not in baselines"));
+            assert_eq!(spec.suite, crate::results::Suite::Wall, "{name}");
+            assert_eq!(spec.unit, "ns", "{name}");
+            assert_eq!(spec.budget, Some(budget), "{name}");
+            assert!(!spec.report_only, "{name}");
+        }
     }
 
     #[test]

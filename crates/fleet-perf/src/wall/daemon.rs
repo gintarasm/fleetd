@@ -23,8 +23,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use super::{MIB, Reaped, median, spawn_fleetd, wait_ready};
 
-const COLS: u32 = 120;
-const ROWS: u32 = 40;
+pub(super) const COLS: u32 = 120;
+pub(super) const ROWS: u32 = 40;
 /// Bound on any single blocking read from the daemon.
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_CHUNK: usize = 1024 * 1024;
@@ -38,7 +38,7 @@ const READY_MARK: &str = "fleet-perf-ready";
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Blocking protocol client over the daemon's unix socket.
-struct Client {
+pub(super) struct Client {
     stream: UnixStream,
     codec: FrameCodec,
     rbuf: BytesMut,
@@ -48,7 +48,7 @@ struct Client {
 }
 
 impl Client {
-    fn connect(sock: &Path) -> Result<Client, String> {
+    pub(super) fn connect(sock: &Path) -> Result<Client, String> {
         let stream = UnixStream::connect(sock).map_err(|e| format!("connecting: {e}"))?;
         stream
             .set_read_timeout(Some(READ_TIMEOUT))
@@ -82,7 +82,7 @@ impl Client {
     }
 
     /// Sends a request; returns its id.
-    fn request(&mut self, kind: request::Kind) -> Result<u64, String> {
+    pub(super) fn request(&mut self, kind: request::Kind) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(Frame::Request(Request {
@@ -92,7 +92,7 @@ impl Client {
         Ok(id)
     }
 
-    fn recv(&mut self) -> Result<Frame, String> {
+    pub(super) fn recv(&mut self) -> Result<Frame, String> {
         loop {
             if let Some(frame) = self
                 .codec
@@ -115,16 +115,16 @@ impl Client {
 
 /// Stream state of one connection: everything that is not a response.
 #[derive(Default)]
-struct Streams {
+pub(super) struct Streams {
     /// Agent id -> exit code, from `AgentExited` events.
-    exited: HashMap<u64, i32>,
+    pub(super) exited: HashMap<u64, i32>,
     /// Subscriptions the daemon dropped for falling behind.
     lagged: usize,
 }
 
 impl Streams {
     /// Consumes a stream frame; returns a response that is not a lag notice.
-    fn take(&mut self, frame: Frame) -> Result<Option<fleet_proto::Response>, String> {
+    pub(super) fn take(&mut self, frame: Frame) -> Result<Option<fleet_proto::Response>, String> {
         match frame {
             Frame::Output { .. } => Ok(None),
             Frame::Event(e) => {
@@ -143,7 +143,7 @@ impl Streams {
     }
 
     /// Reads until the response to `id`, consuming stream frames on the way.
-    fn wait(&mut self, client: &mut Client, id: u64) -> Result<response::Kind, String> {
+    pub(super) fn wait(&mut self, client: &mut Client, id: u64) -> Result<response::Kind, String> {
         loop {
             let Some(r) = self.take(client.recv()?)? else {
                 continue;
@@ -162,23 +162,24 @@ impl Streams {
 
 /// A running `fleetd` with its own state dir; stopped with SIGTERM on drop
 /// (so it stops its agents), then killed if it does not exit in time.
-struct Daemon {
+pub(super) struct Daemon {
     process: Reaped,
-    sock: std::path::PathBuf,
-    _dir: tempfile::TempDir,
+    pub(super) sock: std::path::PathBuf,
+    dir: tempfile::TempDir,
 }
 
 impl Daemon {
-    fn start(fleetd: &Path) -> Result<Daemon, String> {
+    pub(super) fn start(fleetd: &Path) -> Result<Daemon, String> {
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let sock = dir.path().join("fleetd.sock");
         let mut process = spawn_fleetd(fleetd, dir.path())?;
         wait_ready(&mut process, &sock)?;
-        Ok(Daemon {
-            process,
-            sock,
-            _dir: dir,
-        })
+        Ok(Daemon { process, sock, dir })
+    }
+
+    /// Its `--state-dir` (holds `fleetd.sock`).
+    pub(super) fn state_dir(&self) -> &Path {
+        self.dir.path()
     }
 
     fn pid(&self) -> u32 {
@@ -495,7 +496,7 @@ pub(super) fn reattach_snapshot_ns(
 }
 
 /// Spawns one `fake-agent --ansi --bytes <bytes> --seed <seed>`; returns its id.
-fn spawn_fake_agent(
+pub(super) fn spawn_fake_agent(
     client: &mut Client,
     streams: &mut Streams,
     fake_agent: &Path,

@@ -4,11 +4,20 @@ use std::process::Command;
 use fleet_perf::results::{Results, Suite};
 use fleet_perf::wall;
 
-/// `fleet-perf run` finds `fleetd` and `fake-agent` next to itself, so make
-/// sure both exist in the profile this test runs under.
+/// `fleet-perf run` finds `fleetd`, `fake-agent` and `fleet-gui` next to
+/// itself, so make sure they exist in the profile this test runs under.
 fn build_siblings() {
     let mut cmd = Command::new(env!("CARGO"));
-    cmd.args(["build", "-p", "fleetd", "-p", "fleet-perf", "--bins"]);
+    cmd.args([
+        "build",
+        "-p",
+        "fleetd",
+        "-p",
+        "fleet-perf",
+        "-p",
+        "fleet-gui",
+    ]);
+    cmd.arg("--bins");
     if !cfg!(debug_assertions) {
         cmd.arg("--release");
     }
@@ -31,23 +40,26 @@ fn wall_suite_quick_emits_all_metrics() {
     let r = Results::from_json(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
     assert_eq!(r.suite, Suite::Wall);
     let names: Vec<_> = r.metrics.keys().map(String::as_str).collect();
-    assert_eq!(
-        names,
-        [
-            "daemon_flood50_cpu_ns_per_mib",
-            "daemon_flood50_lagged_subscriptions",
-            "daemon_flood50_peak_rss_bytes",
-            "daemon_flood50_wall_ns",
-            "fleetd_cold_start_ns",
-            "fleetd_idle_rss_bytes",
-            "flood50_attached4_lagged_subscriptions",
-            "flood50_cpu_ns_per_mib",
-            "flood50_peak_rss_bytes",
-            "flood50_wall_ns",
-            "input_echo_flood50_ns",
-            "reattach_snapshot_ns",
-        ]
-    );
+    let mut expected = vec![
+        "daemon_flood50_cpu_ns_per_mib",
+        "daemon_flood50_lagged_subscriptions",
+        "daemon_flood50_peak_rss_bytes",
+        "daemon_flood50_wall_ns",
+        "fleetd_cold_start_ns",
+        "fleetd_idle_rss_bytes",
+        "flood50_attached4_lagged_subscriptions",
+        "flood50_cpu_ns_per_mib",
+        "flood50_peak_rss_bytes",
+        "flood50_wall_ns",
+        "input_echo_flood50_ns",
+        "reattach_snapshot_ns",
+    ];
+    // The GUI scenarios need fleet-gui, which is macOS-only.
+    if cfg!(target_os = "macos") {
+        expected.extend(wall::GUI_METRIC_NAMES);
+        expected.sort_unstable();
+    }
+    assert_eq!(names, expected);
     for (name, m) in &r.metrics {
         // Quick payloads are too small for fleetd to drop a subscriber.
         if name == "daemon_flood50_lagged_subscriptions"

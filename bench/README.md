@@ -34,6 +34,9 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 | `flood50_attached4_lagged_subscriptions` | wall | `fleetd` with 50 `fake-agent --ansi --bytes 8388608` spawned on one connection that is attached to agents 0–3 only (a GUI showing four panes) and consumes everything until all exit: subscriptions dropped as lagged (`Event::Lagged`; worst of 3 runs; unit `count`) |
 | `input_echo_flood50_ns` | wall | that flood plus a 51st agent `/bin/cat` attached on its own connection: once every flood agent is spawned, `SendInput` of one byte written until the `Output` holding its PTY echo is read, one at a time 5 ms apart (median of 100, all taken while the flood runs) |
 | `reattach_snapshot_ns` | wall | `Attach` sent to `AttachOk` received for an idle agent that printed 8 MiB (median of 50, detaching in between); since M2a `AttachOk` also carries the history tail (up to 256 KiB / 4096 lines) |
+| `gui_cold_start_ns` | wall | `fleetd` with 10 idle agents (`/bin/cat`); `fleet-gui` (`FLEET_GUI_BENCH=cold-start --target local`) from just before spawn until it prints `ready`, which it does once the frame that drew every agent of its first `ListAgents` reply in the sidebar is presented (minimum of 10); budget 200 ms |
+| `input_to_render_ns` | wall | `fleet-gui` (`FLEET_GUI_BENCH=input`) showing a `/bin/cat` agent in pane 1 on an idle daemon: 50 keys `x`, 20 ms apart, each dispatched through the window's key path (`Window::dispatch_keystroke`, the pane's key and text input handlers) until the frame whose grid holds its PTY echo is presented (`on_next_frame`); median of the 50, printed by the GUI; budget 16 ms |
+| `input_to_render_flood50_ns` | wall | the same while 50 `fake-agent --ansi --bytes 8388608` flood (spawned on their own connection, which consumes everything until all exit), with 3 of them shown in further panes (`FLEET_GUI_BENCH_EXTRA_PANES`); every sample is taken before the flood ends; budget 16 ms |
 | `fleetd_startup_instructions` | instr | Callgrind instruction count of `fleetd::startup` (x86_64, ubuntu-24.04) |
 | `frame_decode_output_64x64k_instructions` | instr | decode 64 back-to-back 64 KiB `Output` frames with `FrameCodec` |
 | `terminal_feed_64k_instructions` | instr | feed 64 KiB of deterministic agent-like ANSI (`FakeOutput`, `\n` as `\r\n`) into a blank 120x40 `Terminal` |
@@ -41,6 +44,8 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 | `terminal_feed_scroll_64k_instructions` | instr | the `terminal_feed_64k` feed plus `drain_history` of the lines it scrolled off (history capture, ADR 0021) |
 | `history_push_1k_lines_instructions` | instr | push 1000 lines of 100 bytes into a new per-agent `History` store (includes its buffered file writes) |
 | `history_read_page_instructions` | instr | one `read_page` of 1000 lines from the middle of a flushed store of 100 000 lines of 100 bytes |
+
+The three GUI metrics need `fleet-gui` next to `fleet-perf` and a logged-in macOS window server (the self-hosted runner's GUI session). The GUI's bench hooks (`crates/fleet-gui/src/app/bench.rs`) never show the connect sheet: a failed connect exits 3, a bench not done within 30 s exits 4. If `fleet-gui` is missing or exits non-zero before its line, the wall run fails with a message saying so; on Linux, where `fleet-gui` is macOS-only, the run skips them with a message (and `compare` then reports them missing).
 
 Tolerances: `instr` 2%, `wall` 5%.
 

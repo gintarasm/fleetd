@@ -13,6 +13,7 @@ use gpui::{
 };
 
 use super::app_state::{AppState, SessionApi};
+use super::bench;
 use super::new_agent::{TextField, button};
 use super::theme::{Theme, current as theme};
 use super::workspace::Workspace;
@@ -219,6 +220,9 @@ impl ConnectSheet {
         match result {
             Ok(target) => cx.emit(ConnectEvent::Connected { target, save }),
             Err(reason) => {
+                if bench::active() {
+                    bench::connect_failed(reason.as_deref());
+                }
                 if let Some(r) = &reason {
                     eprintln!("fleet-gui: connect sheet: {r}");
                 } else {
@@ -239,13 +243,16 @@ impl ConnectSheet {
             None => "Looking for fleetd on this Mac…".to_owned(),
         };
         self.quiet = true;
-        self._quiet_timer = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(STARTUP_QUIET).await;
-            let _ = this.update(cx, |s, cx| {
-                s.quiet = false;
-                cx.notify();
-            });
-        }));
+        // A bench run never shows the sheet: it stays quiet, and a failure exits.
+        self._quiet_timer = (!bench::active()).then(|| {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(STARTUP_QUIET).await;
+                let _ = this.update(cx, |s, cx| {
+                    s.quiet = false;
+                    cx.notify();
+                });
+            })
+        });
         self.run(
             label,
             false,
@@ -509,6 +516,7 @@ pub fn switch_target(target: Target, cx: &mut App) {
     let (ui_tx, ui_rx) = async_channel::unbounded();
     let session = backend.session(&target, ui_tx);
     app.update(cx, |a, cx| a.replace_session(session, ui_rx, target, cx));
+    bench::connected(cx);
 }
 
 /// The launch flow over the open workspace window.

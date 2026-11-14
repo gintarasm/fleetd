@@ -312,6 +312,24 @@ impl Workspace {
         self.focus_current(window, cx);
     }
 
+    /// The `input` bench's panes: `agent` in the focused pane (returned)
+    /// and each of `extra` in a new split; the focus returns to the first.
+    pub(super) fn bench_open(
+        &mut self,
+        agent: u64,
+        extra: &[u64],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PaneId {
+        let pane = self.app.read(cx).focused();
+        self.show_agent(agent, window, cx);
+        for &id in extra {
+            self.app.update(cx, |a, cx| a.open_in_new_split(id, cx));
+        }
+        self.focus_pane(pane, window, cx);
+        pane
+    }
+
     pub fn open_row_menu(&mut self, agent_id: u64, at: Point<Pixels>, cx: &mut Context<Self>) {
         self.menu = Some(RowMenu { agent_id, at });
         cx.notify();
@@ -592,6 +610,7 @@ impl Render for Workspace {
             mark: &mark,
         };
         let sidebar = render_sidebar(&data, &theme, cx);
+        super::bench::sidebar_drawn(window);
         let panes = self.render_panes(cx);
         let toast = error.map(|e| {
             div()

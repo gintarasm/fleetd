@@ -1,6 +1,7 @@
 //! gpui shell (macOS only).
 
 mod app_state;
+mod bench;
 mod connect;
 mod keymap;
 mod new_agent;
@@ -38,6 +39,7 @@ use crate::core::target::Target;
 /// icon; the status menu reopens it); Quit detaches everything and leaves
 /// the agents running.
 pub fn run(state_dir: PathBuf, target: Option<Target>) {
+    bench::init();
     let config = load_config(&state_dir).unwrap_or_else(|e| {
         eprintln!("fleet-gui: {e}; using the default settings");
         GuiConfig::default()

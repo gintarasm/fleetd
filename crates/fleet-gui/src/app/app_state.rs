@@ -397,6 +397,9 @@ impl AppState {
             match event {
                 UiEvent::AgentsChanged => {
                     self.agents = self.session.agents();
+                    if self.live {
+                        super::bench::agents_listed();
+                    }
                     chrome = true;
                     cx.notify();
                 }

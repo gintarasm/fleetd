@@ -13,6 +13,7 @@ use gpui::{
     UnderlineStyle, Window, fill, outline, point, px, relative, size,
 };
 
+use super::bench;
 use super::pane_view::{GridLayout, InputSink, PaneView, grid_size, ime_cell};
 use super::theme::Theme;
 use crate::core::pane::{PaneModel, ViewRow};
@@ -413,6 +414,10 @@ impl Element for TerminalElement {
         self.listen_to_mouse(hitbox.clone(), window);
         // The lock is held only for the copy; shaping happens after.
         let snap = self.snapshot();
+        if bench::watches(self.pane) {
+            let count = snap.rows.iter().map(|r| bench::count_key(&r.cells)).sum();
+            bench::painted(self.pane, count, window);
+        }
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let block_cursor = snap
                 .cursor
