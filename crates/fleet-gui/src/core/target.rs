@@ -127,8 +127,33 @@ impl std::error::Error for ConnectError {}
 
 pub struct Connected {
     pub conn: Connection,
-    /// The ssh child, for an ssh target; the caller reaps or kills it.
-    pub child: Option<Child>,
+    /// The ssh child, for an ssh target: killed and reaped if the
+    /// connection is dropped unused.
+    pub child: ChildGuard,
+}
+
+/// A child process that is killed and reaped when dropped, unless taken.
+#[derive(Debug, Default)]
+pub struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    pub fn new(child: Option<Child>) -> Self {
+        ChildGuard(child)
+    }
+
+    /// The child, now the caller's to reap.
+    pub fn take(mut self) -> Option<Child> {
+        self.0.take()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Connects to `target` and handshakes as `client_name`.
@@ -139,7 +164,10 @@ pub fn connect(
 ) -> Result<Connected, ConnectError> {
     match target {
         Target::Local => match Connection::unix(&state_dir.join("fleetd.sock"), client_name) {
-            Ok(conn) => Ok(Connected { conn, child: None }),
+            Ok(conn) => Ok(Connected {
+                conn,
+                child: ChildGuard::default(),
+            }),
             Err(fleet_client::Error::NotRunning) => Err(ConnectError::NotRunning),
             Err(fleet_client::Error::Timeout) => Err(ConnectError::Timeout),
             Err(e) => Err(ConnectError::Other(e.to_string())),
@@ -206,7 +234,7 @@ fn connect_with(
         // chatty ssh never blocks; it ends when the child does.
         Ok((conn, child)) => Ok(Connected {
             conn,
-            child: Some(child),
+            child: ChildGuard::new(Some(child)),
         }),
         Err(e) => {
             let stderr = tail.text();
@@ -342,6 +370,21 @@ mod tests {
             .err()
             .expect("must fail");
         assert_eq!(err.to_string(), "ssh: Permission denied (publickey).");
+    }
+
+    #[test]
+    fn dropping_a_child_guard_kills_and_reaps_the_child() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().to_string();
+        drop(ChildGuard::new(Some(child)));
+        // Reaped, not a zombie: the pid is gone.
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive);
     }
 
     #[test]

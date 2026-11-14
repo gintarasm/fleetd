@@ -241,7 +241,7 @@ fn reader(link: &Link, out: &mpsc::Sender<Outgoing>) {
             backoff.reset();
             {
                 let mut sh = lock(&link.shared);
-                let mut h = ConnHandle::new(&c.conn, c.child);
+                let mut h = ConnHandle::new(&c.conn, c.child.take());
                 if link.stop.is_set() {
                     h.close();
                     drop(sh);

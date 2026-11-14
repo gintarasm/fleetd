@@ -3,8 +3,8 @@
 //! fleetd on this Mac".
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -19,7 +19,7 @@ use super::new_agent::{TextField, button};
 use super::theme::{Theme, current as theme};
 use super::workspace::Workspace;
 use crate::core::launch::{find_fleetd, start_local};
-use crate::core::session::{CLIENT_NAME, ConnHandle, Session, UiEvent};
+use crate::core::session::{CLIENT_NAME, Session, UiEvent};
 use crate::core::target::{ConnectError, Connected, Startup, Target, connect, startup_action};
 
 /// A startup connect this quick never shows the sheet.
@@ -35,6 +35,9 @@ pub trait Backend: Send + Sync {
     /// Connects to `target` and handshakes. The real backend keeps the
     /// connection for the next [`Backend::session`] to `target`.
     fn probe(&self, target: &Target) -> Result<(), ConnectError>;
+    /// Closes a connection [`Backend::probe`] kept, if any (the attempt
+    /// was abandoned).
+    fn discard_probe(&self) {}
     /// Starts a local fleetd and waits until it answers.
     fn start_local(&self, fleetd: &Path) -> Result<(), ConnectError>;
     /// A session to `target` (main thread).
@@ -49,34 +52,65 @@ pub const PROBE_REUSE_WINDOW: Duration = Duration::from_secs(5);
 pub struct RealBackend {
     pub state_dir: PathBuf,
     /// The last probe's connection, for the session that follows it: one
-    /// handshake instead of two.
-    probed: Mutex<Option<(Target, Instant, Connected)>>,
+    /// handshake instead of two. Closed after [`PROBE_REUSE_WINDOW`] if no
+    /// session takes it (dropping a [`Connected`] closes it and reaps its
+    /// ssh child).
+    probed: Arc<Mutex<Option<Probed>>>,
+    /// Bumped by [`Backend::discard_probe`]: a probe that started before
+    /// does not keep its connection.
+    probe_epoch: AtomicU64,
+}
+
+struct Probed {
+    target: Target,
+    at: Instant,
+    conn: Connected,
 }
 
 impl RealBackend {
     pub fn new(state_dir: PathBuf) -> Self {
         RealBackend {
             state_dir,
-            probed: Mutex::new(None),
+            probed: Arc::default(),
+            probe_epoch: AtomicU64::new(0),
         }
     }
 
-    /// Keeps `c` (to `target`) for the next session; closes the one kept before.
-    fn keep(&self, target: &Target, c: Connected) {
-        let old = lock(&self.probed).replace((target.clone(), Instant::now(), c));
-        if let Some((_, _, old)) = old {
-            ConnHandle::new(&old.conn, old.child).finish();
-        }
+    /// Keeps `c` (to `target`) for the next session, unless the probe that
+    /// made it (in `epoch`) was abandoned; drops the one kept before.
+    fn keep(&self, target: &Target, c: Connected, epoch: u64) {
+        let at = Instant::now();
+        let old = {
+            let mut probed = lock(&self.probed);
+            if self.probe_epoch.load(Ordering::SeqCst) != epoch {
+                return;
+            }
+            probed.replace(Probed {
+                target: target.clone(),
+                at,
+                conn: c,
+            })
+        };
+        drop(old);
+        let probed = Arc::clone(&self.probed);
+        let _ = std::thread::Builder::new()
+            .name("gui-probe-expiry".into())
+            .spawn(move || {
+                std::thread::sleep(PROBE_REUSE_WINDOW);
+                let mut slot = lock(&probed);
+                if slot.as_ref().is_some_and(|p| p.at == at) {
+                    let stale = slot.take();
+                    drop(slot);
+                    drop(stale);
+                }
+            });
     }
 
-    /// The kept connection, if it is to `target` and recent; a stale one is closed.
+    /// The kept connection, if it is to `target` and recent; a stale one is
+    /// dropped (closed).
     fn take_probed(&self, target: &Target) -> Option<Connected> {
-        let (t, at, c) = lock(&self.probed).take()?;
-        if t == *target && at.elapsed() < PROBE_REUSE_WINDOW {
-            return Some(c);
-        }
-        ConnHandle::new(&c.conn, c.child).finish();
-        None
+        let p = lock(&self.probed).take()?;
+        (p.target == *target && p.at.elapsed() < PROBE_REUSE_WINDOW).then_some(p.conn)
     }
 }
 
@@ -90,10 +124,20 @@ impl Backend for RealBackend {
     }
 
     fn probe(&self, target: &Target) -> Result<(), ConnectError> {
+        let epoch = self.probe_epoch.load(Ordering::SeqCst);
         // Handshaken as the session's control connection, which it becomes.
         let c = connect(target, &self.state_dir, CLIENT_NAME)?;
-        self.keep(target, c);
+        self.keep(target, c, epoch);
         Ok(())
+    }
+
+    fn discard_probe(&self) {
+        let kept = {
+            let mut probed = lock(&self.probed);
+            self.probe_epoch.fetch_add(1, Ordering::SeqCst);
+            probed.take()
+        };
+        drop(kept);
     }
 
     fn start_local(&self, fleetd: &Path) -> Result<(), ConnectError> {
@@ -287,8 +331,8 @@ impl ConnectSheet {
     }
 
     /// Waits for `result` (a connect on its way) as [`ConnectSheet::run`]
-    /// does. Dropping it (Cancel) drops the result; a kept probe
-    /// connection then goes stale ([`PROBE_REUSE_WINDOW`]).
+    /// does. Dropping it (Cancel) drops the result; [`ConnectSheet::cancel`]
+    /// also discards the probe's kept connection.
     fn run_future(
         &mut self,
         label: String,
@@ -432,9 +476,11 @@ impl ConnectSheet {
         );
     }
 
-    /// Abandons the attempt on its way; a late success is dropped.
+    /// Abandons the attempt on its way; a late success is dropped, and the
+    /// connection its probe keeps is closed.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if self.busy.take().is_some() {
+            self.backend.discard_probe();
             self.quiet = false;
             self._quiet_timer = None;
             cx.notify();
@@ -632,6 +678,11 @@ pub fn switch_target(target: Target, cx: &mut App) {
     let (Some(app), Some(backend)) = (AppState::global(cx), backend(cx)) else {
         return;
     };
+    if app.read(cx).is_live() && *app.read(cx).target() == target {
+        // Already connected there: keep the session and every pane.
+        backend.discard_probe();
+        return;
+    }
     eprintln!("fleet-gui: connected to {target}");
     let (ui_tx, ui_rx) = async_channel::unbounded();
     let session = backend.session(&target, ui_tx);
@@ -689,6 +740,7 @@ mod tests {
         Session(Target),
         Shutdown(Target),
         Open(Target, PaneId, Option<u64>),
+        DiscardProbe,
     }
 
     #[derive(Default)]
@@ -728,6 +780,10 @@ mod tests {
                 .get(target)
                 .cloned()
                 .unwrap_or(Err(ConnectError::NotRunning))
+        }
+
+        fn discard_probe(&self) {
+            self.calls.lock().unwrap().push(Call::DiscardProbe);
         }
 
         fn start_local(&self, fleetd: &Path) -> Result<(), ConnectError> {
@@ -1112,6 +1168,21 @@ mod tests {
         );
         assert!(!s.app.read_with(s.cx, |a, _| a.is_live()));
         assert_eq!(load_config(dir.path()).unwrap().connection, None);
+        // The probe's connection, kept for the session, is closed.
+        assert!(backend.calls().contains(&Call::DiscardProbe));
+    }
+
+    #[gpui::test]
+    fn switching_to_the_connected_target_keeps_the_session(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let s = setup(cx, &backend, dir.path());
+        s.cx.update(|_, cx| switch_target(Target::Local, cx));
+        let before = backend.calls();
+        s.cx.update(|_, cx| switch_target(Target::Local, cx));
+        s.cx.run_until_parked();
+        assert_eq!(backend.calls()[before.len()..], [Call::DiscardProbe]);
+        assert!(s.app.read_with(s.cx, |a, _| a.is_live()));
     }
 
     #[gpui::test]

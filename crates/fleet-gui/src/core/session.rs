@@ -529,7 +529,7 @@ impl ControlReader {
                     reported = false;
                     {
                         let mut slot = lock(&self.conn);
-                        let mut h = ConnHandle::new(&c.conn, c.child);
+                        let mut h = ConnHandle::new(&c.conn, c.child.take());
                         if self.stop.is_set() {
                             h.close();
                             drop(slot);
