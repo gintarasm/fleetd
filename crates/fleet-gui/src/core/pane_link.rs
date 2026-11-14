@@ -47,6 +47,9 @@ enum Outgoing {
         before_line: u64,
     },
     Palette(Palette),
+    /// The view scrolled: ask for the next history page if it now needs
+    /// one (no output may come to prompt the reader).
+    CheckPaging,
     /// Detach and drop the connection.
     Close,
 }
@@ -186,6 +189,10 @@ impl PaneLink {
         self.send(Outgoing::Palette(palette));
     }
 
+    pub(crate) fn check_paging(&self) {
+        self.send(Outgoing::CheckPaging);
+    }
+
     /// Stops reconnecting, then detaches and closes (on the writer).
     pub(crate) fn close(&self) {
         self.link.stop.set();
@@ -278,26 +285,33 @@ fn apply(link: &Link, out: &mpsc::Sender<Outgoing>, batch: Vec<Frame>) {
     for frame in batch {
         changed |= apply_frame(link, out, &mut model, frame);
     }
-    if model.state() == PaneState::Live {
-        let (epoch, shown) = {
-            let sh = lock(&link.shared);
-            (sh.epoch, sh.shown)
-        };
-        if let (Some(agent_id), Some((generation, before_line))) =
-            (shown, model.next_page_request())
-        {
-            let _ = out.send(Outgoing::ReadHistory {
-                epoch,
-                agent_id,
-                generation,
-                before_line,
-            });
-        }
+    if let Some(request) = page_request(link, &mut model) {
+        let _ = out.send(request);
     }
     drop(model);
     if changed {
         link.changed();
     }
+}
+
+/// The `ReadHistory` the view needs now, if any: only for a live pane
+/// showing an agent, tagged with the current epoch.
+fn page_request(link: &Link, model: &mut PaneModel) -> Option<Outgoing> {
+    if model.state() != PaneState::Live {
+        return None;
+    }
+    let (epoch, shown) = {
+        let sh = lock(&link.shared);
+        (sh.epoch, sh.shown)
+    };
+    let agent_id = shown?;
+    let (generation, before_line) = model.next_page_request()?;
+    Some(Outgoing::ReadHistory {
+        epoch,
+        agent_id,
+        generation,
+        before_line,
+    })
 }
 
 /// `true` if the model changed.
@@ -551,6 +565,12 @@ impl Writer {
                 }));
             }
             Outgoing::Palette(palette) => lock(&self.link.model).set_palette(palette),
+            Outgoing::CheckPaging => {
+                let request = page_request(&self.link, &mut lock(&self.link.model));
+                if let Some(request) = request {
+                    return self.handle(request);
+                }
+            }
             Outgoing::Close => {
                 let agent = lock(&self.link.shared).subscribed;
                 if let Some(agent_id) = agent {
@@ -943,6 +963,32 @@ mod tests {
         );
         assert!(lock(&l.shared).page.is_none());
         assert!(lock(&l.model).scrollback().fully_loaded());
+    }
+
+    #[test]
+    fn check_paging_near_the_top_sends_one_read_history() {
+        let l = link();
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        respond(&l, attached_response(1));
+        w.handle(Outgoing::CheckPaging);
+        // The request is in flight: checking again sends nothing.
+        w.handle(Outgoing::CheckPaging);
+        let reqs = srv.requests(SHORT);
+        assert!(
+            matches!(
+                reqs.as_slice(),
+                [request::Kind::ReadHistory(ReadHistory {
+                    agent_id: 1,
+                    generation: 0,
+                    before_line: 100,
+                    ..
+                })]
+            ),
+            "{reqs:?}"
+        );
+        assert!(lock(&l.shared).page.is_some());
     }
 
     #[test]

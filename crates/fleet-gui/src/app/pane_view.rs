@@ -1,28 +1,37 @@
-//! A terminal pane view: keyboard, IME and paste input for one pane, drawn
-//! by [`TerminalElement`].
+//! A terminal pane view: keyboard, IME, paste and mouse input for one
+//! pane, drawn by [`TerminalElement`].
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use fleet_term::CursorShape;
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Font, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Pixels, Point, Render, Styled, Subscription, UTF16Selection,
-    Window, div, font, point, px, size,
+    KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription, UTF16Selection, Window,
+    div, font, point, px, size,
 };
 
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
 use super::terminal_element::TerminalElement;
 use super::theme::Theme;
 use crate::core::config::GuiConfig;
-use crate::core::keys::{encode_key, encode_paste};
-use crate::core::pane::PaneModel;
+use crate::core::keys::{KeyMods, encode_key, encode_paste};
+use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
+use crate::core::pane::{PaneModel, ViewRow};
+use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
+
+/// At most this many lines are scrolled (or reported) per wheel event.
+const MAX_WHEEL_LINES: f32 = 100.0;
 
 /// Where the pane's input goes: the [`Session`], or a recording fake in
 /// tests.
 pub trait InputSink: Send + Sync {
     fn input(&self, pane: PaneId, bytes: Vec<u8>);
     fn resize(&self, pane: PaneId, cols: u16, rows: u16);
+    /// The view scrolled: fetch older history if it now needs it.
+    fn check_paging(&self, _pane: PaneId) {}
 }
 
 impl InputSink for Session {
@@ -32,6 +41,46 @@ impl InputSink for Session {
 
     fn resize(&self, pane: PaneId, cols: u16, rows: u16) {
         Session::resize(self, pane, cols, rows);
+    }
+
+    fn check_paging(&self, pane: PaneId) {
+        Session::check_paging(self, pane);
+    }
+}
+
+/// The `(col, row)` of the cell under `pos` in a grid of `cols`×`rows`
+/// cells at `bounds.origin`, clamped inside the grid.
+pub fn point_to_cell(
+    pos: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    cell_w: Pixels,
+    line_h: Pixels,
+    cols: u16,
+    rows: u16,
+) -> (u16, u16) {
+    let fit = |offset: Pixels, cell: Pixels, n: u16| {
+        let at = f32::from(offset) / f32::from(cell);
+        if at.is_finite() && at > 0.0 {
+            // `as` saturates; the `min` keeps it on the grid.
+            (at.floor() as u16).min(n.saturating_sub(1))
+        } else {
+            0
+        }
+    };
+    (
+        fit(pos.x - bounds.origin.x, cell_w, cols),
+        fit(pos.y - bounds.origin.y, line_h, rows),
+    )
+}
+
+/// Where the IME's marked text goes (and its candidate window): the
+/// cursor cell when the cursor shows, else the top left. `(col, row)`.
+pub(crate) fn ime_cell(model: &PaneModel) -> (u16, u16) {
+    let cursor = model.terminal().cursor_view();
+    if model.scroll_offset() == 0 && cursor.shape != CursorShape::Hidden {
+        (cursor.col, cursor.row)
+    } else {
+        (0, 0)
     }
 }
 
@@ -57,6 +106,15 @@ pub(crate) struct GridLayout {
     pub rows: u16,
 }
 
+/// What a held mouse button is doing.
+#[derive(Clone, Copy, Debug)]
+enum Drag {
+    /// Extending the selection.
+    Select,
+    /// Reported to the agent; `at` is the cell last reported.
+    Report { button: MouseButton, at: (u16, u16) },
+}
+
 pub struct PaneView {
     pane: PaneId,
     model: Arc<Mutex<PaneModel>>,
@@ -69,6 +127,11 @@ pub struct PaneView {
     marked: Option<String>,
     marked_selection: Option<Range<usize>>,
     pub(crate) layout: Option<GridLayout>,
+    drag: Option<Drag>,
+    /// Wheel movement not yet scrolled, in lines (positive up).
+    wheel_lines: f32,
+    /// Where the "new lines" pill was last drawn, if it was.
+    pub(crate) pill: Option<Bounds<Pixels>>,
     _activation: Subscription,
 }
 
@@ -94,6 +157,9 @@ impl PaneView {
             marked: None,
             marked_selection: None,
             layout: None,
+            drag: None,
+            wheel_lines: 0.0,
+            pill: None,
             _activation: activation,
         }
     }
@@ -107,7 +173,7 @@ impl PaneView {
     }
 
     fn model(&self) -> MutexGuard<'_, PaneModel> {
-        self.model.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.model)
     }
 
     /// Sends input and returns the view to the live grid.
@@ -154,18 +220,247 @@ impl PaneView {
         self.send(encode_paste(&text, &modes), cx);
     }
 
-    /// The cursor cell in window coordinates.
-    fn cursor_bounds(&self) -> Option<Bounds<Pixels>> {
+    /// The marked-text cell ([`ime_cell`]) in window coordinates.
+    fn ime_bounds(&self) -> Option<Bounds<Pixels>> {
         let layout = self.layout?;
-        let cursor = self.model().terminal().cursor_view();
+        let (col, row) = ime_cell(&self.model());
         Some(Bounds::new(
             point(
-                layout.origin.x + layout.cell_w * f32::from(cursor.col),
-                layout.origin.y + layout.line_h * f32::from(cursor.row),
+                layout.origin.x + layout.cell_w * f32::from(col),
+                layout.origin.y + layout.line_h * f32::from(row),
             ),
             size(layout.cell_w, layout.line_h),
         ))
     }
+
+    pub(crate) fn mouse_down(
+        &mut self,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus);
+        if self.pill.is_some_and(|p| p.contains(&ev.position)) {
+            self.drag = None;
+            self.model().scroll_to_bottom();
+            cx.notify();
+            return;
+        }
+        let Some(button) = to_button(ev.button) else {
+            return;
+        };
+        let mut model = lock(&self.model);
+        let Some(at) = cell_at(self.layout, &model, ev.position) else {
+            return;
+        };
+        if reports(&model, ev.modifiers) {
+            let modes = model.terminal().modes();
+            drop(model);
+            self.drag = Some(Drag::Report { button, at });
+            let bytes = encode_mouse(
+                button,
+                MouseKind::Press,
+                at.0,
+                at.1,
+                mods(ev.modifiers),
+                &modes,
+            );
+            if let Some(bytes) = bytes {
+                self.send(bytes, cx);
+            }
+            return;
+        }
+        if button != MouseButton::Left {
+            return;
+        }
+        let p = sel_point(&model, at);
+        match ev.click_count {
+            0 | 1 => model.select_start(p),
+            2 => model.select_word(p),
+            _ => model.select_line(p),
+        }
+        drop(model);
+        self.drag = Some(Drag::Select);
+        cx.notify();
+    }
+
+    pub(crate) fn mouse_move(
+        &mut self,
+        ev: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        let pressed = ev.pressed_button.and_then(to_button);
+        let mut model = lock(&self.model);
+        let Some(at) = cell_at(self.layout, &model, ev.position) else {
+            return;
+        };
+        match drag {
+            // The release happened where it was not seen.
+            Drag::Select if pressed != Some(MouseButton::Left) => self.drag = None,
+            Drag::Select => {
+                let p = sel_point(&model, at);
+                model.select_extend(p);
+                cx.notify();
+            }
+            Drag::Report { button, .. } if pressed != Some(button) => self.drag = None,
+            Drag::Report { at: last, .. } if last == at => {}
+            Drag::Report { button, .. } => {
+                let modes = model.terminal().modes();
+                drop(model);
+                self.drag = Some(Drag::Report { button, at });
+                let kind = MouseKind::Drag;
+                if let Some(bytes) =
+                    encode_mouse(button, kind, at.0, at.1, mods(ev.modifiers), &modes)
+                {
+                    self.send(bytes, cx);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn mouse_up(
+        &mut self,
+        ev: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.drag else {
+            return;
+        };
+        let Drag::Report { button, at: last } = drag else {
+            self.drag = None;
+            return;
+        };
+        if to_button(ev.button) != Some(button) {
+            return;
+        }
+        self.drag = None;
+        let model = lock(&self.model);
+        let at = cell_at(self.layout, &model, ev.position).unwrap_or(last);
+        let modes = model.terminal().modes();
+        drop(model);
+        let kind = MouseKind::Release;
+        if let Some(bytes) = encode_mouse(button, kind, at.0, at.1, mods(ev.modifiers), &modes) {
+            self.send(bytes, cx);
+        }
+    }
+
+    pub(crate) fn scroll_wheel(
+        &mut self,
+        ev: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(layout) = self.layout else {
+            return;
+        };
+        let lines = match ev.delta {
+            ScrollDelta::Lines(d) => d.y,
+            ScrollDelta::Pixels(d) => f32::from(d.y) / f32::from(layout.line_h),
+        };
+        if !lines.is_finite() || lines == 0.0 {
+            return;
+        }
+        // A change of direction drops what the other way left over.
+        if self.wheel_lines != 0.0 && self.wheel_lines.signum() != lines.signum() {
+            self.wheel_lines = 0.0;
+        }
+        self.wheel_lines += lines;
+        let whole = self.wheel_lines.trunc();
+        self.wheel_lines -= whole;
+        let lines = whole.clamp(-MAX_WHEEL_LINES, MAX_WHEEL_LINES) as i32;
+        if lines == 0 {
+            return;
+        }
+
+        let mut model = lock(&self.model);
+        let modes = model.terminal().modes();
+        let bytes = if reports(&model, ev.modifiers) {
+            let (col, row) = cell_at(self.layout, &model, ev.position).unwrap_or((0, 0));
+            let button = if lines > 0 {
+                MouseButton::WheelUp
+            } else {
+                MouseButton::WheelDown
+            };
+            encode_mouse(
+                button,
+                MouseKind::Press,
+                col,
+                row,
+                mods(ev.modifiers),
+                &modes,
+            )
+            .map(|one| one.repeat(lines.unsigned_abs() as usize))
+        } else {
+            wheel_as_arrows(lines, &modes)
+        };
+        if let Some(bytes) = bytes {
+            drop(model);
+            self.send(bytes, cx);
+            return;
+        }
+        model.scroll_lines(lines);
+        drop(model);
+        self.sink.check_paging(self.pane);
+        cx.notify();
+    }
+}
+
+fn lock(model: &Mutex<PaneModel>) -> MutexGuard<'_, PaneModel> {
+    model.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn to_button(button: gpui::MouseButton) -> Option<MouseButton> {
+    match button {
+        gpui::MouseButton::Left => Some(MouseButton::Left),
+        gpui::MouseButton::Middle => Some(MouseButton::Middle),
+        gpui::MouseButton::Right => Some(MouseButton::Right),
+        gpui::MouseButton::Navigate(_) => None,
+    }
+}
+
+fn mods(m: Modifiers) -> KeyMods {
+    KeyMods {
+        shift: m.shift,
+        alt: m.alt,
+        ctrl: m.control,
+    }
+}
+
+/// Whether mouse events go to the agent rather than to the selection: a
+/// mouse mode is on, the view follows the grid, and Shift is not held.
+fn reports(model: &PaneModel, m: Modifiers) -> bool {
+    let modes = model.terminal().modes();
+    let mouse = modes.mouse_click || modes.mouse_drag || modes.mouse_motion;
+    mouse && !m.shift && model.scroll_offset() == 0
+}
+
+/// The drawn grid's cell under `pos`, clamped onto it.
+fn cell_at(
+    layout: Option<GridLayout>,
+    model: &PaneModel,
+    pos: Point<Pixels>,
+) -> Option<(u16, u16)> {
+    let l = layout?;
+    let (cols, rows) = model.terminal().size();
+    let grid = Bounds::new(
+        l.origin,
+        size(l.cell_w * f32::from(cols), l.line_h * f32::from(rows)),
+    );
+    Some(point_to_cell(pos, grid, l.cell_w, l.line_h, cols, rows))
+}
+
+/// The line and column visible cell `(col, row)` shows.
+fn sel_point(model: &PaneModel, (col, row): (u16, u16)) -> SelPoint {
+    let line = match model.view_row(row) {
+        ViewRow::History(abs) => LineRef::History(abs),
+        ViewRow::Grid(r) => LineRef::Grid(r),
+    };
+    SelPoint { line, col }
 }
 
 impl Render for PaneView {
@@ -248,10 +543,13 @@ impl gpui::EntityInputHandler for PaneView {
         self.marked.as_deref().map(|m| 0..utf16_len(m))
     }
 
+    /// The IME gave up composing: what it had marked is committed.
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.marked = None;
         self.marked_selection = None;
-        cx.notify();
+        if let Some(text) = self.marked.take() {
+            cx.notify();
+            self.send(text.into_bytes(), cx);
+        }
     }
 
     fn replace_text_in_range(
@@ -293,7 +591,7 @@ impl gpui::EntityInputHandler for PaneView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        self.cursor_bounds()
+        self.ime_bounds()
     }
 
     fn character_index_for_point(
@@ -310,10 +608,14 @@ impl gpui::EntityInputHandler for PaneView {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use gpui::{ClipboardItem, Entity, EntityInputHandler, TestAppContext, VisualTestContext};
+    use gpui::{
+        Bounds, ClipboardItem, Entity, EntityInputHandler, Modifiers, MouseButton, MouseDownEvent,
+        Pixels, Point, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+        VisualTestContext, bounds, point, px, size,
+    };
 
-    use super::{InputSink, PaneView, grid_size};
-    use crate::app::keymap::{Paste, bind_keys};
+    use super::{InputSink, PaneView, grid_size, ime_cell, point_to_cell};
+    use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::core::config::GuiConfig;
     use crate::core::pane::PaneModel;
     use crate::core::selection::{LineRef, SelPoint};
@@ -324,6 +626,7 @@ mod tests {
     struct Recorder {
         inputs: Mutex<Vec<Vec<u8>>>,
         resizes: Mutex<Vec<(u16, u16)>>,
+        paging_checks: Mutex<u32>,
     }
 
     impl InputSink for Recorder {
@@ -333,6 +636,10 @@ mod tests {
 
         fn resize(&self, _pane: PaneId, cols: u16, rows: u16) {
             self.resizes.lock().unwrap().push((cols, rows));
+        }
+
+        fn check_paging(&self, _pane: PaneId) {
+            *self.paging_checks.lock().unwrap() += 1;
         }
     }
 
@@ -367,6 +674,284 @@ mod tests {
 
     fn blank_model() -> PaneModel {
         PaneModel::new(crate::app::theme::Theme::dark().palette)
+    }
+
+    /// A live pane with `n` history lines `h0..`, an 80×24 grid and the
+    /// cursor on the last row.
+    fn model_with_history(n: usize) -> PaneModel {
+        let mut model = blank_model();
+        model.on_attached(&AttachOk {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            history_tail: (0..n)
+                .map(|i| format!("h{i}").into_bytes().into())
+                .collect(),
+            ..Default::default()
+        });
+        model.on_output(b"\x1b[24;1H");
+        model
+    }
+
+    /// The middle of cell `(col, row)` in window coordinates.
+    fn cell(
+        view: &Entity<PaneView>,
+        cx: &mut VisualTestContext,
+        col: u16,
+        row: u16,
+    ) -> Point<Pixels> {
+        let l = view.read_with(cx, |v, _| v.layout).expect("laid out");
+        point(
+            l.origin.x + l.cell_w * (f32::from(col) + 0.5),
+            l.origin.y + l.line_h * (f32::from(row) + 0.5),
+        )
+    }
+
+    fn wheel(cx: &mut VisualTestContext, position: Point<Pixels>, delta: ScrollDelta) {
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta,
+            modifiers: Modifiers::none(),
+            touch_phase: TouchPhase::Moved,
+        });
+    }
+
+    fn offset(view: &Entity<PaneView>, cx: &mut VisualTestContext) -> u64 {
+        view.read_with(cx, |v, _| v.model().scroll_offset())
+    }
+
+    fn selected(view: &Entity<PaneView>, cx: &mut VisualTestContext) -> Option<String> {
+        view.read_with(cx, |v, _| v.model().selection_text())
+    }
+
+    fn drag(
+        cx: &mut VisualTestContext,
+        from: Point<Pixels>,
+        to: Point<Pixels>,
+        modifiers: Modifiers,
+    ) {
+        cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(to, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(to, MouseButton::Left, modifiers);
+    }
+
+    #[gpui::test]
+    fn wheel_scrolls_history_when_no_mouse_mode(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_history(50));
+        let at = cell(&view, cx, 3, 3);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 3.0)));
+        assert_eq!(offset(&view, cx), 3);
+        assert!(*sink.paging_checks.lock().unwrap() >= 1);
+        assert!(sink.take().is_empty());
+
+        // Pixel deltas scroll a line only once a whole line height adds up.
+        let line_h = view.read_with(cx, |v, _| v.layout.unwrap().line_h);
+        wheel(cx, at, ScrollDelta::Pixels(point(px(0.0), line_h * 0.6)));
+        assert_eq!(offset(&view, cx), 3);
+        wheel(cx, at, ScrollDelta::Pixels(point(px(0.0), line_h * 0.6)));
+        assert_eq!(offset(&view, cx), 4);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, -2.0)));
+        assert_eq!(offset(&view, cx), 2);
+
+        // A huge delta is clamped, and scrolling stops at the oldest line.
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 1e9)));
+        assert_eq!(offset(&view, cx), 50);
+        // Typing returns to the live grid.
+        cx.simulate_keystrokes("a");
+        assert_eq!(offset(&view, cx), 0);
+    }
+
+    #[gpui::test]
+    fn wheel_reports_when_mouse_mode_on(cx: &mut TestAppContext) {
+        let mut model = model_with_history(50);
+        model.on_output(b"\x1b[?1000h\x1b[?1006h");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        let at = cell(&view, cx, 3, 2);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 1.0)));
+        assert_eq!(sink.take(), vec![b"\x1b[<64;4;3M".to_vec()]);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, -2.0)));
+        assert_eq!(sink.take(), vec![b"\x1b[<65;4;3M\x1b[<65;4;3M".to_vec()]);
+        assert_eq!(offset(&view, cx), 0);
+        // A huge delta is clamped to 100 reports.
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 1e9)));
+        assert_eq!(sink.take(), vec![b"\x1b[<64;4;3M".repeat(100)]);
+    }
+
+    #[gpui::test]
+    fn wheel_on_alt_screen_sends_arrows(cx: &mut TestAppContext) {
+        let mut model = model_with_history(50);
+        model.on_output(b"\x1b[?1049h");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 2.0)));
+        assert_eq!(sink.take(), vec![b"\x1b[A\x1b[A".to_vec()]);
+        assert_eq!(offset(&view, cx), 0);
+    }
+
+    #[gpui::test]
+    fn drag_selects_and_cmd_c_copies(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"hello world\r\nsecond line");
+        let (view, sink, cx) = pane(cx, model);
+        let (from, to) = (cell(&view, cx, 2, 0), cell(&view, cx, 5, 1));
+        drag(cx, from, to, Modifiers::none());
+        assert_eq!(selected(&view, cx).as_deref(), Some("llo world\nsecond"));
+
+        cx.dispatch_action(Copy);
+        let clip = cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(clip.as_deref(), Some("llo world\nsecond"));
+
+        // The keystrokes, not just the actions.
+        cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+        cx.simulate_keystrokes("cmd-c");
+        let clip = cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(clip.as_deref(), Some("llo world\nsecond"));
+        sink.take();
+        cx.write_to_clipboard(ClipboardItem::new_string("pasted".to_owned()));
+        cx.simulate_keystrokes("cmd-v");
+        assert_eq!(sink.take(), vec![b"pasted".to_vec()]);
+
+        // A plain click clears the selection.
+        cx.simulate_click(from, Modifiers::none());
+        assert_eq!(selected(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn drag_selects_across_history_and_grid(cx: &mut TestAppContext) {
+        let mut model = model_with_history(50);
+        model.on_output(b"\x1b[1;1Hgrid top");
+        let (view, _sink, cx) = pane(cx, model);
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 2.0)));
+        // Rows 0 and 1 show h48 and h49, row 2 the grid's first row.
+        let (from, to) = (cell(&view, cx, 1, 1), cell(&view, cx, 3, 2));
+        drag(cx, from, to, Modifiers::none());
+        assert_eq!(selected(&view, cx).as_deref(), Some("49\ngrid"));
+    }
+
+    #[gpui::test]
+    fn shift_bypasses_mouse_reporting(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"\x1b[?1002h\x1b[?1006hhello world");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        let (from, to) = (cell(&view, cx, 0, 0), cell(&view, cx, 4, 0));
+        drag(cx, from, to, Modifiers::shift());
+        assert!(sink.take().is_empty());
+        assert_eq!(selected(&view, cx).as_deref(), Some("hello"));
+
+        // Without Shift the button events are reported, not selected.
+        drag(cx, from, to, Modifiers::none());
+        assert_eq!(
+            sink.take(),
+            vec![
+                b"\x1b[<0;1;1M".to_vec(),
+                b"\x1b[<32;5;1M".to_vec(),
+                b"\x1b[<0;5;1m".to_vec()
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn double_click_selects_word_triple_click_line(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"cargo test -p fleet-gui");
+        let (view, _sink, cx) = pane(cx, model);
+        let at = cell(&view, cx, 16, 0);
+        let down = |click_count| MouseDownEvent {
+            button: MouseButton::Left,
+            position: at,
+            modifiers: Modifiers::none(),
+            click_count,
+            first_mouse: false,
+        };
+        cx.simulate_event(down(1));
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        cx.simulate_event(down(2));
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        assert_eq!(selected(&view, cx).as_deref(), Some("fleet-gui"));
+        cx.simulate_event(down(3));
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        assert_eq!(
+            selected(&view, cx).as_deref(),
+            Some("cargo test -p fleet-gui")
+        );
+    }
+
+    #[gpui::test]
+    fn new_lines_pill_shows_while_scrolled_up_and_returns_to_bottom(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_history(50));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 5.0)));
+        assert_eq!(view.read_with(cx, |v, _| v.pill), None);
+        view.update(cx, |v, cx| {
+            v.model().on_output(b"\r\nx\r\ny");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let pill = view.read_with(cx, |v, _| v.pill).expect("pill shown");
+        assert_eq!(offset(&view, cx), 7);
+        cx.simulate_click(pill.center(), Modifiers::none());
+        assert_eq!(offset(&view, cx), 0);
+        assert_eq!(view.read_with(cx, |v, _| v.pill), None);
+        assert_eq!(selected(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn ime_position_follows_the_cursor_else_the_top_left(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_history(50));
+        let ime_bounds = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                view.update(cx, |v, cx| {
+                    v.replace_and_mark_text_in_range(None, "に", None, window, cx);
+                    let at = v.bounds_for_range(0..1, Bounds::default(), window, cx);
+                    (at.map(|b| b.origin), ime_cell(&v.model()))
+                })
+            })
+        };
+        let l = view.read_with(cx, |v, _| v.layout).expect("laid out");
+        // The cursor is on the last row.
+        let (at, ime) = ime_bounds(cx);
+        assert_eq!(ime, (0, 23));
+        assert_eq!(at, Some(point(l.origin.x, l.origin.y + l.line_h * 23.0)));
+        let top = cell(&view, cx, 0, 0);
+        wheel(cx, top, ScrollDelta::Lines(point(0.0, 3.0)));
+        let (at, ime) = ime_bounds(cx);
+        assert_eq!(ime, (0, 0));
+        assert_eq!(at, Some(l.origin));
+        // The overlay draws there too (paint smoke test while scrolled).
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn unmark_text_commits_the_marked_text(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, blank_model());
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.replace_and_mark_text_in_range(None, "é", None, window, cx);
+                v.unmark_text(window, cx);
+                assert_eq!(v.marked_text_range(window, cx), None);
+            });
+        });
+        assert_eq!(sink.take(), vec!["é".as_bytes().to_vec()]);
+    }
+
+    #[test]
+    fn point_to_cell_clamps() {
+        let b = bounds(point(px(10.0), px(20.0)), size(px(800.0), px(480.0)));
+        let cell =
+            |x: f32, y: f32| point_to_cell(point(px(x), px(y)), b, px(8.0), px(16.0), 80, 24);
+        assert_eq!(cell(10.0, 20.0), (0, 0));
+        assert_eq!(cell(10.0 + 8.0 * 2.5, 20.0 + 16.0 * 1.9), (2, 1));
+        assert_eq!(cell(0.0, 0.0), (0, 0));
+        assert_eq!(cell(5000.0, 5000.0), (79, 23));
+        assert_eq!(cell(f32::NAN, -1.0), (0, 0));
+        assert_eq!(
+            point_to_cell(point(px(50.0), px(50.0)), b, px(8.0), px(16.0), 0, 0),
+            (0, 0)
+        );
     }
 
     #[gpui::test]

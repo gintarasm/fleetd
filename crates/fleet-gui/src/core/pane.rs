@@ -5,6 +5,8 @@
 //! is a client [`Terminal`]; lines that scroll off it go to [`Scrollback`]
 //! numbered as the node numbers them (decisions 0021 and 0022).
 
+use std::ops::Range;
+
 use fleet_proto::{AttachOk, HistoryPage};
 use fleet_term::{Cell, HistoryEvent, Palette, Terminal, parse_history_line};
 
@@ -49,6 +51,8 @@ pub struct PaneModel {
     page_in_flight: bool,
     /// History lines the view is scrolled up by; 0 follows the grid.
     scroll_offset: u64,
+    /// History lines added below the view since it last followed the grid.
+    unseen_lines: u64,
     selection: Option<Selection>,
 }
 
@@ -62,6 +66,7 @@ impl PaneModel {
             primary: false,
             page_in_flight: false,
             scroll_offset: 0,
+            unseen_lines: 0,
             selection: None,
         }
     }
@@ -91,6 +96,7 @@ impl PaneModel {
         self.state = PaneState::Live;
         self.page_in_flight = false;
         self.scroll_offset = 0;
+        self.unseen_lines = 0;
         self.selection = None;
     }
 
@@ -196,10 +202,20 @@ impl PaneModel {
     pub fn scroll_lines(&mut self, delta: i32) {
         let offset = self.scroll_offset.saturating_add_signed(i64::from(delta));
         self.scroll_offset = offset.min(self.scrollback.len());
+        if self.scroll_offset == 0 {
+            self.unseen_lines = 0;
+        }
     }
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+        self.unseen_lines = 0;
+    }
+
+    /// Lines of output that scrolled into history below the view while it
+    /// was scrolled up; 0 once it follows the grid again.
+    pub fn unseen_lines(&self) -> u64 {
+        self.unseen_lines
     }
 
     /// History lines the view is scrolled up by; 0 follows the live grid.
@@ -211,14 +227,16 @@ impl PaneModel {
     /// bottom.
     pub fn view_rows(&self, rows: u16, out: &mut Vec<ViewRow>) {
         out.clear();
-        let top = self.scrollback.end_line() - self.scroll_offset;
-        out.extend((0..u64::from(rows)).map(|i| {
-            let abs = top + i;
-            match abs.checked_sub(self.scrollback.end_line()) {
-                Some(row) => ViewRow::Grid(row as u16),
-                None => ViewRow::History(abs),
-            }
-        }));
+        out.extend((0..rows).map(|i| self.view_row(i)));
+    }
+
+    /// What visible row `row` (from the top) shows.
+    pub fn view_row(&self, row: u16) -> ViewRow {
+        let abs = self.scrollback.end_line() - self.scroll_offset + u64::from(row);
+        match abs.checked_sub(self.scrollback.end_line()) {
+            Some(row) => ViewRow::Grid(row as u16),
+            None => ViewRow::History(abs),
+        }
     }
 
     /// Replaces `out` with the cells of history line `abs` (empty if not
@@ -309,6 +327,22 @@ impl PaneModel {
         self.selection.is_some_and(|s| s.contains(line, col))
     }
 
+    /// The selected columns of `line` (`end` exclusive, up to
+    /// [`LINE_END`] for "to the end of the line"), `None` if none are.
+    pub fn selected_cols(&self, line: LineRef) -> Option<Range<u16>> {
+        let (start, end) = self.selection?.bounds()?;
+        if line < start.line || line > end.line {
+            return None;
+        }
+        let from = if line == start.line { start.col } else { 0 };
+        let to = if line == end.line {
+            end.col.saturating_add(1)
+        } else {
+            LINE_END
+        };
+        (from < to).then_some(from..to)
+    }
+
     /// After the grid changed: history events into the scrollback, the view
     /// pinned, a selection on the grid dropped, observer replies discarded.
     fn grid_changed(&mut self) {
@@ -318,11 +352,13 @@ impl PaneModel {
                     self.scrollback.push_back(line);
                     if self.scroll_offset > 0 {
                         self.scroll_offset += 1;
+                        self.unseen_lines += 1;
                     }
                 }
                 HistoryEvent::Cleared => {
                     self.scrollback.clear();
                     self.scroll_offset = 0;
+                    self.unseen_lines = 0;
                     let first = self.scrollback.first_line();
                     if self
                         .selection
@@ -585,6 +621,27 @@ mod tests {
     }
 
     #[test]
+    fn output_below_a_scrolled_up_view_counts_unseen_lines() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(10, 3, &["a", "b", "c"], 0));
+        pane.on_output(b"\x1b[3;1H");
+        pane.on_output(b"\r\n1");
+        assert_eq!(pane.unseen_lines(), 0);
+        pane.scroll_lines(2);
+        pane.on_output(b"\r\n2\r\n3");
+        assert_eq!(pane.unseen_lines(), 2);
+        pane.scroll_lines(-1);
+        assert_eq!(pane.unseen_lines(), 2);
+        pane.scroll_lines(-100);
+        assert_eq!(pane.unseen_lines(), 0);
+        pane.scroll_lines(1);
+        pane.on_output(b"\r\n4");
+        assert_eq!(pane.unseen_lines(), 1);
+        pane.scroll_to_bottom();
+        assert_eq!(pane.unseen_lines(), 0);
+    }
+
+    #[test]
     fn observer_discards_replies_primary_returns_them() {
         let mut pane = pane();
         let mut ok = attach_ok(10, 3, &[], 0);
@@ -614,6 +671,11 @@ mod tests {
         });
         assert!(pane.is_selected(LineRef::History(102), 0));
         assert!(!pane.is_selected(LineRef::History(101), 1));
+        assert_eq!(pane.selected_cols(LineRef::History(100)), None);
+        assert_eq!(pane.selected_cols(LineRef::History(101)), Some(2..LINE_END));
+        assert_eq!(pane.selected_cols(LineRef::History(102)), Some(0..LINE_END));
+        assert_eq!(pane.selected_cols(LineRef::Grid(0)), Some(0..4));
+        assert_eq!(pane.selected_cols(LineRef::Grid(1)), None);
         assert_eq!(
             pane.selection_text().as_deref(),
             Some("llo world\ntwo\ngrid")

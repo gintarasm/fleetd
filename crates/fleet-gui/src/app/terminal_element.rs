@@ -1,17 +1,19 @@
-//! Draws a pane's grid: cell backgrounds, text, selection, cursor and IME
-//! marked text. Built each frame by [`PaneView`].
+//! Draws a pane's grid: cell backgrounds, text, selection, cursor, IME
+//! marked text and the "new lines" pill, and routes the pane's mouse events
+//! to [`PaneView`]. Built each frame by [`PaneView`].
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fleet_term::{Cell, CursorShape, CursorView};
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity,
-    FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Point, SharedString, StrikethroughStyle, Style, TextRun,
-    UnderlineStyle, Window, fill, outline, point, px, relative, size,
+    App, BorderStyle, Bounds, ContentMask, DispatchPhase, Element, ElementId, ElementInputHandler,
+    Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
+    IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window,
+    fill, outline, point, px, relative, size,
 };
 
-use super::pane_view::{GridLayout, InputSink, PaneView, grid_size};
+use super::pane_view::{GridLayout, InputSink, PaneView, grid_size, ime_cell};
 use super::theme::Theme;
 use crate::core::pane::{PaneModel, ViewRow};
 use crate::core::selection::LineRef;
@@ -43,8 +45,8 @@ pub struct Metrics {
 /// One visible row, copied out of the model.
 struct RowSnapshot {
     cells: Vec<Cell>,
-    /// Selected column ranges.
-    selected: Vec<(u16, u16)>,
+    /// The selected columns, `from..to`.
+    selected: Option<(u16, u16)>,
 }
 
 /// What a frame draws, copied out under one model lock.
@@ -52,6 +54,10 @@ struct Snapshot {
     rows: Vec<RowSnapshot>,
     /// `None` when hidden or scrolled into history.
     cursor: Option<CursorView>,
+    /// Where IME marked text goes, `(col, row)`.
+    ime_at: (u16, u16),
+    /// Lines of output below a scrolled-up view (0 when following).
+    unseen: u64,
 }
 
 fn lock(model: &Mutex<PaneModel>) -> MutexGuard<'_, PaneModel> {
@@ -79,16 +85,22 @@ impl TerminalElement {
                         LineRef::Grid(row)
                     }
                 };
-                RowSnapshot {
-                    cells,
-                    selected: selected_ranges(&model, line, cols),
-                }
+                let selected = model
+                    .selected_cols(line)
+                    .map(|r| (r.start.min(cols), r.end.min(cols)))
+                    .filter(|(from, to)| from < to);
+                RowSnapshot { cells, selected }
             })
             .collect();
         let cursor = term.cursor_view();
-        let cursor =
-            (model.scroll_offset() == 0 && cursor.shape != CursorShape::Hidden).then_some(cursor);
-        Snapshot { rows, cursor }
+        let scrolled = model.scroll_offset() > 0;
+        let cursor = (!scrolled && cursor.shape != CursorShape::Hidden).then_some(cursor);
+        Snapshot {
+            rows,
+            cursor,
+            ime_at: ime_cell(&model),
+            unseen: if scrolled { model.unseen_lines() } else { 0 },
+        }
     }
 
     fn paint_row(
@@ -127,9 +139,11 @@ impl TerminalElement {
             paint_bg(r, default_bg, origin, m, window);
         }
 
-        // Text: one shaped line per stretch of single-width cells; wide
-        // and combining cells are shaped alone at their column, since a
-        // forced advance would misplace what follows them.
+        // Text: one shaped line per stretch of single-width cells, every
+        // glyph forced to the cell width. Wide and combining cells are
+        // shaped alone at their column with natural advances: a forced
+        // advance would misplace what follows them (or push a combining
+        // mark into the next cell).
         let end = row
             .cells
             .iter()
@@ -140,15 +154,15 @@ impl TerminalElement {
         let mut seg = Segment::default();
         for (cell, &(col, _, ref look)) in row.cells[..end].iter().zip(&styled) {
             if cell.wide || cell.extra.is_some() {
-                seg.flush(self, origin, m, window, cx);
+                seg.flush(self, origin, m, true, window, cx);
                 let mut alone = Segment::default();
                 alone.push(cell, col, look);
-                alone.flush(self, origin, m, window, cx);
+                alone.flush(self, origin, m, false, window, cx);
             } else {
                 seg.push(cell, col, look);
             }
         }
-        seg.flush(self, origin, m, window, cx);
+        seg.flush(self, origin, m, true, window, cx);
     }
 
     /// Resolved colours and font of a cell.
@@ -254,11 +268,14 @@ impl Segment {
         }
     }
 
+    /// Shapes and paints the segment at its column; `grid` forces every
+    /// glyph's advance to the cell width.
     fn flush(
         &mut self,
         el: &TerminalElement,
         origin: Point<Pixels>,
         m: Metrics,
+        grid: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -268,9 +285,10 @@ impl Segment {
         let text = SharedString::from(std::mem::take(&mut self.text));
         let runs = std::mem::take(&mut self.runs);
         self.last = None;
-        let line = window
-            .text_system()
-            .shape_line(text, el.font_size, &runs, Some(m.cell_w));
+        let line =
+            window
+                .text_system()
+                .shape_line(text, el.font_size, &runs, grid.then_some(m.cell_w));
         let at = point(origin.x + m.cell_w * f32::from(self.start_col), origin.y);
         let _ = line.paint(at, m.line_h, window, cx);
     }
@@ -295,25 +313,6 @@ fn cell_bounds(origin: Point<Pixels>, m: Metrics, col: u16, width: u16) -> Bound
         point(origin.x + m.cell_w * f32::from(col), origin.y),
         size(m.cell_w * f32::from(width), m.line_h),
     )
-}
-
-fn selected_ranges(model: &PaneModel, line: LineRef, cols: u16) -> Vec<(u16, u16)> {
-    let mut out = Vec::new();
-    let mut start = None;
-    for col in 0..cols {
-        match (model.is_selected(line, col), start) {
-            (true, None) => start = Some(col),
-            (false, Some(s)) => {
-                out.push((s, col));
-                start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(s) = start {
-        out.push((s, cols));
-    }
-    out
 }
 
 impl IntoElement for TerminalElement {
@@ -409,6 +408,7 @@ impl Element for TerminalElement {
             ElementInputHandler::new(bounds, self.view.clone()),
             cx,
         );
+        self.listen_to_mouse(bounds, window);
         // The lock is held only for the copy; shaping happens after.
         let snap = self.snapshot();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -421,7 +421,7 @@ impl Element for TerminalElement {
                     .filter(|c| usize::from(c.row) == i)
                     .map(|c| c.col);
                 self.paint_row(row, origin, m, block_col, window, cx);
-                for &(from, to) in &row.selected {
+                if let Some((from, to)) = row.selected {
                     window.paint_quad(fill(
                         cell_bounds(origin, m, from, to - from),
                         self.theme.selection,
@@ -431,23 +431,17 @@ impl Element for TerminalElement {
             if let Some(cursor) = snap.cursor {
                 self.paint_cursor(cursor, &snap, bounds.origin, m, window);
             }
-            if let (Some(marked), Some(cursor)) = (&self.marked, snap.cursor_or_home()) {
-                self.paint_marked(marked, cursor, bounds.origin, m, window, cx);
+            if let Some(marked) = &self.marked {
+                self.paint_marked(marked, snap.ime_at, bounds.origin, m, window, cx);
             }
+            let pill =
+                (snap.unseen > 0).then(|| self.paint_pill(snap.unseen, bounds, m, window, cx));
+            self.view.update(cx, |view, _| view.pill = pill);
         });
     }
 }
 
 impl Snapshot {
-    /// Where the IME's marked text goes: the cursor, else the top left.
-    fn cursor_or_home(&self) -> Option<CursorView> {
-        Some(self.cursor.unwrap_or(CursorView {
-            row: 0,
-            col: 0,
-            shape: CursorShape::Block,
-        }))
-    }
-
     /// Whether the cell at the cursor is double width.
     fn cursor_is_wide(&self, cursor: CursorView) -> bool {
         let Some(row) = self.rows.get(usize::from(cursor.row)) else {
@@ -504,7 +498,7 @@ impl TerminalElement {
     fn paint_marked(
         &self,
         marked: &str,
-        cursor: CursorView,
+        (col, row): (u16, u16),
         origin: Point<Pixels>,
         m: Metrics,
         window: &mut Window,
@@ -530,13 +524,79 @@ impl TerminalElement {
             None,
         );
         let at = point(
-            origin.x + m.cell_w * f32::from(cursor.col),
-            origin.y + m.line_h * f32::from(cursor.row),
+            origin.x + m.cell_w * f32::from(col),
+            origin.y + m.line_h * f32::from(row),
         );
         window.paint_quad(fill(
             Bounds::new(at, size(line.width.max(m.cell_w), m.line_h)),
             self.theme.marked_bg,
         ));
         let _ = line.paint(at, m.line_h, window, cx);
+    }
+
+    /// Paints "↓ N new lines" at the bottom right; returns its bounds.
+    fn paint_pill(
+        &self,
+        unseen: u64,
+        bounds: Bounds<Pixels>,
+        m: Metrics,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Bounds<Pixels> {
+        let text = format!("↓ {unseen} new line{}", if unseen == 1 { "" } else { "s" });
+        let run = TextRun {
+            len: text.len(),
+            font: self.font.clone(),
+            color: self.theme.fg(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line =
+            window
+                .text_system()
+                .shape_line(SharedString::from(text), self.font_size, &[run], None);
+        let pad = m.cell_w;
+        let pill_size = size(line.width + pad * 2.0, m.line_h * 1.5);
+        let pill = Bounds::new(
+            point(
+                bounds.right() - pill_size.width - pad,
+                bounds.bottom() - pill_size.height - m.line_h * 0.5,
+            ),
+            pill_size,
+        );
+        window.paint_quad(fill(pill, self.theme.header_bg).corner_radii(pill_size.height / 2.0));
+        let text_at = point(pill.origin.x + pad, pill.origin.y + m.line_h * 0.25);
+        let _ = line.paint(text_at, m.line_h, window, cx);
+        pill
+    }
+
+    /// Routes this frame's mouse events to the view: presses and the wheel
+    /// inside `bounds`; moves and releases anywhere, for a drag in progress.
+    fn listen_to_mouse(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        let view = self.view.clone();
+        window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && bounds.contains(&ev.position) {
+                view.update(cx, |v, cx| v.mouse_down(ev, window, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble {
+                view.update(cx, |v, cx| v.mouse_move(ev, window, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble {
+                view.update(cx, |v, cx| v.mouse_up(ev, window, cx));
+            }
+        });
+        let view = self.view.clone();
+        window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && bounds.contains(&ev.position) {
+                view.update(cx, |v, cx| v.scroll_wheel(ev, window, cx));
+            }
+        });
     }
 }

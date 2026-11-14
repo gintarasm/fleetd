@@ -397,6 +397,14 @@ impl Session {
         }
     }
 
+    /// Asks for the next history page if the pane's view now needs one
+    /// (after it scrolled).
+    pub fn check_paging(&self, pane: PaneId) {
+        if let Some(link) = lock(&self.inner.panes).get(&pane) {
+            link.check_paging();
+        }
+    }
+
     /// Resizes the pane's agent, debounced by 50 ms (the last size wins).
     pub fn resize(&self, pane: PaneId, cols: u16, rows: u16) {
         if let Some(link) = lock(&self.inner.panes).get(&pane) {
