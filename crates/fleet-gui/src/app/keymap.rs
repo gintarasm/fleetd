@@ -24,6 +24,7 @@ actions!(
         Paste,
         Quit,
         ToggleMaximize,
+        SwitchFleetd,
     ]
 );
 

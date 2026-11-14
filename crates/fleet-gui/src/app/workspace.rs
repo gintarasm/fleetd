@@ -13,6 +13,7 @@ use gpui::{
 };
 
 use super::app_state::AppState;
+use super::connect::{ConnectEvent, ConnectSheet, new_sheet, switch_target};
 use super::keymap::{
     ClosePane, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
     FocusUp, Kill, NewAgent, SplitDown, SplitRight, ToggleMaximize,
@@ -21,6 +22,7 @@ use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
 use super::theme::Theme;
+use crate::core::config::save_connection;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::session::PaneId;
 use crate::core::target::Target;
@@ -71,6 +73,8 @@ struct RowMenu {
 pub struct Workspace {
     app: Entity<AppState>,
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
+    /// The connect sheet, over everything else.
+    connect: Option<(Entity<ConnectSheet>, [Subscription; 2])>,
     menu: Option<RowMenu>,
     /// Focus-in and header-button subscriptions, by pane.
     pane_focus: HashMap<PaneId, (EntityId, [Subscription; 2])>,
@@ -110,6 +114,7 @@ impl Workspace {
             app,
             _ticker: ticker,
             sheet: None,
+            connect: None,
             menu: None,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
@@ -132,9 +137,102 @@ impl Workspace {
         self.sheet.as_ref().map(|(s, _)| s)
     }
 
+    pub fn connect_sheet(&self) -> Option<&Entity<ConnectSheet>> {
+        self.connect.as_ref().map(|(s, _)| s)
+    }
+
+    /// The connect sheet is drawn (not a quiet startup attempt).
+    pub fn connect_sheet_shown(&self, cx: &App) -> bool {
+        self.connect
+            .as_ref()
+            .is_some_and(|(sheet, _)| !sheet.read(cx).quiet)
+    }
+
     /// A sheet or a menu is open over the panes.
     fn modal(&self) -> bool {
-        self.sheet.is_some() || self.menu.is_some()
+        self.sheet.is_some() || self.menu.is_some() || self.connect.is_some()
+    }
+
+    /// Opens the connect sheet (or brings it up), showing `reason`.
+    pub fn open_connect_sheet(
+        &mut self,
+        reason: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = None;
+        self.sheet = None;
+        if let Some((sheet, _)) = &self.connect {
+            let sheet = sheet.clone();
+            sheet.update(cx, |s, cx| {
+                if reason.is_some() {
+                    s.reason = reason;
+                }
+                s.quiet = false;
+                cx.notify();
+            });
+            sheet.read(cx).focus(window, cx);
+            cx.notify();
+            return;
+        }
+        let Some(sheet) = self.install_connect_sheet(reason, window, cx) else {
+            return;
+        };
+        sheet.read(cx).focus(window, cx);
+    }
+
+    /// The launch: connects to `saved` (or a local fleetd that answers),
+    /// showing the connect sheet if that takes a while or fails.
+    pub fn start_up(&mut self, saved: Option<Target>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(sheet) = self.install_connect_sheet(None, window, cx) {
+            sheet.update(cx, |s, cx| s.startup(saved, cx));
+        }
+    }
+
+    fn install_connect_sheet(
+        &mut self,
+        reason: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ConnectSheet>> {
+        let sheet = new_sheet(reason, cx)?;
+        let events = cx.subscribe_in(&sheet, window, Self::connect_event);
+        // A quiet startup sheet appearing takes the keyboard.
+        let shown = cx.observe_in(&sheet, window, |_, sheet, window, cx| {
+            let visible = !sheet.read(cx).quiet;
+            let field = sheet.read(cx).remote.read(cx).focus_handle().clone();
+            if visible && !field.contains_focused(window, cx) {
+                window.focus(&field);
+            }
+            cx.notify();
+        });
+        self.connect = Some((sheet.clone(), [events, shown]));
+        cx.notify();
+        Some(sheet)
+    }
+
+    fn connect_event(
+        &mut self,
+        _sheet: &Entity<ConnectSheet>,
+        event: &ConnectEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConnectEvent::Connected { target, save } => {
+                if *save {
+                    let dir = self.app.read(cx).state_dir().to_owned();
+                    if let Err(e) = save_connection(&dir, target) {
+                        eprintln!("fleet-gui: cannot save the connection: {e}");
+                    }
+                }
+                switch_target(target.clone(), cx);
+            }
+            ConnectEvent::Dismiss => {}
+        }
+        self.connect = None;
+        self.focus_current(window, cx);
+        cx.notify();
     }
 
     fn pane_focus_handle(&self, pane: PaneId, cx: &App) -> Option<FocusHandle> {
@@ -207,6 +305,9 @@ impl Workspace {
     }
 
     pub fn open_new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connect.is_some() {
+            return;
+        }
         self.menu = None;
         if let Some((sheet, _)) = &self.sheet {
             sheet.read(cx).focus(window, cx);
@@ -501,6 +602,25 @@ impl Render for Workspace {
             .menu
             .as_ref()
             .map(|m| self.render_menu(m, &theme, cx).into_any_element());
+        let connect = self
+            .connect
+            .as_ref()
+            .filter(|_| self.connect_sheet_shown(cx))
+            .map(|(sheet, _)| {
+                deferred(
+                    div()
+                        .id("connect-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(gpui::black().opacity(0.35))
+                        .flex()
+                        .justify_center()
+                        .pt(px(120.))
+                        .child(sheet.clone()),
+                )
+                .with_priority(3)
+            });
         let sheet = self.sheet.as_ref().map(|(sheet, _)| {
             // The backdrop takes every click and wheel event over the panes.
             deferred(
@@ -545,6 +665,7 @@ impl Render for Workspace {
             .children(toast)
             .children(menu)
             .children(sheet)
+            .children(connect)
     }
 }
 

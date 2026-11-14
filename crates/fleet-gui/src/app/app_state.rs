@@ -20,7 +20,7 @@ use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::PaneModel;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent};
 use crate::core::sidebar::tilde;
-use crate::core::state::{GuiState, MAX_RECENT_DIRS, push_recent};
+use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::target::Target;
 
 /// Saved state is written once it has been still this long.
@@ -44,6 +44,8 @@ pub trait SessionApi: InputSink {
     fn attach(&self, pane: PaneId, agent_id: u64);
     fn close_pane(&self, pane: PaneId);
     fn set_palette(&self, palette: Palette);
+    /// Detaches every pane and closes every connection.
+    fn shutdown(&self) {}
 }
 
 impl SessionApi for Session {
@@ -82,6 +84,69 @@ impl SessionApi for Session {
     fn set_palette(&self, palette: Palette) {
         Session::set_palette(self, palette);
     }
+
+    fn shutdown(&self) {
+        Session::shutdown(self.clone());
+    }
+}
+
+/// The session before any fleetd is connected: panes stay empty and
+/// nothing reaches a daemon.
+struct NoSession;
+
+impl InputSink for NoSession {
+    fn input(&self, _pane: PaneId, _bytes: Vec<u8>) {}
+    fn resize(&self, _pane: PaneId, _cols: u16, _rows: u16) {}
+}
+
+impl SessionApi for NoSession {
+    fn agents(&self) -> Vec<AgentRow> {
+        Vec::new()
+    }
+
+    fn spawn(
+        &self,
+        _program: String,
+        _args: Vec<String>,
+        _cwd: String,
+        _cols: u16,
+        _rows: u16,
+        _pane: PaneId,
+    ) -> Result<(), String> {
+        Err("not connected to a fleetd".into())
+    }
+
+    fn kill(&self, _agent_id: u64) {}
+
+    fn open_pane(&self, _pane: PaneId, _agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
+        Arc::new(Mutex::new(PaneModel::new(Theme::dark().palette)))
+    }
+
+    fn attach(&self, _pane: PaneId, _agent_id: u64) {}
+    fn close_pane(&self, _pane: PaneId) {}
+    fn set_palette(&self, _palette: Palette) {}
+}
+
+/// `target`'s saved layout, else one empty pane.
+fn saved_layout(state: &GuiState, target: &Target) -> Layout {
+    state
+        .layouts
+        .get(&target.to_string())
+        .map_or_else(Layout::single, Layout::from_saved)
+}
+
+/// Applies the session's events from `ui`, in batches.
+fn follow(ui: async_channel::Receiver<UiEvent>, cx: &mut Context<AppState>) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        while let Ok(first) = ui.recv().await {
+            let batch: Vec<UiEvent> = std::iter::once(first)
+                .chain(std::iter::from_fn(|| ui.try_recv().ok()))
+                .collect();
+            if this.update(cx, |s, cx| s.apply_events(batch, cx)).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 fn lock(m: &Mutex<PaneModel>) -> MutexGuard<'_, PaneModel> {
@@ -101,6 +166,8 @@ impl Global for AppGlobal {}
 /// every pane attached.
 pub struct AppState {
     session: Arc<dyn SessionApi>,
+    /// A fleetd is connected (false before the first connect).
+    live: bool,
     pub(super) target: Target,
     state_dir: PathBuf,
     pub(super) home: PathBuf,
@@ -147,26 +214,15 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> Self {
         let gui_state = GuiState::load(&state_dir);
-        let layout = gui_state
-            .layouts
-            .get(&target.to_string())
-            .map_or_else(Layout::single, Layout::from_saved);
+        let layout = saved_layout(&gui_state, &target);
         session.set_palette(theme.palette);
         cx.set_global(theme);
-        let events = cx.spawn(async move |this, cx| {
-            while let Ok(first) = ui.recv().await {
-                let batch: Vec<UiEvent> = std::iter::once(first)
-                    .chain(std::iter::from_fn(|| ui.try_recv().ok()))
-                    .collect();
-                if this.update(cx, |s, cx| s.apply_events(batch, cx)).is_err() {
-                    break;
-                }
-            }
-        });
+        let events = follow(ui, cx);
         let focused = layout.panes()[0];
         let mut s = AppState {
             agents: session.agents(),
             session,
+            live: true,
             target,
             state_dir,
             home: home_dir(),
@@ -194,6 +250,93 @@ impl AppState {
         }
         s.refresh_chrome(cx);
         s
+    }
+
+    /// No fleetd yet: one empty pane until [`AppState::replace_session`].
+    pub fn without_session(
+        target: Target,
+        state_dir: PathBuf,
+        config: GuiConfig,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (_tx, rx) = async_channel::unbounded();
+        let mut s = AppState::new(
+            Arc::new(NoSession),
+            rx,
+            target,
+            state_dir,
+            config,
+            theme,
+            cx,
+        );
+        s.live = false;
+        s.panes.clear();
+        s.layout = Layout::single();
+        s.focused = s.layout.panes()[0];
+        s.open(s.focused, None, cx);
+        s.refresh_chrome(cx);
+        s
+    }
+
+    /// Switches to `session` (connected to `target`): the old session
+    /// detaches everything, and the target's saved layout is restored,
+    /// its panes attached. The target becomes the most recent one.
+    pub fn replace_session(
+        &mut self,
+        session: Arc<dyn SessionApi>,
+        ui: async_channel::Receiver<UiEvent>,
+        target: Target,
+        cx: &mut Context<Self>,
+    ) {
+        let old = std::mem::replace(&mut self.session, session);
+        old.shutdown();
+        self.live = true;
+        self.target = target;
+        self.session.set_palette(self.theme.palette);
+        self._events = follow(ui, cx);
+        self.layout = saved_layout(&self.gui_state, &self.target);
+        self.panes.clear();
+        self.focused = self.layout.panes()[0];
+        self.maximized = None;
+        self.titles.clear();
+        self.error = None;
+        self.starting.clear();
+        self.spawn_dirs.clear();
+        self.requested.clear();
+        self.reconnect_at = None;
+        self.agents = self.session.agents();
+        for pane in self.layout.panes() {
+            let agent = self.layout.agent(pane);
+            self.open(pane, agent, cx);
+        }
+        let target = self.target.clone();
+        push_recent(
+            &mut self.gui_state.recent_targets,
+            target,
+            MAX_RECENT_TARGETS,
+        );
+        self.schedule_save(cx);
+        self.refresh_chrome(cx);
+        cx.notify();
+    }
+
+    /// Detaches everything (at quit).
+    pub fn shutdown_session(&self) {
+        self.session.shutdown();
+    }
+
+    /// A fleetd is connected.
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
+
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    pub fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
     }
 
     /// Makes `state` the process-wide app state.
@@ -367,9 +510,12 @@ impl AppState {
 
     /// The layout changed: redraw, and save it after [`SAVE_DEBOUNCE`].
     fn layout_changed(&mut self, cx: &mut Context<Self>) {
-        let key = self.target_key();
-        self.gui_state.layouts.insert(key, self.layout.to_saved());
-        self.schedule_save(cx);
+        // Unconnected, the layout is a placeholder: the target's saved one stays.
+        if self.live {
+            let key = self.target_key();
+            self.gui_state.layouts.insert(key, self.layout.to_saved());
+            self.schedule_save(cx);
+        }
         self.refresh_chrome(cx);
         cx.notify();
     }

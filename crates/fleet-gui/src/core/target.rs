@@ -94,7 +94,7 @@ pub fn ssh_command(dest: &str, state_dir: &Path) -> std::io::Result<Command> {
 
 /// Why a connection could not be made; the `Display` copy is shown in the
 /// connect sheet.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectError {
     NotRunning,
     FleetdNotFound { host: String },

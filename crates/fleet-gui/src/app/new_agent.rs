@@ -369,7 +369,7 @@ impl NewAgentSheet {
     }
 }
 
-fn button(
+pub(super) fn button(
     id: &'static str,
     label: &'static str,
     theme: &Theme,
