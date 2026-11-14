@@ -10,7 +10,7 @@ use std::ops::Range;
 use fleet_proto::{AttachOk, HistoryPage};
 use fleet_term::{Cell, HistoryEvent, Palette, Terminal, parse_history_line};
 
-use super::scrollback::Scrollback;
+use super::scrollback::{Cap, Scrollback};
 use super::selection::{self, LINE_END, LineRef, SelPoint, SelUnit, Selection};
 
 /// Lines asked for per `ReadHistory`.
@@ -56,6 +56,8 @@ pub struct PaneModel {
     /// History lines added below the view since it last followed the grid.
     unseen_lines: u64,
     selection: Option<Selection>,
+    /// How much history stays loaded.
+    history_cap: Cap,
 }
 
 impl PaneModel {
@@ -71,6 +73,7 @@ impl PaneModel {
             scroll_offset: 0,
             unseen_lines: 0,
             selection: None,
+            history_cap: Cap::default(),
         }
     }
 
@@ -84,10 +87,11 @@ impl PaneModel {
         let cols = u16::try_from(ok.cols).unwrap_or(u16::MAX);
         let rows = u16::try_from(ok.rows).unwrap_or(u16::MAX);
         self.term = Terminal::new_client(cols, rows, self.palette);
-        self.scrollback = Scrollback::new(
+        self.scrollback = Scrollback::with_cap(
             ok.history_generation,
             ok.tail_first_line,
             ok.history_first_line,
+            self.history_cap,
         );
         for line in &ok.history_tail {
             self.scrollback.push_back(line.to_vec());
@@ -160,10 +164,11 @@ impl PaneModel {
 
     /// `(generation, before_line)` of the next `ReadHistory` to send, once:
     /// when the view's top is within [`PREFETCH_LINES`] of the oldest loaded
-    /// line, older history exists and no request is in flight.
+    /// line, older history exists, no request is in flight and the loaded
+    /// history is not at its cap.
     pub fn next_page_request(&mut self) -> Option<(u64, u64)> {
         let sb = &self.scrollback;
-        if self.page_in_flight || sb.fully_loaded() {
+        if self.page_in_flight || sb.fully_loaded() || sb.is_full() {
             return None;
         }
         let top = sb.end_line() - self.scroll_offset;
@@ -176,14 +181,18 @@ impl PaneModel {
 
     /// A page answering the request made with `generation`. Dropped if a
     /// clear happened since or it does not join the loaded lines; a page of
-    /// the current generation that adds nothing older ends the paging.
+    /// the current generation that adds nothing older ends the paging
+    /// (unless the cap left its lines out).
     pub fn on_page(&mut self, page: &HistoryPage, generation: u64) {
         self.page_in_flight = false;
         let before = self.scrollback.first_line();
         let lines = page.lines.iter().map(|l| l.to_vec()).collect();
         self.scrollback
             .prepend_page(generation, page.first_line, lines);
-        if generation == self.scrollback.generation() && self.scrollback.first_line() == before {
+        if generation == self.scrollback.generation()
+            && self.scrollback.first_line() == before
+            && !self.scrollback.is_full()
+        {
             self.scrollback.mark_fully_loaded();
         }
     }
@@ -359,10 +368,22 @@ impl PaneModel {
         for event in self.term.drain_history() {
             match event {
                 HistoryEvent::Line(line) => {
-                    self.scrollback.push_back(line);
+                    let dropped = self.scrollback.push_back(line);
                     if self.scroll_offset > 0 {
                         self.scroll_offset += 1;
                         self.unseen_lines += 1;
+                    }
+                    if dropped > 0 {
+                        // The view stops at the oldest line still loaded.
+                        self.scroll_offset = self.scroll_offset.min(self.scrollback.len());
+                        self.unseen_lines = self.unseen_lines.min(self.scroll_offset);
+                        let first = self.scrollback.first_line();
+                        if self
+                            .selection
+                            .is_some_and(|s| s.touches_history_before(first))
+                        {
+                            self.selection = None;
+                        }
                     }
                 }
                 HistoryEvent::Cleared => {
@@ -746,6 +767,64 @@ mod tests {
         assert_eq!(pane.state(), PaneState::Exited(3));
         pane.on_disconnected();
         assert_eq!(pane.state(), PaneState::Disconnected);
+    }
+
+    fn capped(lines: usize) -> PaneModel {
+        let mut pane = pane();
+        pane.history_cap = Cap {
+            lines,
+            bytes: usize::MAX,
+        };
+        pane
+    }
+
+    #[test]
+    fn history_over_the_cap_keeps_the_view_and_drops_a_selection_on_dropped_lines() {
+        let mut pane = capped(4);
+        let mut ok = attach_ok(10, 2, &["a", "b", "c"], 10);
+        ok.history_first_line = 0;
+        pane.on_attached(&ok);
+        pane.on_output(b"\x1b[2;1H");
+        pane.select_line(SelPoint {
+            line: LineRef::History(10),
+            col: 0,
+        });
+        pane.scroll_lines(3);
+        pane.on_output(b"\r\n1\r\n2\r\n3");
+        let sb = pane.scrollback();
+        assert_eq!((sb.first_line(), sb.end_line()), (12, 16));
+        assert_eq!(history_texts(&pane), ["c", "", "", "1"]);
+        // Scrolled to the oldest loaded line, not past it.
+        assert_eq!(pane.scroll_offset(), 4);
+        let mut rows = Vec::new();
+        pane.view_rows(2, &mut rows);
+        assert_eq!(rows, [ViewRow::History(12), ViewRow::History(13)]);
+        // The selected line 10 is gone.
+        assert_eq!(pane.selection_text(), None);
+        // The node still has lines 0..12, but the full history pages no more.
+        assert!(!pane.scrollback().fully_loaded());
+        assert_eq!(pane.next_page_request(), None);
+    }
+
+    #[test]
+    fn page_cut_by_the_cap_does_not_end_paging_for_good() {
+        let mut pane = capped(3);
+        let mut ok = attach_ok(10, 2, &["e", "f"], 50);
+        ok.history_first_line = 0;
+        pane.on_attached(&ok);
+        assert_eq!(pane.next_page_request(), Some((0, 50)));
+        let page = HistoryPage {
+            agent_id: 1,
+            first_line: 48,
+            lines: vec![b"c".to_vec().into(), b"d".to_vec().into()],
+        };
+        pane.on_page(&page, 0);
+        assert_eq!(history_texts(&pane), ["d", "e", "f"]);
+        assert!(!pane.scrollback().fully_loaded());
+        assert_eq!(pane.next_page_request(), None);
+        // A re-attach rebuilds the history: paging resumes.
+        pane.on_attached(&ok);
+        assert_eq!(pane.next_page_request(), Some((0, 50)));
     }
 
     #[test]
