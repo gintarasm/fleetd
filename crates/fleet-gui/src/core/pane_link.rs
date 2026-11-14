@@ -22,6 +22,9 @@ use super::target::connect;
 
 /// Resizes are sent once the size has been still this long.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
+/// A spawn asked for while disconnected is dropped, with an error, if the
+/// connection is not back within this long.
+const DEFERRED_SPAWN_TTL: Duration = Duration::from_secs(5);
 
 enum Outgoing {
     /// A new connection is up; the writer sends on it from now on.
@@ -67,6 +70,9 @@ struct Shared {
     /// The agent the pane should show (`None` until the first attach or
     /// spawn reply).
     agent: Option<u64>,
+    /// The agent the pane showed before a spawn on its way into it; shown
+    /// again if the spawn fails.
+    before_spawn: Option<u64>,
     /// The agent the current connection is subscribed to (or attaching).
     subscribed: Option<u64>,
     /// The agent whose attach the model last applied; frames for any other
@@ -332,7 +338,7 @@ fn apply_frame(
             }
             true
         }
-        Frame::Response(r) => apply_response(link, model, r),
+        Frame::Response(r) => apply_response(link, out, model, r),
         Frame::Event(ev) => match ev.kind {
             Some(event::Kind::Exited(e)) if is_shown(e.agent_id) => {
                 model.on_exited(e.exit_code);
@@ -368,7 +374,12 @@ fn apply_frame(
     }
 }
 
-fn apply_response(link: &Link, model: &mut PaneModel, r: Response) -> bool {
+fn apply_response(
+    link: &Link,
+    out: &mpsc::Sender<Outgoing>,
+    model: &mut PaneModel,
+    r: Response,
+) -> bool {
     let mut sh = lock(&link.shared);
     let pending = sh.take_pending(r.id);
     let is_page = matches!(pending, Some(Pending::Page { .. })) && sh.page == Some(r.id);
@@ -385,6 +396,7 @@ fn apply_response(link: &Link, model: &mut PaneModel, r: Response) -> bool {
                 return false;
             };
             sh.agent = Some(info.id);
+            sh.before_spawn = None;
             sh.subscribed = Some(info.id);
             attached(&mut sh, model, &ok);
             true
@@ -410,9 +422,17 @@ fn apply_response(link: &Link, model: &mut PaneModel, r: Response) -> bool {
             true
         }
         (Some(Pending::Spawn), Some(response::Kind::Error(e))) => {
+            // Back to the agent the pane showed before.
+            let restore = sh.agent.is_none() && sh.before_spawn.is_some();
+            if restore {
+                sh.agent = sh.before_spawn.take();
+            }
             drop(sh);
             link.ctx
                 .notify(UiEvent::Error(format!("spawn failed: {}", e.message)));
+            if restore {
+                let _ = out.send(Outgoing::Reattach);
+            }
             false
         }
         _ => false,
@@ -432,8 +452,9 @@ fn attached(sh: &mut Shared, model: &mut PaneModel, ok: &AttachOk) {
 struct Writer {
     link: Arc<Link>,
     sender: Option<Sender>,
-    /// A spawn asked for while disconnected, sent on the next connection.
-    deferred_spawn: Option<SpawnAgent>,
+    /// A spawn asked for while disconnected, and when: sent on the next
+    /// connection unless older than [`DEFERRED_SPAWN_TTL`].
+    deferred_spawn: Option<(SpawnAgent, Instant)>,
     size: Option<(u16, u16)>,
     resize_due: Option<Instant>,
 }
@@ -451,15 +472,23 @@ impl Writer {
 
     fn run(mut self, rx: &mpsc::Receiver<Outgoing>) {
         loop {
-            let next = match self.resize_due {
+            let deadline = [
+                self.resize_due,
+                self.deferred_spawn
+                    .as_ref()
+                    .map(|(_, at)| *at + DEFERRED_SPAWN_TTL),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let next = match deadline {
                 Some(due) => rx.recv_timeout(due.saturating_duration_since(Instant::now())),
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
             let o = match next {
                 Ok(o) => o,
                 Err(RecvTimeoutError::Timeout) => {
-                    self.resize_due = None;
-                    self.send_resize();
+                    self.timers();
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -468,17 +497,46 @@ impl Writer {
                 return;
             }
             // A steady stream of messages never lets `recv_timeout` time out.
-            if self.resize_due.is_some_and(|due| due <= Instant::now()) {
-                self.resize_due = None;
-                self.send_resize();
+            self.timers();
+        }
+    }
+
+    /// Sends a resize that is due and drops a deferred spawn that expired.
+    fn timers(&mut self) {
+        if self.resize_due.is_some_and(|due| due <= Instant::now()) {
+            self.resize_due = None;
+            self.send_resize();
+        }
+        self.expire_deferred_spawn();
+    }
+
+    /// A spawn deferred for longer than [`DEFERRED_SPAWN_TTL`] is dropped
+    /// with an error; the pane shows its old agent again.
+    fn expire_deferred_spawn(&mut self) {
+        if !self
+            .deferred_spawn
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= DEFERRED_SPAWN_TTL)
+        {
+            return;
+        }
+        self.deferred_spawn = None;
+        {
+            let mut sh = lock(&self.link.shared);
+            if sh.agent.is_none() {
+                sh.agent = sh.before_spawn.take();
             }
         }
+        self.link.ctx.notify(UiEvent::Error(
+            "spawn dropped: not connected to fleetd".into(),
+        ));
     }
 
     /// `false` once the pane is closed.
     fn handle(&mut self, o: Outgoing) -> bool {
         match o {
             Outgoing::Connected(sender) => {
+                self.expire_deferred_spawn();
                 self.sender = Some(sender);
                 let mut sh = lock(&self.link.shared);
                 sh.subscribed = None;
@@ -487,7 +545,7 @@ impl Writer {
                 sh.epoch += 1;
                 let idle = sh.agent.is_none();
                 drop(sh);
-                if let Some(spawn) = self.deferred_spawn.take() {
+                if let Some((spawn, _)) = self.deferred_spawn.take() {
                     self.spawn(spawn);
                 } else if idle {
                     // Nothing to attach: back to the neutral state a new
@@ -505,7 +563,11 @@ impl Writer {
                 lock(&self.link.shared).subscribed = None;
             }
             Outgoing::Attach(agent) => {
-                lock(&self.link.shared).agent = Some(agent);
+                {
+                    let mut sh = lock(&self.link.shared);
+                    sh.agent = Some(agent);
+                    sh.before_spawn = None;
+                }
                 self.attach(agent);
             }
             Outgoing::Reattach => {
@@ -516,12 +578,18 @@ impl Writer {
             }
             Outgoing::Spawn(spawn) => {
                 // Until `SpawnedAttached` names the new agent, nothing
-                // re-attaches the old one (a reconnect or a late `Lagged`).
-                lock(&self.link.shared).agent = None;
+                // re-attaches the old one (a reconnect or a late `Lagged`);
+                // a failed spawn shows it again.
+                {
+                    let mut sh = lock(&self.link.shared);
+                    if let Some(old) = sh.agent.take() {
+                        sh.before_spawn = Some(old);
+                    }
+                }
                 if self.sender.is_some() {
                     self.spawn(spawn);
                 } else {
-                    self.deferred_spawn = Some(spawn);
+                    self.deferred_spawn = Some((spawn, Instant::now()));
                 }
             }
             Outgoing::Input(data) => {
@@ -622,7 +690,7 @@ impl Writer {
             self.send(request::Kind::Detach(Detach { agent_id }));
         }
         let Some(id) = self.sender.as_ref().map(Sender::next_id) else {
-            self.deferred_spawn = Some(spawn);
+            self.deferred_spawn = Some((spawn, Instant::now()));
             return;
         };
         lock(&self.link.model).on_attaching();
@@ -749,8 +817,12 @@ mod tests {
     const SHORT: Duration = Duration::from_millis(200);
 
     fn link() -> Arc<Link> {
+        link_with(Ctx::for_test())
+    }
+
+    fn link_with(ctx: Arc<Ctx>) -> Arc<Link> {
         Arc::new(Link {
-            ctx: Ctx::for_test(),
+            ctx,
             pane: PaneId(1),
             model: Arc::new(Mutex::new(PaneModel::new(DEFAULT_PALETTE_FOR_TEST))),
             shared: Mutex::new(Shared {
@@ -808,7 +880,7 @@ mod tests {
 
     fn respond(l: &Link, r: Response) {
         let mut m = lock(&l.model);
-        apply_response(l, &mut m, r);
+        apply_response(l, &mpsc::channel().0, &mut m, r);
     }
 
     #[test]
@@ -989,6 +1061,80 @@ mod tests {
             "{reqs:?}"
         );
         assert!(lock(&l.shared).page.is_some());
+    }
+
+    fn error_response(id: u64) -> Response {
+        Response {
+            id,
+            kind: Some(response::Kind::Error(fleet_proto::Error {
+                message: "no such directory".into(),
+            })),
+        }
+    }
+
+    #[test]
+    fn failed_spawn_reattaches_the_agent_the_pane_showed() {
+        let (ctx, events) = Ctx::for_test_with_events();
+        let l = link_with(ctx);
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        w.handle(Outgoing::Attach(1));
+        w.handle(Outgoing::Spawn(spawn_req()));
+        let spawn_id = lock(&l.shared).pending.back().unwrap().0;
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut m = lock(&l.model);
+            apply_response(&l, &tx, &mut m, error_response(spawn_id));
+        }
+        for o in rx.try_iter() {
+            w.handle(o);
+        }
+        let reqs = srv.requests(SHORT);
+        assert!(
+            matches!(
+                reqs.as_slice(),
+                [
+                    request::Kind::Attach(Attach { agent_id: 1, .. }),
+                    request::Kind::Detach(Detach { agent_id: 1 }),
+                    request::Kind::Spawn(_),
+                    request::Kind::Attach(Attach { agent_id: 1, .. }),
+                ]
+            ),
+            "{reqs:?}"
+        );
+        assert_eq!(lock(&l.shared).agent, Some(1));
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .any(|e| matches!(e, UiEvent::Error(m) if m.contains("no such directory")))
+        );
+    }
+
+    #[test]
+    fn deferred_spawn_older_than_its_ttl_is_dropped_with_an_error() {
+        let (ctx, events) = Ctx::for_test_with_events();
+        let l = link_with(ctx);
+        let mut w = Writer::new(Arc::clone(&l));
+        w.handle(Outgoing::Spawn(spawn_req()));
+        let queued = Instant::now()
+            .checked_sub(DEFERRED_SPAWN_TTL + Duration::from_millis(1))
+            .unwrap();
+        w.deferred_spawn.as_mut().unwrap().1 = queued;
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        w.handle(Outgoing::Reattach);
+        let reqs = srv.requests(SHORT);
+        assert!(
+            matches!(
+                reqs.as_slice(),
+                [request::Kind::Attach(Attach { agent_id: 1, .. })]
+            ),
+            "{reqs:?}"
+        );
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .any(|e| matches!(e, UiEvent::Error(m) if m.contains("spawn")))
+        );
     }
 
     #[test]

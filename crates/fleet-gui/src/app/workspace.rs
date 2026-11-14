@@ -1043,6 +1043,30 @@ mod tests {
     }
 
     #[gpui::test]
+    fn clicking_the_shown_agent_reattaches_a_pane_not_showing_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        let attaches = |f: &Fake| {
+            f.calls()
+                .iter()
+                .filter(|c| **c == Call::Attach(PaneId(1), 7))
+                .count()
+        };
+        click(&mut s, "tab-7");
+        assert_eq!(attaches(&fake), 1);
+        // The layout names agent 7 but the pane does not show it (a failed
+        // spawn left it attaching): clicking attaches again.
+        click(&mut s, "tab-7");
+        assert_eq!(attaches(&fake), 2);
+        // Shown: clicking again does nothing.
+        attach_model(&fake, PaneId(1), 7);
+        click(&mut s, "tab-7");
+        assert_eq!(attaches(&fake), 2);
+    }
+
+    #[gpui::test]
     fn kill_requires_confirmation(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(Fake::default());

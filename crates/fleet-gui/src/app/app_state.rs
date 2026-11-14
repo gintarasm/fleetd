@@ -17,7 +17,7 @@ use super::theme::Theme;
 use super::workspace::Workspace;
 use crate::core::config::GuiConfig;
 use crate::core::layout::{Axis, Dir, Layout};
-use crate::core::pane::PaneModel;
+use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent};
 use crate::core::sidebar::tilde;
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
@@ -652,10 +652,11 @@ impl AppState {
         self.layout.neighbour(self.focused, dir, 1.0, 1.0)
     }
 
-    /// Shows `agent_id` in the focused pane.
+    /// Shows `agent_id` in the focused pane (attaching again if the pane
+    /// is meant to show it but does not, for example after a failed spawn).
     pub fn show_agent(&mut self, agent_id: u64, cx: &mut Context<Self>) {
         let pane = self.focused;
-        if self.layout.agent(pane) == Some(agent_id) {
+        if self.layout.agent(pane) == Some(agent_id) && self.pane_shows(pane, agent_id, cx) {
             return;
         }
         self.forget_pending(pane);
@@ -663,6 +664,15 @@ impl AppState {
         self.layout.set_agent(pane, Some(agent_id));
         self.session.attach(pane, agent_id);
         self.layout_changed(cx);
+    }
+
+    /// `pane`'s grid shows `agent_id`, live or exited.
+    fn pane_shows(&self, pane: PaneId, agent_id: u64, cx: &App) -> bool {
+        self.panes.get(&pane).is_some_and(|v| {
+            let m = lock(v.read(cx).model_handle());
+            m.agent_id() == Some(agent_id)
+                && matches!(m.state(), PaneState::Live | PaneState::Exited(_))
+        })
     }
 
     /// Drops what was on its way into `pane`.

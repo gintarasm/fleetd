@@ -109,6 +109,18 @@ impl Ctx {
         })
     }
 
+    /// [`Ctx::for_test`], with the UI's end of the event channel.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_events() -> (Arc<Ctx>, async_channel::Receiver<UiEvent>) {
+        let (ui, rx) = async_channel::unbounded();
+        let ctx = Arc::new(Ctx {
+            target: Target::Local,
+            state_dir: PathBuf::from("/nonexistent"),
+            ui,
+        });
+        (ctx, rx)
+    }
+
     /// Wakes the UI. The channel is unbounded (see [`Session::start`]), so
     /// only a closed one (the UI is gone) loses events.
     pub(crate) fn notify(&self, e: UiEvent) {
