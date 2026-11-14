@@ -1,0 +1,542 @@
+//! Draws a pane's grid: cell backgrounds, text, selection, cursor and IME
+//! marked text. Built each frame by [`PaneView`].
+
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use fleet_term::{Cell, CursorShape, CursorView};
+use gpui::{
+    App, BorderStyle, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity,
+    FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hsla, InspectorElementId,
+    IntoElement, LayoutId, Pixels, Point, SharedString, StrikethroughStyle, Style, TextRun,
+    UnderlineStyle, Window, fill, outline, point, px, relative, size,
+};
+
+use super::pane_view::{GridLayout, InputSink, PaneView, grid_size};
+use super::theme::Theme;
+use crate::core::pane::{PaneModel, ViewRow};
+use crate::core::selection::LineRef;
+use crate::core::session::PaneId;
+
+/// Cursor bar thickness (beam width, underline height).
+const CURSOR_BAR: Pixels = px(2.0);
+
+pub struct TerminalElement {
+    pub(crate) view: Entity<PaneView>,
+    pub(crate) pane: PaneId,
+    pub(crate) model: Arc<Mutex<PaneModel>>,
+    pub(crate) sink: Arc<dyn InputSink>,
+    pub(crate) focus: FocusHandle,
+    pub(crate) theme: Theme,
+    pub(crate) font: Font,
+    pub(crate) font_size: Pixels,
+    /// The pane has keyboard focus in the active window.
+    pub(crate) focused: bool,
+    pub(crate) marked: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Metrics {
+    cell_w: Pixels,
+    line_h: Pixels,
+}
+
+/// One visible row, copied out of the model.
+struct RowSnapshot {
+    cells: Vec<Cell>,
+    /// Selected column ranges.
+    selected: Vec<(u16, u16)>,
+}
+
+/// What a frame draws, copied out under one model lock.
+struct Snapshot {
+    rows: Vec<RowSnapshot>,
+    /// `None` when hidden or scrolled into history.
+    cursor: Option<CursorView>,
+}
+
+fn lock(model: &Mutex<PaneModel>) -> MutexGuard<'_, PaneModel> {
+    model.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl TerminalElement {
+    fn snapshot(&self) -> Snapshot {
+        let model = lock(&self.model);
+        let term = model.terminal();
+        let (cols, rows) = term.size();
+        let mut view_rows = Vec::with_capacity(usize::from(rows));
+        model.view_rows(rows, &mut view_rows);
+        let rows = view_rows
+            .iter()
+            .map(|&vr| {
+                let mut cells = Vec::with_capacity(usize::from(cols));
+                let line = match vr {
+                    ViewRow::History(abs) => {
+                        model.history_cells(abs, &mut cells);
+                        LineRef::History(abs)
+                    }
+                    ViewRow::Grid(row) => {
+                        term.row_cells(row, &mut cells);
+                        LineRef::Grid(row)
+                    }
+                };
+                RowSnapshot {
+                    cells,
+                    selected: selected_ranges(&model, line, cols),
+                }
+            })
+            .collect();
+        let cursor = term.cursor_view();
+        let cursor =
+            (model.scroll_offset() == 0 && cursor.shape != CursorShape::Hidden).then_some(cursor);
+        Snapshot { rows, cursor }
+    }
+
+    fn paint_row(
+        &self,
+        row: &RowSnapshot,
+        origin: Point<Pixels>,
+        m: Metrics,
+        block_cursor_col: Option<u16>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let default_bg = self.theme.bg();
+        let mut styled: Vec<(u16, u16, CellLook)> = Vec::with_capacity(row.cells.len());
+        let mut col = 0u16;
+        for cell in &row.cells {
+            let width = if cell.wide { 2 } else { 1 };
+            let look = self.look(cell, block_cursor_col == Some(col));
+            styled.push((col, width, look));
+            col = col.saturating_add(width);
+        }
+
+        // Backgrounds, merging neighbours of one colour.
+        let mut run: Option<(u16, u16, Hsla)> = None;
+        for &(col, width, ref look) in &styled {
+            match &mut run {
+                Some((_, end, bg)) if *end == col && *bg == look.bg => *end += width,
+                _ => {
+                    if let Some(r) = run.take() {
+                        paint_bg(r, default_bg, origin, m, window);
+                    }
+                    run = Some((col, col + width, look.bg));
+                }
+            }
+        }
+        if let Some(r) = run {
+            paint_bg(r, default_bg, origin, m, window);
+        }
+
+        // Text: one shaped line per stretch of single-width cells; wide
+        // and combining cells are shaped alone at their column, since a
+        // forced advance would misplace what follows them.
+        let end = row
+            .cells
+            .iter()
+            .rposition(|c| {
+                (!c.style.hidden && c.ch != ' ') || c.style.underline || c.style.strikeout
+            })
+            .map_or(0, |i| i + 1);
+        let mut seg = Segment::default();
+        for (cell, &(col, _, ref look)) in row.cells[..end].iter().zip(&styled) {
+            if cell.wide || cell.extra.is_some() {
+                seg.flush(self, origin, m, window, cx);
+                let mut alone = Segment::default();
+                alone.push(cell, col, look);
+                alone.flush(self, origin, m, window, cx);
+            } else {
+                seg.push(cell, col, look);
+            }
+        }
+        seg.flush(self, origin, m, window, cx);
+    }
+
+    /// Resolved colours and font of a cell.
+    fn look(&self, cell: &Cell, block_cursor: bool) -> CellLook {
+        let s = &cell.style;
+        let mut fg = self.theme.resolve(s.fg, true);
+        let mut bg = self.theme.resolve(s.bg, false);
+        if s.inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if s.dim {
+            fg.a *= 0.6;
+        }
+        if s.hidden {
+            fg = bg;
+        }
+        if block_cursor {
+            fg = self.theme.bg();
+            bg = self.theme.cursor();
+        }
+        let mut font = self.font.clone();
+        if s.bold {
+            font.weight = FontWeight::BOLD;
+        }
+        if s.italic {
+            font.style = FontStyle::Italic;
+        }
+        CellLook {
+            fg,
+            bg,
+            font,
+            underline: s.underline,
+            strikeout: s.strikeout,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct CellLook {
+    fg: Hsla,
+    bg: Hsla,
+    font: Font,
+    underline: bool,
+    strikeout: bool,
+}
+
+impl CellLook {
+    fn run(&self, len: usize) -> TextRun {
+        TextRun {
+            len,
+            font: self.font.clone(),
+            color: self.fg,
+            background_color: None,
+            underline: self.underline.then_some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(self.fg),
+                wavy: false,
+            }),
+            strikethrough: self.strikeout.then_some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(self.fg),
+            }),
+        }
+    }
+}
+
+/// Cells collected for one `shape_line`.
+#[derive(Default)]
+struct Segment {
+    start_col: u16,
+    text: String,
+    runs: Vec<TextRun>,
+    last: Option<CellLook>,
+}
+
+impl Segment {
+    fn push(&mut self, cell: &Cell, col: u16, look: &CellLook) {
+        if self.text.is_empty() {
+            self.start_col = col;
+        }
+        let before = self.text.len();
+        if cell.style.hidden {
+            self.text.push(' ');
+        } else {
+            self.text.push(cell.ch);
+            if let Some(extra) = &cell.extra {
+                self.text.push_str(extra);
+            }
+        }
+        let len = self.text.len() - before;
+        let same = self.last.as_ref().is_some_and(|l| {
+            l.fg == look.fg
+                && l.font == look.font
+                && l.underline == look.underline
+                && l.strikeout == look.strikeout
+        });
+        match self.runs.last_mut() {
+            Some(run) if same => run.len += len,
+            _ => {
+                self.runs.push(look.run(len));
+                self.last = Some(look.clone());
+            }
+        }
+    }
+
+    fn flush(
+        &mut self,
+        el: &TerminalElement,
+        origin: Point<Pixels>,
+        m: Metrics,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.text.is_empty() {
+            return;
+        }
+        let text = SharedString::from(std::mem::take(&mut self.text));
+        let runs = std::mem::take(&mut self.runs);
+        self.last = None;
+        let line = window
+            .text_system()
+            .shape_line(text, el.font_size, &runs, Some(m.cell_w));
+        let at = point(origin.x + m.cell_w * f32::from(self.start_col), origin.y);
+        let _ = line.paint(at, m.line_h, window, cx);
+    }
+}
+
+fn paint_bg(
+    (from, to, bg): (u16, u16, Hsla),
+    default_bg: Hsla,
+    origin: Point<Pixels>,
+    m: Metrics,
+    window: &mut Window,
+) {
+    if bg == default_bg {
+        return;
+    }
+    window.paint_quad(fill(cell_bounds(origin, m, from, to - from), bg));
+}
+
+/// Bounds of `width` cells from `col` on the row at `origin`.
+fn cell_bounds(origin: Point<Pixels>, m: Metrics, col: u16, width: u16) -> Bounds<Pixels> {
+    Bounds::new(
+        point(origin.x + m.cell_w * f32::from(col), origin.y),
+        size(m.cell_w * f32::from(width), m.line_h),
+    )
+}
+
+fn selected_ranges(model: &PaneModel, line: LineRef, cols: u16) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for col in 0..cols {
+        match (model.is_selected(line, col), start) {
+            (true, None) => start = Some(col),
+            (false, Some(s)) => {
+                out.push((s, col));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, cols));
+    }
+    out
+}
+
+impl IntoElement for TerminalElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for TerminalElement {
+    type RequestLayoutState = ();
+    type PrepaintState = Metrics;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = relative(1.).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Metrics {
+        let ts = window.text_system();
+        let font_id = ts.resolve_font(&self.font);
+        let cell_w = ts
+            .advance(font_id, self.font_size, 'm')
+            .map_or(self.font_size * 0.6, |a| a.width);
+        let line_h =
+            (ts.ascent(font_id, self.font_size) + ts.descent(font_id, self.font_size).abs()).ceil();
+        let (cols, rows) = grid_size(
+            bounds.size.width.into(),
+            bounds.size.height.into(),
+            cell_w.into(),
+            line_h.into(),
+        );
+        let layout = GridLayout {
+            origin: bounds.origin,
+            cell_w,
+            line_h,
+            cols,
+            rows,
+        };
+        let resized = self.view.update(cx, |view, _| {
+            let old = view.layout.replace(layout);
+            old.is_none_or(|o| (o.cols, o.rows) != (cols, rows))
+        });
+        if resized {
+            self.sink.resize(self.pane, cols, rows);
+            // An observer draws at the primary's size (ADR 0022).
+            let mut model = lock(&self.model);
+            if model.is_primary() {
+                model.on_resized(cols, rows);
+            }
+        }
+        Metrics { cell_w, line_h }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        m: &mut Metrics,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let m = *m;
+        window.handle_input(
+            &self.focus,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            cx,
+        );
+        // The lock is held only for the copy; shaping happens after.
+        let snap = self.snapshot();
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            let block_cursor = snap
+                .cursor
+                .filter(|c| self.focused && c.shape == CursorShape::Block);
+            for (i, row) in snap.rows.iter().enumerate() {
+                let origin = point(bounds.origin.x, bounds.origin.y + m.line_h * i as f32);
+                let block_col = block_cursor
+                    .filter(|c| usize::from(c.row) == i)
+                    .map(|c| c.col);
+                self.paint_row(row, origin, m, block_col, window, cx);
+                for &(from, to) in &row.selected {
+                    window.paint_quad(fill(
+                        cell_bounds(origin, m, from, to - from),
+                        self.theme.selection,
+                    ));
+                }
+            }
+            if let Some(cursor) = snap.cursor {
+                self.paint_cursor(cursor, &snap, bounds.origin, m, window);
+            }
+            if let (Some(marked), Some(cursor)) = (&self.marked, snap.cursor_or_home()) {
+                self.paint_marked(marked, cursor, bounds.origin, m, window, cx);
+            }
+        });
+    }
+}
+
+impl Snapshot {
+    /// Where the IME's marked text goes: the cursor, else the top left.
+    fn cursor_or_home(&self) -> Option<CursorView> {
+        Some(self.cursor.unwrap_or(CursorView {
+            row: 0,
+            col: 0,
+            shape: CursorShape::Block,
+        }))
+    }
+
+    /// Whether the cell at the cursor is double width.
+    fn cursor_is_wide(&self, cursor: CursorView) -> bool {
+        let Some(row) = self.rows.get(usize::from(cursor.row)) else {
+            return false;
+        };
+        let mut col = 0u16;
+        for cell in &row.cells {
+            if col == cursor.col {
+                return cell.wide;
+            }
+            col = col.saturating_add(if cell.wide { 2 } else { 1 });
+            if col > cursor.col {
+                break;
+            }
+        }
+        false
+    }
+}
+
+impl TerminalElement {
+    fn paint_cursor(
+        &self,
+        cursor: CursorView,
+        snap: &Snapshot,
+        origin: Point<Pixels>,
+        m: Metrics,
+        window: &mut Window,
+    ) {
+        let width = if snap.cursor_is_wide(cursor) { 2 } else { 1 };
+        let row_origin = point(origin.x, origin.y + m.line_h * f32::from(cursor.row));
+        let cell = cell_bounds(row_origin, m, cursor.col, width);
+        let color = self.theme.cursor();
+        if !self.focused {
+            window.paint_quad(outline(cell, color, BorderStyle::Solid));
+            return;
+        }
+        match cursor.shape {
+            // Drawn with the cell: cursor-coloured background, inverted text.
+            CursorShape::Block | CursorShape::Hidden => {}
+            CursorShape::Underline => window.paint_quad(fill(
+                Bounds::new(
+                    point(cell.origin.x, cell.origin.y + cell.size.height - CURSOR_BAR),
+                    size(cell.size.width, CURSOR_BAR),
+                ),
+                color,
+            )),
+            CursorShape::Beam => window.paint_quad(fill(
+                Bounds::new(cell.origin, size(CURSOR_BAR, cell.size.height)),
+                color,
+            )),
+        }
+    }
+
+    fn paint_marked(
+        &self,
+        marked: &str,
+        cursor: CursorView,
+        origin: Point<Pixels>,
+        m: Metrics,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let fg = self.theme.fg();
+        let run = TextRun {
+            len: marked.len(),
+            font: self.font.clone(),
+            color: fg,
+            background_color: None,
+            underline: Some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(fg),
+                wavy: false,
+            }),
+            strikethrough: None,
+        };
+        let line = window.text_system().shape_line(
+            SharedString::from(marked.to_owned()),
+            self.font_size,
+            &[run],
+            None,
+        );
+        let at = point(
+            origin.x + m.cell_w * f32::from(cursor.col),
+            origin.y + m.line_h * f32::from(cursor.row),
+        );
+        window.paint_quad(fill(
+            Bounds::new(at, size(line.width.max(m.cell_w), m.line_h)),
+            self.theme.marked_bg,
+        ));
+        let _ = line.paint(at, m.line_h, window, cx);
+    }
+}

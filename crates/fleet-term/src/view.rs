@@ -105,7 +105,7 @@ impl Palette {
     /// 256-colour cube and gray ramp, 256/257/258 foreground/background/cursor
     /// (alacritty's `NamedColor` numbering); other indexes fall back to the
     /// foreground.
-    pub(crate) fn rgb(&self, index: usize) -> (u8, u8, u8) {
+    pub fn rgb(&self, index: usize) -> (u8, u8, u8) {
         match index {
             0..=15 => self.ansi[index],
             16..=231 => {
