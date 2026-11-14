@@ -18,6 +18,11 @@ Daily use of the GUI leaves exited and lost agents in the list with no way to re
 - `AgentList.replaced: map<old id, newest successor>`: the durable restart record, so a client that missed `AgentRemoved` can still follow a restart. Chains are collapsed on write, so one lookup suffices.
 - `AgentRemoved` may arrive before `AgentExited` for the same id in a narrow window; clients treat it as authoritative and relist.
 
+### GUI following
+
+- A pane restarting its agent with ⌘R gets the successor from its own `Restarted` reply, so the control connection's `AgentRemoved` moves the layout to the successor without attaching it. If the pane's connection drops before that reply, the pane link sends `UiEvent::LaunchDropped(pane)` (same for a spawn into the pane): the app drops what was on its way into the pane and attaches the agent the layout names, which is the successor if it was announced already, else the old agent until `AgentRemoved` moves it on.
+- After each list, a pane whose agent is neither listed nor replaced is emptied unless a spawn, restart or attach to another agent is on its way into it: a lost pane at once, a pane showing its agent's final screen only when two lists in a row left the agent out (so an agent spawned after a list was taken, which exited before the next one, keeps its pane).
+
 ### Store: schema v3
 
 - `agents.id` becomes `INTEGER PRIMARY KEY AUTOINCREMENT`: **ids are never reused**, including after failed spawns, so a stale id held by a script, an agent or a saved layout can only be refused, never hit an unrelated agent. A fresh state DB is created directly at v3; v1 and v2 databases migrate in place, keeping rows and `agent_labels`.
@@ -25,16 +30,18 @@ Daily use of the GUI leaves exited and lost agents in the list with no way to re
 
 ### Restart
 
-1. Refuse an id that is unknown (`Error "unknown agent"`), still running, or not yet settled: `forget` and `restart` refuse ids in `agents.live`, `histories.spawning` or being restarted (`WouldBlock "agent {id} is being restarted"`, per-id `restarting` guard). The store row alone is not trusted for "not running".
+1. Refuse, checked under the agents lock in this order: an id being restarted (per-id `restarting` guard) → `WouldBlock` "agent {id} is being restarted"; an id with no store row → `NotFound` "unknown agent {id}"; an id whose row says running, or that is still in `agents.live` or `histories.spawning` (its row may already say exited) → `InvalidInput` "agent {id} is running". The store row alone is not trusted for "not running".
 2. Read program, args, cwd and labels from the store. **Labels are not re-validated**: they were validated when set, so the spec's "validated without the reserved check" is superseded. The stored cwd must be a directory, else `NotFound`: portable-pty would silently fall back to `$HOME`. Plain spawn keeps that fallback.
 3. Spawn outside the agents lock (it waits on the base environment and PTY spawn, and must not block `on_exit`). A failed spawn leaves the old agent untouched.
-4. One store transaction: delete the old row and labels, write the replacement. Then delete the old final screen, history directory and scrollback ring, and announce `AgentRemoved { old, replaced_by }`.
+4. One store transaction: delete the old row and labels, write the replacement. Then delete the old final screen, history directory and scrollback ring, and announce `AgentRemoved { old, replaced_by }`. If the transaction fails, the restart still succeeds (the new agent runs) but nothing is announced: `Node::restart` reports `replaced: false`, the old agent stays listed and unreplaced, and the server answers `Restarted` without queueing `AgentRemoved` to the requester either.
 
 A crash between steps 3 and 4 leaves both rows (old exited, new running), never neither.
 
 ### Forget
 
-For each non-running id: drop it from `Agents.exited`, delete the store row, the history directory (closing an open handle) and `<state>/scrollback/<id>.ring` (raw output, may contain secrets; never deleted before). Then announce `AgentRemoved`.
+For each id, under the agents lock: refuse it if it is in `agents.live`, `histories.spawning` or being restarted, or if the store has no non-running row for it (unknown, or its row says running). A refused id goes into `Forgotten.refused`, untouched; there is no per-id reason, so `fleet rm` reports it as "not removed (running or unknown)" even when it was refused for being mid-restart. Otherwise: delete the store row, then drop it from `Agents.exited` and delete the history directory (closing an open handle) and `<state>/scrollback/<id>.ring` (raw output, may contain secrets; never deleted before), and announce `AgentRemoved`.
+
+A store error stops the loop. The request is answered with an `Error` (not `Forgotten`: the request failed, and a partial success would hide that), but the ids forgotten before it were already announced to other connections, so the requester's `AgentRemoved` for each of them is still queued after the `Error`. `Node::forget` returns them in `ForgetError.partial`.
 
 ### Environment is not restored
 

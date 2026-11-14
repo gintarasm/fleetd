@@ -15,6 +15,6 @@ Builds on [0028](0028-gui-client.md) and [0016](0016-crate-layout.md). Spec: `do
 
 ## Consequences
 
-- The core can be compiled and tested without a display, and later exposed through uniffi.
+- The core's source names no toolkit API, so its logic can be tested without a window (its unit tests build no gpui context) and could later move to its own crate and be exposed through uniffi. It does not yet build without gpui: `src/core` lives in the `fleet-gui` crate, which depends on gpui, so building or testing it still compiles gpui; the guard only keeps that move a matter of moving files.
 - Anything that needs the toolkit goes in `src/app`, even when it is small; the core takes plain data in and returns plain data out.
 - The test is textual: it does not catch a toolkit type reached through a re-export. Review still matters.
