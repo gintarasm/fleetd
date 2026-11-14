@@ -1522,8 +1522,54 @@ pub struct Removed {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ForgetOutcome {
     pub forgotten: Vec<u64>,
-    /// Running or unknown agents, left untouched.
+    /// Running, unknown or being-restarted agents, left untouched.
     pub refused: Vec<u64>,
+}
+
+/// [`Node::forget`] failed: `partial` is what it did before the error
+/// (each id in `partial.forgotten` was removed and announced).
+#[derive(Debug)]
+pub struct ForgetError {
+    pub error: io::Error,
+    pub partial: ForgetOutcome,
+}
+
+impl std::fmt::Display for ForgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ForgetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<io::Error> for ForgetError {
+    fn from(error: io::Error) -> Self {
+        ForgetError {
+            error,
+            partial: ForgetOutcome::default(),
+        }
+    }
+}
+
+impl From<ForgetError> for io::Error {
+    fn from(e: ForgetError) -> Self {
+        e.error
+    }
+}
+
+/// The result of [`Node::restart`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestartOutcome {
+    /// The new agent.
+    pub info: AgentInfo,
+    /// The store recorded the new agent as replacing the old one: the old
+    /// one is forgotten and its [`Removed`] announced. `false` if recording
+    /// failed: both agents stay known and nothing is announced.
+    pub replaced: bool,
 }
 
 #[derive(Default)]
@@ -1701,9 +1747,9 @@ impl Node {
         cols: u32,
         rows: u32,
         origin: Option<ConnId>,
-    ) -> io::Result<AgentInfo> {
+    ) -> io::Result<RestartOutcome> {
         self.restart_with(id, cols, rows, None, origin)
-            .map(|(info, _)| info)
+            .map(|(out, _)| out)
     }
 
     /// [`Node::restart`], with the new agent attached by `conn` as for
@@ -1715,8 +1761,8 @@ impl Node {
         rows: u32,
         conn: ConnId,
         before_start: impl FnOnce(u64),
-    ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
-        let (info, attached) = self.restart_with(
+    ) -> io::Result<(RestartOutcome, AttachOk, Subscription)> {
+        let (out, attached) = self.restart_with(
             id,
             cols,
             rows,
@@ -1724,7 +1770,7 @@ impl Node {
             Some(conn),
         )?;
         let (ok, sub) = attached.expect("an attached start returns its attachment");
-        Ok((info, ok, sub))
+        Ok((out, ok, sub))
     }
 
     fn restart_with(
@@ -1734,7 +1780,7 @@ impl Node {
         rows: u32,
         attach: Option<(ConnId, BeforeStart<'_>)>,
         origin: Option<ConnId>,
-    ) -> io::Result<(AgentInfo, Option<(AttachOk, Subscription)>)> {
+    ) -> io::Result<(RestartOutcome, Option<(AttachOk, Subscription)>)> {
         let (old, _restarting) = {
             let mut agents = lock(&self.agents);
             if agents.restarting.contains(&id) {
@@ -1795,7 +1841,11 @@ impl Node {
         if let Err(e) = lock(&self.store).replace_agent(id, info.id) {
             // Both agents stay known: never neither.
             warn!(agent = id, replaced_by = info.id, error = %e, "recording the restart failed");
-            return Ok((info, attached));
+            let out = RestartOutcome {
+                info,
+                replaced: false,
+            };
+            return Ok((out, attached));
         }
         self.drop_agent_files(id);
         info!(agent = id, replaced_by = info.id, "agent restarted");
@@ -1807,7 +1857,11 @@ impl Node {
             },
             origin,
         });
-        Ok((info, attached))
+        let out = RestartOutcome {
+            info,
+            replaced: true,
+        };
+        Ok((out, attached))
     }
 
     /// Spawns an agent; with `attach`, also attaches to it before the process
@@ -1991,20 +2045,22 @@ impl Node {
     /// are deleted and a [`Removed`] is announced for each. Running and
     /// unknown agents are refused, never killed. With `exited_only`, `ids`
     /// must be empty and every non-running agent matching `selector` is
-    /// forgotten.
+    /// forgotten. A store error stops it; the [`ForgetError`] carries the
+    /// agents forgotten (and announced) before it.
     pub fn forget(
         &self,
         ids: &[u64],
         exited_only: bool,
         selector: &Labels,
         origin: Option<ConnId>,
-    ) -> io::Result<ForgetOutcome> {
+    ) -> Result<ForgetOutcome, ForgetError> {
         let targets: Vec<u64> = if exited_only {
             if !ids.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "exited_only cannot be combined with agent ids",
-                ));
+                )
+                .into());
             }
             self.list_matching(selector)?
                 .into_iter()
@@ -2024,8 +2080,21 @@ impl Node {
             let busy = agents.live.contains_key(&id)
                 || agents.restarting.contains(&id)
                 || lock(&self.histories).spawning.contains(&id);
-            let gone = !busy && lock(&self.store).forget_agent(id).map_err(store_err)?;
+            let gone = if busy {
+                Ok(false)
+            } else {
+                lock(&self.store).forget_agent(id)
+            };
             drop(agents);
+            let gone = match gone {
+                Ok(gone) => gone,
+                Err(e) => {
+                    return Err(ForgetError {
+                        error: store_err(e),
+                        partial: out,
+                    });
+                }
+            };
             if !gone {
                 out.refused.push(id);
                 continue;
@@ -2338,6 +2407,69 @@ mod tests {
         assert_eq!(out.refused, vec![id]);
         lock(&node.agents).restarting.remove(&id);
         assert!(node.restart(id, 0, 0, None).is_ok());
+        node.shutdown();
+    }
+
+    /// Runs `sql` on a second connection to the node's state DB (e.g. a
+    /// trigger that makes a store write fail).
+    fn inject(dir: &Path, sql: &str) {
+        rusqlite::Connection::open(dir.join("state.db"))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    /// An agent that ran and was retired (its exit event is sent after).
+    fn exited(node: &Node) -> u64 {
+        let mut exits = node.exit_events();
+        let id = spawn_sized(node, 80, 24).unwrap().id;
+        node.kill(id).unwrap();
+        while exits.blocking_recv().unwrap().agent_id != id {}
+        id
+    }
+
+    #[test]
+    fn restart_whose_record_fails_says_so_and_announces_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let old = exited(&node);
+        let mut removed = node.removed_events();
+        inject(
+            dir.path(),
+            "CREATE TRIGGER no_replace BEFORE INSERT ON agent_replacements \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        );
+        let out = node.restart(old, 0, 0, None).unwrap();
+        assert!(!out.replaced);
+        assert_ne!(out.info.id, old);
+        // Both agents stay known, and nobody is told the old one is gone.
+        let ids: Vec<u64> = node.list().unwrap().iter().map(|a| a.id).collect();
+        assert!(ids.contains(&old) && ids.contains(&out.info.id), "{ids:?}");
+        assert!(node.replacements().unwrap().is_empty());
+        assert!(removed.try_recv().is_err());
+        node.shutdown();
+    }
+
+    #[test]
+    fn forget_that_fails_midway_reports_what_it_forgot() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let (a, b, c) = (exited(&node), exited(&node), exited(&node));
+        inject(
+            dir.path(),
+            &format!(
+                "CREATE TRIGGER no_forget BEFORE DELETE ON agents WHEN OLD.id = {b} \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+            ),
+        );
+        let e = node
+            .forget(&[a, b, c], false, &Labels::new(), None)
+            .unwrap_err();
+        assert_eq!(e.partial.forgotten, vec![a]);
+        assert!(e.partial.refused.is_empty());
+        assert!(e.to_string().contains("injected"), "{e}");
+        let ids: Vec<u64> = node.list().unwrap().iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![b, c]);
         node.shutdown();
     }
 

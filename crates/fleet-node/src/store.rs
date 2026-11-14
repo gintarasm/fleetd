@@ -138,23 +138,8 @@ impl Store {
             // shows in the daemon's idle RSS.
             return self.create_v3();
         }
-        if version < 1 {
-            self.conn.execute_batch(
-                "BEGIN;
-                 CREATE TABLE agents (
-                     id INTEGER PRIMARY KEY,
-                     program TEXT NOT NULL,
-                     args_json TEXT NOT NULL,
-                     cwd TEXT NOT NULL,
-                     state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
-                     exit_code INTEGER,
-                     created_unix_ms INTEGER NOT NULL,
-                     scrollback_path TEXT NOT NULL
-                 );
-                 PRAGMA user_version = 1;
-                 COMMIT;",
-            )?;
-        }
+        // An existing DB is at v1 or later here (v1 created the `agents`
+        // table); it migrates in place.
         if version < 2 {
             self.conn.execute_batch(
                 "BEGIN;

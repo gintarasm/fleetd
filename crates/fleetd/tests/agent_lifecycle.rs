@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use fleet_proto::{
-    AgentInfo, AgentList, AgentRemoved, AgentState, ForgetAgents, Forgotten, Frame, FrameCodec,
-    Hello, ListAgents, PROTOCOL_VERSION, Request, RestartAgent, Restarted, SpawnAgent, event,
-    request, response,
+    AgentInfo, AgentList, AgentRemoved, ForgetAgents, Forgotten, Frame, FrameCodec, Hello,
+    ListAgents, PROTOCOL_VERSION, Request, RestartAgent, Restarted, SpawnAgent, event, request,
+    response,
 };
 use tempfile::TempDir;
 use tokio_util::codec::{Decoder, Encoder};
@@ -221,20 +221,25 @@ impl Client {
     }
 }
 
-/// Polls `list` until the agent leaves the running state.
+/// Waits for the agent's exit event (read now or earlier). The node sends
+/// it once the agent is retired, unlike the list, whose row says exited a
+/// moment before restart and forget stop refusing the agent as running.
 fn wait_not_running(c: &mut Client, id: u64) {
-    let deadline = Instant::now() + TIMEOUT;
+    let is_exit = |f: &Frame| {
+        matches!(f, Frame::Event(fleet_proto::Event {
+            kind: Some(event::Kind::Exited(e)),
+        }) if e.agent_id == id)
+    };
+    if let Some(i) = c.pending.iter().position(is_exit) {
+        c.pending.remove(i);
+        return;
+    }
     loop {
-        let list = c.list();
-        let info = list
-            .iter()
-            .find(|a| a.id == id)
-            .unwrap_or_else(|| panic!("agent {id} not listed"));
-        if info.state() != AgentState::Running {
-            return;
+        match c.read_frame() {
+            Some(f) if is_exit(&f) => return,
+            Some(f) => c.pending.push_back(f),
+            None => panic!("closed before agent {id} exited"),
         }
-        assert!(Instant::now() < deadline, "agent {id} still running");
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -346,4 +351,71 @@ fn restart_running_is_an_error() {
         response::Kind::Error(e) => assert!(e.message.contains("is running"), "{}", e.message),
         other => panic!("expected Error, got {other:?}"),
     }
+}
+
+/// Runs `sql` on a second connection to the daemon's state DB (e.g. a
+/// trigger that makes a store write fail).
+fn inject(dir: &Path, sql: &str) {
+    rusqlite::Connection::open(dir.join("state.db"))
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+}
+
+#[test]
+fn restart_whose_record_fails_announces_no_removal() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let old = a.sh("exit 0").id;
+    wait_not_running(&mut a, old);
+    inject(
+        dir.path(),
+        "CREATE TRIGGER no_replace BEFORE INSERT ON agent_replacements \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    );
+    let new = restarted(a.restart(old, false)).agent.unwrap().id;
+    // Anything queued after the reply precedes the list's reply.
+    let list = a.list_full();
+    assert!(a.pending_removed().is_empty(), "{:?}", a.pending_removed());
+    assert!(list.replaced.is_empty());
+    let ids: Vec<u64> = list.agents.iter().map(|x| x.id).collect();
+    assert!(ids.contains(&old) && ids.contains(&new), "{ids:?}");
+}
+
+#[test]
+fn forget_that_fails_midway_announces_what_it_forgot() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let mut b = Client::open(dir.path());
+    let e1 = a.sh("exit 0").id;
+    let e2 = a.sh("exit 0").id;
+    wait_not_running(&mut a, e1);
+    wait_not_running(&mut a, e2);
+    inject(
+        dir.path(),
+        &format!(
+            "CREATE TRIGGER no_forget BEFORE DELETE ON agents WHEN OLD.id = {e2} \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        ),
+    );
+    match a.request(request::Kind::Forget(ForgetAgents {
+        ids: vec![e1, e2],
+        exited_only: false,
+        selector: HashMap::new(),
+    })) {
+        response::Kind::Error(e) => assert!(e.message.contains("injected"), "{}", e.message),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    let removed = AgentRemoved {
+        agent_id: e1,
+        replaced_by: None,
+    };
+    // The requester is told of what was forgotten, after the reply.
+    assert!(a.pending_removed().is_empty());
+    let ids: Vec<u64> = a.list().iter().map(|x| x.id).collect();
+    assert_eq!(a.pending_removed(), vec![removed]);
+    assert_eq!(ids, vec![e2]);
+    assert_eq!(b.removed_event(), removed);
 }

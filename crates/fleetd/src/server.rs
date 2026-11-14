@@ -490,7 +490,8 @@ impl Connection {
     /// Restarts an exited or lost agent, attached if asked (as
     /// [`Connection::spawn_attached`]). The old agent's `AgentRemoved` is
     /// queued right after the reply; other connections get it from the
-    /// broadcast.
+    /// broadcast. If the node could not record the replacement, the old
+    /// agent stays known and none is queued (the node announces none).
     async fn restart(&mut self, id: u64, r: RestartAgent) -> bool {
         let old_id = r.agent_id;
         let conn = self.id;
@@ -506,7 +507,7 @@ impl Connection {
             })
             .await;
             match restarted {
-                Ok((Ok((info, ok, sub)), _)) => (info, Some((ok, sub))),
+                Ok((Ok((out, ok, sub)), _)) => (out, Some((ok, sub))),
                 Ok((Err(e), started)) => {
                     if let Some(agent_id) = started {
                         lock(&self.attached).remove(&agent_id);
@@ -521,13 +522,17 @@ impl Connection {
             })
             .await
             {
-                Ok(info) => (info, None),
+                Ok(out) => (out, None),
                 Err(e) => return self.respond(id, error(e.to_string())).await,
             }
         };
+        let replaced = info.replaced;
+        let info = info.info;
         let new_id = info.id;
         info!(agent = new_id, old = old_id, conn = self.id.0, "restarted");
-        self.forget_local(old_id).await;
+        if replaced {
+            self.forget_local(old_id).await;
+        }
         let (ok, sub) = match attached {
             Some((ok, sub)) => (Some(ok), Some(sub)),
             None => (None, None),
@@ -540,7 +545,7 @@ impl Connection {
         if !self.respond(id, reply).await {
             return false;
         }
-        if !self.queue_removed(old_id, Some(new_id)).await {
+        if replaced && !self.queue_removed(old_id, Some(new_id)).await {
             return false;
         }
         if let Some(sub) = sub {
@@ -550,28 +555,33 @@ impl Connection {
     }
 
     /// Forgets exited or lost agents; their `AgentRemoved` events are queued
-    /// right after the reply.
+    /// right after the reply. A store error midway is answered with an
+    /// `Error`, still followed by `AgentRemoved` for the agents forgotten
+    /// before it (other connections got theirs from the broadcast).
     async fn forget(&mut self, id: u64, f: ForgetAgents) -> bool {
         let conn = self.id;
         let outcome = blocking(&self.node, move |n| {
-            n.forget(&f.ids, f.exited_only, &f.selector, Some(conn))
+            Ok(n.forget(&f.ids, f.exited_only, &f.selector, Some(conn)))
         })
         .await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
+        let (forgotten, reply) = match outcome {
+            Ok(Ok(outcome)) => (
+                outcome.forgotten.clone(),
+                response::Kind::Forgotten(Forgotten {
+                    ids: outcome.forgotten,
+                    refused: outcome.refused,
+                }),
+            ),
+            Ok(Err(e)) => (e.partial.forgotten, error(e.error.to_string())),
             Err(e) => return self.respond(id, error(e.to_string())).await,
         };
-        for &agent_id in &outcome.forgotten {
+        for &agent_id in &forgotten {
             self.forget_local(agent_id).await;
         }
-        let reply = response::Kind::Forgotten(Forgotten {
-            ids: outcome.forgotten.clone(),
-            refused: outcome.refused,
-        });
         if !self.respond(id, reply).await {
             return false;
         }
-        for agent_id in outcome.forgotten {
+        for agent_id in forgotten {
             if !self.queue_removed(agent_id, None).await {
                 return false;
             }

@@ -107,7 +107,7 @@ fn forget_exited_only_with_ids_is_invalid() {
     let dir = tempfile::tempdir().unwrap();
     let node = Node::open(dir.path()).unwrap();
     let e = node.forget(&[1], true, &Labels::new(), None).unwrap_err();
-    assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(e.error.kind(), io::ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -218,6 +218,8 @@ fn restart_replaces_exited_agent() {
         .find(|a| a.id == old)
         .unwrap();
     let new = node.restart(old, 0, 0, None).unwrap();
+    assert!(new.replaced);
+    let new = new.info;
     assert_ne!(new.id, old);
     assert_eq!(new.program, before.program);
     assert_eq!(new.args, before.args);
@@ -297,7 +299,7 @@ fn concurrent_restart_creates_one_agent() {
     assert_eq!(oks.len(), 1, "{results:?}");
     let listed = node.list().unwrap();
     assert_eq!(listed.len(), 1, "{listed:?}");
-    assert_eq!(listed[0].id, oks[0].id);
+    assert_eq!(listed[0].id, oks[0].info.id);
     assert_ne!(listed[0].id, old);
 }
 
@@ -313,9 +315,10 @@ fn restart_attached_gets_first_output() {
     node.kill(old).unwrap();
     wait_exited(&mut exits, old);
     let mut started = None;
-    let (info, ok, mut sub) = node
+    let (out, ok, mut sub) = node
         .restart_attached(old, 80, 24, ConnId(7), |id| started = Some(id))
         .unwrap();
+    let info = out.info;
     assert_eq!(started, Some(info.id));
     assert_eq!(ok.agent_id, info.id);
     assert!(ok.primary);
@@ -339,7 +342,8 @@ fn restart_attached_announces_origin() {
     let node = Node::open(dir.path()).unwrap();
     let mut removed = node.removed_events();
     let old = spawn_exited(&node, &[]);
-    let (info, _ok, _sub) = node.restart_attached(old, 0, 0, ConnId(7), |_| {}).unwrap();
+    let (out, _ok, _sub) = node.restart_attached(old, 0, 0, ConnId(7), |_| {}).unwrap();
+    let info = out.info;
     let Removed { event, origin } = removed.blocking_recv().unwrap();
     assert_eq!(event.agent_id, old);
     assert_eq!(event.replaced_by, Some(info.id));
@@ -362,7 +366,7 @@ fn restart_does_not_restore_env() {
         .id;
     wait_exited(&mut exits, old);
     wait_screen(&node, old, "secret=[s3cr3tv4lue]");
-    let new = node.restart(old, 0, 0, None).unwrap();
+    let new = node.restart(old, 0, 0, None).unwrap().info;
     let screen = wait_screen(&node, new.id, "done");
     assert!(screen.contains("secret=[]"), "{screen:?}");
     assert!(!screen.contains("s3cr3tv4lue"), "{screen:?}");
