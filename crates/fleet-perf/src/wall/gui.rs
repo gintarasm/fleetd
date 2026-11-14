@@ -11,14 +11,13 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use fleet_proto::{SpawnAgent, request, response};
+use fleet_proto::{KillAgent, SpawnAgent, request, response};
 
 use super::Reaped;
-use super::daemon::{COLS, Client, Daemon, ROWS, Streams, spawn_fake_agent};
+use super::daemon::{COLS, Client, Daemon, ROWS, Streams, spawn_fake};
 
 /// Idle agents listed in the sidebar during `gui_cold_start_ns`.
 const COLD_START_AGENTS: usize = 10;
@@ -201,16 +200,20 @@ pub(super) fn input_to_render_ns(fleetd: &Path, gui: &Path) -> Result<f64, Strin
 }
 
 /// `input_to_render_flood50_ns`: the `input` hook while `agents`
-/// `fake-agent --ansi --bytes <bytes>` flood (spawned on their own
-/// connection, which consumes everything until all exit), the GUI also
-/// showing [`FLOOD_PANES`] of them. Unless `quick`, the GUI must finish
-/// its samples before the flood ends.
+/// `fake-agent --ansi --forever` flood (spawned on their own connection,
+/// which consumes everything until all exit), the GUI also showing
+/// [`FLOOD_PANES`] of them. The floods run until the GUI has printed its
+/// result and are then killed, so every sample is taken during the flood;
+/// unless `quick`, it is an error if any flood agent exited before that.
+///
+/// `_bytes` is not used: a fixed-size flood (8 MiB per agent lasts ~3 s)
+/// raced the GUI's start, attaches and samples (~1.4 s).
 pub(super) fn input_to_render_flood_ns(
     fleetd: &Path,
     gui: &Path,
     fake_agent: &Path,
     agents: usize,
-    bytes: u64,
+    _bytes: u64,
     quick: bool,
 ) -> Result<f64, String> {
     let daemon = Daemon::start(fleetd)?;
@@ -221,34 +224,34 @@ pub(super) fn input_to_render_flood_ns(
     let mut flood_client = Client::connect(&daemon.sock)?;
     let mut flood_streams = Streams::default();
     let mut ids = Vec::with_capacity(agents);
+    let flood_start = Instant::now();
     for i in 0..agents {
-        ids.push(spawn_fake_agent(
+        ids.push(spawn_fake(
             &mut flood_client,
             &mut flood_streams,
             fake_agent,
-            bytes,
+            &["--forever".into()],
             i,
         )?);
     }
-    let done = Arc::new(AtomicBool::new(false));
+    // Flood agents that have exited so far, with their exit codes.
+    let exited: Arc<Mutex<Vec<(u64, i32)>>> = Arc::default();
     let flood = std::thread::spawn({
         let ids: HashSet<u64> = ids.iter().copied().collect();
-        let done = Arc::clone(&done);
+        let exited = Arc::clone(&exited);
         move || -> Result<(), String> {
-            let r = (|| {
-                while !ids.iter().all(|id| flood_streams.exited.contains_key(id)) {
-                    if let Some(r) = flood_streams.take(flood_client.recv()?)? {
-                        return Err(format!("unexpected response {r:?}"));
+            let mut seen = HashSet::new();
+            while seen.len() < ids.len() {
+                if let Some(r) = flood_streams.take(flood_client.recv()?)? {
+                    return Err(format!("unexpected response {r:?}"));
+                }
+                for (&id, &code) in &flood_streams.exited {
+                    if ids.contains(&id) && seen.insert(id) {
+                        lock(&exited).push((id, code));
                     }
                 }
-                Ok(())
-            })();
-            done.store(true, Ordering::Release);
-            r?;
-            match flood_streams.exited.iter().find(|(_, code)| **code != 0) {
-                Some((id, code)) => Err(format!("agent {id} exited with {code}")),
-                None => Ok(()),
             }
+            Ok(())
         }
     });
 
@@ -266,19 +269,38 @@ pub(super) fn input_to_render_flood_ns(
         ],
     };
     let result = run.run("input_ns ");
-    let during_flood = !done.load(Ordering::Acquire);
+    let gui_done = flood_start.elapsed();
+    let early = lock(&exited).clone();
     let line = result?.0;
+    for &agent_id in &ids {
+        let req = client.request(request::Kind::Kill(KillAgent { agent_id }))?;
+        streams.wait(&mut client, req)?;
+    }
     flood
         .join()
         .map_err(|_| "flood thread panicked".to_string())??;
-    if !during_flood {
-        let msg = "input to render: the flood ended before the GUI finished its samples";
+    eprintln!(
+        "fleet-perf: input to render (flood): GUI done {:.2} s after the first \
+         flood spawn, {} of {agents} flood agents still running",
+        gui_done.as_secs_f64(),
+        agents - early.len()
+    );
+    if !early.is_empty() {
+        let msg = format!(
+            "input to render: {} of {agents} flood agents exited before the GUI \
+             finished its samples (agent id, exit code): {early:?}",
+            early.len()
+        );
         if !quick {
-            return Err(msg.into());
+            return Err(msg);
         }
         eprintln!("fleet-perf: {msg}");
     }
     parse_input_ns(&line)
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

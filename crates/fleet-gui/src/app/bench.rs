@@ -12,7 +12,8 @@
 //!
 //! In bench mode the connect sheet never shows: a failed connect exits
 //! [`EXIT_NO_FLEETD`]; a bench that does not finish within [`WATCHDOG`]
-//! exits [`EXIT_TIMEOUT`].
+//! exits [`EXIT_TIMEOUT`]. The window floats above other apps' windows
+//! ([`window_opened`]): an occluded window presents no frames.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -130,6 +131,43 @@ pub fn connect_failed(reason: Option<&str>) -> ! {
         reason.unwrap_or("no saved connection, no local fleetd")
     );
     std::process::exit(EXIT_NO_FLEETD);
+}
+
+/// The workspace window opened. In bench mode it floats above other apps'
+/// windows on every Space: gpui stops a window's display link while it is
+/// occluded, so a window opened behind another app's (fleet-gui is
+/// launched from the background and not activated) presents no frame and
+/// the bench hits [`WATCHDOG`]. The app is not activated: that costs the
+/// cold start ~15-20 ms, and the bench dispatches its keys itself.
+pub fn window_opened(window: &Window) {
+    if active() {
+        raise(window);
+    }
+}
+
+fn raise(window: &Window) {
+    use objc2_app_kit::{NSFloatingWindowLevel, NSView, NSWindowCollectionBehavior};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: gpui's AppKit handle points at the window's live content
+    // view, and this runs on the main thread (gpui's foreground).
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    let Some(ns_window) = view.window() else {
+        return;
+    };
+    ns_window.setLevel(NSFloatingWindowLevel);
+    ns_window.setCollectionBehavior(
+        ns_window.collectionBehavior()
+            | NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    ns_window.orderFrontRegardless();
 }
 
 fn finish(line: &str) -> ! {

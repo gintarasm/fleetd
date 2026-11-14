@@ -56,6 +56,7 @@ pub fn open_main_window(cx: &mut App) {
     };
     let state = app.clone();
     match cx.open_window(options, |window, cx| {
+        super::bench::window_opened(window);
         cx.new(|cx| Workspace::new(state, window, cx))
     }) {
         Ok(handle) => app.update(cx, |a, _| a.window = Some(handle)),
