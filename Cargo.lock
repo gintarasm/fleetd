@@ -1954,6 +1954,7 @@ dependencies = [
  "clap",
  "fleet-client",
  "fleet-proto",
+ "fleet-term",
  "gpui",
  "libc",
  "objc2",
