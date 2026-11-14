@@ -23,12 +23,19 @@ pub fn default_state_dir() -> PathBuf {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuiState {
+    /// Entries that do not parse are dropped.
+    #[serde(deserialize_with = "lenient_targets")]
     pub recent_targets: Vec<Target>,
     /// Keyed by target string.
     pub recent_dirs: BTreeMap<String, Vec<String>>,
     /// Keyed by target string. Entries that do not parse (old or unknown shape) are dropped.
     #[serde(deserialize_with = "lenient_layouts")]
     pub layouts: BTreeMap<String, SavedLayout>,
+}
+
+fn lenient_targets<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Target>, D::Error> {
+    let raw = Vec::<toml::Value>::deserialize(d)?;
+    Ok(raw.into_iter().filter_map(|v| v.try_into().ok()).collect())
 }
 
 fn lenient_layouts<'de, D: Deserializer<'de>>(
@@ -142,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_layout_data_loads_as_default_layout_or_dropped() {
+    fn unknown_layout_entry_is_dropped_rest_loads() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("gui-state.toml"),
@@ -161,5 +168,18 @@ mod tests {
         assert_eq!(v, [3, 1, 2]);
         push_recent(&mut v, 9, 3);
         assert_eq!(v, [9, 3, 1]);
+    }
+
+    #[test]
+    fn bad_recent_target_entry_is_dropped_rest_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("gui-state.toml"),
+            "recent_targets = [\"ftp://x\", \"local\", 5]\n[recent_dirs]\nlocal = [\"/a\"]\n",
+        )
+        .unwrap();
+        let s = GuiState::load(dir.path());
+        assert_eq!(s.recent_targets, [Target::Local]);
+        assert_eq!(s.recent_dirs["local"], ["/a"]);
     }
 }

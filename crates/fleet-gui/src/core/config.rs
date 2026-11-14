@@ -78,11 +78,14 @@ pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
             format!("{}: {e}", path.display()),
         )
     })?;
-    if !doc.contains_table("gui") {
+    if doc.get("gui").and_then(|i| i.as_table_like()).is_none() {
         doc["gui"] = toml_edit::table();
     }
-    doc["gui"]["connection"] = toml_edit::value(target.to_string());
-    write_atomic(&path, doc.to_string().as_bytes(), 0o644)
+    let gui = doc["gui"].as_table_like_mut().expect("gui is a table");
+    gui.insert("connection", toml_edit::value(target.to_string()));
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o777);
+    write_atomic(&path, doc.to_string().as_bytes(), mode)
 }
 
 #[cfg(test)]
@@ -148,5 +151,27 @@ mod tests {
             load_config(dir.path()).unwrap().connection,
             Some(Target::Local)
         );
+    }
+
+    #[test]
+    fn save_connection_preserves_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\nfont_size = 15\n");
+        let path = dir.path().join("config.toml");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        save_connection(dir.path(), &Target::Local).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn save_connection_keeps_inline_gui_table_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "gui = { font_size = 15 }\n");
+        save_connection(dir.path(), &Target::Local).unwrap();
+        let c = load_config(dir.path()).unwrap();
+        assert_eq!(c.font_size, 15.0);
+        assert_eq!(c.connection, Some(Target::Local));
     }
 }
