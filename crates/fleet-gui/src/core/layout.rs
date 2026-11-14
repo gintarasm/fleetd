@@ -208,7 +208,7 @@ impl Node {
 const MAX_SAVED_DEPTH: usize = 16;
 
 /// Builds a tree from saved form, keeping the first `budget` leaves
-/// (reading order). `Err` if nested deeper than `MAX_SAVED_DEPTH`.
+/// (tree order). `Err` if nested deeper than `MAX_SAVED_DEPTH`.
 fn from_saved_node(s: &SavedNode, budget: &mut usize, depth: usize) -> Result<Option<Node>, ()> {
     if depth > MAX_SAVED_DEPTH {
         return Err(());
@@ -285,11 +285,26 @@ impl Layout {
         self.root.close(pane)
     }
 
-    /// Panes in reading order (top-left first).
+    /// Panes in reading order (top-left first): by row, then left to
+    /// right, from where each pane sits, not from how the tree was split.
     pub fn panes(&self) -> Vec<PaneId> {
-        let mut v = Vec::new();
-        self.root.leaves(&mut v);
-        v
+        let mut rects = self.rects(1.0, 1.0);
+        rects.sort_by(|(_, a), (_, b)| a.y.total_cmp(&b.y));
+        // Tops within EPS of a row's first top share that row.
+        let mut row = 0usize;
+        let mut row_top = f32::NEG_INFINITY;
+        let mut keyed: Vec<(usize, f32, PaneId)> = rects
+            .into_iter()
+            .map(|(p, r)| {
+                if r.y - row_top > EPS {
+                    row += 1;
+                    row_top = r.y;
+                }
+                (row, r.x, p)
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        keyed.into_iter().map(|(_, _, p)| p).collect()
     }
 
     /// 1-based number of `pane` in reading order.
@@ -349,7 +364,7 @@ impl Layout {
     }
 
     /// Rebuilds a layout; more than `MAX_PANES` leaves are truncated to the
-    /// first four. A corrupt one (a pane id twice, or nested too deep)
+    /// first four in tree order. A corrupt one (a pane id twice, or nested too deep)
     /// gives [`Layout::single`].
     pub fn from_saved(saved: &SavedLayout) -> Layout {
         let mut budget = MAX_PANES;
@@ -413,6 +428,36 @@ mod tests {
         assert_eq!(l.close(a), Some(a));
         assert_eq!(l.panes(), vec![a]);
         assert_eq!(l.agent(a), None);
+    }
+
+    #[test]
+    fn grid_numbers_row_major() {
+        // Built depth-first as a | b, then a / c, b / d: a 2x2 grid.
+        let (l, [a, b, c, d]) = four();
+        assert_eq!(l.panes(), vec![a, b, c, d]);
+        assert_eq!(l.pane_number(a), Some(1));
+        assert_eq!(l.pane_number(b), Some(2));
+        assert_eq!(l.pane_number(c), Some(3));
+        assert_eq!(l.pane_number(d), Some(4));
+        // Split the other way round: top / bottom, then each side by side.
+        let mut t = Layout::single();
+        let tl = t.panes()[0];
+        let bl = t.split(tl, Axis::Vertical).unwrap();
+        let tr = t.split(tl, Axis::Horizontal).unwrap();
+        let br = t.split(bl, Axis::Horizontal).unwrap();
+        assert_eq!(t.panes(), vec![tl, tr, bl, br]);
+    }
+
+    #[test]
+    fn stacked_left_then_right_numbers_top_row_first() {
+        // (top / bottom) | right: the right pane shares the top row.
+        let mut l = Layout::single();
+        let top = l.panes()[0];
+        let right = l.split(top, Axis::Horizontal).unwrap();
+        let bottom = l.split(top, Axis::Vertical).unwrap();
+        assert_eq!(l.panes(), vec![top, right, bottom]);
+        // Saved and restored, the numbering is the same.
+        assert_eq!(Layout::from_saved(&l.to_saved()).panes(), l.panes());
     }
 
     #[test]

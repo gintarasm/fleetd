@@ -1471,13 +1471,16 @@ mod tests {
         let mut s = setup(cx, &fake, dir.path());
         click(&mut s, "pane-1-split-right");
         assert_eq!(panes(&mut s), [PaneId(1), PaneId(2)]);
-        // Pane 1's button acts on pane 1, though pane 2 has the focus.
+        click(&mut s, "pane-2-split-down");
+        assert_eq!(panes(&mut s), [PaneId(1), PaneId(2), PaneId(3)]);
+        // Pane 1's button acts on pane 1, though pane 3 has the focus.
         click(&mut s, "pane-1-split-down");
-        assert_eq!(panes(&mut s), [PaneId(1), PaneId(3), PaneId(2)]);
-        // Selectors go by pane number: pane id 3 is number 2.
-        click(&mut s, "pane-2-close");
-        assert_eq!(panes(&mut s), [PaneId(1), PaneId(2)]);
-        assert_eq!(fake.calls().last(), Some(&Call::Close(PaneId(3))));
+        // Numbered in reading order: the new bottom-left pane (id 4) is 3.
+        assert_eq!(panes(&mut s), [PaneId(1), PaneId(2), PaneId(4), PaneId(3)]);
+        // Selectors go by pane number: number 3 is pane id 4.
+        click(&mut s, "pane-3-close");
+        assert_eq!(panes(&mut s), [PaneId(1), PaneId(2), PaneId(3)]);
+        assert_eq!(fake.calls().last(), Some(&Call::Close(PaneId(4))));
     }
 
     #[gpui::test]
