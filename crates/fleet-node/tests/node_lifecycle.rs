@@ -45,6 +45,8 @@ fn forget_removes_exited_agent_everywhere() {
     let dir = tempfile::tempdir().unwrap();
     let node = Node::open(dir.path()).unwrap();
     let id = spawn_exited(&node, &[]);
+    let ring = dir.path().join("scrollback").join(format!("{id}.ring"));
+    assert!(ring.exists(), "ring should exist before the forget");
     let before = node.retained_exited_agents();
     let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
     assert_eq!(out.forgotten, vec![id]);
@@ -90,11 +92,14 @@ fn forget_exited_only_respects_selector() {
     let a1 = spawn_exited(&node, &[("project", "a")]);
     let b = spawn_exited(&node, &[("project", "b")]);
     let a2 = spawn_exited(&node, &[("project", "a")]);
+    let running = spawn_sh_labeled(&node, "exec sleep 100", &[("project", "a")]);
     let sel: Labels = [("project".to_string(), "a".to_string())].into();
     let mut out = node.forget(&[], true, &sel, None).unwrap();
     out.forgotten.sort();
     assert_eq!(out.forgotten, vec![a1, a2]);
-    assert_eq!(ids(&node), vec![b]);
+    let mut left = ids(&node);
+    left.sort();
+    assert_eq!(left, vec![b, running]);
 }
 
 #[test]
@@ -131,4 +136,27 @@ fn forgotten_id_is_not_reused() {
     node.forget(&[id], false, &Labels::new(), None).unwrap();
     let next = spawn_exited(&node, &[]);
     assert!(next > id);
+}
+
+#[test]
+fn forget_removes_lost_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let node = Node::open(dir.path()).unwrap();
+        let id = spawn_sh(&node, "exec sleep 100");
+        // Dropping the node without shutdown leaves the row `running`.
+        std::mem::forget(node);
+        id
+    };
+    let node = Node::open(dir.path()).unwrap();
+    let info = node
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == id)
+        .unwrap();
+    assert_eq!(info.state, fleet_proto::AgentState::Lost as i32);
+    let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
+    assert_eq!(out.forgotten, vec![id]);
+    assert!(!ids(&node).contains(&id));
 }

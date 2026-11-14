@@ -1877,7 +1877,15 @@ impl Node {
         };
         let mut out = ForgetOutcome::default();
         for id in targets {
-            let gone = lock(&self.store).forget_agent(id).map_err(store_err)?;
+            // Under the agents lock, so an exit cannot retire the agent
+            // between the check and the delete: an agent still `live` (its
+            // row may already say exited while its pipeline finishes) or
+            // still being spawned is refused.
+            let agents = lock(&self.agents);
+            let busy =
+                agents.live.contains_key(&id) || lock(&self.histories).spawning.contains(&id);
+            let gone = !busy && lock(&self.store).forget_agent(id).map_err(store_err)?;
+            drop(agents);
             if !gone {
                 out.refused.push(id);
                 continue;
@@ -2147,6 +2155,20 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forget_refuses_agent_still_live_after_its_row_says_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let id = spawn_sized(&node, 80, 24).unwrap().id;
+        // The window in `on_exit`: row exited, agent not yet retired.
+        lock(&node.store).set_exited(id, 0).unwrap();
+        let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
+        assert_eq!(out.refused, vec![id]);
+        assert!(out.forgotten.is_empty());
+        assert!(node.list().unwrap().iter().any(|a| a.id == id));
+        node.shutdown();
+    }
 
     fn spawn_sized(node: &Node, cols: u32, rows: u32) -> io::Result<AgentInfo> {
         node.spawn(SpawnAgent {
