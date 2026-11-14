@@ -204,33 +204,42 @@ impl Node {
     }
 }
 
-/// Builds a tree from saved form, keeping the first `budget` leaves (reading order).
-fn from_saved_node(s: &SavedNode, budget: &mut usize) -> Option<Node> {
+/// Deepest saved split nesting read; `MAX_PANES` leaves need far less.
+const MAX_SAVED_DEPTH: usize = 16;
+
+/// Builds a tree from saved form, keeping the first `budget` leaves
+/// (reading order). `Err` if nested deeper than `MAX_SAVED_DEPTH`.
+fn from_saved_node(s: &SavedNode, budget: &mut usize, depth: usize) -> Result<Option<Node>, ()> {
+    if depth > MAX_SAVED_DEPTH {
+        return Err(());
+    }
     if *budget == 0 {
-        return None;
+        return Ok(None);
     }
     match s {
         SavedNode::Leaf { pane, agent } => {
             *budget -= 1;
-            Some(Node::Leaf {
+            Ok(Some(Node::Leaf {
                 pane: PaneId(*pane),
                 agent: *agent,
-            })
+            }))
         }
         SavedNode::Split {
             axis,
             first,
             second,
         } => {
-            let a = from_saved_node(first, budget)?;
-            match from_saved_node(second, budget) {
-                Some(b) => Some(Node::Split {
+            let Some(a) = from_saved_node(first, budget, depth + 1)? else {
+                return Ok(None);
+            };
+            Ok(Some(match from_saved_node(second, budget, depth + 1)? {
+                Some(b) => Node::Split {
                     axis: *axis,
                     first: Box::new(a),
                     second: Box::new(b),
-                }),
-                None => Some(a),
-            }
+                },
+                None => a,
+            }))
         }
     }
 }
@@ -339,14 +348,21 @@ impl Layout {
         }
     }
 
-    /// Rebuilds a layout; more than `MAX_PANES` leaves are truncated to the first four.
+    /// Rebuilds a layout; more than `MAX_PANES` leaves are truncated to the
+    /// first four. A corrupt one (a pane id twice, or nested too deep)
+    /// gives [`Layout::single`].
     pub fn from_saved(saved: &SavedLayout) -> Layout {
         let mut budget = MAX_PANES;
-        let root = from_saved_node(&saved.root, &mut budget).unwrap_or(Node::Leaf {
-            pane: PaneId(1),
-            agent: None,
-        });
+        let Ok(Some(root)) = from_saved_node(&saved.root, &mut budget, 0) else {
+            return Layout::single();
+        };
         let mut l = Layout { root, next_id: 1 };
+        let mut ids = l.panes();
+        ids.sort_unstable_by_key(|p| p.0);
+        ids.dedup();
+        if ids.len() != l.panes().len() {
+            return Layout::single();
+        }
         l.next_id = l.panes().iter().map(|p| p.0).max().unwrap_or(0) + 1;
         l
     }
@@ -483,5 +499,37 @@ mod tests {
         assert_eq!(t.split(PaneId(1), Axis::Vertical), None);
         t.close(PaneId(4));
         assert_eq!(t.split(PaneId(1), Axis::Vertical), Some(PaneId(5)));
+    }
+
+    fn leaf(pane: u32) -> SavedNode {
+        SavedNode::Leaf { pane, agent: None }
+    }
+
+    fn split(first: SavedNode, second: SavedNode) -> SavedNode {
+        SavedNode::Split {
+            axis: Axis::Horizontal,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
+    }
+
+    #[test]
+    fn saved_layout_with_duplicate_pane_ids_falls_back_to_one_pane() {
+        let dup = SavedLayout {
+            root: split(leaf(1), leaf(1)),
+        };
+        assert_eq!(Layout::from_saved(&dup), Layout::single());
+    }
+
+    #[test]
+    fn saved_layout_nested_too_deep_falls_back_to_one_pane() {
+        let mut node = leaf(1);
+        for _ in 0..100_000 {
+            node = split(node, leaf(2));
+        }
+        let deep = SavedLayout { root: node };
+        assert_eq!(Layout::from_saved(&deep), Layout::single());
+        // Dropping the deep tree recurses too; leak it in the test.
+        std::mem::forget(deep);
     }
 }
