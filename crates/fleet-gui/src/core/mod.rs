@@ -11,5 +11,6 @@ mod pane_link;
 pub mod scrollback;
 pub mod selection;
 pub mod session;
+pub mod sidebar;
 pub mod state;
 pub mod target;
