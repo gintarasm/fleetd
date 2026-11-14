@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use fleet_proto::AgentState;
 use fleet_term::Palette;
 use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle};
 
@@ -20,7 +19,7 @@ use crate::core::config::GuiConfig;
 use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent};
-use crate::core::sidebar::tilde;
+use crate::core::sidebar::{ended, tilde};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::target::Target;
 
@@ -45,6 +44,21 @@ pub trait SessionApi: InputSink {
         pane: PaneId,
     ) -> Result<(), String>;
     fn kill(&self, agent_id: u64);
+    /// Restarts an exited agent, unattached (panes follow `AgentRemoved`).
+    fn restart(&self, agent_id: u64);
+    /// Restarts an exited agent at `cols`x`rows`, attached in `pane`.
+    fn restart_in_pane(
+        &self,
+        pane: PaneId,
+        agent_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String>;
+    fn forget(&self, ids: Vec<u64>);
+    /// Forgets every exited or lost agent on the target.
+    fn clear_exited(&self);
+    /// The latest list's old id to newest successor.
+    fn replaced(&self) -> HashMap<u64, u64>;
     fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>>;
     fn attach(&self, pane: PaneId, agent_id: u64);
     fn close_pane(&self, pane: PaneId);
@@ -76,6 +90,32 @@ impl SessionApi for Session {
 
     fn kill(&self, agent_id: u64) {
         Session::kill(self, agent_id);
+    }
+
+    fn restart(&self, agent_id: u64) {
+        Session::restart(self, agent_id);
+    }
+
+    fn restart_in_pane(
+        &self,
+        pane: PaneId,
+        agent_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String> {
+        Session::restart_in_pane(self, pane, agent_id, cols, rows)
+    }
+
+    fn forget(&self, ids: Vec<u64>) {
+        Session::forget(self, ids);
+    }
+
+    fn clear_exited(&self) {
+        Session::clear_exited(self);
+    }
+
+    fn replaced(&self) -> HashMap<u64, u64> {
+        Session::replaced(self)
     }
 
     fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
@@ -126,6 +166,24 @@ impl SessionApi for NoSession {
     }
 
     fn kill(&self, _agent_id: u64) {}
+    fn restart(&self, _agent_id: u64) {}
+
+    fn restart_in_pane(
+        &self,
+        _pane: PaneId,
+        _agent_id: u64,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), String> {
+        Err("not connected to a fleetd".into())
+    }
+
+    fn forget(&self, _ids: Vec<u64>) {}
+    fn clear_exited(&self) {}
+
+    fn replaced(&self) -> HashMap<u64, u64> {
+        HashMap::new()
+    }
 
     fn open_pane(&self, _pane: PaneId, _agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
         Arc::new(Mutex::new(PaneModel::new(Theme::dark().palette)))
@@ -208,6 +266,9 @@ pub struct AppState {
     /// Agents asked for in a pane (sidebar click) that it does not show
     /// yet; until then the pane's old agent is not adopted back.
     requested: HashMap<PaneId, u64>,
+    /// Panes restarting the agent they show (by its old id) on their own
+    /// connection: they show the new agent without attaching to it.
+    restarting: HashMap<PaneId, u64>,
     /// When the control connection retries, while it is down.
     reconnect_at: Option<Instant>,
     pub(super) window: Option<WindowHandle<Workspace>>,
@@ -257,6 +318,7 @@ impl AppState {
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
             requested: HashMap::new(),
+            restarting: HashMap::new(),
             reconnect_at: None,
             window: None,
             dirty: false,
@@ -326,6 +388,7 @@ impl AppState {
         self.starting.clear();
         self.spawn_dirs.clear();
         self.requested.clear();
+        self.restarting.clear();
         self.reconnect_at = None;
         self.agents = self.session.agents();
         for pane in self.layout.panes() {
@@ -421,6 +484,9 @@ impl AppState {
                     self.agents = self.session.agents();
                     if self.live {
                         super::bench::agents_listed();
+                        if self.session.listed() {
+                            layout |= self.follow_list(cx);
+                        }
                     }
                     chrome = true;
                     cx.notify();
@@ -445,9 +511,10 @@ impl AppState {
                     }
                     view.update(cx, |_, cx| cx.notify());
                 }
-                // Panes and saved layouts follow it once the app layer is
-                // wired to `Layout::replace_agent`.
-                UiEvent::AgentRemoved { .. } => {}
+                UiEvent::AgentRemoved {
+                    agent_id,
+                    replaced_by,
+                } => layout |= self.follow_removed(agent_id, replaced_by, cx),
                 UiEvent::Connection(state) => {
                     self.reconnect_at = match state {
                         ConnState::Disconnected { retry_in } => Some(Instant::now() + retry_in),
@@ -470,8 +537,10 @@ impl AppState {
                     eprintln!("fleet-gui: {e}");
                     // A spawn on its way may be what failed: stop saying
                     // "starting…". Should it land after all, the pane still
-                    // adopts its agent.
+                    // adopts its agent. A pane restart may have failed too:
+                    // its pane then attaches to a successor it is told of.
                     self.starting.clear();
+                    self.restarting.clear();
                     self.error = Some(e);
                     self.error_is_connection = false;
                     chrome = true;
@@ -509,6 +578,7 @@ impl AppState {
         }
         self.layout.set_agent(pane, Some(shown));
         self.starting.remove(&pane);
+        self.restarting.remove(&pane);
         if let Some(dir) = self.spawn_dirs.remove(&pane) {
             let dirs = self
                 .gui_state
@@ -518,6 +588,65 @@ impl AppState {
             push_recent(dirs, dir, MAX_RECENT_DIRS);
         }
         true
+    }
+
+    /// `old` was removed, restarted as `new` if set: every pane showing it
+    /// shows `new` (attaching unless it started `new` itself) or becomes
+    /// empty. True if the layout changed.
+    fn follow_removed(&mut self, old: u64, new: Option<u64>, cx: &mut Context<Self>) -> bool {
+        let panes = self.layout.replace_agent(old, new);
+        for &pane in &panes {
+            let restarted_here = self.restarting.get(&pane) == Some(&old);
+            self.forget_pending(pane);
+            match new {
+                Some(new) if self.pane_has(pane, new, cx) => {}
+                Some(new) => {
+                    if !restarted_here {
+                        self.session.attach(pane, new);
+                    }
+                    // Until the pane shows `new`, `old` is not adopted back.
+                    self.requested.insert(pane, new);
+                }
+                None => self.open(pane, None, cx),
+            }
+        }
+        !panes.is_empty()
+    }
+
+    /// After a list: panes follow restarts they missed, and a pane whose
+    /// agent the node no longer has (and did not replace) becomes empty.
+    /// True if the layout changed.
+    fn follow_list(&mut self, cx: &mut Context<Self>) -> bool {
+        let replaced = self.session.replaced();
+        let mut changed = false;
+        for pane in self.layout.panes() {
+            let Some(id) = self.layout.agent(pane) else {
+                continue;
+            };
+            if let Some(&new) = replaced.get(&id) {
+                changed |= self.follow_removed(id, Some(new), cx);
+                continue;
+            }
+            let listed = self.agents.iter().any(|r| r.info.id == id);
+            let lost = self
+                .panes
+                .get(&pane)
+                .is_some_and(|v| lock(v.read(cx).model_handle()).state() == PaneState::Lost);
+            if !listed && lost {
+                self.layout.set_agent(pane, None);
+                self.forget_pending(pane);
+                self.open(pane, None, cx);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// `pane`'s grid shows `agent_id` (in any state).
+    fn pane_has(&self, pane: PaneId, agent_id: u64, cx: &App) -> bool {
+        self.panes
+            .get(&pane)
+            .is_some_and(|v| lock(v.read(cx).model_handle()).agent_id() == Some(agent_id))
     }
 
     /// Takes the session's agent list if it arrived before its event was
@@ -551,9 +680,7 @@ impl AppState {
             let chrome = PaneChrome {
                 number: i + 1,
                 has_agent: agent.is_some(),
-                agent_ended: row.is_some_and(|r| {
-                    matches!(r.info.state(), AgentState::Exited | AgentState::Lost)
-                }),
+                agent_ended: row.is_some_and(ended),
                 program: match (row, agent) {
                     (Some(r), _) => Some(program_name(&r.info.program)),
                     (None, Some(id)) => Some(format!("agent {id}")),
@@ -712,6 +839,7 @@ impl AppState {
         self.starting.remove(&pane);
         self.spawn_dirs.remove(&pane);
         self.requested.remove(&pane);
+        self.restarting.remove(&pane);
     }
 
     /// Splits the focused pane to the right and shows `agent_id` there.
@@ -762,6 +890,59 @@ impl AppState {
 
     pub fn kill(&self, agent_id: u64) {
         self.session.kill(agent_id);
+    }
+
+    /// Restarts an exited agent from the sidebar: panes showing it follow.
+    pub fn restart(&self, agent_id: u64) {
+        self.session.restart(agent_id);
+    }
+
+    pub fn forget(&self, agent_id: u64) {
+        self.session.forget(vec![agent_id]);
+    }
+
+    pub fn clear_exited(&self) {
+        self.session.clear_exited();
+    }
+
+    /// Exited or lost agents in the list.
+    pub fn ended_count(&self) -> usize {
+        self.agents.iter().filter(|r| ended(r)).count()
+    }
+
+    /// Restarts the agent the focused pane shows, in that pane at its
+    /// size, if it exited or is lost; otherwise does nothing.
+    pub fn restart_focused(&mut self, cx: &mut Context<Self>) {
+        let pane = self.focused;
+        let Some(view) = self.panes.get(&pane) else {
+            return;
+        };
+        let (state, shown) = {
+            let m = lock(view.read(cx).model_handle());
+            (m.state(), m.agent_id())
+        };
+        let agent = match state {
+            // The final screen on show is that agent's.
+            PaneState::Exited(_) => shown,
+            // The attach failed: the agent is the one the layout names.
+            PaneState::Lost => self.layout.agent(pane).or(shown),
+            _ => None,
+        };
+        let Some(agent) = agent else {
+            return;
+        };
+        let (cols, rows) = view.read(cx).grid().unwrap_or((80, 24));
+        match self.session.restart_in_pane(pane, agent, cols, rows) {
+            Ok(()) => {
+                self.forget_pending(pane);
+                self.restarting.insert(pane, agent);
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.error_is_connection = false;
+                cx.notify();
+            }
+        }
     }
 
     /// The New agent sheet's directories.

@@ -12,6 +12,12 @@ pub struct Group {
     pub agents: Vec<AgentRow>,
 }
 
+/// The agent exited or is lost: what Restart, Remove and Clear exited
+/// act on.
+pub fn ended(row: &AgentRow) -> bool {
+    matches!(row.info.state(), AgentState::Exited | AgentState::Lost)
+}
+
 /// `cwd` with the home directory shown as `~`.
 pub fn tilde(cwd: &str, home: &Path) -> String {
     match Path::new(cwd).strip_prefix(home) {

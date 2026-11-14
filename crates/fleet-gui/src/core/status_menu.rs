@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use fleet_proto::AgentState;
 
 use super::session::AgentRow;
-use super::sidebar::{program_name, tilde};
+use super::sidebar::{ended, program_name, tilde};
 use super::target::Target;
 
 /// Running agents listed in the menu before "…".
@@ -37,6 +37,8 @@ pub enum StatusEntry {
         label: String,
     },
     NewAgent,
+    /// Forgets every exited or lost agent; listed only when one exists.
+    ClearExited,
     SwitchFleetd,
     InstallSkill,
     Separator,
@@ -50,6 +52,7 @@ impl StatusEntry {
             StatusEntry::Header(text) | StatusEntry::Agent { label: text, .. } => text,
             StatusEntry::Show => "Show fleetd",
             StatusEntry::NewAgent => "New agent…",
+            StatusEntry::ClearExited => "Clear exited agents",
             StatusEntry::SwitchFleetd => "Switch fleetd…",
             StatusEntry::InstallSkill => "Install agent skill",
             StatusEntry::Separator => "",
@@ -59,7 +62,8 @@ impl StatusEntry {
 }
 
 /// The header, "Show fleetd", the running agents (oldest first, at most
-/// [`MAX_MENU_AGENTS`], then "…") between separators, the commands and Quit.
+/// [`MAX_MENU_AGENTS`], then "…") between separators, the commands (Clear
+/// exited only if an agent [`ended`]) and Quit.
 pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
     let mut header = match (&state.target, state.live) {
         (_, false) => "fleetd: not connected".to_owned(),
@@ -99,8 +103,11 @@ pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
         }
         menu.push(StatusEntry::Separator);
     }
+    menu.push(StatusEntry::NewAgent);
+    if state.agents.iter().any(ended) {
+        menu.push(StatusEntry::ClearExited);
+    }
     menu.extend([
-        StatusEntry::NewAgent,
         StatusEntry::SwitchFleetd,
         StatusEntry::InstallSkill,
         StatusEntry::Separator,
@@ -185,6 +192,7 @@ mod tests {
                 },
                 StatusEntry::Separator,
                 StatusEntry::NewAgent,
+                StatusEntry::ClearExited,
                 StatusEntry::SwitchFleetd,
                 StatusEntry::InstallSkill,
                 StatusEntry::Separator,
@@ -228,6 +236,21 @@ mod tests {
                 StatusEntry::NewAgent,
             ]
         );
+    }
+
+    #[test]
+    fn clear_exited_is_offered_only_when_an_agent_ended() {
+        let running = vec![row(1, "sh", "/tmp", AgentState::Running)];
+        assert!(
+            !status_menu(&state(Target::Local, running.clone()))
+                .contains(&StatusEntry::ClearExited)
+        );
+        for ended in [AgentState::Exited, AgentState::Lost] {
+            let mut rows = running.clone();
+            rows.push(row(2, "sh", "/tmp", ended));
+            assert!(status_menu(&state(Target::Local, rows)).contains(&StatusEntry::ClearExited));
+        }
+        assert_eq!(StatusEntry::ClearExited.title(), "Clear exited agents");
     }
 
     #[test]

@@ -271,6 +271,26 @@ impl Sidebar {
         self.list_requested = false;
         self.listed = true;
     }
+
+    /// `old` was removed, restarted as `new` if set: `replaced` keeps
+    /// leading every old id to its newest successor (as the node's map
+    /// does), and nothing leads to a forgotten id.
+    fn follow_removed(&mut self, old: u64, new: Option<u64>) {
+        match new {
+            Some(new) => {
+                for v in self.replaced.values_mut() {
+                    if *v == old {
+                        *v = new;
+                    }
+                }
+                self.replaced.insert(old, new);
+            }
+            None => {
+                self.replaced.remove(&old);
+                self.replaced.retain(|_, v| *v != old);
+            }
+        }
+    }
 }
 
 enum ControlCmd {
@@ -691,7 +711,7 @@ impl ControlReader {
                         Some(event::Kind::AgentRemoved(r)) => {
                             sb.infos.remove(&r.agent_id);
                             sb.activity.remove(&r.agent_id);
-                            sb.replaced.remove(&r.agent_id);
+                            sb.follow_removed(r.agent_id, r.replaced_by);
                             changed = true;
                             self.ctx.notify(UiEvent::AgentRemoved {
                                 agent_id: r.agent_id,
@@ -864,6 +884,33 @@ mod tests {
             "{got:?}"
         );
         assert!(got.contains(&UiEvent::AgentsChanged), "{got:?}");
+    }
+
+    fn removed(agent_id: u64, replaced_by: Option<u64>) -> Frame {
+        Frame::Event(Event {
+            kind: Some(event::Kind::AgentRemoved(AgentRemoved {
+                agent_id,
+                replaced_by,
+            })),
+        })
+    }
+
+    #[test]
+    fn removed_event_collapses_the_replaced_chain() {
+        let (r, _events) = reader();
+        r.apply(vec![list_reply(
+            vec![info(5), info(7)],
+            HashMap::from([(1, 5), (2, 7)]),
+        )]);
+        // 5 restarted as 9: 1 -> 5 becomes 1 -> 9, and 5 -> 9 is added.
+        r.apply(vec![removed(5, Some(9))]);
+        assert_eq!(
+            lock(&r.sidebar).replaced,
+            HashMap::from([(1, 9), (5, 9), (2, 7)])
+        );
+        // 7 forgotten: nothing leads to it any more.
+        r.apply(vec![removed(7, None)]);
+        assert_eq!(lock(&r.sidebar).replaced, HashMap::from([(1, 9), (5, 9)]));
     }
 
     #[test]
