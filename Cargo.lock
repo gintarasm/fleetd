@@ -1952,8 +1952,10 @@ name = "fleet-gui"
 version = "0.1.0"
 dependencies = [
  "async-channel 2.5.0",
+ "bytes",
  "clap",
  "fleet-client",
+ "fleet-gui",
  "fleet-proto",
  "fleet-term",
  "gpui",
@@ -1964,6 +1966,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio-util",
  "toml 1.2.1+spec-1.1.0",
  "toml_edit 0.25.19+spec-1.1.0",
 ]

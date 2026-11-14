@@ -14,6 +14,11 @@ path = "src/lib.rs"
 name = "fleet-gui"
 path = "src/main.rs"
 
+[features]
+# Test-only hooks (`Session::pause_reader_for_test`, ...), for the
+# integration tests; enabled by the dev-dependency on this crate below.
+test-hooks = []
+
 [dependencies]
 async-channel = "2.5.0"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -36,4 +41,7 @@ objc2-foundation = "0.3"
 gpui = { version = "=0.2.2", features = ["test-support"] }
 
 [dev-dependencies]
+bytes = "1.12.1"
+fleet-gui = { path = ".", features = ["test-hooks"] }
 tempfile = "3.27.0"
+tokio-util = { version = "0.7.20", features = ["codec"] }

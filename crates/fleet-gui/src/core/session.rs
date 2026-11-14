@@ -106,8 +106,8 @@ impl Ctx {
         })
     }
 
-    /// Wakes the UI; a closed or full channel loses nothing that matters
-    /// (events are wake-ups, the state lives in the models).
+    /// Wakes the UI. The channel is unbounded (see [`Session::start`]), so
+    /// only a closed one (the UI is gone) loses events.
     pub(crate) fn notify(&self, e: UiEvent) {
         let _ = self.ui.try_send(e);
     }
@@ -200,14 +200,31 @@ pub(crate) fn read_batch(reader: &mut FrameReader) -> Result<Vec<Frame>, ()> {
     }
 }
 
+/// How long activity for an id the last list did not show is kept.
+const UNLISTED_ACTIVITY_TTL: Duration = Duration::from_secs(2 * RELIST.as_secs());
+
 #[derive(Default)]
 struct Sidebar {
     infos: BTreeMap<u64, AgentInfo>,
-    /// `(last_line, last_output_unix_ms)` from `AgentActivity`; kept for ids
-    /// not listed yet, so the row has its line once it is.
-    activity: HashMap<u64, (String, i64)>,
+    /// `(last_line, last_output_unix_ms, received)` from `AgentActivity`.
+    /// Unlisted ids are kept for [`UNLISTED_ACTIVITY_TTL`], so an agent
+    /// spawned after a list was taken has its line once it is listed.
+    activity: HashMap<u64, (String, i64, Instant)>,
     /// A `ListAgents` was asked for because of an unknown id.
     list_requested: bool,
+}
+
+impl Sidebar {
+    /// Applies a `ListAgents` reply: the rows are replaced and activity
+    /// for ids not listed is dropped unless it is recent.
+    fn set_list(&mut self, agents: Vec<AgentInfo>, now: Instant) {
+        self.infos = agents.into_iter().map(|a| (a.id, a)).collect();
+        let infos = &self.infos;
+        self.activity.retain(|id, a| {
+            infos.contains_key(id) || now.duration_since(a.2) < UNLISTED_ACTIVITY_TTL
+        });
+        self.list_requested = false;
+    }
 }
 
 enum ControlCmd {
@@ -240,6 +257,10 @@ impl Session {
     /// Starts the control connection thread: it handshakes as `gui`, lists
     /// the agents, follows activity and exit events, re-lists every 5 s
     /// (and at once for an unknown id), and reconnects with [`Backoff`].
+    ///
+    /// `ui` must be an [`async_channel::unbounded`] channel's sender: events
+    /// are sent with `try_send`, and a bounded channel that fills up would
+    /// lose `Connection` and `Error` events.
     pub fn start(
         target: Target,
         state_dir: PathBuf,
@@ -317,6 +338,9 @@ impl Session {
             attach: true,
             ..Default::default()
         };
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Err("the session is shut down".into());
+        }
         match lock(&self.inner.panes).get(&pane) {
             Some(link) => {
                 link.spawn(spawn);
@@ -332,11 +356,21 @@ impl Session {
 
     /// Opens `pane` with its own connection (`gui-pane-<n>`), attached to
     /// `agent_id` if given. A pane already open under that id is closed.
+    /// After [`Session::shutdown`] the model is not connected (it stays
+    /// `Disconnected`).
     pub fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
         let palette = *lock(&self.inner.palette);
+        let mut panes = lock(&self.inner.panes);
+        // Checked under the panes lock, which `shutdown` drains after
+        // setting the flag, so no pane outlives it.
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            let mut model = PaneModel::new(palette);
+            model.on_disconnected();
+            return Arc::new(Mutex::new(model));
+        }
         let link = PaneLink::open(Arc::clone(&self.inner.ctx), pane, agent_id, palette);
         let model = link.model();
-        if let Some(old) = lock(&self.inner.panes).insert(pane, link) {
+        if let Some(old) = panes.insert(pane, link) {
             old.close();
         }
         model
@@ -405,6 +439,7 @@ impl Session {
 
     /// Test hook: the pane's reader stops reading for `d` (to force a
     /// `Lagged`).
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn pause_reader_for_test(&self, pane: PaneId, d: Duration) {
         if let Some(link) = lock(&self.inner.panes).get(&pane) {
@@ -413,6 +448,7 @@ impl Session {
     }
 
     /// Test hook: how many `Lagged` events the pane re-attached after.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn lag_count_for_test(&self, pane: PaneId) -> u32 {
         lock(&self.inner.panes)
@@ -493,8 +529,7 @@ impl ControlReader {
                         kind: Some(response::Kind::Agents(list)),
                         ..
                     }) => {
-                        sb.infos = list.agents.into_iter().map(|a| (a.id, a)).collect();
-                        sb.list_requested = false;
+                        sb.set_list(list.agents, Instant::now());
                         changed = true;
                     }
                     Frame::Response(Response {
@@ -504,8 +539,10 @@ impl ControlReader {
                     Frame::Event(ev) => match ev.kind {
                         Some(event::Kind::Activity(a)) => {
                             let known = sb.infos.contains_key(&a.agent_id);
-                            sb.activity
-                                .insert(a.agent_id, (a.last_line, a.last_output_unix_ms));
+                            sb.activity.insert(
+                                a.agent_id,
+                                (a.last_line, a.last_output_unix_ms, Instant::now()),
+                            );
                             changed |= known;
                             relist |= !known;
                         }
@@ -574,5 +611,57 @@ fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
             },
             Some(ControlCmd::Stop) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(id: u64) -> AgentInfo {
+        AgentInfo {
+            id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn list_prunes_activity_of_unlisted_ids_unless_recent() {
+        let now = Instant::now();
+        let mut sb = Sidebar::default();
+        sb.activity
+            .insert(1, ("listed".into(), 1, now - RELIST * 4));
+        sb.activity.insert(2, ("gone".into(), 1, now - RELIST * 4));
+        sb.activity.insert(3, ("new".into(), 1, now));
+        sb.list_requested = true;
+        sb.set_list(vec![info(1)], now);
+        let mut kept: Vec<u64> = sb.activity.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [1, 3]);
+        assert!(!sb.list_requested);
+    }
+
+    #[test]
+    fn panes_and_spawns_are_refused_after_shutdown() {
+        let dir = std::env::temp_dir().join(format!("fleet-gui-no-daemon-{}", std::process::id()));
+        let (tx, _rx) = async_channel::unbounded();
+        let s = Session::start(Target::Local, dir, tx);
+        let handle = s.clone();
+        s.shutdown();
+        let model = handle.open_pane(PaneId(1), Some(1));
+        assert_eq!(
+            lock(&model).state(),
+            super::super::pane::PaneState::Disconnected
+        );
+        assert!(lock(&handle.inner.panes).is_empty());
+        let r = handle.spawn(
+            "/bin/true".into(),
+            Vec::new(),
+            "/".into(),
+            80,
+            24,
+            PaneId(1),
+        );
+        assert!(r.is_err());
     }
 }

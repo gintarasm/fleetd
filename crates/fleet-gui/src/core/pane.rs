@@ -185,6 +185,12 @@ impl PaneModel {
         self.scrollback.mark_fully_loaded();
     }
 
+    /// The request [`PaneModel::next_page_request`] returned was not sent:
+    /// it may be asked for again.
+    pub fn cancel_page_request(&mut self) {
+        self.page_in_flight = false;
+    }
+
     /// Scrolls by `delta` lines, positive up into history, clamped to the
     /// loaded history.
     pub fn scroll_lines(&mut self, delta: i32) {

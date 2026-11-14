@@ -77,7 +77,9 @@ struct Shared {
     /// request computed before either is dropped.
     epoch: u64,
     conn: Option<ConnHandle>,
+    #[cfg(any(test, feature = "test-hooks"))]
     pause_until: Option<Instant>,
+    #[cfg(any(test, feature = "test-hooks"))]
     lags: u32,
 }
 
@@ -205,10 +207,12 @@ impl PaneLink {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn pause_reader(&self, d: Duration) {
         lock(&self.link.shared).pause_until = Some(Instant::now() + d);
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn lag_count(&self) -> u32 {
         lock(&self.link.shared).lags
     }
@@ -237,9 +241,12 @@ fn reader(link: &Link, out: &mpsc::Sender<Outgoing>) {
             let _ = out.send(Outgoing::Connected(sender));
             let _ = out.send(Outgoing::Reattach);
             loop {
-                let pause = lock(&link.shared).pause_until.take();
-                if let Some(until) = pause {
-                    thread::sleep(until.saturating_duration_since(Instant::now()));
+                #[cfg(any(test, feature = "test-hooks"))]
+                {
+                    let pause = lock(&link.shared).pause_until.take();
+                    if let Some(until) = pause {
+                        thread::sleep(until.saturating_duration_since(Instant::now()));
+                    }
                 }
                 let Ok(batch) = read_batch(&mut frames) else {
                     break;
@@ -328,14 +335,15 @@ fn apply_frame(
                 true
             }
             Some(event::Kind::Lagged(l)) if is_shown(l.agent_id) => {
-                let mut sh = lock(&link.shared);
                 // A stale `Lagged` can precede the reply to an attach
                 // already on its way (ADR 0022).
-                if sh.attach_pending(l.agent_id) {
+                if lock(&link.shared).attach_pending(l.agent_id) {
                     return false;
                 }
-                sh.lags += 1;
-                drop(sh);
+                #[cfg(any(test, feature = "test-hooks"))]
+                {
+                    lock(&link.shared).lags += 1;
+                }
                 model.on_attaching();
                 let _ = out.send(Outgoing::Reattach);
                 true
@@ -372,7 +380,7 @@ fn apply_response(link: &Link, model: &mut PaneModel, r: Response) -> bool {
             model.on_page(&page, generation);
             true
         }
-        (Some(Pending::Page { .. }), Some(response::Kind::Error(_))) if is_page => {
+        (Some(Pending::Page { .. }), _) if is_page => {
             drop(sh);
             model.on_page_error();
             false
@@ -445,6 +453,11 @@ impl Writer {
             if !self.handle(o) {
                 return;
             }
+            // A steady stream of messages never lets `recv_timeout` time out.
+            if self.resize_due.is_some_and(|due| due <= Instant::now()) {
+                self.resize_due = None;
+                self.send_resize();
+            }
         }
     }
 
@@ -458,9 +471,19 @@ impl Writer {
                 sh.pending.clear();
                 sh.page = None;
                 sh.epoch += 1;
+                let idle = sh.agent.is_none();
                 drop(sh);
                 if let Some(spawn) = self.deferred_spawn.take() {
                     self.spawn(spawn);
+                } else if idle {
+                    // Nothing to attach: back to the neutral state a new
+                    // pane starts in, not "disconnected".
+                    let mut m = lock(&self.link.model);
+                    if m.state() == PaneState::Disconnected {
+                        m.on_attaching();
+                        drop(m);
+                        self.link.changed();
+                    }
                 }
             }
             Outgoing::Disconnected => {
@@ -478,6 +501,9 @@ impl Writer {
                 }
             }
             Outgoing::Spawn(spawn) => {
+                // Until `SpawnedAttached` names the new agent, nothing
+                // re-attaches the old one (a reconnect or a late `Lagged`).
+                lock(&self.link.shared).agent = None;
                 if self.sender.is_some() {
                     self.spawn(spawn);
                 } else {
@@ -503,7 +529,10 @@ impl Writer {
                 generation,
                 before_line,
             } => {
-                let Some(id) = self.sender.as_ref().map(Sender::next_id) else {
+                let live = lock(&self.link.model).state() == PaneState::Live;
+                let id = self.sender.as_ref().map(Sender::next_id);
+                let Some(id) = id.filter(|_| live) else {
+                    lock(&self.link.model).cancel_page_request();
                     return true;
                 };
                 {
@@ -564,7 +593,11 @@ impl Writer {
     }
 
     fn spawn(&mut self, spawn: SpawnAgent) {
-        let old = lock(&self.link.shared).subscribed.take();
+        let old = {
+            let mut sh = lock(&self.link.shared);
+            sh.agent = None;
+            sh.subscribed.take()
+        };
         if let Some(agent_id) = old {
             self.send(request::Kind::Detach(Detach { agent_id }));
         }
@@ -605,10 +638,98 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::HistoryPage;
+    use bytes::BytesMut;
+    use fleet_client::Connection;
+    use fleet_proto::{Ack, FrameCodec, HelloOk, HistoryPage, PROTOCOL_VERSION};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use tokio_util::codec::{Decoder, Encoder};
 
-    fn link() -> Link {
-        Link {
+    /// The server end of a handshaken connection: decodes what the writer
+    /// sends.
+    struct FakeServer {
+        stream: UnixStream,
+        buf: BytesMut,
+    }
+
+    impl FakeServer {
+        fn next_frame(&mut self, wait: Duration) -> Option<Frame> {
+            let deadline = Instant::now() + wait;
+            loop {
+                if let Some(f) = FrameCodec::new().decode(&mut self.buf).unwrap() {
+                    return Some(f);
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                // Fails on macOS once the peer has closed; reads then end.
+                let _ = self.stream.set_read_timeout(Some(left));
+                let mut chunk = [0u8; 4096];
+                match self.stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+        }
+
+        /// The requests that arrive within `wait`.
+        fn requests(&mut self, wait: Duration) -> Vec<request::Kind> {
+            let mut out = Vec::new();
+            while let Some(f) = self.next_frame(wait) {
+                if let Frame::Request(r) = f {
+                    out.extend(r.kind);
+                }
+            }
+            out
+        }
+    }
+
+    fn connected() -> (Sender, FakeServer) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut srv = FakeServer {
+            stream: server,
+            buf: BytesMut::new(),
+        };
+        let handshake = thread::spawn(move || {
+            assert!(matches!(
+                srv.next_frame(Duration::from_secs(5)),
+                Some(Frame::Hello(_))
+            ));
+            let mut out = BytesMut::new();
+            FrameCodec::new()
+                .encode(
+                    Frame::HelloOk(HelloOk {
+                        protocol_version: PROTOCOL_VERSION,
+                        server: "fake".into(),
+                    }),
+                    &mut out,
+                )
+                .unwrap();
+            srv.stream.write_all(&out).unwrap();
+            srv
+        });
+        let conn =
+            Connection::over(Box::new(client.try_clone().unwrap()), Box::new(client), "t").unwrap();
+        (conn.split().1, handshake.join().unwrap())
+    }
+
+    fn spawn_req() -> SpawnAgent {
+        SpawnAgent {
+            program: "/bin/true".into(),
+            attach: true,
+            ..Default::default()
+        }
+    }
+
+    fn is_attach(k: &request::Kind) -> bool {
+        matches!(k, request::Kind::Attach(_))
+    }
+
+    const SHORT: Duration = Duration::from_millis(200);
+
+    fn link() -> Arc<Link> {
+        Arc::new(Link {
             ctx: Ctx::for_test(),
             pane: PaneId(1),
             model: Arc::new(Mutex::new(PaneModel::new(DEFAULT_PALETTE_FOR_TEST))),
@@ -617,7 +738,7 @@ mod tests {
                 ..Shared::default()
             }),
             stop: Stop::default(),
-        }
+        })
     }
 
     const DEFAULT_PALETTE_FOR_TEST: Palette = Palette {
@@ -704,5 +825,134 @@ mod tests {
         assert_eq!(first_line(&l), 100);
         respond(&l, page_response(3));
         assert_eq!(first_line(&l), 99);
+    }
+
+    #[test]
+    fn deferred_spawn_then_reattach_sends_no_attach() {
+        let l = link();
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Spawn(spawn_req()));
+        w.handle(Outgoing::Connected(sender));
+        w.handle(Outgoing::Reattach);
+        let reqs = srv.requests(SHORT);
+        assert!(
+            matches!(reqs.as_slice(), [request::Kind::Spawn(_)]),
+            "{reqs:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_then_late_reattach_does_not_resubscribe_the_old_agent() {
+        let l = link();
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        w.handle(Outgoing::Attach(1));
+        w.handle(Outgoing::Spawn(spawn_req()));
+        // A reconnect or a late `Lagged` for agent 1.
+        w.handle(Outgoing::Reattach);
+        let reqs = srv.requests(SHORT);
+        assert_eq!(reqs.iter().filter(|k| is_attach(k)).count(), 1, "{reqs:?}");
+        assert!(
+            matches!(
+                reqs.as_slice(),
+                [
+                    request::Kind::Attach(_),
+                    request::Kind::Detach(Detach { agent_id: 1 }),
+                    request::Kind::Spawn(_)
+                ]
+            ),
+            "{reqs:?}"
+        );
+    }
+
+    #[test]
+    fn resize_is_sent_under_a_steady_input_stream() {
+        let l = link();
+        let (sender, mut srv) = connected();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Outgoing::Connected(sender)).unwrap();
+        tx.send(Outgoing::Attach(1)).unwrap();
+        tx.send(Outgoing::Resize(100, 30)).unwrap();
+        // A backlog that takes the writer far longer than the 50 ms
+        // debounce to send, so `recv_timeout` never times out meanwhile.
+        for _ in 0..200_000 {
+            tx.send(Outgoing::Input(b"x".to_vec())).unwrap();
+        }
+        tx.send(Outgoing::Close).unwrap();
+        let w = Writer::new(Arc::clone(&l));
+        let writer = thread::spawn(move || w.run(&rx));
+        let reqs = srv.requests(SHORT);
+        let resize = reqs.iter().position(|k| {
+            matches!(
+                k,
+                request::Kind::Resize(Resize {
+                    agent_id: 1,
+                    cols: 100,
+                    rows: 30
+                })
+            )
+        });
+        let last_input = reqs
+            .iter()
+            .rposition(|k| matches!(k, request::Kind::Input(_)));
+        // Sent while the inputs were still coming, not after they stopped.
+        assert!(
+            resize.zip(last_input).is_some_and(|(r, i)| r < i),
+            "resize at {resize:?}, last input at {last_input:?}"
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn page_request_is_not_sent_once_the_pane_is_not_live() {
+        let l = link();
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, mut srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        respond(&l, attached_response(1));
+        let (generation, before_line) = lock(&l.model).next_page_request().unwrap();
+        lock(&l.model).on_exited(0);
+        let epoch = lock(&l.shared).epoch;
+        w.handle(Outgoing::ReadHistory {
+            epoch,
+            agent_id: 1,
+            generation,
+            before_line,
+        });
+        let reqs = srv.requests(SHORT);
+        assert!(reqs.is_empty(), "{reqs:?}");
+        assert!(lock(&l.shared).page.is_none());
+        // Not left marked as in flight.
+        assert!(lock(&l.model).next_page_request().is_some());
+    }
+
+    #[test]
+    fn unexpected_reply_to_the_page_in_flight_ends_paging() {
+        let l = link();
+        respond(&l, attached_response(1));
+        assert!(lock(&l.model).next_page_request().is_some());
+        page_sent(&l, 2);
+        respond(
+            &l,
+            Response {
+                id: 2,
+                kind: Some(response::Kind::Ack(Ack {})),
+            },
+        );
+        assert!(lock(&l.shared).page.is_none());
+        assert!(lock(&l.model).scrollback().fully_loaded());
+    }
+
+    #[test]
+    fn pane_without_agent_is_not_disconnected_once_connected() {
+        let l = link();
+        lock(&l.shared).agent = None;
+        lock(&l.model).on_disconnected();
+        let mut w = Writer::new(Arc::clone(&l));
+        let (sender, _srv) = connected();
+        w.handle(Outgoing::Connected(sender));
+        assert_eq!(lock(&l.model).state(), PaneState::Attaching);
     }
 }
