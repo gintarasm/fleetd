@@ -71,12 +71,8 @@ pub struct FrameReader {
 impl FrameReader {
     /// The next frame; `Ok(None)` when the server closed the connection.
     pub fn read_frame(&mut self) -> Result<Option<Frame>> {
-        let mut codec = FrameCodec::new();
         loop {
-            if let Some(frame) = codec
-                .decode(&mut self.buf)
-                .map_err(|e| Error::Protocol(e.to_string()))?
-            {
+            if let Some(frame) = self.buffered_frame()? {
                 return Ok(Some(frame));
             }
             let mut chunk = [0u8; 64 * 1024];
@@ -88,6 +84,14 @@ impl FrameReader {
             }
         }
     }
+
+    /// The next frame if it has already been read from the stream in full;
+    /// never blocks. Lets a caller handle a burst of frames as one batch.
+    pub fn buffered_frame(&mut self) -> Result<Option<Frame>> {
+        FrameCodec::new()
+            .decode(&mut self.buf)
+            .map_err(|e| Error::Protocol(e.to_string()))
+    }
 }
 
 /// Encodes requests onto the socket.
@@ -97,6 +101,12 @@ pub struct Sender {
 }
 
 impl Sender {
+    /// The id the next [`Sender::send`] will use (ids count up from 1 per
+    /// connection), so a caller can record a request before sending it.
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Sends a request and returns its id.
     pub fn send(&mut self, kind: request::Kind) -> Result<u64> {
         let id = self.next_id;
@@ -120,6 +130,19 @@ impl Sender {
 pub struct Connection {
     reader: FrameReader,
     sender: Sender,
+    closer: Option<Closer>,
+}
+
+/// Shuts a unix-socket connection down from any thread, ending a blocked
+/// [`FrameReader::read_frame`] (it returns `Ok(None)`) and telling the server
+/// the client is gone.
+#[derive(Debug)]
+pub struct Closer(UnixStream);
+
+impl Closer {
+    pub fn close(&self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
 }
 
 /// How long a constructor waits for the server's answer to its `Hello`.
@@ -182,6 +205,7 @@ impl Connection {
                 stream: write,
                 next_id: 1,
             },
+            closer: None,
         };
         let mut out = BytesMut::new();
         FrameCodec::new()
@@ -229,7 +253,8 @@ impl Connection {
             Err(e) => return Err(e.into()),
         };
         let closer = stream.try_clone()?;
-        Self::over_within(
+        let keep = stream.try_clone()?;
+        let mut conn = Self::over_within(
             Box::new(stream.try_clone()?),
             Box::new(stream),
             client_name,
@@ -237,7 +262,9 @@ impl Connection {
             move || {
                 let _ = closer.shutdown(Shutdown::Both);
             },
-        )
+        )?;
+        conn.closer = Some(Closer(keep));
+        Ok(conn)
     }
 
     /// Spawns `cmd` and talks over its stdin/stdout (e.g. `ssh host fleetd
@@ -347,6 +374,13 @@ impl Connection {
                 None => return Ok(None),
             }
         }
+    }
+
+    /// A handle that shuts the connection down; `None` for a command's
+    /// stdio (kill the child instead).
+    pub fn closer(&self) -> Option<Closer> {
+        let stream = self.closer.as_ref()?.0.try_clone().ok()?;
+        Some(Closer(stream))
     }
 
     pub fn split(self) -> (FrameReader, Sender) {

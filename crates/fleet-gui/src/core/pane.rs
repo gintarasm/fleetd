@@ -25,6 +25,9 @@ pub enum PaneState {
     Attaching,
     Live,
     Exited(i32),
+    /// The node no longer has the agent (it was lost, for example in a
+    /// daemon restart): attaching failed.
+    Lost,
     Disconnected,
 }
 
@@ -118,6 +121,24 @@ impl PaneModel {
 
     pub fn on_disconnected(&mut self) {
         self.state = PaneState::Disconnected;
+    }
+
+    /// An attach (or re-attach) was sent; the grid stays as it is until
+    /// [`PaneModel::on_attached`].
+    pub fn on_attaching(&mut self) {
+        self.state = PaneState::Attaching;
+    }
+
+    /// Attaching failed: the node does not have the agent any more.
+    pub fn on_lost(&mut self) {
+        self.state = PaneState::Lost;
+    }
+
+    /// Replaces the palette that answers colour queries, now and after
+    /// every later attach.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+        self.term.set_palette(palette);
     }
 
     /// Replies to terminal queries to send to the agent: empty unless
