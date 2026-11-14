@@ -105,7 +105,7 @@ Manifest declares kind + capabilities (`pty:read`, `pty:write`, `fs:worktree`, `
 | `fleet-controller` | fleet view, SSH transport, bootstrap, secrets |
 | `fleet-plugin-host` | wasmtime host, WIT worlds |
 | `fleetd` | daemon binary wiring roles |
-| `fleet-gui` | gpui client |
+| `fleet-gui` | gpui client (macOS shell over a platform-neutral core) ([0028](decisions/0028-gui-client.md)) |
 | `fleet-cli` | thin scripting client |
 
 ## Milestones
