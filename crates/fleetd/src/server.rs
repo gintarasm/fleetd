@@ -20,11 +20,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
-use fleet_node::node::{ActivityReceiver, ConnId, Node, StreamItem, Subscription};
+use fleet_node::node::{ActivityReceiver, ConnId, Node, Removed, StreamItem, Subscription};
 use fleet_proto::{
-    Ack, AgentList, AgentResized, AttachOk, AttachRole, Event, Frame, FrameCodec, HandshakeReject,
-    HelloOk, HistoryPage, Lagged, LogLine, LogLines, MAX_FRAME, PROTOCOL_VERSION, ReadHistory,
-    ReadLogs, Request, Response, SpawnAgent, SpawnedAttached, event, request, response,
+    Ack, AgentList, AgentRemoved, AgentResized, AttachOk, AttachRole, Event, ForgetAgents,
+    Forgotten, Frame, FrameCodec, HandshakeReject, HelloOk, HistoryPage, Lagged, LogLine, LogLines,
+    MAX_FRAME, PROTOCOL_VERSION, ReadHistory, ReadLogs, Request, Response, RestartAgent, Restarted,
+    SpawnAgent, SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -147,8 +148,10 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
     let (rd, wr) = stream.into_split();
     let mut reader = FramedRead::new(rd, FrameCodec::with_max(HELLO_MAX_FRAME));
     let mut writer = FramedWrite::new(wr, FrameCodec::new());
-    // Subscribed before `HelloOk`, so no exit after the handshake is missed.
+    // Subscribed before `HelloOk`, so no exit or removal after the handshake
+    // is missed.
     let exits = node.exit_events();
+    let removed = node.removed_events();
     let activity = node.activity_events();
     let id = ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
     let Some(client) = handshake(id, &mut reader, &mut writer).await else {
@@ -175,6 +178,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
             Arc::clone(&conn.attached),
         )),
         tokio::spawn(forward_activity(activity, conn.outbox.clone())),
+        tokio::spawn(forward_removed(removed, conn.outbox.clone(), id)),
     ]);
 
     let reason = loop {
@@ -268,11 +272,14 @@ impl Connection {
                 }
             }
             Some(request::Kind::List(list)) => {
-                match blocking(&self.node, move |n| n.list_matching(&list.selector)).await {
-                    Ok(agents) => response::Kind::Agents(AgentList {
-                        agents,
-                        ..Default::default()
-                    }),
+                let listed = blocking(&self.node, move |n| {
+                    Ok((n.list_matching(&list.selector)?, n.replacements()?))
+                })
+                .await;
+                match listed {
+                    Ok((agents, replaced)) => {
+                        response::Kind::Agents(AgentList { agents, replaced })
+                    }
                     Err(e) => error(e.to_string()),
                 }
             }
@@ -310,10 +317,8 @@ impl Connection {
                 self.stop_logs();
                 response::Kind::Ack(Ack {})
             }
-            // Temporary: Task 5 implements restart and forget.
-            Some(request::Kind::Restart(_) | request::Kind::Forget(_)) => {
-                error("not implemented".into())
-            }
+            Some(request::Kind::Restart(r)) => return self.restart(req.id, r).await,
+            Some(request::Kind::Forget(f)) => return self.forget(req.id, f).await,
         };
         self.respond(req.id, kind).await
     }
@@ -482,6 +487,117 @@ impl Connection {
         true
     }
 
+    /// Restarts an exited or lost agent, attached if asked (as
+    /// [`Connection::spawn_attached`]). The old agent's `AgentRemoved` is
+    /// queued right after the reply; other connections get it from the
+    /// broadcast.
+    async fn restart(&mut self, id: u64, r: RestartAgent) -> bool {
+        let old_id = r.agent_id;
+        let conn = self.id;
+        let (info, attached) = if r.attach {
+            let attached = Arc::clone(&self.attached);
+            let restarted = blocking(&self.node, move |n| {
+                let mut started = None;
+                let res = n.restart_attached(old_id, r.cols, r.rows, conn, |agent_id| {
+                    started = Some(agent_id);
+                    lock(&attached).insert(agent_id);
+                });
+                Ok((res, started))
+            })
+            .await;
+            match restarted {
+                Ok((Ok((info, ok, sub)), _)) => (info, Some((ok, sub))),
+                Ok((Err(e), started)) => {
+                    if let Some(agent_id) = started {
+                        lock(&self.attached).remove(&agent_id);
+                    }
+                    return self.respond(id, error(e.to_string())).await;
+                }
+                Err(e) => return self.respond(id, error(e.to_string())).await,
+            }
+        } else {
+            match blocking(&self.node, move |n| {
+                n.restart(old_id, r.cols, r.rows, Some(conn))
+            })
+            .await
+            {
+                Ok(info) => (info, None),
+                Err(e) => return self.respond(id, error(e.to_string())).await,
+            }
+        };
+        let new_id = info.id;
+        info!(agent = new_id, old = old_id, conn = self.id.0, "restarted");
+        self.forget_local(old_id).await;
+        let (ok, sub) = match attached {
+            Some((ok, sub)) => (Some(ok), Some(sub)),
+            None => (None, None),
+        };
+        let reply = response::Kind::Restarted(Box::new(Restarted {
+            old_id,
+            agent: Some(info),
+            attached: ok,
+        }));
+        if !self.respond(id, reply).await {
+            return false;
+        }
+        if !self.queue_removed(old_id, Some(new_id)).await {
+            return false;
+        }
+        if let Some(sub) = sub {
+            self.forward(new_id, sub);
+        }
+        true
+    }
+
+    /// Forgets exited or lost agents; their `AgentRemoved` events are queued
+    /// right after the reply.
+    async fn forget(&mut self, id: u64, f: ForgetAgents) -> bool {
+        let conn = self.id;
+        let outcome = blocking(&self.node, move |n| {
+            n.forget(&f.ids, f.exited_only, &f.selector, Some(conn))
+        })
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => return self.respond(id, error(e.to_string())).await,
+        };
+        for &agent_id in &outcome.forgotten {
+            self.forget_local(agent_id).await;
+        }
+        let reply = response::Kind::Forgotten(Forgotten {
+            ids: outcome.forgotten.clone(),
+            refused: outcome.refused,
+        });
+        if !self.respond(id, reply).await {
+            return false;
+        }
+        for agent_id in outcome.forgotten {
+            if !self.queue_removed(agent_id, None).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Drops a forgotten agent from this connection: its forwarder (whose
+    /// stream already ended with the exit) and its `attached` mark.
+    async fn forget_local(&mut self, agent_id: u64) {
+        self.stop_forwarder(agent_id).await;
+        lock(&self.attached).remove(&agent_id);
+    }
+
+    /// Queues this connection's own `AgentRemoved`, which its removal
+    /// forwarder skips.
+    async fn queue_removed(&self, agent_id: u64, replaced_by: Option<u64>) -> bool {
+        self.outbox
+            .send(removed_event(AgentRemoved {
+                agent_id,
+                replaced_by,
+            }))
+            .await
+            .is_ok()
+    }
+
     /// Starts forwarding `sub`, the agent's subscription.
     fn forward(&mut self, agent_id: u64, sub: Subscription) {
         let task = tokio::spawn(forward_output(
@@ -585,6 +701,42 @@ async fn forward_exits(
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(missed = n, "a connection missed exit events");
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+fn removed_event(e: AgentRemoved) -> Frame {
+    Frame::Event(Event {
+        kind: Some(event::Kind::AgentRemoved(e)),
+    })
+}
+
+/// Announces removals this connection did not cause (its own are queued
+/// after its response). Missed events are not resent: clients recover by
+/// relisting, whose `replaced` map carries restarts.
+async fn forward_removed(
+    mut removed: broadcast::Receiver<Removed>,
+    outbox: mpsc::Sender<Frame>,
+    own: ConnId,
+) {
+    loop {
+        match removed.recv().await {
+            Ok(r) => {
+                if r.origin == Some(own) {
+                    continue;
+                }
+                if outbox.send(removed_event(r.event)).await.is_err() {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(
+                    conn = own.0,
+                    missed = n,
+                    "a connection missed removal events"
+                );
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
