@@ -132,6 +132,12 @@ impl Store {
                 )),
             ));
         }
+        if version == 0 {
+            // A new DB gets the v3 schema at once: replaying v1 -> v2 -> v3
+            // (a table rebuild) leaves ~1 MB of SQLite heap behind, which
+            // shows in the daemon's idle RSS.
+            return self.create_v3();
+        }
         if version < 1 {
             self.conn.execute_batch(
                 "BEGIN;
@@ -166,6 +172,36 @@ impl Store {
             self.migrate_to_v3()?;
         }
         Ok(())
+    }
+
+    /// The v3 schema for a new DB; the same tables the v1 -> v2 -> v3
+    /// migrations produce.
+    fn create_v3(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE agents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 program TEXT NOT NULL,
+                 args_json TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
+                 exit_code INTEGER,
+                 created_unix_ms INTEGER NOT NULL,
+                 scrollback_path TEXT NOT NULL
+             );
+             CREATE TABLE agent_labels (
+                 agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (agent_id, key)
+             );
+             CREATE TABLE agent_replacements (
+                 old_id INTEGER PRIMARY KEY,
+                 new_id INTEGER NOT NULL
+             );
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )
     }
 
     /// v3: agent ids use AUTOINCREMENT so they are never reused, and
@@ -725,6 +761,92 @@ mod tests {
         s.set_exited(b, 0).unwrap();
         assert!(s.forget_agent(b).unwrap());
         assert_eq!(s.insert_agent(&new_agent(3)).unwrap(), 3);
+    }
+
+    /// Columns, foreign keys and indexes of every table, for comparing schemas.
+    fn schema(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut out = Vec::new();
+        for table in [
+            "agents",
+            "agent_labels",
+            "agent_replacements",
+            "sqlite_sequence",
+        ] {
+            for pragma in ["table_info", "foreign_key_list", "index_list"] {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM pragma_{pragma}('{table}')"))
+                    .unwrap();
+                let n = stmt.column_count();
+                let rows = stmt
+                    .query_map([], |r| {
+                        (0..n)
+                            .map(|i| {
+                                r.get::<_, rusqlite::types::Value>(i)
+                                    .map(|v| format!("{v:?}"))
+                            })
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap();
+                for row in rows {
+                    out.push(format!("{table} {pragma} {}", row.unwrap().join(",")));
+                }
+            }
+        }
+        let autoinc: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'agents' AND sql LIKE '%AUTOINCREMENT%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        out.push(format!("agents autoincrement {autoinc}"));
+        out
+    }
+
+    #[test]
+    fn new_database_is_created_at_v3_like_a_migrated_one() {
+        let (_d, fresh, s) = open_tmp();
+        assert_eq!(user_version(&fresh), 3);
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        s.set_exited(a, 0).unwrap();
+        assert!(s.forget_agent(a).unwrap());
+        let b = s.insert_agent(&new_agent(2)).unwrap();
+        assert_ne!(a, b, "a forgotten id is not reused");
+        s.set_exited(b, 0).unwrap();
+        let c = s.insert_agent(&new_agent(3)).unwrap();
+        s.replace_agent(b, c).unwrap();
+        assert_eq!(s.replacements().unwrap(), HashMap::from([(b, c)]));
+        drop(s);
+
+        // A v1 DB migrated through v2 to v3 has the same schema.
+        let dir = tempfile::tempdir().unwrap();
+        let migrated = dir.path().join("state.db");
+        Connection::open(&migrated)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE agents (
+                     id INTEGER PRIMARY KEY,
+                     program TEXT NOT NULL,
+                     args_json TEXT NOT NULL,
+                     cwd TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
+                     exit_code INTEGER,
+                     created_unix_ms INTEGER NOT NULL,
+                     scrollback_path TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(Store::open(&migrated).unwrap());
+        let fresh_schema = schema(&fresh);
+        assert!(
+            fresh_schema
+                .iter()
+                .any(|l| l.starts_with("agent_replacements table_info"))
+        );
+        assert!(fresh_schema.contains(&"agents autoincrement 1".to_string()));
+        assert_eq!(fresh_schema, schema(&migrated));
     }
 
     #[test]
