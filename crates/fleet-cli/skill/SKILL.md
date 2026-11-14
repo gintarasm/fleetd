@@ -66,12 +66,17 @@ agent is waiting for input, not while it is working.
 fleet spawn --cwd DIR -- claude
 fleet spawn --cwd DIR -- claude "review the diff"
 fleet kill <id>
+fleet restart <id>
+fleet rm <id>
 ```
 
 - `spawn` prints the new agent's id. Everything after `--` is the command
   and its arguments; `--cwd` is its working directory (default: yours).
 - `kill` stops the agent (SIGTERM to its process group). Its history stays
   readable afterwards.
+- `restart`: same command/cwd/labels, new id (printed), only after the
+  agent exited. The environment is not restored.
+- `rm`: forgets an exited agent and its history. Only when asked.
 
 ## Errors
 

@@ -842,7 +842,11 @@ fn skill_examples_run() {
     let d = Daemon::start();
     let work = TempDir::new().unwrap();
     for example in &examples {
-        let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+        let id = if matches!(example[1].as_str(), "restart" | "rm") {
+            spawn_exited(&d)
+        } else {
+            d.ok(&["spawn", "--", "cat"]).trim().to_string()
+        };
         let mut args: Vec<String> = Vec::new();
         for w in &example[1..] {
             if args.last().is_some_and(|a| a == "--") {
@@ -863,4 +867,63 @@ fn skill_examples_run() {
             assert!(v.is_array());
         }
     }
+}
+
+fn ls_ids(d: &Daemon) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].to_string())
+        .collect()
+}
+
+fn spawn_exited(d: &Daemon) -> String {
+    let id = d
+        .ok(&["spawn", "--", "sh", "-c", "exit 0"])
+        .trim()
+        .to_string();
+    wait_for("exited", || {
+        let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"].as_u64().unwrap().to_string() == id && a["state"] == "exited")
+    });
+    id
+}
+
+#[test]
+fn restart_prints_new_id_and_replaces() {
+    let d = Daemon::start();
+    let old = spawn_exited(&d);
+    let new = d.ok(&["restart", &old]).trim().to_string();
+    assert!(new.parse::<u64>().is_ok(), "id: {new:?}");
+    assert_ne!(new, old);
+    let ids = ls_ids(&d);
+    assert!(!ids.contains(&old), "{ids:?}");
+    assert!(ids.contains(&new), "{ids:?}");
+}
+
+#[test]
+fn rm_removes_exited_and_refuses_running() {
+    let d = Daemon::start();
+    let gone = spawn_exited(&d);
+    let live = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+    let out = d.fleet(&["rm", &gone, &live]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&format!("agent {live} not removed")), "{err}");
+    assert!(!err.contains(&format!("agent {gone} not removed")), "{err}");
+    assert_eq!(ls_ids(&d), [live]);
+}
+
+#[test]
+fn rm_exited_counts() {
+    let d = Daemon::start();
+    spawn_exited(&d);
+    spawn_exited(&d);
+    let live = d.ok(&["spawn", "--", "cat"]).trim().to_string();
+    assert_eq!(d.ok(&["rm", "--exited"]).trim(), "removed 2 agents");
+    assert_eq!(ls_ids(&d), [live]);
 }
