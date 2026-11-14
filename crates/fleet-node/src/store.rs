@@ -68,6 +68,31 @@ fn conversion_err(col: usize, e: Box<dyn std::error::Error + Send + Sync>) -> ru
     rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, e)
 }
 
+const AGENT_COLUMNS: &str = "SELECT id, program, args_json, cwd, state, exit_code, \
+     created_unix_ms, scrollback_path FROM agents";
+
+/// Decodes an `AGENT_COLUMNS` row, taking its labels out of `labels`.
+fn decode_agent(
+    r: &rusqlite::Row<'_>,
+    labels: &mut HashMap<u64, Labels>,
+) -> rusqlite::Result<AgentRecord> {
+    let args_json: String = r.get(2)?;
+    let state: String = r.get(4)?;
+    let id = r.get::<_, i64>(0)? as u64;
+    Ok(AgentRecord {
+        id,
+        program: r.get(1)?,
+        args: serde_json::from_str(&args_json).map_err(|e| conversion_err(2, Box::new(e)))?,
+        cwd: r.get(3)?,
+        state: AgentState::parse(&state)
+            .ok_or_else(|| conversion_err(4, format!("unknown state {state:?}").into()))?,
+        exit_code: r.get(5)?,
+        created_unix_ms: r.get(6)?,
+        scrollback_path: r.get(7)?,
+        labels: labels.remove(&id).unwrap_or_default(),
+    })
+}
+
 impl Store {
     /// Opens (creating with mode 0600 if new) the DB, enables WAL and
     /// migrates to schema v3. Fails on a DB written by a newer schema.
@@ -340,8 +365,15 @@ impl Store {
 
     /// One agent with its labels; `None` if unknown.
     pub fn agent(&self, id: u64) -> rusqlite::Result<Option<AgentRecord>> {
-        let Some(mut rec) = self.query_agents(false, Some(id), |rows| rows.next().transpose())?
-        else {
+        let rec = self
+            .conn
+            .query_row(
+                &format!("{AGENT_COLUMNS} WHERE id = ?1"),
+                (id as i64,),
+                |r| decode_agent(r, &mut HashMap::new()),
+            )
+            .optional()?;
+        let Some(mut rec) = rec else {
             return Ok(None);
         };
         rec.labels = self.labels(id)?.unwrap_or_default();
@@ -375,14 +407,14 @@ impl Store {
     }
 
     pub fn list_agents(&self) -> rusqlite::Result<Vec<AgentRecord>> {
-        self.query_agents(true, None, |rows| rows.collect())
+        self.query_agents(true, |rows| rows.collect())
     }
 
     /// Like [`Store::list_agents`], but a row that fails to decode is
     /// returned as an error alongside the good rows instead of failing the
     /// whole listing.
     pub fn list_agents_lossy(&self) -> rusqlite::Result<(Vec<AgentRecord>, Vec<rusqlite::Error>)> {
-        self.query_agents(true, None, Self::split_lossy)
+        self.query_agents(true, Self::split_lossy)
     }
 
     /// [`Store::list_agents_lossy`] without reading labels (every record's
@@ -390,7 +422,7 @@ impl Store {
     pub fn list_agents_lossy_unlabeled(
         &self,
     ) -> rusqlite::Result<(Vec<AgentRecord>, Vec<rusqlite::Error>)> {
-        self.query_agents(false, None, Self::split_lossy)
+        self.query_agents(false, Self::split_lossy)
     }
 
     /// Splits decoded rows into the good ones and the errors.
@@ -426,7 +458,6 @@ impl Store {
     fn query_agents<T>(
         &self,
         with_labels: bool,
-        only: Option<u64>,
         collect: impl FnOnce(
             &mut dyn Iterator<Item = rusqlite::Result<AgentRecord>>,
         ) -> rusqlite::Result<T>,
@@ -436,28 +467,8 @@ impl Store {
         } else {
             HashMap::new()
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT id, program, args_json, cwd, state, exit_code, created_unix_ms, scrollback_path
-             FROM agents WHERE (?1 IS NULL OR id = ?1) ORDER BY id",
-        )?;
-        let mut rows = stmt.query_map((only.map(|i| i as i64),), |r| {
-            let args_json: String = r.get(2)?;
-            let state: String = r.get(4)?;
-            let id = r.get::<_, i64>(0)? as u64;
-            Ok(AgentRecord {
-                id,
-                program: r.get(1)?,
-                args: serde_json::from_str(&args_json)
-                    .map_err(|e| conversion_err(2, Box::new(e)))?,
-                cwd: r.get(3)?,
-                state: AgentState::parse(&state)
-                    .ok_or_else(|| conversion_err(4, format!("unknown state {state:?}").into()))?,
-                exit_code: r.get(5)?,
-                created_unix_ms: r.get(6)?,
-                scrollback_path: r.get(7)?,
-                labels: labels.remove(&id).unwrap_or_default(),
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!("{AGENT_COLUMNS} ORDER BY id"))?;
+        let mut rows = stmt.query_map([], |r| decode_agent(r, &mut labels))?;
         collect(&mut rows)
     }
 
@@ -773,6 +784,16 @@ mod tests {
         let a = s.insert_agent(&new_agent(1)).unwrap();
         assert!(!s.forget_agent(a).unwrap());
         assert!(s.agent(a).unwrap().is_some());
+    }
+
+    #[test]
+    fn forget_unknown_is_false_and_lost_is_forgettable() {
+        let (_d, _p, s) = open_tmp();
+        assert!(!s.forget_agent(999).unwrap());
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        assert_eq!(s.mark_running_as_lost().unwrap(), 1);
+        assert!(s.forget_agent(a).unwrap());
+        assert!(s.agent(a).unwrap().is_none());
     }
 
     #[test]
