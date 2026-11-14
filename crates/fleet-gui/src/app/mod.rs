@@ -9,6 +9,7 @@ mod pane_view;
 mod resident;
 mod sidebar_view;
 mod status_item;
+mod tail_text;
 mod terminal_element;
 mod theme;
 mod workspace;

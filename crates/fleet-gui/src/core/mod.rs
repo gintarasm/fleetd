@@ -15,3 +15,4 @@ pub mod sidebar;
 pub mod state;
 pub mod status_menu;
 pub mod target;
+pub mod truncate;

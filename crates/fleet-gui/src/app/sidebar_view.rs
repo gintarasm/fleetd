@@ -12,6 +12,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, px,
 };
 
+use super::tail_text::tail_text;
 use super::theme::Theme;
 use super::workspace::Workspace;
 use crate::core::session::AgentRow;
@@ -86,9 +87,9 @@ pub fn render_sidebar(
                         .px(px(10.))
                         .pb(px(2.))
                         .text_size(px(11.))
+                        .flex()
                         .text_color(theme.dim_text)
-                        .truncate()
-                        .child(SharedString::from(group.title)),
+                        .child(tail_text(group.title)),
                 )
                 .children(tabs)
         })

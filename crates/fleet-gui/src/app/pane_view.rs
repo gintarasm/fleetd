@@ -15,6 +15,7 @@ use gpui::{
 };
 
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
+use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
 use super::theme::current as theme;
 use crate::core::config::GuiConfig;
@@ -645,10 +646,14 @@ impl Render for PaneView {
                     )
                     .children((!path.is_empty()).then(|| {
                         div()
+                            .flex()
+                            .flex_row()
+                            .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .gap(px(4.))
                             .text_color(theme.dim_text)
-                            .child(SharedString::from(format!("· {path}")))
+                            .child(div().flex_none().child("·"))
+                            .child(tail_text(path))
                     })),
             )
             .children(observing.then(|| {
@@ -660,6 +665,8 @@ impl Render for PaneView {
             .children((chrome.number > 0).then(|| {
                 div()
                     .flex_none()
+                    // Apart from a long path that ends next to it.
+                    .ml(px(6.))
                     .text_color(theme.dim_text)
                     .child(SharedString::from(chrome.number.to_string()))
             }))
