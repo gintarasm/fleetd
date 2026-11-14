@@ -233,10 +233,11 @@ impl Connection {
     /// [`HANDSHAKE_TIMEOUT`]. The child is returned so the caller can reap or
     /// kill it; on any failure (a timeout included) it is killed and reaped.
     pub fn command(cmd: Command, client_name: &str) -> Result<(Connection, Child)> {
-        Self::command_within(cmd, client_name, HANDSHAKE_TIMEOUT)
+        Self::command_with_timeout(cmd, client_name, HANDSHAKE_TIMEOUT)
     }
 
-    fn command_within(
+    /// Like [`Connection::command`] with a caller-chosen handshake timeout.
+    pub fn command_with_timeout(
         mut cmd: Command,
         client_name: &str,
         timeout: Duration,
@@ -394,7 +395,7 @@ mod tests {
         cmd.args(["-c", "echo $$ >&2; exec sleep 30"]);
         let pidfile = std::env::temp_dir().join(format!("fleet-client-pid-{}", std::process::id()));
         cmd.stderr(std::fs::File::create(&pidfile).unwrap());
-        let (r, _) = within_5s(move || Connection::command_within(cmd, "t", SHORT));
+        let (r, _) = within_5s(move || Connection::command_with_timeout(cmd, "t", SHORT));
         assert!(is_timeout(&r), "{:?}", r.err().map(|e| e.to_string()));
         let pid: i32 = std::fs::read_to_string(&pidfile)
             .unwrap()

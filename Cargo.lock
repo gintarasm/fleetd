@@ -1952,7 +1952,10 @@ name = "fleet-gui"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "fleet-client",
+ "fleet-proto",
  "gpui",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
