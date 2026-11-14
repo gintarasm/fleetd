@@ -164,6 +164,12 @@ pub fn empty_message(chrome: &PaneChrome) -> Option<&'static str> {
     }
 }
 
+/// Whether the grid draws a cursor: only for an agent that may still
+/// take input (none in an empty pane, or once the agent exited or is gone).
+pub fn draws_cursor(chrome: &PaneChrome, state: PaneState) -> bool {
+    chrome.has_agent && !matches!(state, PaneState::Exited(_) | PaneState::Lost)
+}
+
 /// The header's title and path: the OSC title if the agent set one, else
 /// the program; and the directory with `~`.
 pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> (String, String) {
@@ -585,6 +591,7 @@ impl Render for PaneView {
             font: self.font.clone(),
             font_size: self.font_size,
             focused,
+            show_cursor: draws_cursor(&self.chrome, state),
             marked: self.marked.clone(),
         };
         let chrome = &self.chrome;
@@ -836,8 +843,8 @@ mod tests {
     };
 
     use super::{
-        InputSink, PaneChrome, PaneView, banner, empty_message, grid_size, header_parts, ime_cell,
-        point_to_cell,
+        InputSink, PaneChrome, PaneView, banner, draws_cursor, empty_message, grid_size,
+        header_parts, ime_cell, point_to_cell,
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::core::config::GuiConfig;
@@ -1317,6 +1324,22 @@ mod tests {
             banner(&down, PaneState::Disconnected).as_deref(),
             Some("disconnected — reconnecting in 3s")
         );
+    }
+
+    #[test]
+    fn cursor_only_for_an_agent_that_runs() {
+        let empty = PaneChrome::default();
+        assert!(!draws_cursor(&empty, PaneState::Attaching));
+        assert!(!draws_cursor(&empty, PaneState::Live));
+        let shown = PaneChrome {
+            has_agent: true,
+            ..PaneChrome::default()
+        };
+        assert!(draws_cursor(&shown, PaneState::Live));
+        assert!(draws_cursor(&shown, PaneState::Attaching));
+        assert!(draws_cursor(&shown, PaneState::Disconnected));
+        assert!(!draws_cursor(&shown, PaneState::Exited(0)));
+        assert!(!draws_cursor(&shown, PaneState::Lost));
     }
 
     #[test]

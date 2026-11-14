@@ -34,6 +34,8 @@ pub struct TerminalElement {
     pub(crate) font_size: Pixels,
     /// The pane has keyboard focus in the active window.
     pub(crate) focused: bool,
+    /// Draw the cursor at all (not in an empty pane or after the agent exited).
+    pub(crate) show_cursor: bool,
     pub(crate) marked: Option<String>,
 }
 
@@ -95,7 +97,8 @@ impl TerminalElement {
             .collect();
         let cursor = term.cursor_view();
         let scrolled = model.scroll_offset() > 0;
-        let cursor = (!scrolled && cursor.shape != CursorShape::Hidden).then_some(cursor);
+        let cursor = (self.show_cursor && !scrolled && cursor.shape != CursorShape::Hidden)
+            .then_some(cursor);
         Snapshot {
             rows,
             cursor,
