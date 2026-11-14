@@ -24,17 +24,25 @@ fn build_siblings() {
     assert!(cmd.status().expect("cargo build").success());
 }
 
+/// Set to also run the GUI scenarios (macOS; opens windows, needs an
+/// unlocked screen): `FLEET_PERF_GUI_SMOKE=1 cargo test -p fleet-perf`.
+const GUI_SMOKE_ENV: &str = "FLEET_PERF_GUI_SMOKE";
+
 #[test]
 fn wall_suite_quick_emits_all_metrics() {
     build_siblings();
     let bin = Path::new(env!("CARGO_BIN_EXE_fleet-perf"));
     let out = tempfile::tempdir().unwrap();
     let out_file = out.path().join("wall.json");
-    let status = Command::new(bin)
-        .args(["run", "--suite", "wall", "--quick", "--out"])
-        .arg(&out_file)
-        .status()
-        .expect("run fleet-perf");
+    let mut cmd = Command::new(bin);
+    cmd.args(["run", "--suite", "wall", "--quick", "--out"])
+        .arg(&out_file);
+    // The GUI scenarios open windows (and need an unlocked screen): opt-in.
+    let gui = cfg!(target_os = "macos") && std::env::var_os(GUI_SMOKE_ENV).is_some();
+    if !gui {
+        cmd.env(wall::NO_GUI_ENV, "1");
+    }
+    let status = cmd.status().expect("run fleet-perf");
     assert!(status.success());
 
     let r = Results::from_json(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
@@ -54,8 +62,7 @@ fn wall_suite_quick_emits_all_metrics() {
         "input_echo_flood50_ns",
         "reattach_snapshot_ns",
     ];
-    // The GUI scenarios need fleet-gui, which is macOS-only.
-    if cfg!(target_os = "macos") {
+    if gui {
         expected.extend(wall::GUI_METRIC_NAMES);
         expected.sort_unstable();
     }

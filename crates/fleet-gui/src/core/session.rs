@@ -22,7 +22,10 @@ use fleet_term::Palette;
 use super::backoff::Backoff;
 use super::pane::PaneModel;
 use super::pane_link::PaneLink;
-use super::target::{Target, connect};
+use super::target::{Connected, Target, connect};
+
+/// How the control connection introduces itself.
+pub const CLIENT_NAME: &str = "gui";
 
 /// Sidebar re-list interval.
 const RELIST: Duration = Duration::from_secs(5);
@@ -212,6 +215,8 @@ struct Sidebar {
     activity: HashMap<u64, (String, i64, Instant)>,
     /// A `ListAgents` was asked for because of an unknown id.
     list_requested: bool,
+    /// A `ListAgents` reply arrived.
+    listed: bool,
 }
 
 impl Sidebar {
@@ -224,6 +229,7 @@ impl Sidebar {
             infos.contains_key(id) || now.duration_since(a.2) < UNLISTED_ACTIVITY_TTL
         });
         self.list_requested = false;
+        self.listed = true;
     }
 }
 
@@ -266,6 +272,18 @@ impl Session {
         state_dir: PathBuf,
         ui: async_channel::Sender<UiEvent>,
     ) -> Session {
+        Session::start_with(target, state_dir, ui, None)
+    }
+
+    /// [`Session::start`], with `first` (already connected to `target`
+    /// and handshaken, e.g. the startup probe's connection) as the first
+    /// control connection; every later reconnect connects anew.
+    pub fn start_with(
+        target: Target,
+        state_dir: PathBuf,
+        ui: async_channel::Sender<UiEvent>,
+        first: Option<Connected>,
+    ) -> Session {
         let ctx = Arc::new(Ctx {
             target,
             state_dir,
@@ -288,6 +306,7 @@ impl Session {
             .spawn(move || control_writer(&writer_ctx, &rx))
             .expect("spawn control writer");
         let reader = ControlReader {
+            first,
             ctx,
             sidebar: Arc::clone(&inner.sidebar),
             cmds: tx,
@@ -299,6 +318,11 @@ impl Session {
             .spawn(move || reader.run())
             .expect("spawn control reader");
         Session { inner }
+    }
+
+    /// A `ListAgents` reply arrived: [`Session::agents`] lists them.
+    pub fn listed(&self) -> bool {
+        lock(&self.inner.sidebar).listed
     }
 
     /// A snapshot of the sidebar rows, by agent id.
@@ -467,6 +491,8 @@ impl Session {
 
 /// The control connection's reader: connects, reads, reconnects.
 struct ControlReader {
+    /// Used instead of connecting, the first time.
+    first: Option<Connected>,
     ctx: Arc<Ctx>,
     sidebar: Arc<Mutex<Sidebar>>,
     cmds: mpsc::Sender<ControlCmd>,
@@ -475,13 +501,17 @@ struct ControlReader {
 }
 
 impl ControlReader {
-    fn run(self) {
+    fn run(mut self) {
         let mut backoff = Backoff::new();
         // One error per outage, not one per retry.
         let mut reported = false;
         while !self.stop.is_set() {
             self.ctx.notify(UiEvent::Connection(ConnState::Connecting));
-            match connect(&self.ctx.target, &self.ctx.state_dir, "gui") {
+            let attempt = match self.first.take() {
+                Some(c) => Ok(c),
+                None => connect(&self.ctx.target, &self.ctx.state_dir, CLIENT_NAME),
+            };
+            match attempt {
                 Ok(c) => {
                     backoff.reset();
                     reported = false;

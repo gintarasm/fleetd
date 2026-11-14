@@ -6,7 +6,7 @@ Baselines live in `bench/baselines.toml`; all metrics are lower-is-better. Desig
 
 ```sh
 cargo build --release --workspace
-target/release/fleet-perf run --suite wall --out wall.json      # add --quick for a smoke run
+caffeinate -d target/release/fleet-perf run --suite wall --out wall.json   # add --quick for a smoke run
 target/release/fleet-perf compare --baselines bench/baselines.toml --results wall.json
 ```
 
@@ -45,7 +45,9 @@ Locally on macOS use Docker (`rust:1`, install `valgrind`) with `--security-opt 
 | `history_push_1k_lines_instructions` | instr | push 1000 lines of 100 bytes into a new per-agent `History` store (includes its buffered file writes) |
 | `history_read_page_instructions` | instr | one `read_page` of 1000 lines from the middle of a flushed store of 100 000 lines of 100 bytes |
 
-The three GUI metrics need `fleet-gui` next to `fleet-perf` and a logged-in macOS window server (the self-hosted runner's GUI session). The GUI's bench hooks (`crates/fleet-gui/src/app/bench.rs`) never show the connect sheet: a failed connect exits 3, a bench not done within 30 s exits 4. If `fleet-gui` is missing or exits non-zero before its line, the wall run fails with a message saying so; on Linux, where `fleet-gui` is macOS-only, the run skips them with a message (and `compare` then reports them missing).
+The three GUI metrics need `fleet-gui` next to `fleet-perf` and a logged-in, **unlocked** macOS GUI session with the display awake (the self-hosted runner's; `perf-wall` runs the suite under `caffeinate -d`). A locked screen or a sleeping display presents no frames: the run checks `CGSSessionScreenIsLocked` up front and before each GUI launch and fails with "the screen is locked"; a GUI that presents no frame in time (exit 4) fails too. The GUI's bench hooks (`crates/fleet-gui/src/app/bench.rs`) never show the connect sheet: a failed connect exits 3. If `fleet-gui` is missing or exits non-zero before its line, the wall run fails with a message saying so. They are skipped, with a message, only on Linux (`fleet-gui` is macOS-only) and when `FLEET_PERF_NO_GUI` is set; `compare` then reports them missing, so a gate run fails.
+
+The quick smoke test (`crates/fleet-perf/tests/wall_smoke.rs`) sets `FLEET_PERF_NO_GUI`, so a plain `cargo test` opens no windows; run `FLEET_PERF_GUI_SMOKE=1 cargo test -p fleet-perf --test wall_smoke` (macOS, screen unlocked) to include the GUI scenarios.
 
 Tolerances: `instr` 2%, `wall` 5%.
 

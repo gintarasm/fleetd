@@ -4,7 +4,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, Global, InteractiveElement, IntoElement,
@@ -18,8 +19,8 @@ use super::new_agent::{TextField, button};
 use super::theme::{Theme, current as theme};
 use super::workspace::Workspace;
 use crate::core::launch::{find_fleetd, start_local};
-use crate::core::session::{ConnHandle, Session, UiEvent};
-use crate::core::target::{ConnectError, Startup, Target, connect, startup_action};
+use crate::core::session::{CLIENT_NAME, ConnHandle, Session, UiEvent};
+use crate::core::target::{ConnectError, Connected, Startup, Target, connect, startup_action};
 
 /// A startup connect this quick never shows the sheet.
 pub const STARTUP_QUIET: Duration = Duration::from_millis(400);
@@ -31,7 +32,8 @@ const SPINNER_STEP: Duration = Duration::from_millis(80);
 /// runs on the background executor.
 pub trait Backend: Send + Sync {
     fn find_fleetd(&self) -> Option<PathBuf>;
-    /// Connects to `target`, handshakes, and closes the connection again.
+    /// Connects to `target` and handshakes. The real backend keeps the
+    /// connection for the next [`Backend::session`] to `target`.
     fn probe(&self, target: &Target) -> Result<(), ConnectError>;
     /// Starts a local fleetd and waits until it answers.
     fn start_local(&self, fleetd: &Path) -> Result<(), ConnectError>;
@@ -39,9 +41,47 @@ pub trait Backend: Send + Sync {
     fn session(&self, target: &Target, ui: async_channel::Sender<UiEvent>) -> Arc<dyn SessionApi>;
 }
 
+/// A probe's connection older than this is not reused (it may have been
+/// cancelled and left idle); the session connects anew.
+pub const PROBE_REUSE_WINDOW: Duration = Duration::from_secs(5);
+
 /// The real thing, over `state_dir`.
 pub struct RealBackend {
     pub state_dir: PathBuf,
+    /// The last probe's connection, for the session that follows it: one
+    /// handshake instead of two.
+    probed: Mutex<Option<(Target, Instant, Connected)>>,
+}
+
+impl RealBackend {
+    pub fn new(state_dir: PathBuf) -> Self {
+        RealBackend {
+            state_dir,
+            probed: Mutex::new(None),
+        }
+    }
+
+    /// Keeps `c` (to `target`) for the next session; closes the one kept before.
+    fn keep(&self, target: &Target, c: Connected) {
+        let old = lock(&self.probed).replace((target.clone(), Instant::now(), c));
+        if let Some((_, _, old)) = old {
+            ConnHandle::new(&old.conn, old.child).finish();
+        }
+    }
+
+    /// The kept connection, if it is to `target` and recent; a stale one is closed.
+    fn take_probed(&self, target: &Target) -> Option<Connected> {
+        let (t, at, c) = lock(&self.probed).take()?;
+        if t == *target && at.elapsed() < PROBE_REUSE_WINDOW {
+            return Some(c);
+        }
+        ConnHandle::new(&c.conn, c.child).finish();
+        None
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Backend for RealBackend {
@@ -50,8 +90,9 @@ impl Backend for RealBackend {
     }
 
     fn probe(&self, target: &Target) -> Result<(), ConnectError> {
-        let c = connect(target, &self.state_dir, "gui-probe")?;
-        ConnHandle::new(&c.conn, c.child).finish();
+        // Handshaken as the session's control connection, which it becomes.
+        let c = connect(target, &self.state_dir, CLIENT_NAME)?;
+        self.keep(target, c);
         Ok(())
     }
 
@@ -60,7 +101,13 @@ impl Backend for RealBackend {
     }
 
     fn session(&self, target: &Target, ui: async_channel::Sender<UiEvent>) -> Arc<dyn SessionApi> {
-        Arc::new(Session::start(target.clone(), self.state_dir.clone(), ui))
+        let first = self.take_probed(target);
+        Arc::new(Session::start_with(
+            target.clone(),
+            self.state_dir.clone(),
+            ui,
+            first,
+        ))
     }
 }
 
@@ -87,6 +134,63 @@ pub fn remote_target(text: &str) -> Option<Target> {
     Some(Target::Ssh {
         dest: dest.to_owned(),
     })
+}
+
+fn startup_label(saved: Option<&Target>) -> String {
+    match saved {
+        Some(t) => format!("Connecting to {}…", target_label(t)),
+        None => "Looking for fleetd on this Mac…".to_owned(),
+    }
+}
+
+/// The launch's connect: `saved`, else a local fleetd if one answers
+/// (never starting one), else ask the user (`Err`, with the reason).
+pub fn startup_work(b: &dyn Backend, saved: Option<Target>) -> Result<Target, Option<String>> {
+    let local_answers = saved.is_none() && b.probe(&Target::Local).is_ok();
+    match startup_action(saved.as_ref(), local_answers) {
+        Startup::Connect(t) if local_answers => Ok(t),
+        Startup::Connect(t) => b.probe(&t).map(|()| t).map_err(|e| Some(e.to_string())),
+        Startup::AskUser { reason } => Err(reason),
+    }
+}
+
+/// The launch's connect, started on its own thread before the window
+/// opens so the two overlap; the connect sheet waits for its result.
+pub struct StartupAttempt {
+    saved: Option<Target>,
+    result: async_channel::Receiver<Result<Target, Option<String>>>,
+}
+
+impl StartupAttempt {
+    pub fn start(backend: Arc<dyn Backend>, saved: Option<Target>) -> Self {
+        let (tx, rx) = async_channel::bounded(1);
+        let target = saved.clone();
+        let spawned = std::thread::Builder::new()
+            .name("gui-startup".into())
+            .spawn(move || {
+                let _ = tx.send_blocking(startup_work(backend.as_ref(), target));
+            });
+        if let Err(e) = spawned {
+            // The receiver then reports the attempt as failed.
+            eprintln!("fleet-gui: cannot start the startup connect: {e}");
+        }
+        StartupAttempt { saved, result: rx }
+    }
+
+    /// Its result if it is already done, else the attempt.
+    pub fn into_result(self) -> Result<Result<Target, Option<String>>, StartupAttempt> {
+        match self.result.try_recv() {
+            Ok(r) => Ok(r),
+            Err(_) => Err(self),
+        }
+    }
+
+    /// An attempt whose result is already known.
+    pub fn finished(saved: Option<Target>, result: Result<Target, Option<String>>) -> Self {
+        let (tx, rx) = async_channel::bounded(1);
+        let _ = tx.try_send(result);
+        StartupAttempt { saved, result: rx }
+    }
 }
 
 /// How a target is named in the sheet.
@@ -179,8 +283,20 @@ impl ConnectSheet {
         let bg = cx
             .background_executor()
             .spawn(async move { work(backend.as_ref()) });
-        // Dropping this task (Cancel) drops the result; a probe has closed
-        // its connection by then either way.
+        self.run_future(label, save, bg, cx);
+    }
+
+    /// Waits for `result` (a connect on its way) as [`ConnectSheet::run`]
+    /// does. Dropping it (Cancel) drops the result; a kept probe
+    /// connection then goes stale ([`PROBE_REUSE_WINDOW`]).
+    fn run_future(
+        &mut self,
+        label: String,
+        save: bool,
+        result: impl Future<Output = Result<Target, Option<String>>> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let bg = result;
         let work = cx.spawn(async move |this, cx| {
             let result = bg.await;
             let _ = this.update(cx, |s, cx| s.finished(result, save, cx));
@@ -238,12 +354,29 @@ impl ConnectSheet {
     /// local fleetd if one answers, else ask. The sheet stays hidden for
     /// [`STARTUP_QUIET`] or until it has to ask.
     pub fn startup(&mut self, saved: Option<Target>, cx: &mut Context<Self>) {
-        let label = match &saved {
-            Some(t) => format!("Connecting to {}…", target_label(t)),
-            None => "Looking for fleetd on this Mac…".to_owned(),
+        self.arm_quiet(cx);
+        let label = startup_label(saved.as_ref());
+        self.run(label, false, move |b| startup_work(b, saved), cx);
+    }
+
+    /// [`ConnectSheet::startup`] for an attempt that started before the
+    /// window opened ([`StartupAttempt::start`]).
+    pub fn startup_from(&mut self, attempt: StartupAttempt, cx: &mut Context<Self>) {
+        self.arm_quiet(cx);
+        let label = startup_label(attempt.saved.as_ref());
+        let rx = attempt.result;
+        let result = async move {
+            rx.recv()
+                .await
+                .unwrap_or_else(|_| Err(Some("the startup connect thread failed".to_owned())))
         };
+        self.run_future(label, false, result, cx);
+    }
+
+    /// Hides the sheet for [`STARTUP_QUIET`]. A bench run never shows it:
+    /// it stays quiet, and a failure exits.
+    fn arm_quiet(&mut self, cx: &mut Context<Self>) {
         self.quiet = true;
-        // A bench run never shows the sheet: it stays quiet, and a failure exits.
         self._quiet_timer = (!bench::active()).then(|| {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(STARTUP_QUIET).await;
@@ -253,19 +386,6 @@ impl ConnectSheet {
                 });
             })
         });
-        self.run(
-            label,
-            false,
-            move |b| {
-                let local_answers = saved.is_none() && b.probe(&Target::Local).is_ok();
-                match startup_action(saved.as_ref(), local_answers) {
-                    Startup::Connect(t) if local_answers => Ok(t),
-                    Startup::Connect(t) => b.probe(&t).map(|()| t).map_err(|e| Some(e.to_string())),
-                    Startup::AskUser { reason } => Err(reason),
-                }
-            },
-            cx,
-        );
     }
 
     /// "Start fleetd on this Mac": the only way the GUI starts a daemon.
@@ -519,12 +639,12 @@ pub fn switch_target(target: Target, cx: &mut App) {
     bench::connected(cx);
 }
 
-/// The launch flow over the open workspace window.
-pub fn begin_startup(saved: Option<Target>, cx: &mut App) {
+/// The launch flow over the open workspace window, waiting for `attempt`.
+pub fn begin_startup(attempt: StartupAttempt, cx: &mut App) {
     let Some(handle) = AppState::global(cx).and_then(|a| a.read(cx).window) else {
         return;
     };
-    let _ = handle.update(cx, |ws, window, cx| ws.start_up(saved, window, cx));
+    let _ = handle.update(cx, |ws, window, cx| ws.start_up_from(attempt, window, cx));
 }
 
 pub(super) fn new_sheet(reason: Option<String>, cx: &mut App) -> Option<Entity<ConnectSheet>> {
@@ -546,7 +666,10 @@ mod tests {
     use fleet_term::Palette;
     use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext};
 
-    use super::{Backend, ConnectSheet, install_backend, remote_target, switch_target};
+    use super::{
+        Backend, ConnectSheet, StartupAttempt, install_backend, remote_target, startup_work,
+        switch_target,
+    };
     use crate::app::app_state::{AppState, SessionApi};
     use crate::app::keymap::bind_keys;
     use crate::app::pane_view::InputSink;
@@ -773,6 +896,63 @@ mod tests {
         assert!(backend.calls().contains(&Call::Session(Target::Local)));
         // Not saved: no connection was chosen.
         assert_eq!(load_config(dir.path()).unwrap().connection, None);
+    }
+
+    /// As `begin_startup` does, for an attempt started before the window.
+    fn startup_from(s: &mut Setup<'_>, attempt: StartupAttempt) {
+        s.ws.update_in(s.cx, |ws, window, cx| ws.start_up_from(attempt, window, cx));
+        s.cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn early_attempt_that_connected_starts_the_session(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let mut s = setup(cx, &backend, dir.path());
+        let attempt = StartupAttempt::finished(Some(Target::Local), Ok(Target::Local));
+        startup_from(&mut s, attempt);
+        assert!(!shown(&mut s));
+        assert!(sheet(&mut s).is_none());
+        assert!(s.app.read_with(s.cx, |a, _| a.is_live()));
+        // The sheet probes nothing itself: the attempt did.
+        assert!(!backend.calls().iter().any(|c| matches!(c, Call::Probe(_))));
+        assert!(backend.calls().contains(&Call::Session(Target::Local)));
+        assert!(!backend.started_daemon());
+    }
+
+    #[gpui::test]
+    fn early_attempt_that_failed_shows_the_sheet(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let mut s = setup(cx, &backend, dir.path());
+        let attempt = StartupAttempt::finished(
+            Some(Target::Local),
+            Err(Some("fleetd is not running".into())),
+        );
+        startup_from(&mut s, attempt);
+        assert!(shown(&mut s));
+        let sheet = sheet(&mut s).unwrap();
+        let reason = sheet.read_with(s.cx, |sh, _| sh.reason.clone());
+        assert_eq!(reason.as_deref(), Some("fleetd is not running"));
+        assert!(backend.calls().is_empty());
+        assert!(!backend.started_daemon());
+        assert!(!s.app.read_with(s.cx, |a, _| a.is_live()));
+    }
+
+    #[test]
+    fn startup_work_never_starts_a_daemon() {
+        let backend = FakeBackend {
+            fleetd: Some("/x/fleetd".into()),
+            ..Default::default()
+        };
+        assert_eq!(startup_work(&backend, None), Err(None));
+        backend.answer(Target::Local, Ok(()));
+        assert_eq!(startup_work(&backend, None), Ok(Target::Local));
+        assert_eq!(
+            startup_work(&backend, Some(Target::Local)),
+            Ok(Target::Local)
+        );
+        assert!(!backend.started_daemon());
     }
 
     #[gpui::test]

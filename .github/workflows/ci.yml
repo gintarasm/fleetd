@@ -43,7 +43,9 @@ jobs:
       - name: Install pinned toolchain
         run: cargo --version
       - run: cargo build --release --workspace
-      - run: target/release/fleet-perf run --suite wall --out wall.json
+      # caffeinate -d keeps the display awake: a sleeping display or a locked
+      # screen presents no frames, and the GUI metrics then fail.
+      - run: caffeinate -d target/release/fleet-perf run --suite wall --out wall.json
       - run: target/release/fleet-perf compare --baselines bench/baselines.toml --results wall.json
       - uses: actions/upload-artifact@v4
         if: always()

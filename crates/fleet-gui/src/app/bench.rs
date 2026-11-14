@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use fleet_term::Cell;
-use gpui::{App, AppContext, Keystroke, Window};
+use gpui::{App, AppContext, AsyncApp, Keystroke, Window};
 
 use super::app_state::AppState;
 use crate::core::pane::PaneState;
@@ -266,32 +266,30 @@ fn live_count(pane: PaneId, agent: u64, cx: &App) -> Option<usize> {
     Some(n)
 }
 
-/// The app connected to its fleetd: the `input` bench starts (once the
-/// caller, possibly the workspace itself, is done).
+/// The app connected to its fleetd: the `input` bench starts, once the
+/// window is open (the session may start before it) and the caller,
+/// possibly the workspace itself, is done.
 pub fn connected(cx: &mut App) {
-    if matches!(mode(), Some(Mode::Input { .. })) {
-        cx.defer(start_input);
-    }
-}
-
-fn start_input(cx: &mut App) {
     let Some(Mode::Input { agent, extra }) = mode() else {
-        return;
-    };
-    let Some(app) = AppState::global(cx) else {
-        return;
-    };
-    let Some(handle) = app.read(cx).window else {
-        eprintln!("fleet-gui: bench: no window");
-        std::process::exit(EXIT_TIMEOUT);
-    };
-    let Ok(pane) = handle.update(cx, |ws, window, cx| {
-        ws.bench_open(*agent, extra, window, cx)
-    }) else {
         return;
     };
     let agent = *agent;
     cx.spawn(async move |cx| {
+        let window = |cx: &mut AsyncApp| {
+            cx.update(|cx| AppState::global(cx).and_then(|a| a.read(cx).window))
+                .ok()
+                .flatten()
+        };
+        let handle = loop {
+            if let Some(h) = window(cx) {
+                break h;
+            }
+            cx.background_executor().timer(POLL).await;
+        };
+        let Ok(pane) = handle.update(cx, |ws, window, cx| ws.bench_open(agent, extra, window, cx))
+        else {
+            return;
+        };
         // Until pane 1 shows the agent's snapshot at its laid-out size.
         loop {
             cx.background_executor().timer(POLL).await;

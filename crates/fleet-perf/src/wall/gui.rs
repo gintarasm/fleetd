@@ -26,6 +26,37 @@ const COLD_START_AGENTS: usize = 10;
 const FLOOD_PANES: usize = 3;
 /// The GUI's exit status when it cannot connect to fleetd.
 const EXIT_NO_FLEETD: i32 = 3;
+/// The GUI's exit status when its bench did not finish (no frame presented).
+const EXIT_TIMEOUT: i32 = 4;
+
+/// Whether `ioreg -a -n Root -d1` output says the session's screen is locked.
+fn locked_in(ioreg: &str) -> bool {
+    let mut lines = ioreg.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line == "<key>CGSSessionScreenIsLocked</key>" {
+            return lines.next() == Some("<true/>");
+        }
+    }
+    false
+}
+
+/// Fails with "the screen is locked" when it is: a locked session presents
+/// no frames, so the GUI metrics cannot be measured (they are never skipped).
+pub(super) fn check_screen() -> Result<(), String> {
+    let out = Command::new("ioreg")
+        .args(["-a", "-n", "Root", "-d1"])
+        .output()
+        .map_err(|e| format!("running ioreg: {e}"))?;
+    if locked_in(&String::from_utf8_lossy(&out.stdout)) {
+        return Err(format!(
+            "{}: the screen is locked (CGSSessionScreenIsLocked); a locked \
+             session presents no frames. Unlock the Mac's GUI session and keep \
+             the display awake (caffeinate -d) to measure them",
+            super::GUI_METRIC_NAMES.join(", ")
+        ));
+    }
+    Ok(())
+}
 
 /// One `fleet-gui` run in bench `mode` against the daemon in `state_dir`.
 struct GuiRun<'a> {
@@ -40,6 +71,7 @@ impl GuiRun<'_> {
     /// returns that line and the time from just before spawn to reading it.
     /// The GUI must then exit 0.
     fn run(&self, prefix: &str) -> Result<(String, u128), String> {
+        check_screen()?;
         let stderr = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(self.gui);
         cmd.arg("--state-dir")
@@ -77,6 +109,16 @@ impl GuiRun<'_> {
         };
         match (found, status.code()) {
             (Some(found), Some(0)) => Ok(found),
+            (_, Some(EXIT_TIMEOUT)) => {
+                // Locked while it ran?
+                check_screen()?;
+                Err(format!(
+                    "fleet-gui ({}) presented no frame in time: is the screen locked or \
+                     the display asleep? {}",
+                    self.mode,
+                    log()
+                ))
+            }
             (_, Some(EXIT_NO_FLEETD)) => Err(format!(
                 "fleet-gui ({}) could not connect to fleetd: {}",
                 self.mode,
@@ -84,7 +126,7 @@ impl GuiRun<'_> {
             )),
             (None, _) => Err(format!(
                 "fleet-gui ({}) exited with {status} before printing {prefix:?} \
-                 (is a window server session available, with the screen unlocked?): {}",
+                 (is a window server session available?): {}",
                 self.mode,
                 log()
             )),
@@ -241,7 +283,22 @@ pub(super) fn input_to_render_flood_ns(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_input_ns;
+    use super::{locked_in, parse_input_ns};
+
+    #[test]
+    fn locked_screen_is_read_from_ioreg() {
+        let plist = |v: &str| {
+            format!(
+                "<dict>\n\t<key>CGSSessionScreenIsLocked</key>\n\t{v}\n\t<key>kCGSSessionOnConsoleKey</key>\n\t<true/>\n</dict>"
+            )
+        };
+        assert!(locked_in(&plist("<true/>")));
+        assert!(!locked_in(&plist("<false/>")));
+        // An unlocked session has no such key at all.
+        assert!(!locked_in(
+            "<dict>\n\t<key>kCGSSessionOnConsoleKey</key>\n\t<true/>\n</dict>"
+        ));
+    }
 
     #[test]
     fn input_ns_line_is_parsed() {

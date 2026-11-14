@@ -30,6 +30,10 @@ pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// fake in tests.
 pub trait SessionApi: InputSink {
     fn agents(&self) -> Vec<AgentRow>;
+    /// The agents were listed ([`SessionApi::agents`] holds them).
+    fn listed(&self) -> bool {
+        false
+    }
     fn spawn(
         &self,
         program: String,
@@ -51,6 +55,10 @@ pub trait SessionApi: InputSink {
 impl SessionApi for Session {
     fn agents(&self) -> Vec<AgentRow> {
         Session::agents(self)
+    }
+
+    fn listed(&self) -> bool {
+        Session::listed(self)
     }
 
     fn spawn(
@@ -481,6 +489,15 @@ impl AppState {
             push_recent(dirs, dir, MAX_RECENT_DIRS);
         }
         true
+    }
+
+    /// Takes the session's agent list if it arrived before its event was
+    /// applied (the window's first frame then draws it).
+    pub fn sync_agents(&mut self) {
+        if self.live && self.session.listed() {
+            self.agents = self.session.agents();
+            super::bench::agents_listed();
+        }
     }
 
     pub fn has_agents(&self) -> bool {

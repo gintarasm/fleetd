@@ -20,7 +20,8 @@ use gpui::{AppContext, Application, Menu, MenuItem};
 
 pub use app_state::{AppState, SessionApi};
 pub use connect::{
-    Backend, ConnectSheet, RealBackend, show_connect_sheet, switch_fleetd, switch_target,
+    Backend, ConnectSheet, RealBackend, StartupAttempt, show_connect_sheet, startup_work,
+    switch_fleetd, switch_target,
 };
 pub use keymap::to_key;
 pub use pane_view::{InputSink, PaneChrome, PaneView, grid_size};
@@ -46,6 +47,9 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
     });
     // `--target` beats `[gui] connection`.
     let saved = target.or_else(|| config.connection.clone());
+    let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(state_dir.clone()));
+    // The connect runs while the app launches and the window opens.
+    let attempt = StartupAttempt::start(backend.clone(), saved.clone());
 
     let app = Application::new();
     // Unconnected, the reopened window asks again.
@@ -62,16 +66,28 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                 MenuItem::action("Quit fleet", keymap::Quit),
             ],
         }]);
-        let backend: Arc<dyn Backend> = Arc::new(RealBackend {
-            state_dir: state_dir.clone(),
-        });
         connect::install_backend(backend, cx);
         let theme = Theme::for_appearance(cx.window_appearance());
         let shown = saved.clone().unwrap_or(Target::Local);
         let state = cx.new(|cx| AppState::without_session(shown, state_dir, config, theme, cx));
         AppState::install(state.clone(), cx);
-        open_main_window(cx);
-        connect::begin_startup(saved, cx);
+        // Connected already (the usual case): the session starts, and
+        // lists the agents, while the window opens. Otherwise the startup
+        // flow waits for the attempt over the open window.
+        match attempt.into_result() {
+            Ok(Ok(target)) => {
+                switch_target(target, cx);
+                open_main_window(cx);
+            }
+            Ok(Err(reason)) => {
+                open_main_window(cx);
+                connect::begin_startup(StartupAttempt::finished(saved, Err(reason)), cx);
+            }
+            Err(attempt) => {
+                open_main_window(cx);
+                connect::begin_startup(attempt, cx);
+            }
+        }
         resident::install(cx);
 
         // Detach only, well inside gpui's 100 ms quit budget; agents run on.

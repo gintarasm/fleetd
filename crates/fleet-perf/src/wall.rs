@@ -310,8 +310,32 @@ fn repeat(
     (0..n).map(|_| f()).collect::<Result<Vec<_>, _>>().map(stat)
 }
 
+/// Set to skip the GUI scenarios (the quick smoke test does, so a plain
+/// `cargo test` opens no windows). `compare` then reports their metrics
+/// missing, so a gate run with it set fails.
+pub const NO_GUI_ENV: &str = "FLEET_PERF_NO_GUI";
+
+/// `fleet-gui` for the GUI scenarios, or `None` (with a message) where
+/// they are skipped. Checked up front: a missing binary or a locked
+/// screen fails the run before the long scenarios.
+fn gui_binary() -> Result<Option<PathBuf>, String> {
+    let names = GUI_METRIC_NAMES.join(", ");
+    if !cfg!(target_os = "macos") {
+        eprintln!("fleet-perf: skipping {names}: fleet-gui is macOS-only");
+        return Ok(None);
+    }
+    if std::env::var_os(NO_GUI_ENV).is_some_and(|v| !v.is_empty()) {
+        eprintln!("fleet-perf: skipping {names}: {NO_GUI_ENV} is set");
+        return Ok(None);
+    }
+    let gui = sibling("fleet-gui")?;
+    gui::check_screen()?;
+    Ok(Some(gui))
+}
+
 pub fn run(quick: bool) -> Result<Results, String> {
     let fleetd = sibling("fleetd")?;
+    let gui = gui_binary()?;
     let (cold_runs, rss_runs, flood_runs, bytes) = if quick {
         (1, 1, 1, QUICK_FLOOD_BYTES)
     } else {
@@ -382,10 +406,9 @@ pub fn run(quick: bool) -> Result<Results, String> {
         eprintln!("fleet-perf: {msg}");
     }
 
-    // fleet-gui is macOS-only (it exits 1 elsewhere); missing or unable to
-    // open a window, these metrics fail.
-    let gui_metrics = if cfg!(target_os = "macos") {
-        let gui = sibling("fleet-gui")?;
+    // fleet-gui is macOS-only (it exits 1 elsewhere); missing, unable to
+    // open a window or on a locked screen, these metrics fail.
+    let gui_metrics = if let Some(gui) = gui {
         let cold_runs = if quick {
             QUICK_GUI_COLD_RUNS
         } else {
@@ -410,10 +433,6 @@ pub fn run(quick: bool) -> Result<Results, String> {
             ),
         ]
     } else {
-        eprintln!(
-            "fleet-perf: skipping {}: fleet-gui is macOS-only",
-            GUI_METRIC_NAMES.join(", ")
-        );
         vec![]
     };
 

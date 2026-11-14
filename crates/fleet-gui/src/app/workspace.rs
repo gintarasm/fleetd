@@ -13,7 +13,7 @@ use gpui::{
 };
 
 use super::app_state::AppState;
-use super::connect::{ConnectEvent, ConnectSheet, new_sheet, switch_target};
+use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
 use super::keymap::{
     ClosePane, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
     FocusUp, Kill, NewAgent, SplitDown, SplitRight, ToggleMaximize,
@@ -109,7 +109,11 @@ impl Workspace {
             window.refresh();
         });
         let theme = Theme::for_appearance(window.appearance());
-        app.update(cx, |a, cx| a.set_theme(theme, cx));
+        app.update(cx, |a, cx| {
+            a.set_theme(theme, cx);
+            // The list is often in before the window: draw it at once.
+            a.sync_agents();
+        });
         // `since` in the sidebar and the reconnect countdown age by the
         // second; the timer lives as long as the window.
         let ticker = cx.spawn(async move |this, cx| {
@@ -204,6 +208,19 @@ impl Workspace {
     pub fn start_up(&mut self, saved: Option<Target>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(sheet) = self.install_connect_sheet(None, window, cx) {
             sheet.update(cx, |s, cx| s.startup(saved, cx));
+        }
+    }
+
+    /// [`Workspace::start_up`] for a connect that started before the
+    /// window opened.
+    pub fn start_up_from(
+        &mut self,
+        attempt: StartupAttempt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(sheet) = self.install_connect_sheet(None, window, cx) {
+            sheet.update(cx, |s, cx| s.startup_from(attempt, cx));
         }
     }
 
@@ -759,6 +776,7 @@ mod tests {
         agents: Mutex<Vec<AgentRow>>,
         models: Mutex<HashMap<PaneId, Arc<Mutex<PaneModel>>>>,
         spawn_error: Mutex<Option<String>>,
+        listed: std::sync::atomic::AtomicBool,
     }
 
     impl Fake {
@@ -782,6 +800,10 @@ mod tests {
     impl SessionApi for Fake {
         fn agents(&self) -> Vec<AgentRow> {
             self.agents.lock().unwrap().clone()
+        }
+
+        fn listed(&self) -> bool {
+            self.listed.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn spawn(
@@ -921,6 +943,23 @@ mod tests {
         *fake.agents.lock().unwrap() = rows;
         s.ui.try_send(UiEvent::AgentsChanged).unwrap();
         s.cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn agents_listed_before_the_window_are_in_its_first_frame(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let app = app_state(cx, &fake, dir.path());
+        assert!(!app.read_with(cx, |a, _| a.has_agents()));
+        // The list arrives while the window opens, its event not yet applied.
+        *fake.agents.lock().unwrap() = vec![row(1, "/a", 1), row(2, "/b", 2)];
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = app.clone();
+        let (_ws, cx) = cx.add_window_view(|window, cx| Workspace::new(state, window, cx));
+        let ids: Vec<u64> = app.read_with(cx, |a, _| a.agents.iter().map(|r| r.info.id).collect());
+        assert_eq!(ids, [1, 2]);
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tab-1").is_some() && cx.debug_bounds("tab-2").is_some());
     }
 
     #[gpui::test]

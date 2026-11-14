@@ -247,6 +247,48 @@ fn sidebar_lists_and_follows_activity() {
     s.shutdown();
 }
 
+/// `Session::start_with` uses the connection it is given (here one to a
+/// daemon in another dir than the session's target, so a fresh connect
+/// could not have listed this agent) and, once it drops, reconnects to
+/// the target as before.
+#[test]
+fn start_with_uses_the_given_connection_first() {
+    let d = Daemon::start();
+    let id = d.spawn("sleep 30", 80, 24);
+    let other = tempfile::tempdir().unwrap();
+    let first = connect(&Target::Local, d.path(), "gui").expect("connect");
+    let (tx, rx) = async_channel::unbounded();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    std::thread::spawn(move || {
+        while let Ok(e) = rx.recv_blocking() {
+            sink.lock().unwrap().push(e);
+        }
+    });
+    let events = Events(events);
+    let s = Session::start_with(Target::Local, other.path().to_owned(), tx, Some(first));
+    wait_until("the agent listed over the given connection", || {
+        s.agents().iter().any(|r| r.info.id == id)
+    });
+    assert_eq!(
+        events.conn_states().first(),
+        Some(&ConnState::Connecting),
+        "{:?}",
+        events.conn_states()
+    );
+    assert!(events.has(|e| *e == UiEvent::Connection(ConnState::Connected)));
+    // The daemon goes away: the session retries its own target (which has
+    // no daemon) with backoff, unchanged.
+    d.cleanup.stop();
+    wait_until("a reconnect attempt to the target", || {
+        events
+            .conn_states()
+            .iter()
+            .any(|c| matches!(c, ConnState::Disconnected { .. }))
+    });
+    s.shutdown();
+}
+
 /// The bytes the agent read back, from the `HEX:` dump on its screen.
 fn hex_dump(lines: &[String]) -> Option<Vec<u8>> {
     let start = lines.iter().position(|l| l.starts_with("HEX:"))?;
