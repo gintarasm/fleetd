@@ -1174,6 +1174,31 @@ mod tests {
     }
 
     #[gpui::test]
+    fn config_error_stays_shown_after_the_first_connect(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FakeBackend::default());
+        let s = setup(cx, &backend, dir.path());
+        let msg = "config.toml line 2: expected a value".to_owned();
+        s.app
+            .update(s.cx, |a, cx| a.set_config_error(msg.clone(), cx));
+        assert_eq!(
+            s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned)),
+            Some(msg.clone())
+        );
+        s.cx.update(|_, cx| switch_target(Target::Local, cx));
+        assert_eq!(
+            s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned)),
+            Some(msg)
+        );
+        // A later switch starts clean.
+        s.cx.update(|_, cx| switch_target(Target::Ssh { dest: "box".into() }, cx));
+        assert_eq!(
+            s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned)),
+            None
+        );
+    }
+
+    #[gpui::test]
     fn switching_to_the_connected_target_keeps_the_session(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let backend = Arc::new(FakeBackend::default());

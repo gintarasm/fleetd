@@ -195,6 +195,8 @@ pub struct AppState {
     pub(super) agents: Vec<AgentRow>,
     /// The last error, shown until dismissed or replaced.
     pub(super) error: Option<String>,
+    /// A config error from launch, still shown after the first connect.
+    config_error: Option<String>,
     /// Panes a spawn is on its way into (for the "starting…" text only).
     starting: HashSet<PaneId>,
     /// The directory of the spawn on its way into a pane; it becomes a
@@ -247,6 +249,7 @@ impl AppState {
             titles: HashMap::new(),
             theme,
             error: None,
+            config_error: None,
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
             requested: HashMap::new(),
@@ -313,7 +316,8 @@ impl AppState {
         self.focused = self.layout.panes()[0];
         self.maximized = None;
         self.titles.clear();
-        self.error = None;
+        // A launch config error outlives the first connect only.
+        self.error = self.config_error.take();
         self.starting.clear();
         self.spawn_dirs.clear();
         self.requested.clear();
@@ -754,6 +758,13 @@ impl AppState {
         self.theme = theme;
         self.session.set_palette(theme.palette);
         cx.set_global(theme);
+        cx.notify();
+    }
+
+    /// Shows a config error from launch (also after the first connect).
+    pub fn set_config_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.config_error = Some(message.clone());
+        self.error = Some(message);
         cx.notify();
     }
 

@@ -41,10 +41,14 @@ use crate::core::target::Target;
 /// the agents running.
 pub fn run(state_dir: PathBuf, target: Option<Target>) {
     bench::init();
-    let config = load_config(&state_dir).unwrap_or_else(|e| {
-        eprintln!("fleet-gui: {e}; using the default settings");
-        GuiConfig::default()
-    });
+    let (config, config_error) = match load_config(&state_dir) {
+        Ok(c) => (c, None),
+        Err(e) => {
+            let message = format!("{e}; using the default settings");
+            eprintln!("fleet-gui: {message}");
+            (GuiConfig::default(), Some(message))
+        }
+    };
     // `--target` beats `[gui] connection`.
     let saved = target.or_else(|| config.connection.clone());
     let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(state_dir.clone()));
@@ -73,6 +77,10 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
         let shown = saved.clone().unwrap_or(Target::Local);
         let state = cx.new(|cx| AppState::without_session(shown, state_dir, config, theme, cx));
         AppState::install(state.clone(), cx);
+        // Shown in the error toast too: launched from the Dock, stderr is unseen.
+        if let Some(message) = config_error {
+            state.update(cx, |s, cx| s.set_config_error(message, cx));
+        }
         // Connected already (the usual case): the session starts, and
         // lists the agents, while the window opens. Otherwise the startup
         // flow waits for the attempt over the open window.
