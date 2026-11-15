@@ -18,6 +18,10 @@ use fleet_proto::{request, response};
 
 use fleet_client::{Connection, Error, Restart, Result, TOO_OLD, restart_daemon};
 
+/// Pause between `fleet send`'s text and its `--enter` Return, long enough
+/// for the receiving TUI to finish reading the text as one paste.
+const SEND_ENTER_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
 #[derive(Parser)]
 #[command(name = "fleet", about = "Manage agents run by fleetd")]
 struct Cli {
@@ -433,11 +437,23 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }
         Command::Send { id, text, enter } => {
-            let mut data = text.into_bytes();
-            if enter {
-                data.push(b'\r');
+            // The Return goes as its own write, a moment after the text: TUIs
+            // such as Claude Code read text and Return arriving together as a
+            // paste, and leave it typed but unsubmitted.
+            let data = text.into_bytes();
+            let typed = !data.is_empty();
+            if typed {
+                client.call(request::Kind::Input(SendInput { agent_id: id, data }))?;
             }
-            client.call(request::Kind::Input(SendInput { agent_id: id, data }))?;
+            if enter {
+                if typed {
+                    std::thread::sleep(SEND_ENTER_DELAY);
+                }
+                client.call(request::Kind::Input(SendInput {
+                    agent_id: id,
+                    data: b"\r".to_vec(),
+                }))?;
+            }
         }
         Command::Attach {
             id,
