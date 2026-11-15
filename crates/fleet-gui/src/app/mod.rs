@@ -5,6 +5,7 @@ mod bench;
 mod connect;
 mod context_menu;
 mod controls;
+mod fonts;
 mod icons;
 mod keymap;
 mod native;
@@ -56,6 +57,8 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
             (GuiConfig::default(), Some(message))
         }
     };
+    // Off the main thread while the app launches.
+    fonts::preload(&config.font_family);
     // `--target` beats `[gui] connection`.
     let saved = target.or_else(|| config.connection.clone());
     let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(state_dir.clone()));

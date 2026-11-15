@@ -7,9 +7,34 @@ use super::state::write_atomic;
 use super::target::Target;
 
 /// The terminal font when the config names none: SF Mono, the macOS
-/// terminal face (installed with Xcode and Terminal's fonts; not on
-/// every Mac).
+/// terminal face. It is rarely installed for apps (only with Apple's
+/// developer download), but every Mac carries its static faces inside
+/// Terminal.app ([`SF_MONO_DIR`]); the GUI registers those with its own
+/// text system (see [`sf_mono_files`]).
 pub const DEFAULT_FONT_FAMILY: &str = "SF Mono";
+
+/// Where Terminal.app keeps SF Mono (macOS 10.15 and later).
+pub const SF_MONO_DIR: &str =
+    "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts";
+
+/// The SF Mono faces a terminal draws with: regular, bold, italic, bold
+/// italic.
+pub const SF_MONO_FACES: [&str; 4] = [
+    "SF-Mono-Regular.otf",
+    "SF-Mono-Bold.otf",
+    "SF-Mono-RegularItalic.otf",
+    "SF-Mono-BoldItalic.otf",
+];
+
+/// The font files to register for the configured terminal family: SF
+/// Mono's faces from `dir` when the family is SF Mono, else none (other
+/// families come from the system as installed).
+pub fn sf_mono_files(configured: &str, dir: &Path) -> Vec<PathBuf> {
+    if configured.trim() != DEFAULT_FONT_FAMILY {
+        return Vec::new();
+    }
+    SF_MONO_FACES.iter().map(|f| dir.join(f)).collect()
+}
 /// Used when the configured family (or SF Mono) is not installed.
 pub const FALLBACK_FONT_FAMILY: &str = "Menlo";
 
@@ -115,6 +140,21 @@ mod tests {
 
     fn write(dir: &Path, text: &str) {
         std::fs::write(dir.join("config.toml"), text).unwrap();
+    }
+
+    #[test]
+    fn sf_mono_is_registered_from_terminal_only_when_configured() {
+        let dir = Path::new("/T");
+        let files = sf_mono_files("SF Mono", dir);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0], Path::new("/T/SF-Mono-Regular.otf"));
+        assert!(
+            files
+                .iter()
+                .all(|f| f.extension().is_some_and(|e| e == "otf"))
+        );
+        assert!(sf_mono_files("Menlo", dir).is_empty());
+        assert!(sf_mono_files("Iosevka", dir).is_empty());
     }
 
     #[test]

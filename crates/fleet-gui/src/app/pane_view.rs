@@ -7,20 +7,21 @@ use std::time::Duration;
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, App, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle,
-    Font, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
+    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, Subscription, UTF16Selection, Window, div,
-    font, point, px, size,
+    point, px, size,
 };
 
 use super::controls;
+use super::fonts::terminal_font;
 use super::icons;
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
 use super::theme::{Typography, current as theme};
-use crate::core::config::{FALLBACK_FONT_FAMILY, GuiConfig, font_families};
+use crate::core::config::GuiConfig;
 use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
@@ -53,24 +54,6 @@ impl InputSink for Session {
     fn check_paging(&self, pane: PaneId) {
         Session::check_paging(self, pane);
     }
-}
-
-/// The terminal font: the first of [`font_families`] (the configured
-/// family, then Menlo) that is installed. gpui would otherwise fall back
-/// to a proportional face for a missing family.
-pub fn terminal_font(configured: &str, cx: &App) -> Font {
-    let ts = cx.text_system();
-    for family in font_families(configured) {
-        let f = font(family.to_owned());
-        let id = ts.resolve_font(&f);
-        if ts
-            .get_font_for_id(id)
-            .is_some_and(|got| got.family == f.family)
-        {
-            return f;
-        }
-    }
-    font(FALLBACK_FONT_FAMILY)
 }
 
 /// The `(col, row)` of the cell under `pos` in a grid of `cols`×`rows`
