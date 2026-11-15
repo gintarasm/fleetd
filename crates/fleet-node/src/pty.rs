@@ -320,11 +320,15 @@ impl Freeze {
         self.frozen.load(Ordering::Acquire)
     }
 
-    /// Called first by a reader thread, so a freeze can interrupt it.
-    fn reader_started(&self, id: AgentId) {
+    /// Called first by a reader thread, so a freeze can interrupt it. The
+    /// guard deregisters it when dropped, also when the thread unwinds (a
+    /// panicking sink): a dead thread left registered would be signalled by
+    /// every later freeze and, never parking, make each one time out.
+    fn reader_started(&self, id: AgentId) -> ReaderGuard<'_> {
         if let Some(reader) = lock(&self.state).readers.get_mut(&id) {
             reader.thread = Some(Thread::current());
         }
+        ReaderGuard { freeze: self, id }
     }
 
     /// Called by a reader that saw `frozen`: acknowledges and waits for thaw.
@@ -349,7 +353,8 @@ impl Freeze {
         self.cv.notify_all();
     }
 
-    /// Runs `write` registered as a writer a freeze interrupts.
+    /// Runs `write` registered as a writer a freeze interrupts; deregistered
+    /// by a guard, so also if `write` unwinds.
     fn as_writer<T>(&self, write: impl FnOnce() -> T) -> T {
         let token = {
             let mut state = lock(&self.state);
@@ -358,10 +363,11 @@ impl Freeze {
             state.writers.insert(token, Thread::current());
             token
         };
-        let written = write();
-        lock(&self.state).writers.remove(&token);
-        self.cv.notify_all();
-        written
+        let _writing = WriterGuard {
+            freeze: self,
+            token,
+        };
+        write()
     }
 
     /// Freezes and waits until every reader has parked or seen its output
@@ -418,6 +424,31 @@ impl Freeze {
         state.frozen = false;
         self.frozen.store(false, Ordering::SeqCst);
         self.cv.notify_all();
+    }
+}
+
+/// Deregisters a reader thread when dropped; see [`Freeze::reader_started`].
+struct ReaderGuard<'a> {
+    freeze: &'a Freeze,
+    id: AgentId,
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        self.freeze.reader_done(self.id);
+    }
+}
+
+/// Deregisters a writer thread when dropped; see [`Freeze::as_writer`].
+struct WriterGuard<'a> {
+    freeze: &'a Freeze,
+    token: u64,
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.freeze.state).writers.remove(&self.token);
+        self.freeze.cv.notify_all();
     }
 }
 
@@ -540,7 +571,7 @@ impl PtyHost {
         let spawned = std::thread::Builder::new()
             .name(format!("pty-reader-{}", id.0))
             .spawn(move || {
-                freeze.reader_started(id);
+                let reading = freeze.reader_started(id);
                 let mut buf = vec![0u8; READ_BUF];
                 loop {
                     // Only here, between reads: a freeze never strands bytes
@@ -564,7 +595,7 @@ impl PtyHost {
                         Err(_) => break, // EIO on Linux once the slave closes
                     }
                 }
-                freeze.reader_done(id);
+                drop(reading);
                 let code = match child.wait() {
                     Ok(status) => status.exit_code() as i32,
                     Err(_) => -1,
@@ -909,5 +940,44 @@ mod tests {
             host.force_kill(id).unwrap();
         }
         host.wait_all(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn a_reader_whose_sink_panicked_does_not_hold_a_later_freeze() {
+        struct Panics;
+        impl OutputSink for Panics {
+            fn on_output(&mut self, _bytes: &[u8]) {
+                // Not `panic!`: no panic hook, so no noise in the test output.
+                std::panic::resume_unwind(Box::new("sink bug"));
+            }
+            fn on_exit(&mut self, _code: i32) {}
+        }
+        let host = PtyHost::new();
+        let broken = host
+            .spawn_with_sink(sh("printf x; sleep 30"), Box::new(Panics))
+            .unwrap();
+        let healthy = host.spawn(sh("sleep 30")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&host.freeze.state).readers.contains_key(&broken) {
+            assert!(
+                Instant::now() < deadline,
+                "the dead reader stayed registered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let frozen = host
+            .freeze(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        host.thaw();
+        let ids: Vec<_> = frozen.iter().map(|f| f.id).collect();
+        assert_eq!(ids, [healthy]);
+        // The broken agent's reader never reaps it, so no `wait_all`.
+        host.force_kill(broken).unwrap();
+        host.force_kill(healthy).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.stats(healthy).unwrap().exit_code.is_none() {
+            assert!(Instant::now() < deadline, "agent never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
