@@ -2,8 +2,8 @@
 # Runs scripts/install.sh against temp dirs (never the real /Applications,
 # ~/.local/bin or ~/.fleet): a fresh install, an install over a running
 # daemon with an agent, the same with relative dirs from another directory
-# and with CARGO_TARGET_DIR set, a daemon socket that does not answer, and a
-# non-fleet file at the link path.
+# and with CARGO_TARGET_DIR set, a daemon socket that does not answer, a
+# stale socket from a killed daemon, and a non-fleet file at the link path.
 # Not wired into CI; run it by hand: sh scripts/install-test.sh
 set -eu
 cd "$(dirname "$0")/.."
@@ -12,7 +12,7 @@ root=$(pwd)
 tmp=$(mktemp -d)
 daemon_pid=
 cleanup() {
-  [ -z "$daemon_pid" ] || kill "$daemon_pid" 2>/dev/null || true
+  [ -z "$daemon_pid" ] || kill -KILL "$daemon_pid" 2>/dev/null || true
   # A daemon restarted by the script is the same pid; this catches strays.
   pkill -f "fleetd --state-dir $tmp/state" 2>/dev/null || true
   rm -rf "$tmp"
@@ -81,14 +81,22 @@ else
 fi
 
 echo "== a daemon socket that does not answer"
+# Stopped, the daemon's socket still accepts but nothing answers: a stuck
+# daemon, which must not be taken for "none running".
+kill -STOP "$daemon_pid"
+if out=$(install 2>&1); then echo "$out"; fail "install.sh reported success with a socket that does not answer"; fi
+echo "$out"
+case "$out" in *"a fleetd socket exists but did not answer; not restarting it"*) ;; *) fail "output lacks the unanswered-socket warning" ;; esac
+case "$out" in *"no fleetd running"*) fail "said 'no fleetd running' with a stuck daemon" ;; esac
+
+echo "== a stale socket from a killed daemon"
 kill -KILL "$daemon_pid"
 wait "$daemon_pid" 2>/dev/null || true
 daemon_pid=
 [ -S "$tmp/state/fleetd.sock" ] || fail "the killed daemon left no socket"
-if out=$(install 2>&1); then echo "$out"; fail "install.sh reported success with a socket that does not answer"; fi
+out=$(install 2>&1) || { echo "$out"; fail "install.sh failed over a stale socket"; }
 echo "$out"
-case "$out" in *"a fleetd socket exists but did not answer; not restarting it"*) ;; *) fail "output lacks the unanswered-socket warning" ;; esac
-case "$out" in *"no fleetd running"*) fail "said 'no fleetd running' with a socket present" ;; esac
+case "$out" in *"no fleetd running"*) ;; *) fail "output lacks 'no fleetd running' over a stale socket" ;; esac
 
 echo "== non-fleet file at the link path"
 rm -f "$tmp/bin/fleet"
