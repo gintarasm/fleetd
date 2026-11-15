@@ -136,11 +136,11 @@ fn roundtrip_every_kind() {
             rows: 24,
             attach: true,
         }),
-        request::Kind::Forget(ForgetAgents {
+        request::Kind::Forget(Box::new(ForgetAgents {
             ids: vec![1, 2],
             exited_only: false,
             selector: labels(),
-        }),
+        })),
     ];
     let responses = [
         response::Kind::Spawned(Box::new(info())),

@@ -299,13 +299,13 @@ mod tests {
             }),
             Frame::Request(Request {
                 id: 3,
-                kind: Some(request::Kind::Forget(crate::ForgetAgents {
+                kind: Some(request::Kind::Forget(Box::new(crate::ForgetAgents {
                     ids: vec![],
                     exited_only: true,
                     selector: [("project".to_string(), "x".to_string())]
                         .into_iter()
                         .collect(),
-                })),
+                }))),
             }),
             Frame::Response(Response {
                 id: 3,
@@ -322,6 +322,17 @@ mod tests {
             assert_eq!(got, frame);
             assert!(buf.is_empty());
         }
+    }
+
+    /// `Frame` is moved on every decode (the `frame_decode` benchmark): a
+    /// large new oneof variant must be boxed in `build.rs`, not grow it.
+    #[test]
+    fn frame_stays_small() {
+        assert!(
+            std::mem::size_of::<Frame>() <= 88,
+            "Frame is {} bytes: box the large variant in build.rs",
+            std::mem::size_of::<Frame>()
+        );
     }
 
     #[test]

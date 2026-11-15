@@ -336,7 +336,7 @@ impl Connection {
                 response::Kind::Ack(Ack {})
             }
             Some(request::Kind::Restart(r)) => return self.restart(req.id, r).await,
-            Some(request::Kind::Forget(f)) => return self.forget(req.id, f).await,
+            Some(request::Kind::Forget(f)) => return self.forget(req.id, *f).await,
             // Answered for real once the restart path lands.
             Some(request::Kind::RestartDaemon(_)) => error("restart not supported yet".into()),
         };

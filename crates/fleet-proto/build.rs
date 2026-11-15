@@ -10,6 +10,7 @@ fn main() {
         // Large oneof variants are boxed so `Frame` stays small: it is moved and
         // initialised on every decode (see the `frame_decode` benchmark).
         .boxed(".fleet.v1.Request.kind.spawn")
+        .boxed(".fleet.v1.Request.kind.forget")
         .boxed(".fleet.v1.Response.kind.spawned")
         .boxed(".fleet.v1.Response.kind.attached")
         .boxed(".fleet.v1.Response.kind.spawned_attached")
