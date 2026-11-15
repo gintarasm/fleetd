@@ -135,15 +135,23 @@ esac
 
 fleet="$bin_dir/fleet"
 sock="$state_dir/fleetd.sock"
-if ! "$fleet" --state-dir "$state_dir" ls >/dev/null 2>&1; then
-  # A socket that does not answer may still be a daemon (stuck, or this
-  # state dir's under another user): not "none running".
+if ! ls_err=$("$fleet" --state-dir "$state_dir" ls 2>&1 >/dev/null); then
+  # Nothing listening (no socket, or a stale one a killed daemon left):
+  # fleet says so, and the next daemon replaces the stale socket.
+  case "$ls_err" in
+    *"fleetd is not running"*)
+      echo "no fleetd running; the next client starts the new one"
+      exit 0
+      ;;
+  esac
+  # A socket that accepts but does not answer may still be a daemon
+  # (stuck, or this state dir's under another user): not "none running".
   if [ -S "$sock" ]; then
     echo "install: a fleetd socket exists but did not answer; not restarting it ($sock)" >&2
     exit 1
   fi
-  echo "no fleetd running; the next client starts the new one"
-  exit 0
+  echo "install: could not ask fleetd for its agents: $ls_err" >&2
+  exit 1
 fi
 
 echo "restarting fleetd onto the new build..."
