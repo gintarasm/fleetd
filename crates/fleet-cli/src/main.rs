@@ -83,11 +83,11 @@ enum Command {
         #[arg(long)]
         attach: bool,
     },
-    /// Remove exited agents and their history
+    /// Remove exited or lost agents and their history
     Rm {
-        /// Agents to remove (must have exited)
+        /// Agents to remove (must be exited or lost)
         ids: Vec<u64>,
-        /// Remove every exited agent instead
+        /// Remove every exited or lost agent instead
         #[arg(long, conflicts_with = "ids", required_unless_present = "ids")]
         exited: bool,
         /// With --exited: only agents with this label, as k=v
@@ -225,6 +225,18 @@ fn old_daemon(e: Error) -> Error {
     }
 }
 
+/// Attaches interactively; the exit code of `fleet attach`.
+fn attach_interactive(client: Connection, id: u64) -> Result<u8> {
+    Ok(match attach::run(client, id)? {
+        attach::Outcome::Lagged => {
+            eprintln!("fleet: output lagged behind; re-attach");
+            2
+        }
+        attach::Outcome::Signaled(sig) => 128 + sig as u8,
+        attach::Outcome::Exited | attach::Outcome::Detached => 0,
+    })
+}
+
 /// Exit code of a finished command.
 fn run(cli: Cli) -> Result<u8> {
     if let Command::Skill(args) = cli.command {
@@ -303,14 +315,7 @@ fn run(cli: Cli) -> Result<u8> {
             if !attach {
                 println!("{new_id}");
             } else {
-                match attach::run(client, new_id)? {
-                    attach::Outcome::Lagged => {
-                        eprintln!("fleet: output lagged behind; re-attach");
-                        return Ok(2);
-                    }
-                    attach::Outcome::Signaled(sig) => return Ok(128 + sig as u8),
-                    attach::Outcome::Exited | attach::Outcome::Detached => {}
-                }
+                return attach_interactive(client, new_id);
             }
         }
         Command::Rm {
@@ -352,14 +357,7 @@ fn run(cli: Cli) -> Result<u8> {
             id,
             snapshot_only: true,
         } => attach::snapshot_only(client, id)?,
-        Command::Attach { id, .. } => match attach::run(client, id)? {
-            attach::Outcome::Lagged => {
-                eprintln!("fleet: output lagged behind; re-attach");
-                return Ok(2);
-            }
-            attach::Outcome::Signaled(sig) => return Ok(128 + sig as u8),
-            attach::Outcome::Exited | attach::Outcome::Detached => {}
-        },
+        Command::Attach { id, .. } => return attach_interactive(client, id),
         Command::Logs { lines, follow } => logs(client, lines, follow)?,
         Command::Skill(_) => unreachable!("handled before connecting"),
     }
