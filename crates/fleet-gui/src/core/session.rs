@@ -3,7 +3,7 @@
 //! protocol traffic into calls on [`PaneModel`] and the sidebar rows, and
 //! into [`UiEvent`] wake-ups for the UI.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +30,9 @@ pub const CLIENT_NAME: &str = "gui";
 /// What an old daemon answers a request it does not know with.
 const UNKNOWN_REQUEST: &str = "empty request";
 /// Shown instead of [`UNKNOWN_REQUEST`]: the only requests the GUI sends
-/// that an older fleetd lacks are restart and forget.
+/// that an older fleetd lacks are restart and forget. [`error_text`] maps
+/// "empty request" for every reply, whatever the request was: revisit this
+/// when a new request kind is added.
 pub(crate) const DAEMON_TOO_OLD: &str = "fleetd is too old to restart or remove agents";
 
 /// The UI's text for an error reply.
@@ -371,9 +373,11 @@ impl Session {
             shut_down: AtomicBool::new(false),
         });
         let writer_ctx = Arc::clone(&ctx);
+        let pending = ControlPending::default();
+        let writer_pending = Arc::clone(&pending);
         thread::Builder::new()
             .name("gui-control-writer".into())
-            .spawn(move || control_writer(&writer_ctx, &rx))
+            .spawn(move || control_writer(&writer_ctx, &rx, &writer_pending))
             .expect("spawn control writer");
         let reader = ControlReader {
             first,
@@ -382,6 +386,7 @@ impl Session {
             cmds: tx,
             stop: Arc::clone(&inner.control_stop),
             conn: Arc::clone(&inner.control_conn),
+            pending,
         };
         thread::Builder::new()
             .name("gui-control".into())
@@ -617,6 +622,25 @@ impl Session {
     }
 }
 
+/// Restarts and forgets sent on the control connection, by request id
+/// (ascending), with the verb that names them in an error.
+type ControlPending = Arc<Mutex<VecDeque<(u64, &'static str)>>>;
+
+/// The verb of the tracked request answered by response `id` (responses
+/// come in request order, so older entries are done).
+fn take_verb(pending: &mut VecDeque<(u64, &'static str)>, id: u64) -> Option<&'static str> {
+    while pending.front().is_some_and(|(p, _)| *p < id) {
+        pending.pop_front();
+    }
+    match pending.front() {
+        Some(&(p, verb)) if p == id => {
+            pending.pop_front();
+            Some(verb)
+        }
+        _ => None,
+    }
+}
+
 /// The control connection's reader: connects, reads, reconnects.
 struct ControlReader {
     /// Used instead of connecting, the first time.
@@ -626,6 +650,7 @@ struct ControlReader {
     cmds: mpsc::Sender<ControlCmd>,
     stop: Arc<Stop>,
     conn: Arc<Mutex<Option<ConnHandle>>>,
+    pending: ControlPending,
 }
 
 impl ControlReader {
@@ -699,9 +724,31 @@ impl ControlReader {
                         changed = true;
                     }
                     Frame::Response(Response {
+                        id,
                         kind: Some(response::Kind::Error(e)),
-                        ..
-                    }) => self.ctx.notify(UiEvent::Error(error_text(e.message))),
+                    }) => {
+                        let text = error_text(e.message);
+                        let text = match take_verb(&mut lock(&self.pending), id) {
+                            Some(verb) if text != DAEMON_TOO_OLD => {
+                                format!("{verb} failed: {text}")
+                            }
+                            _ => text,
+                        };
+                        self.ctx.notify(UiEvent::Error(text));
+                    }
+                    Frame::Response(Response {
+                        id,
+                        kind: Some(response::Kind::Forgotten(f)),
+                    }) => {
+                        take_verb(&mut lock(&self.pending), id);
+                        let n = f.refused.len();
+                        if n > 0 {
+                            let agents = if n == 1 { "agent" } else { "agents" };
+                            self.ctx.notify(UiEvent::Error(format!(
+                                "{n} {agents} not removed (running or unknown)"
+                            )));
+                        }
+                    }
                     Frame::Event(ev) => match ev.kind {
                         Some(event::Kind::Activity(a)) => {
                             let known = sb.infos.contains_key(&a.agent_id);
@@ -752,7 +799,11 @@ impl ControlReader {
 
 /// Owns the control connection's [`Sender`]: lists on connect, every
 /// [`RELIST`] and on request, and sends kills, restarts and forgets.
-fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
+fn control_writer(
+    ctx: &Ctx,
+    rx: &mpsc::Receiver<ControlCmd>,
+    pending: &Mutex<VecDeque<(u64, &'static str)>>,
+) {
     let mut sender: Option<Sender> = None;
     // A failed write drops the sender (the reader sees the end and
     // reconnects); with none, the user is told.
@@ -763,6 +814,14 @@ fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
             }
         }
         None => ctx.notify(UiEvent::Error("not connected to fleetd".into())),
+    };
+    // A restart or forget is recorded before it is sent, so its reply finds
+    // the verb.
+    let send_tracked = |sender: &mut Option<Sender>, verb: &'static str, req: request::Kind| {
+        if let Some(s) = sender {
+            lock(pending).push_back((s.next_id(), verb));
+        }
+        send(sender, req);
     };
     let mut next_list = Instant::now() + RELIST;
     loop {
@@ -783,6 +842,7 @@ fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
         match cmd {
             None | Some(ControlCmd::List) => list(&mut sender, &mut next_list),
             Some(ControlCmd::Connected(s)) => {
+                lock(pending).clear();
                 sender = Some(s);
                 list(&mut sender, &mut next_list);
             }
@@ -795,21 +855,21 @@ fn control_writer(ctx: &Ctx, rx: &mpsc::Receiver<ControlCmd>) {
                     agent_id,
                     ..Default::default()
                 };
-                send(&mut sender, request::Kind::Restart(restart));
+                send_tracked(&mut sender, "restart", request::Kind::Restart(restart));
             }
             Some(ControlCmd::Forget(ids)) => {
                 let forget = ForgetAgents {
                     ids,
                     ..Default::default()
                 };
-                send(&mut sender, request::Kind::Forget(forget));
+                send_tracked(&mut sender, "remove", request::Kind::Forget(forget));
             }
             Some(ControlCmd::ClearExited) => {
                 let forget = ForgetAgents {
                     exited_only: true,
                     ..Default::default()
                 };
-                send(&mut sender, request::Kind::Forget(forget));
+                send_tracked(&mut sender, "remove", request::Kind::Forget(forget));
             }
             Some(ControlCmd::Stop) => return,
         }
@@ -863,6 +923,7 @@ mod tests {
             cmds: mpsc::channel().0,
             stop: Arc::default(),
             conn: Arc::default(),
+            pending: Arc::default(),
         };
         (r, events)
     }
@@ -936,15 +997,63 @@ mod tests {
 
     #[test]
     fn list_reply_keeps_replaced_map() {
-        let dir =
-            std::env::temp_dir().join(format!("fleet-gui-no-daemon-r-{}", std::process::id()));
-        let (tx, _rx) = async_channel::unbounded();
-        let s = Session::start(Target::Local, dir, tx);
-        let (mut r, _events) = reader();
-        r.sidebar = Arc::clone(&s.inner.sidebar);
-        r.apply(vec![list_reply(vec![info(3)], HashMap::from([(1, 3)]))]);
-        assert_eq!(s.replaced(), HashMap::from([(1, 3)]));
-        s.shutdown();
+        let mut sb = Sidebar::default();
+        sb.set_list(vec![info(3)], HashMap::from([(1, 3)]), Instant::now());
+        assert_eq!(sb.replaced, HashMap::from([(1, 3)]));
+    }
+
+    fn error_reply(id: u64, message: &str) -> Frame {
+        Frame::Response(Response {
+            id,
+            kind: Some(response::Kind::Error(fleet_proto::Error {
+                message: message.into(),
+            })),
+        })
+    }
+
+    #[test]
+    fn restart_and_forget_errors_name_the_request() {
+        let (r, events) = reader();
+        lock(&r.pending).extend([(1, "restart"), (3, "remove"), (4, "restart")]);
+        r.apply(vec![
+            error_reply(1, "agent 5 is running"),
+            error_reply(2, "unknown agent 6"),
+            error_reply(3, "injected"),
+            error_reply(4, "empty request"),
+        ]);
+        assert_eq!(
+            drain(&events),
+            [
+                UiEvent::Error("restart failed: agent 5 is running".into()),
+                UiEvent::Error("unknown agent 6".into()),
+                UiEvent::Error("remove failed: injected".into()),
+                UiEvent::Error("fleetd is too old to restart or remove agents".into()),
+            ]
+        );
+        assert!(lock(&r.pending).is_empty());
+    }
+
+    #[test]
+    fn forgotten_with_refused_ids_is_an_error() {
+        let (r, events) = reader();
+        let forgotten = |ids: Vec<u64>, refused: Vec<u64>| {
+            Frame::Response(Response {
+                id: 1,
+                kind: Some(response::Kind::Forgotten(fleet_proto::Forgotten {
+                    ids,
+                    refused,
+                })),
+            })
+        };
+        r.apply(vec![forgotten(vec![1], vec![])]);
+        assert_eq!(drain(&events), []);
+        r.apply(vec![forgotten(vec![1], vec![2, 3])]);
+        assert_eq!(
+            drain(&events),
+            [UiEvent::Error(
+                "2 agents not removed (running or unknown)".into()
+            )]
+        );
     }
 
     #[test]
