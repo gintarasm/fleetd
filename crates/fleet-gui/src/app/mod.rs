@@ -3,6 +3,7 @@
 mod app_state;
 mod bench;
 mod connect;
+mod controls;
 mod keymap;
 mod new_agent;
 mod pane_view;

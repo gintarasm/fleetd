@@ -1,119 +1,93 @@
-//! The dark and light palettes, chosen by the window appearance. The
-//! terminal palette also answers OSC 4/10/11 queries (through
-//! `Session::set_palette`).
+//! The dark and light themes, chosen by the window appearance: the core's
+//! colour tokens ([`Tokens`]) as gpui colours. The terminal palette also
+//! answers OSC 4/10/11 queries (through `Session::set_palette`).
 
 use fleet_term::{Color, Palette};
-use gpui::{App, Global, Hsla, Rgba, WindowAppearance};
+use gpui::{App, FontWeight, Global, Hsla, Rgba as GpuiRgba, Styled, WindowAppearance, px};
 
+use crate::core::style::TextStyle;
+use crate::core::theme::{Appearance, Rgba, Tokens};
+
+/// Every colour of [`Tokens`], ready to draw with.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
+    pub appearance: Appearance,
     pub palette: Palette,
+    pub window: Hsla,
+    pub card: Hsla,
+    pub raised: Hsla,
+    pub field: Hsla,
+    pub hover: Hsla,
+    pub pressed: Hsla,
+    pub selected: Hsla,
+    pub border: Hsla,
+    pub separator: Hsla,
+    pub text: Hsla,
+    pub secondary: Hsla,
+    pub tertiary: Hsla,
+    pub accent: Hsla,
     /// Translucent fill drawn over selected cells.
     pub selection: Hsla,
-    pub header_bg: Hsla,
-    pub dim_text: Hsla,
     /// Background of the IME's marked (uncommitted) text.
-    pub marked_bg: Hsla,
-    /// Behind the sidebar and the pane cards (cards use `bg`).
-    pub window_bg: Hsla,
-    /// The one accent colour: the focused tab's bar, focus borders.
-    pub accent: Hsla,
-    /// 1 px card borders and separators.
-    pub border: Hsla,
+    pub marked: Hsla,
+    pub danger: Hsla,
+    pub success: Hsla,
+    pub shadow: Hsla,
 }
 
 impl Global for Theme {}
 
-const DARK: Palette = Palette {
-    fg: (0xd8, 0xd8, 0xd8),
-    bg: (0x1b, 0x1c, 0x1f),
-    cursor: (0xd8, 0xd8, 0xd8),
-    ansi: [
-        (0x1b, 0x1c, 0x1f),
-        (0xe0, 0x6c, 0x75),
-        (0x98, 0xc3, 0x79),
-        (0xe5, 0xc0, 0x7b),
-        (0x61, 0xaf, 0xef),
-        (0xc6, 0x78, 0xdd),
-        (0x56, 0xb6, 0xc2),
-        (0xc8, 0xcc, 0xd4),
-        (0x5c, 0x63, 0x70),
-        (0xf0, 0x7c, 0x85),
-        (0xa8, 0xd3, 0x89),
-        (0xf5, 0xd0, 0x8b),
-        (0x71, 0xbf, 0xff),
-        (0xd6, 0x88, 0xed),
-        (0x66, 0xc6, 0xd2),
-        (0xf0, 0xf0, 0xf0),
-    ],
-};
-
-const LIGHT: Palette = Palette {
-    fg: (0x24, 0x29, 0x2e),
-    bg: (0xfb, 0xfb, 0xfa),
-    cursor: (0x24, 0x29, 0x2e),
-    ansi: [
-        (0x24, 0x29, 0x2e),
-        (0xc8, 0x28, 0x29),
-        (0x3a, 0x86, 0x2c),
-        (0x9a, 0x6a, 0x00),
-        (0x20, 0x5e, 0xc4),
-        (0x8e, 0x3c, 0xa8),
-        (0x10, 0x80, 0x8c),
-        (0xbc, 0xbc, 0xbc),
-        (0x6a, 0x73, 0x7d),
-        (0xe0, 0x40, 0x40),
-        (0x4c, 0xa0, 0x3c),
-        (0xb8, 0x84, 0x10),
-        (0x3a, 0x78, 0xe0),
-        (0xa8, 0x54, 0xc4),
-        (0x20, 0x9a, 0xa6),
-        (0xe8, 0xe8, 0xe8),
-    ],
-};
-
 impl Theme {
-    pub fn dark() -> Self {
+    pub fn from_tokens(t: &Tokens) -> Self {
         Theme {
-            palette: DARK,
-            selection: Hsla {
-                h: 0.6,
-                s: 0.6,
-                l: 0.55,
-                a: 0.35,
-            },
-            header_bg: rgb((0x25, 0x26, 0x2a)),
-            dim_text: rgb((0x8a, 0x8f, 0x98)),
-            marked_bg: rgb((0x3a, 0x3d, 0x44)),
-            window_bg: rgb((0x13, 0x14, 0x16)),
-            accent: rgb((0x61, 0xaf, 0xef)),
-            border: rgb((0x2c, 0x2e, 0x33)),
+            appearance: t.appearance,
+            palette: t.palette,
+            window: hsla(t.window),
+            card: hsla(t.card),
+            raised: hsla(t.raised),
+            field: hsla(t.field),
+            hover: hsla(t.hover),
+            pressed: hsla(t.pressed),
+            selected: hsla(t.selected),
+            border: hsla(t.border),
+            separator: hsla(t.separator),
+            text: hsla(t.text),
+            secondary: hsla(t.secondary),
+            tertiary: hsla(t.tertiary),
+            accent: hsla(t.accent),
+            selection: hsla(t.selection),
+            marked: hsla(t.marked),
+            danger: hsla(t.danger),
+            success: hsla(t.success),
+            shadow: hsla(t.shadow),
         }
+    }
+
+    pub fn dark() -> Self {
+        Theme::from_tokens(&Tokens::dark())
     }
 
     pub fn light() -> Self {
-        Theme {
-            palette: LIGHT,
-            selection: Hsla {
-                h: 0.6,
-                s: 0.7,
-                l: 0.55,
-                a: 0.28,
-            },
-            header_bg: rgb((0xec, 0xec, 0xea)),
-            dim_text: rgb((0x6a, 0x73, 0x7d)),
-            marked_bg: rgb((0xdd, 0xe4, 0xee)),
-            window_bg: rgb((0xe9, 0xe9, 0xe7)),
-            accent: rgb((0x20, 0x5e, 0xc4)),
-            border: rgb((0xd6, 0xd6, 0xd3)),
-        }
+        Theme::from_tokens(&Tokens::light())
     }
 
     pub fn for_appearance(appearance: WindowAppearance) -> Self {
-        match appearance {
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => Theme::dark(),
-            WindowAppearance::Light | WindowAppearance::VibrantLight => Theme::light(),
-        }
+        Theme::from_tokens(&Tokens::for_appearance(appearance_of(appearance)))
+    }
+
+    /// This theme with `accent` (the user's system accent colour) for
+    /// the accent and the selection tint.
+    pub fn with_accent(mut self, accent: Hsla) -> Self {
+        self.accent = accent;
+        self.selection = Hsla {
+            a: self.selection.a,
+            ..accent
+        };
+        self
+    }
+
+    pub fn is_dark(&self) -> bool {
+        self.appearance == Appearance::Dark
     }
 
     pub fn fg(&self) -> Hsla {
@@ -139,6 +113,14 @@ impl Theme {
     }
 }
 
+/// The core's appearance for gpui's.
+pub fn appearance_of(appearance: WindowAppearance) -> Appearance {
+    match appearance {
+        WindowAppearance::Dark | WindowAppearance::VibrantDark => Appearance::Dark,
+        WindowAppearance::Light | WindowAppearance::VibrantLight => Appearance::Light,
+    }
+}
+
 /// The current theme (dark until the window sets one).
 pub fn current(cx: &App) -> Theme {
     cx.try_global::<Theme>()
@@ -147,14 +129,30 @@ pub fn current(cx: &App) -> Theme {
 }
 
 pub fn rgb((r, g, b): (u8, u8, u8)) -> Hsla {
-    Rgba {
-        r: f32::from(r) / 255.0,
-        g: f32::from(g) / 255.0,
-        b: f32::from(b) / 255.0,
-        a: 1.0,
+    hsla(Rgba { r, g, b, a: 1.0 })
+}
+
+pub fn hsla(c: Rgba) -> Hsla {
+    GpuiRgba {
+        r: f32::from(c.r) / 255.0,
+        g: f32::from(c.g) / 255.0,
+        b: f32::from(c.b) / 255.0,
+        a: c.a,
     }
     .into()
 }
+
+/// Sets a div's text to a type-scale step (in the window's font, the
+/// system UI font: SF Pro).
+pub trait Typography: Styled + Sized {
+    fn type_style(self, style: TextStyle) -> Self {
+        self.text_size(px(style.size))
+            .line_height(px(style.line_height))
+            .font_weight(FontWeight(style.weight.value()))
+    }
+}
+
+impl<T: Styled> Typography for T {}
 
 #[cfg(test)]
 mod tests {
@@ -191,5 +189,14 @@ mod tests {
             t.resolve(Color::Named(1), true),
             super::rgb(t.palette.ansi[1])
         );
+    }
+
+    #[test]
+    fn accent_also_tints_the_selection() {
+        let accent = super::rgb((0xff, 0x00, 0x00));
+        let t = Theme::dark().with_accent(accent);
+        assert_eq!(t.accent, accent);
+        assert_eq!(t.selection.h, accent.h);
+        assert_eq!(t.selection.a, Theme::dark().selection.a);
     }
 }

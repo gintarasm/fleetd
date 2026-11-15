@@ -14,5 +14,7 @@ pub mod session;
 pub mod sidebar;
 pub mod state;
 pub mod status_menu;
+pub mod style;
 pub mod target;
+pub mod theme;
 pub mod truncate;

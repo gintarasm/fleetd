@@ -11,9 +11,13 @@ use gpui::{
     StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div, px,
 };
 
+use super::controls::{
+    ButtonKind, button, error_text, field_label, list_row, list_well, sheet_card, sheet_title,
+};
 use super::keymap::{Paste, TEXT_FIELD_CONTEXT};
-use super::theme::{Theme, current as theme};
+use super::theme::{Typography, current as theme};
 use crate::core::session::AgentRow;
+use crate::core::style::{space, text};
 use crate::core::target::Target;
 
 /// What a spawn needs from the sheet.
@@ -156,9 +160,9 @@ impl Render for TextField {
         let theme = theme(cx);
         let focused = self.focus.is_focused(window);
         let (shown, color) = if self.text.is_empty() {
-            (self.placeholder.clone(), theme.dim_text)
+            (self.placeholder.clone(), theme.tertiary)
         } else {
-            (SharedString::from(self.text.clone()), theme.fg())
+            (SharedString::from(self.text.clone()), theme.text)
         };
         let entity = cx.entity();
         let focus = self.focus.clone();
@@ -175,12 +179,12 @@ impl Render for TextField {
             .px(px(6.))
             .rounded(px(4.))
             .border_1()
-            .border_color(if focused { theme.fg() } else { theme.dim_text })
-            .bg(theme.bg())
+            .border_color(if focused { theme.accent } else { theme.border })
+            .bg(theme.field)
             .overflow_hidden()
             .child(div().text_color(color).whitespace_nowrap().child(shown))
             // The caret, after the text.
-            .children(focused.then(|| div().w(px(1.)).h(px(14.)).bg(theme.fg())))
+            .children(focused.then(|| div().w(px(1.)).h(px(14.)).bg(theme.text)))
             .child(
                 canvas(
                     |_, _, _| (),
@@ -385,116 +389,78 @@ impl NewAgentSheet {
     }
 }
 
-pub(super) fn button(
-    id: &'static str,
-    label: &'static str,
-    theme: &Theme,
-    primary: bool,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .px(px(12.))
-        .py(px(4.))
-        .rounded(px(4.))
-        .border_1()
-        .border_color(theme.dim_text)
-        .bg(if primary { theme.header_bg } else { theme.bg() })
-        .text_color(theme.fg())
-        .cursor_pointer()
-        .child(label)
-}
-
 impl Render for NewAgentSheet {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        let label = |text: &'static str| {
-            div()
-                .text_size(px(12.))
-                .text_color(theme.dim_text)
-                .child(text)
-        };
         let mut dir_row = div()
             .flex()
             .flex_row()
-            .gap(px(8.))
+            .gap(px(space::SM))
             .child(div().flex_1().child(self.dir.clone()));
         if self.can_choose {
             dir_row = dir_row.child(
-                button("choose", "Choose…", &theme, false)
+                button("choose", "Choose…", &theme, ButtonKind::Secondary, true)
                     .on_click(cx.listener(|this, _, _, cx| this.choose(cx))),
             );
         }
-        let recent = div()
-            .id("recent-dirs")
-            .flex()
-            .flex_col()
-            .max_h(px(140.))
-            .overflow_y_scroll()
-            .children(self.dirs.iter().enumerate().map(|(i, d)| {
-                let path = d.clone();
-                div()
-                    .id(("dir", i))
-                    .px(px(6.))
-                    .py(px(2.))
-                    .rounded(px(3.))
-                    .text_size(px(12.))
-                    .truncate()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.header_bg))
-                    .child(SharedString::from(d.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let path = path.clone();
-                        this.dir.update(cx, |f, cx| f.set_text(path, cx));
-                    }))
-            }));
-        div()
-            .id("new-agent-sheet")
+        let recent = (!self.dirs.is_empty()).then(|| {
+            list_well("recent-dirs", 140.0, &theme).children(self.dirs.iter().enumerate().map(
+                |(i, d)| {
+                    let path = d.clone();
+                    list_row(("dir", i), d.clone(), &theme, true).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let path = path.clone();
+                            this.dir.update(cx, |f, cx| f.set_text(path, cx));
+                        },
+                    ))
+                },
+            ))
+        });
+        sheet_card("new-agent-sheet", 520.0, &theme)
             .debug_selector(|| "new-agent-sheet".to_owned())
             .on_key_down(cx.listener(Self::key_down))
             // Clicks and the wheel stop here, never reaching the panes.
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .w(px(520.))
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .p(px(16.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(theme.dim_text)
-            .bg(theme.header_bg)
-            .text_color(theme.fg())
-            .text_size(px(13.))
-            .child(div().text_size(px(15.)).child("New agent"))
-            .child(label("Directory"))
-            .child(dir_row)
-            .children(self.hint.clone().map(|h| {
+            .child(sheet_title("New agent"))
+            .child(
                 div()
-                    .debug_selector(|| "dir-hint".to_owned())
-                    .text_size(px(11.))
-                    .text_color(theme.dim_text)
-                    .child(SharedString::from(h))
-            }))
-            .child(recent)
-            .child(label("Command"))
-            .child(self.command.clone())
-            .children(self.error.clone().map(|e| {
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SM - space::XXS))
+                    .child(field_label("Directory", &theme))
+                    .child(dir_row)
+                    .children(self.hint.clone().map(|h| {
+                        div()
+                            .debug_selector(|| "dir-hint".to_owned())
+                            .type_style(text::SUBHEADLINE)
+                            .text_color(theme.tertiary)
+                            .child(SharedString::from(h))
+                    }))
+                    .children(recent),
+            )
+            .child(
                 div()
-                    .text_color(theme.resolve(fleet_term::Color::Named(1), true))
-                    .child(e)
-            }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SM - space::XXS))
+                    .child(field_label("Command", &theme))
+                    .child(self.command.clone()),
+            )
+            .children(self.error.clone().map(|e| error_text(e, &theme)))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .justify_end()
-                    .gap(px(8.))
+                    .gap(px(space::SM))
+                    .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, false)
+                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        button("spawn", "Spawn", &theme, true)
+                        button("spawn", "Spawn", &theme, ButtonKind::Primary, true)
                             .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     ),
             )

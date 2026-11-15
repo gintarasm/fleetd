@@ -22,15 +22,16 @@ use super::keymap::{
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
-use super::theme::Theme;
+use super::theme::{Theme, Typography};
 use crate::core::config::save_connection;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
+use crate::core::style::{chrome, radius, space, text};
 use crate::core::target::Target;
 
 /// Between pane cards, and around them.
-const PANE_GAP: f32 = 8.0;
+const PANE_GAP: f32 = chrome::PANE_GAP;
 
 /// Opens the workspace window, or brings the open one to the front.
 pub fn open_main_window(cx: &mut App) {
@@ -619,11 +620,11 @@ impl Workspace {
             div()
                 .id(id)
                 .debug_selector(move || format!("menu-{id}"))
-                .px(px(10.))
-                .py(px(4.))
-                .rounded(px(3.))
+                .px(px(space::SM))
+                .py(px(space::XS))
+                .rounded(px(radius::SM))
                 .cursor_pointer()
-                .hover(|s| s.bg(theme.bg()))
+                .hover(|s| s.bg(theme.accent).text_color(gpui::white()))
                 .child(label)
         };
         let mut items = div()
@@ -631,14 +632,15 @@ impl Workspace {
             .occlude()
             .flex()
             .flex_col()
-            .p(px(4.))
+            .p(px(space::XS))
             .min_w(px(160.))
-            .rounded(px(6.))
+            .rounded(px(radius::MD))
             .border_1()
-            .border_color(theme.dim_text)
-            .bg(theme.header_bg)
-            .text_color(theme.fg())
-            .text_size(px(13.));
+            .border_color(theme.border)
+            .bg(theme.raised)
+            .shadow_lg()
+            .text_color(theme.text)
+            .type_style(text::BODY);
         for entry in self.menu_items(agent_id, cx) {
             let el =
                 match entry {
@@ -717,17 +719,18 @@ impl Render for Workspace {
                 .id("error")
                 .debug_selector(|| "error-toast".to_owned())
                 .absolute()
-                .bottom(px(12.))
-                .right(px(12.))
+                .bottom(px(space::LG))
+                .right(px(space::LG))
                 .max_w(px(480.))
-                .px(px(10.))
-                .py(px(6.))
-                .rounded(px(6.))
+                .px(px(space::MD))
+                .py(px(space::SM))
+                .rounded(px(radius::MD))
                 .border_1()
-                .border_color(theme.resolve(fleet_term::Color::Named(1), true))
-                .bg(theme.header_bg)
-                .text_color(theme.fg())
-                .text_size(px(12.))
+                .border_color(theme.danger.opacity(0.6))
+                .bg(theme.raised)
+                .shadow_lg()
+                .text_color(theme.text)
+                .type_style(text::CALLOUT)
                 .occlude()
                 .cursor_pointer()
                 .child(SharedString::from(format!("{e}   ✕")))
@@ -783,8 +786,8 @@ impl Render for Workspace {
             .relative()
             .flex()
             .flex_row()
-            .bg(theme.window_bg)
-            .text_color(theme.fg())
+            .bg(theme.window)
+            .text_color(theme.text)
             .on_action(cx.listener(Self::toggle_maximize))
             .on_action(
                 cx.listener(|this, _: &SplitRight, w, cx| this.split(Axis::Horizontal, w, cx)),
