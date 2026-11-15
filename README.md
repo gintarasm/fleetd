@@ -15,10 +15,11 @@ A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Co
 | M2a | Daemon side of the GUI: agent history, protocol v2, labels, flood fix, `fleetd --stdio`, login-shell env, agent skill | done |
 | M2b | GUI (gpui): sidebar, terminal panes, splits, menu-bar app, connect sheet | done |
 | M2c | Daily-drive polish: native-feeling GUI, restart and remove exited agents | TBD |
-| M3 | Projects, workspaces, worktrees, tasks; diff view | TBD |
-| M4 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent MCP channel | TBD |
-| M5 | Remote nodes over SSH | TBD |
-| M6 | Credentials | TBD |
+| M3 | Satellite: agents spawning agents (MCP), spawn quotas, a graph view of what's running | TBD |
+| M4 | Projects, workspaces, worktrees, tasks; diff view | TBD |
+| M5 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent messaging | TBD |
+| M6 | Remote nodes over SSH | TBD |
+| M7 | Credentials | TBD |
 
 ## Install
 
