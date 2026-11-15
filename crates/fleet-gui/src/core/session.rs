@@ -715,6 +715,13 @@ impl ControlReader {
         {
             let mut sb = lock(&self.sidebar);
             for frame in batch {
+                // Every response settles its tracked request, if any.
+                let verb = match &frame {
+                    Frame::Response(Response { id, .. }) => {
+                        take_verb(&mut lock(&self.pending), *id)
+                    }
+                    _ => None,
+                };
                 match frame {
                     Frame::Response(Response {
                         kind: Some(response::Kind::Agents(list)),
@@ -724,11 +731,11 @@ impl ControlReader {
                         changed = true;
                     }
                     Frame::Response(Response {
-                        id,
                         kind: Some(response::Kind::Error(e)),
+                        ..
                     }) => {
                         let text = error_text(e.message);
-                        let text = match take_verb(&mut lock(&self.pending), id) {
+                        let text = match verb {
                             Some(verb) if text != DAEMON_TOO_OLD => {
                                 format!("{verb} failed: {text}")
                             }
@@ -737,10 +744,9 @@ impl ControlReader {
                         self.ctx.notify(UiEvent::Error(text));
                     }
                     Frame::Response(Response {
-                        id,
                         kind: Some(response::Kind::Forgotten(f)),
+                        ..
                     }) => {
-                        take_verb(&mut lock(&self.pending), id);
                         let n = f.refused.len();
                         if n > 0 {
                             let agents = if n == 1 { "agent" } else { "agents" };
@@ -1031,6 +1037,36 @@ mod tests {
             ]
         );
         assert!(lock(&r.pending).is_empty());
+    }
+
+    #[test]
+    fn every_response_settles_its_pending_verb() {
+        let (r, events) = reader();
+        lock(&r.pending).extend([(1, "restart"), (2, "remove")]);
+        r.apply(vec![Frame::Response(Response {
+            id: 1,
+            kind: Some(response::Kind::Restarted(Box::new(
+                fleet_proto::Restarted {
+                    old_id: 5,
+                    agent: Some(info(6)),
+                    attached: None,
+                },
+            ))),
+        })]);
+        assert_eq!(
+            lock(&r.pending).iter().copied().collect::<Vec<_>>(),
+            [(2, "remove")]
+        );
+        r.apply(vec![Frame::Response(Response {
+            id: 2,
+            kind: Some(response::Kind::Ack(fleet_proto::Ack {})),
+        })]);
+        assert!(lock(&r.pending).is_empty());
+        assert!(
+            !drain(&events)
+                .iter()
+                .any(|e| matches!(e, UiEvent::Error(_)))
+        );
     }
 
     #[test]
