@@ -121,3 +121,40 @@ fn check_refusals() {
     run_check(&script(tmp.path(), "ok", "echo 'handoff 1'"), t).unwrap();
     run_check(Path::new(env!("CARGO_BIN_EXE_fleetd")), t).unwrap();
 }
+
+/// Pids of processes whose command line contains `needle`.
+fn pgrep(needle: &str) -> Vec<String> {
+    let out = Command::new("pgrep")
+        .arg("-f")
+        .arg(needle)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn check_leaves_no_descendants_and_is_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = Duration::from_secs(2);
+
+    // A grandchild holds stdout open: the check still returns promptly with
+    // the child's answer, and the grandchild is gone.
+    let leaky = script(tmp.path(), "leaky", "sleep 101 &\necho 'handoff 1'");
+    let started = Instant::now();
+    run_check(&leaky, t).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // A timeout takes the child's descendants with it.
+    let slow = script(tmp.path(), "slow2", "sleep 102");
+    assert_eq!(run_check(&slow, t).unwrap_err(), "check timed out");
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(pgrep("sleep 101").is_empty(), "grandchild left running");
+    assert!(
+        pgrep("sleep 102").is_empty(),
+        "timed-out child left running"
+    );
+}

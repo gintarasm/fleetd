@@ -4,8 +4,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -131,13 +132,36 @@ pub fn run_check(binary: &Path, timeout: Duration) -> Result<(), String> {
         Ok(m) if m.is_file() && m.permissions().mode() & 0o111 != 0 => {}
         _ => return Err(NOT_EXEC.into()),
     }
+    // Its own process group, so a descendant it leaves behind (holding the
+    // pipe, or still sleeping) is killed with it and cannot outlive the check.
     let mut child = Command::new(binary)
         .arg("--handoff-check")
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| NOT_EXEC.to_string())?;
+    let group = child.id() as libc::pid_t;
+    // Whatever the outcome, nothing from the check is left running. The
+    // group id outlives the reaped child while any member remains; with none
+    // left this is ESRCH.
+    let kill_group = || {
+        // SAFETY: plain signal to the process group we created.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    };
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    // Never block on a pipe a grandchild may hold open: the output is read
+    // non-blocking, once, after the child has exited.
+    // SAFETY: fcntl on an fd we own.
+    unsafe {
+        let fd = stdout.as_raw_fd();
+        libc::fcntl(
+            fd,
+            libc::F_SETFL,
+            libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK,
+        );
+    }
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -146,24 +170,24 @@ pub fn run_check(binary: &Path, timeout: Duration) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
-                let _ = child.kill();
+                kill_group();
                 let _ = child.wait();
                 return Err("check timed out".into());
             }
         }
     };
+    // The child wrote before it exited, so its output is already in the pipe
+    // (a child that fills the pipe never exits and times out above).
+    let mut out = Vec::new();
+    let _ = (&mut stdout).take(4096).read_to_end(&mut out);
+    kill_group();
     if !status.success() {
         return Err(format!(
             "check failed (exit {})",
             status.code().unwrap_or(-1)
         ));
     }
-    // The child has exited, so this does not block; the output is a line or
-    // two (a child that fills the pipe never exits and times out above).
-    let mut out = String::new();
-    if let Some(stdout) = child.stdout.take() {
-        let _ = stdout.take(4096).read_to_string(&mut out);
-    }
+    let out = String::from_utf8_lossy(&out);
     let common = out
         .lines()
         .filter_map(|l| l.strip_prefix("handoff ")?.trim().parse::<u32>().ok())
