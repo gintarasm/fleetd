@@ -5,13 +5,14 @@ mod history;
 mod skill;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use fleet_proto::{
-    AgentInfo, AgentState, ForgetAgents, KillAgent, ListAgents, RestartAgent, SendInput, SetLabels,
-    SpawnAgent,
+    AgentInfo, AgentState, ForgetAgents, HelloOk, KillAgent, ListAgents, RestartAgent,
+    RestartDaemon, SendInput, SetLabels, SpawnAgent,
 };
 use fleet_proto::{request, response};
 
@@ -118,8 +119,23 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Manage the fleetd daemon itself
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
     /// Install the agent skill that teaches agents to use `fleet`
     Skill(skill::SkillArgs),
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// Restart fleetd into a new binary; running agents keep running
+    Restart {
+        /// The fleetd binary to restart into (default: `fleetd` on the daemon's PATH)
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
 }
 
 /// Prints `lines`; `false` once stdout is closed (e.g. piped into `head`).
@@ -225,6 +241,110 @@ fn old_daemon(e: Error) -> Error {
     }
 }
 
+/// How long the CLI waits for the restarted daemon to answer.
+const RECONNECT: Duration = Duration::from_secs(10);
+
+const TOO_OLD: &str = "this fleetd is too old to restart itself; stop it once (pkill fleetd) \
+                       and the next client starts the new one";
+
+fn restart_failed(reason: &str) -> String {
+    format!("fleetd restart failed: {reason}; the old fleetd is still running")
+}
+
+/// What the daemon that answered after a restart tells us, as the line to
+/// print and the exit code; `None` while it is still the old, not yet
+/// thawed daemon (same instance, no `restart_error`).
+///
+/// `agents` is what the old daemon reported in `RestartingDaemon`. A
+/// `fell_back` daemon (the handoff could not be used) started fresh and ended
+/// every previously running agent, so it kept none and `agents` is the count
+/// ended; its ids are `failed`'s when it lists any, else unknown.
+fn restart_outcome(old_instance: u64, agents: u32, hello: &HelloOk) -> Option<(String, u8)> {
+    let restore = hello.restore.as_deref().cloned().unwrap_or_default();
+    if hello.instance == old_instance {
+        // exec failed after `RestartingDaemon`: the old daemon thawed.
+        return (!restore.restart_error.is_empty())
+            .then(|| (restart_failed(&restore.restart_error), 1));
+    }
+    let ids = |ids: &[u64]| match ids {
+        [] => "unknown".to_string(),
+        ids => ids.iter().map(u64::to_string).collect::<Vec<_>>().join(","),
+    };
+    let partial = |kept: usize, ended: usize, ids: String| {
+        (
+            format!(
+                "fleetd restarted: {kept} kept, {ended} could not be restored and were ended (ids {ids})"
+            ),
+            1,
+        )
+    };
+    Some(if restore.fell_back {
+        partial(0, agents as usize, ids(&restore.failed))
+    } else if !restore.failed.is_empty() {
+        partial(
+            restore.kept.len(),
+            restore.failed.len(),
+            ids(&restore.failed),
+        )
+    } else {
+        (
+            format!("fleetd restarted: {} agents kept", restore.kept.len()),
+            0,
+        )
+    })
+}
+
+/// `fleet daemon restart`: asks the daemon to exec into `binary`, waits for
+/// whichever daemon answers next and reports what it says. Success goes to
+/// stdout, every other outcome to stderr with exit 1.
+fn daemon_restart(mut client: Connection, sock: &Path, binary: Option<PathBuf>) -> Result<u8> {
+    let old_instance = client.hello().instance;
+    let req = RestartDaemon {
+        binary: binary
+            .map(|b| b.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    let agents = match client.call(request::Kind::RestartDaemon(req)) {
+        Ok(response::Kind::RestartingDaemon(r)) => r.agents,
+        Ok(_) => return Err(Error::Protocol("unexpected reply to restart".into())),
+        Err(Error::Server(m)) if m == "empty request" => {
+            eprintln!("{TOO_OLD}");
+            return Ok(1);
+        }
+        // The daemon refused before exec; it is still serving.
+        Err(Error::Server(reason)) => {
+            eprintln!("{}", restart_failed(&reason));
+            return Ok(1);
+        }
+        Err(e) => return Err(e),
+    };
+    drop(client);
+    let deadline = Instant::now() + RECONNECT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // The handshake may block while the process is between exec and
+        // serving, so it gets what is left of the budget.
+        if let Ok(c) =
+            Connection::unix_with_timeout(sock, "fleet", left.max(Duration::from_millis(100)))
+            && let Some((line, code)) = restart_outcome(old_instance, agents, c.hello())
+        {
+            if code == 0 {
+                println!("{line}");
+            } else {
+                eprintln!("{line}");
+            }
+            return Ok(code);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Protocol(format!(
+                "fleetd did not come back within {} s",
+                RECONNECT.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Attaches interactively; the exit code of `fleet attach`.
 fn attach_interactive(client: Connection, id: u64) -> Result<u8> {
     Ok(match attach::run(client, id)? {
@@ -242,7 +362,8 @@ fn run(cli: Cli) -> Result<u8> {
     if let Command::Skill(args) = cli.command {
         return skill::run(args).map(|()| 0);
     }
-    let mut client = Connection::unix(&state_dir(&cli).join("fleetd.sock"), "fleet")?;
+    let sock = state_dir(&cli).join("fleetd.sock");
+    let mut client = Connection::unix(&sock, "fleet")?;
     match cli.command {
         Command::Spawn {
             cols,
@@ -359,6 +480,9 @@ fn run(cli: Cli) -> Result<u8> {
         } => attach::snapshot_only(client, id)?,
         Command::Attach { id, .. } => return attach_interactive(client, id),
         Command::Logs { lines, follow } => logs(client, lines, follow)?,
+        Command::Daemon {
+            cmd: DaemonCmd::Restart { binary },
+        } => return daemon_restart(client, &sock, binary),
         Command::Skill(_) => unreachable!("handled before connecting"),
     }
     Ok(0)
