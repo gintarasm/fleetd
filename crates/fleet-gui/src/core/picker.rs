@@ -167,6 +167,23 @@ impl Picker {
     }
 }
 
+/// `hits` (byte offsets of matched characters in `text`) as byte ranges
+/// to highlight, adjacent characters merged into one range.
+pub fn hit_ranges(text: &str, hits: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for &start in hits {
+        let Some(c) = text.get(start..).and_then(|t| t.chars().next()) else {
+            continue;
+        };
+        let end = start + c.len_utf8();
+        match out.last_mut() {
+            Some(last) if last.end == start => last.end = end,
+            _ => out.push(start..end),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +296,16 @@ mod tests {
         assert_eq!(p.items()[r.item].key, "agent:7");
         assert_eq!(r.title_hits, [0, 1, 2, 3, 4, 5]);
         assert_eq!(r.detail_hits, [0, 1, 2]);
+    }
+
+    #[test]
+    fn hits_become_merged_ranges() {
+        assert_eq!(hit_ranges("Split Right", &[0, 1, 6]), [0..2, 6..7]);
+        // Multi-byte characters span their bytes.
+        assert_eq!(hit_ranges("café x", &[3, 6]), [3..5, 6..7]);
+        assert!(hit_ranges("ab", &[]).is_empty());
+        // An offset off the text is skipped.
+        assert_eq!(hit_ranges("ab", &[1, 9]), vec![1..2]);
     }
 
     #[test]
