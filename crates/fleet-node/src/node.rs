@@ -2438,7 +2438,9 @@ impl Node {
     ///
     /// Refuses with "a restart is already in progress", or with "agents are
     /// starting; try again" if a spawn, restart or forget is still in flight
-    /// at `deadline`; the freeze also has to finish by then. On any error
+    /// at `deadline`; the freeze also has to finish by then, and so must the
+    /// exit of any agent whose output has ended (else "an agent is exiting;
+    /// try again", see `wait_for_exiting`). On any error
     /// nothing stays frozen and the node keeps serving. Undo a success with
     /// [`Node::thaw`] (for example when the `exec` fails).
     ///
@@ -2463,11 +2465,43 @@ impl Node {
     fn freeze_for_handoff(&self, deadline: Instant) -> io::Result<Vec<HandoffAgent>> {
         // A failed freeze thaws itself, or was not ours to thaw (busy).
         let frozen = self.host.freeze(deadline)?;
-        let described = self.describe_frozen(frozen);
+        let described = self
+            .wait_for_exiting(&frozen, deadline)
+            .and_then(|()| self.describe_frozen(frozen));
         if described.is_err() {
             self.host.thaw();
         }
         described
+    }
+
+    /// Waits until `deadline` for every live agent the freeze did not list
+    /// to be retired. Such an agent's output has ended, but its reader has
+    /// not yet reaped it and recorded its exit (`on_exit`): usually a matter
+    /// of milliseconds, but a process that closed its terminal and keeps
+    /// running holds its reader in `waitpid` for as long as it runs. Handed
+    /// over neither way, it would be marked lost and left running untracked
+    /// by the successor; so the handoff fails with "an agent is exiting; try
+    /// again" if one remains.
+    fn wait_for_exiting(&self, frozen: &[crate::FrozenAgent], deadline: Instant) -> io::Result<()> {
+        let frozen: HashSet<AgentId> = frozen.iter().map(|a| a.id).collect();
+        loop {
+            let exiting = lock(&self.agents)
+                .live
+                .values()
+                .filter(|live| !frozen.contains(&live.host_id))
+                .count();
+            if exiting == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    agents = exiting,
+                    "agents still exiting at the handoff deadline"
+                );
+                return Err(handoff::agent_exiting());
+            }
+            std::thread::sleep(handoff::EXITING_POLL);
+        }
     }
 
     fn describe_frozen(&self, frozen: Vec<crate::FrozenAgent>) -> io::Result<Vec<HandoffAgent>> {

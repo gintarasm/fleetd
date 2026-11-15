@@ -23,6 +23,15 @@ pub(crate) fn restarting() -> io::Error {
     io::Error::other("fleetd is restarting")
 }
 
+/// A handoff found an agent whose output has ended but whose exit is not
+/// recorded yet, and it did not finish by the deadline.
+pub(crate) fn agent_exiting() -> io::Error {
+    io::Error::new(io::ErrorKind::WouldBlock, "an agent is exiting; try again")
+}
+
+/// How often a handoff checks whether exiting agents have been retired.
+pub(crate) const EXITING_POLL: Duration = Duration::from_millis(5);
+
 /// Holds operations that create or remove agents (spawn, M2c restart,
 /// forget) out of a handoff: a handoff waits for those in flight, and none
 /// starts while it lasts.

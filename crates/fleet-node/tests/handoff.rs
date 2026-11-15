@@ -395,3 +395,65 @@ fn restored_screen_reaches_only_the_grid() {
     let ring = String::from_utf8(ring.read_tail(usize::MAX).unwrap()).unwrap();
     assert!(!ring.contains("line"), "the ring got the restored screen");
 }
+
+#[test]
+fn agent_past_its_output_but_running_blocks_the_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    // Closes its terminal and keeps running: its reader sees the output end
+    // and then waits in `waitpid` for as long as it runs. Perl, not sh:
+    // macOS's /bin/sh (bash 3.2) keeps the terminal referenced after
+    // redirecting every fd, so the output would never end.
+    let id = node
+        .spawn(SpawnAgent {
+            program: "perl".into(),
+            args: vec![
+                "-e".into(),
+                "print \"ready\\n\"; open STDIN, '</dev/null'; open STDOUT, '>/dev/null'; \
+                 open STDERR, '>/dev/null'; sleep 1000"
+                    .into(),
+            ],
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    wait_for_line(&node, id, "ready");
+    // Until the reader has seen the output end, the agent is frozen and
+    // handed over like any other: thaw and try again.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let e = loop {
+        match node.prepare_handoff(Instant::now() + Duration::from_millis(200)) {
+            Ok(_) => node.thaw(),
+            Err(e) => break e,
+        }
+        assert!(Instant::now() < deadline, "the agent's output never ended");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(e.to_string(), "an agent is exiting; try again");
+    // Still serving, the agent still tracked.
+    assert_eq!(state_of(&node, id).0, AgentState::Running as i32);
+    let other = spawn_sh(&node, "exit 0");
+    assert_eq!(wait_exited(&node, other), 0);
+    node.kill(id).unwrap();
+    wait_exited(&node, id);
+}
+
+#[test]
+fn agents_exiting_around_the_freeze_record_their_codes() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = Node::open(dir.path()).unwrap();
+    // Staggered exits: some end before the freeze (retired by the old node
+    // while it waits), some as it freezes (handed over and reaped by the new
+    // node), whichever the timing.
+    let ids: Vec<u64> = (0..6)
+        .map(|i| spawn_sh(&old, &format!("echo ready; sleep 0.0{i}; exit 7")))
+        .collect();
+    let (new, _, failed) = hand_over(old, dir.path());
+    assert!(failed.is_empty());
+    for id in ids {
+        assert_eq!(wait_exited(&new, id), 7, "agent {id}");
+        assert_eq!(state_of(&new, id), (AgentState::Exited as i32, Some(7)));
+    }
+}
