@@ -6,6 +6,7 @@ pub mod logging;
 mod restart;
 mod server;
 pub mod stdio;
+pub mod upgrade;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};

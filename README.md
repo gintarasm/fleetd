@@ -56,11 +56,14 @@ Or build without installing: `cargo build --release -p fleetd -p fleet-cli` puts
 ```sh
 fleetd                      # state in ~/.fleet
 fleetd --state-dir /path    # alternative state directory
+fleetd --upgrade            # restart a running daemon of another build onto this binary
+fleetd --force-stop         # stop a running daemon too old to restart itself, then start
 fleetd --stdio              # bridge stdin/stdout to the daemon, starting one if needed
 ```
 
 - **Foreground process.** `fleetd` runs in the foreground and serves clients on `<state-dir>/fleetd.sock`. To keep it running, start it from a terminal multiplexer or a service manager (a launchd/systemd setup is TBD).
-- **One instance per state directory.** A second `fleetd` on the same directory exits with `fleetd already running` (exit code 2).
+- **One instance per state directory.** A second `fleetd` on the same directory exits with `fleetd already running` (exit code 2). If the running daemon is a different build, `fleetd` offers to restart it onto this binary (agents keep running); see **Upgrading**.
+- **Upgrading.** When another fleetd holds the lock and runs a different binary, `fleetd` in a terminal asks whether to restart it onto this one (agents keep running); `fleetd --upgrade` does it without asking and prints the same result as `fleet daemon restart`. Without a terminal or flag it only says so and exits 2. A daemon too old to restart itself can only be stopped, which ends its agents: `fleetd` asks, and `fleetd --force-stop` does it without asking (SIGTERM to the pid holding the lock, found with `lsof` or `fuser`; never SIGKILL: if it does not exit within 5 s `fleetd` names the pid and exits 1), then starts normally. The flags are ignored with `--stdio`, which never prompts.
 - **Stopping.** SIGTERM, SIGINT (Ctrl-C) or SIGHUP stops every agent: each gets SIGTERM, then 2 s later SIGKILL. Their exits are recorded, then the socket is removed.
 - **Crashes.** If `fleetd` is killed hard, the agents it was running are shown as `lost` on the next start.
 - **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M5).

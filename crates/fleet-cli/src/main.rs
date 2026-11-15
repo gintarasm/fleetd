@@ -7,19 +7,15 @@ mod skill;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use fleet_proto::{
-    AgentInfo, AgentState, ForgetAgents, KillAgent, ListAgents, RestartAgent, RestartDaemon,
-    SendInput, SetLabels, SpawnAgent,
+    AgentInfo, AgentState, ForgetAgents, KillAgent, ListAgents, RestartAgent, SendInput, SetLabels,
+    SpawnAgent,
 };
 use fleet_proto::{request, response};
 
-use fleet_client::{
-    Connection, Error, RESTART_WAIT, RestartOutcome, Result, TOO_OLD, did_not_come_back,
-    restart_failed, restart_outcome,
-};
+use fleet_client::{Connection, Error, Restart, Result, TOO_OLD, restart_daemon};
 
 #[derive(Parser)]
 #[command(name = "fleet", about = "Manage agents run by fleetd")]
@@ -247,53 +243,24 @@ fn old_daemon(e: Error) -> Error {
 /// `fleet daemon restart`: asks the daemon to exec into `binary`, waits for
 /// whichever daemon answers next and reports what it says. Success goes to
 /// stdout, every other outcome to stderr with exit 1.
-fn daemon_restart(mut client: Connection, sock: &Path, binary: Option<PathBuf>) -> Result<u8> {
-    let old_instance = client.hello().instance;
-    let req = RestartDaemon {
-        binary: binary
-            .map(|b| b.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    };
-    let agents = match client.call(request::Kind::RestartDaemon(req)) {
-        Ok(response::Kind::RestartingDaemon(r)) => r.agents,
-        Ok(_) => return Err(Error::Protocol("unexpected reply to restart".into())),
-        Err(Error::Server(m)) if m == "empty request" => {
+fn daemon_restart(client: Connection, sock: &Path, binary: Option<PathBuf>) -> Result<u8> {
+    let binary = binary
+        .map(|b| b.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(match restart_daemon(client, sock, "fleet", &binary)? {
+        Restart::TooOld => {
             eprintln!("{TOO_OLD}");
-            return Ok(1);
+            1
         }
-        // The daemon refused before exec; it is still serving.
-        Err(Error::Server(reason)) => {
-            eprintln!("{}", restart_failed(&reason));
-            return Ok(1);
+        Restart::Outcome(done) if done.is_success() => {
+            println!("{done}");
+            0
         }
-        Err(e) => return Err(e),
-    };
-    drop(client);
-    let deadline = Instant::now() + RESTART_WAIT;
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        // The handshake may block while the process is between exec and
-        // serving, so it gets what is left of the budget.
-        if let Ok(c) =
-            Connection::unix_with_timeout(sock, "fleet", left.max(Duration::from_millis(100)))
-        {
-            match restart_outcome(old_instance, agents, c.hello()) {
-                RestartOutcome::Pending => {}
-                done if done.is_success() => {
-                    println!("{done}");
-                    return Ok(0);
-                }
-                other => {
-                    eprintln!("{other}");
-                    return Ok(1);
-                }
-            }
+        Restart::Outcome(other) => {
+            eprintln!("{other}");
+            1
         }
-        if Instant::now() >= deadline {
-            return Err(Error::Protocol(did_not_come_back()));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    })
 }
 
 /// Attaches interactively; the exit code of `fleet attach`.

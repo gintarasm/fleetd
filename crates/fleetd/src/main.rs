@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use fleetd::handoff::{self, Handed};
 use fleetd::logging::{self, DAEMON_LOG, STDIO_LOG};
+use fleetd::upgrade::{self, Flags, Next};
 use fleetd::{Config, Daemon, StartupError, raise_fd_limit, startup};
 use tracing::{error, info, warn};
 
@@ -46,11 +47,17 @@ fn main() -> ExitCode {
 
     let mut cfg = Config::default();
     let mut stdio = false;
+    // Used only when another fleetd holds the lock; ignored with --stdio.
+    let mut flags = Flags::default();
     let mut args = std::env::args_os().skip(1);
     // Usage errors go to stderr only: there is no state dir to log to yet.
     while let Some(arg) = args.next() {
         if arg == "--stdio" {
             stdio = true;
+        } else if arg == "--upgrade" {
+            flags.upgrade = true;
+        } else if arg == "--force-stop" {
+            flags.force_stop = true;
         } else if arg == "--state-dir" {
             let Some(dir) = args.next() else {
                 eprintln!("fleetd: --state-dir requires a path");
@@ -58,7 +65,7 @@ fn main() -> ExitCode {
             };
             cfg.state_dir = PathBuf::from(dir);
         } else {
-            eprintln!("usage: fleetd [--stdio] [--state-dir <path>]");
+            eprintln!("usage: fleetd [--stdio] [--upgrade] [--force-stop] [--state-dir <path>]");
             return ExitCode::from(64);
         }
     }
@@ -113,8 +120,17 @@ fn main() -> ExitCode {
         Ok(d) => d,
         Err(StartupError::AlreadyRunning) => {
             info!(state_dir = ?cfg.state_dir, "another fleetd holds the instance lock; exiting");
-            eprintln!("fleetd already running");
-            return ExitCode::from(2);
+            match upgrade::on_already_running(&cfg, flags) {
+                Next::Exit(code) => return ExitCode::from(code),
+                // The old daemon was stopped: take over.
+                Next::Start => match startup(&cfg) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        fatal(&e.to_string());
+                        return ExitCode::FAILURE;
+                    }
+                },
+            }
         }
         Err(e) => {
             fatal(&e.to_string());

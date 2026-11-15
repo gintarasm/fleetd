@@ -4,9 +4,12 @@
 //! same words.
 
 use std::fmt;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
-use fleet_proto::HelloOk;
+use fleet_proto::{HelloOk, RestartDaemon, request, response};
+
+use crate::{Connection, Error, Result};
 
 /// How long a client waits for the restarted daemon to answer.
 pub const RESTART_WAIT: Duration = Duration::from_secs(10);
@@ -115,6 +118,63 @@ pub fn restart_outcome(old_instance: u64, agents: u32, hello: &HelloOk) -> Resta
             }
         }
         _ => partial(0, agents, &[]),
+    }
+}
+
+/// What asking a daemon to restart came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// The daemon predates `RestartDaemon` (it answered "empty request").
+    TooOld,
+    /// The daemon refused (it is still serving), or it restarted and the
+    /// verdict is in. Never [`RestartOutcome::Pending`].
+    Outcome(RestartOutcome),
+}
+
+/// Asks the daemon on `client` to exec into `binary` (empty: `fleetd` on its
+/// PATH), then waits up to [`RESTART_WAIT`] for whichever daemon answers on
+/// `sock` next and decides with [`restart_outcome`]. `client_name` is how the
+/// reconnects introduce themselves in the daemon's log. `Err` when the
+/// request failed in some other way or no daemon came back in time
+/// ([`did_not_come_back`]).
+pub fn restart_daemon(
+    mut client: Connection,
+    sock: &Path,
+    client_name: &str,
+    binary: &str,
+) -> Result<Restart> {
+    let old_instance = client.hello().instance;
+    let req = RestartDaemon {
+        binary: binary.to_string(),
+    };
+    let agents = match client.call(request::Kind::RestartDaemon(req)) {
+        Ok(response::Kind::RestartingDaemon(r)) => r.agents,
+        Ok(_) => return Err(Error::Protocol("unexpected reply to restart".into())),
+        Err(Error::Server(m)) if m == "empty request" => return Ok(Restart::TooOld),
+        // The daemon refused before exec; it is still serving.
+        Err(Error::Server(reason)) => {
+            return Ok(Restart::Outcome(RestartOutcome::Failed(reason)));
+        }
+        Err(e) => return Err(e),
+    };
+    drop(client);
+    let deadline = Instant::now() + RESTART_WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        // The handshake may block while the process is between exec and
+        // serving, so it gets what is left of the budget.
+        if let Ok(c) =
+            Connection::unix_with_timeout(sock, client_name, left.max(Duration::from_millis(100)))
+        {
+            match restart_outcome(old_instance, agents, c.hello()) {
+                RestartOutcome::Pending => {}
+                done => return Ok(Restart::Outcome(done)),
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Protocol(did_not_come_back()));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
