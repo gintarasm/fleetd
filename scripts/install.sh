@@ -11,6 +11,9 @@
 #
 # Every step prints one line saying what it did.
 set -eu
+# Relative paths in the flags are the caller's: resolved against where the
+# script was run from, not the repo it changes into.
+caller=$(pwd)
 cd "$(dirname "$0")/.."
 repo=$(pwd)
 
@@ -30,12 +33,32 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --force-stop) force_stop=1; shift ;;
-    -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,12p' "$repo/scripts/install.sh" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install: unknown option $1 (see --help)" >&2; exit 64 ;;
   esac
 done
 
 die() { echo "install: $*" >&2; exit 1; }
+
+# `$1` as an absolute path, a relative one taken from the caller's directory.
+from_caller() {
+  case "$1" in
+    /*) echo "$1" ;;
+    *) echo "$caller/$1" ;;
+  esac
+}
+app_dir=$(from_caller "$app_dir")
+bin_dir=$(from_caller "$bin_dir")
+state_dir=$(from_caller "$state_dir")
+
+# Where cargo builds: a relative CARGO_TARGET_DIR is taken from the repo,
+# where cargo runs. Copying from ./target instead would install a stale (or
+# foreign) build.
+target_dir=${CARGO_TARGET_DIR:-target}
+case "$target_dir" in
+  /*) ;;
+  *) target_dir="$repo/$target_dir" ;;
+esac
 
 # Resolves a directory to an absolute path, creating it if needed, so links
 # and the daemon's exec target stay valid whatever the current directory is.
@@ -78,7 +101,7 @@ if [ "$os" = Darwin ]; then
   new="$app_dir/.fleetd.app.new.$$"
   old="$app_dir/.fleetd.app.old.$$"
   rm -rf "$new"
-  cp -R target/release/fleetd.app "$new" || { rm -rf "$new"; die "could not copy the app into $app_dir"; }
+  cp -R "$target_dir/release/fleetd.app" "$new" || { rm -rf "$new"; die "could not copy the app into $app_dir"; }
   # A directory cannot be renamed over a non-empty one, so the old copy steps
   # aside first; it comes back if the new one cannot take its place.
   if [ -e "$app_dir/fleetd.app" ]; then
@@ -99,10 +122,8 @@ if [ "$os" = Darwin ]; then
 else
   echo "building fleetd and fleet..."
   cargo build --release -p fleetd -p fleet-cli
-  # cargo honours CARGO_TARGET_DIR; copying from ./target would pick up a stale
-  # (or foreign) build.
   for b in fleetd fleet; do
-    install_file "${CARGO_TARGET_DIR:-target}/release/$b" "$bin_dir/$b"
+    install_file "$target_dir/release/$b" "$bin_dir/$b"
     echo "installed $bin_dir/$b"
   done
 fi
@@ -115,6 +136,12 @@ esac
 fleet="$bin_dir/fleet"
 sock="$state_dir/fleetd.sock"
 if ! "$fleet" --state-dir "$state_dir" ls >/dev/null 2>&1; then
+  # A socket that does not answer may still be a daemon (stuck, or this
+  # state dir's under another user): not "none running".
+  if [ -S "$sock" ]; then
+    echo "install: a fleetd socket exists but did not answer; not restarting it ($sock)" >&2
+    exit 1
+  fi
   echo "no fleetd running; the next client starts the new one"
   exit 0
 fi
