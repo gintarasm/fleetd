@@ -24,7 +24,19 @@ A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Co
 
 Requires the Rust toolchain pinned in `rust-toolchain.toml`; `rustup` installs it automatically. Runs on macOS and Linux.
 
-Install both binaries into `~/.cargo/bin`, which rustup normally puts on your `PATH`:
+```sh
+scripts/install.sh
+```
+
+It builds, installs, and moves a running `fleetd` onto the new build with its agents kept (`fleet daemon restart`). Updating is `git pull && scripts/install.sh`. Each step prints one line.
+
+- **macOS:** builds the app bundle (needs the Metal toolchain, see below), copies it to `/Applications/fleetd.app`, and links `fleetd` and `fleet` in `~/.local/bin` to the binaries inside it. It stops rather than replace an existing `fleetd` or `fleet` file there that is not ours.
+- **Linux:** builds and copies `fleetd` and `fleet` into `~/.local/bin`. There is no app.
+- **Flags:** `--app-dir <dir>` (default `/Applications`), `--bin-dir <dir>` (default `~/.local/bin`), `--state-dir <dir>` (default `~/.fleet`, the daemon to restart), `--force-stop`.
+- **A daemon too old to restart itself** (built before this feature) is not touched: the script says so and exits 1. Run again with `--force-stop` to stop it (its running agents end); the next client starts the new one. This is needed once.
+- **No daemon running:** nothing to restart; the next client starts the new one.
+
+Or, with cargo, install both binaries into `~/.cargo/bin`, which rustup normally puts on your `PATH` (this does not restart a running daemon; run `fleet daemon restart` afterwards):
 
 ```sh
 cargo install --locked --path crates/fleetd      # installs fleetd
