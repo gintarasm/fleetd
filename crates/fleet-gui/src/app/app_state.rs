@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use fleet_term::Palette;
 use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle};
 
-use super::new_agent::{SpawnRequest, dir_choices};
+use super::new_agent::dir_choices;
 use super::pane_view::{InputSink, PaneChrome, PaneView};
 use super::sidebar_view::{TabMark, program_name};
 use super::theme::Theme;
@@ -20,6 +20,7 @@ use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::sidebar::{ended, tilde};
+use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
@@ -39,15 +40,7 @@ pub trait SessionApi: InputSink {
     fn lists(&self) -> u64 {
         0
     }
-    fn spawn(
-        &self,
-        program: String,
-        args: Vec<String>,
-        cwd: String,
-        cols: u16,
-        rows: u16,
-        pane: PaneId,
-    ) -> Result<(), String>;
+    fn spawn(&self, req: SpawnRequest, cols: u16, rows: u16, pane: PaneId) -> Result<(), String>;
     fn kill(&self, agent_id: u64);
     /// Restarts an exited agent, unattached (panes follow `AgentRemoved`).
     fn restart(&self, agent_id: u64);
@@ -98,16 +91,8 @@ impl SessionApi for Session {
         Session::lists(self)
     }
 
-    fn spawn(
-        &self,
-        program: String,
-        args: Vec<String>,
-        cwd: String,
-        cols: u16,
-        rows: u16,
-        pane: PaneId,
-    ) -> Result<(), String> {
-        Session::spawn(self, program, args, cwd, cols, rows, pane)
+    fn spawn(&self, req: SpawnRequest, cols: u16, rows: u16, pane: PaneId) -> Result<(), String> {
+        Session::spawn(self, req, cols, rows, pane)
     }
 
     fn kill(&self, agent_id: u64) {
@@ -189,9 +174,7 @@ impl SessionApi for NoSession {
 
     fn spawn(
         &self,
-        _program: String,
-        _args: Vec<String>,
-        _cwd: String,
+        _req: SpawnRequest,
         _cols: u16,
         _rows: u16,
         _pane: PaneId,
@@ -998,14 +981,45 @@ impl AppState {
             .and_then(|v| v.read(cx).grid())
             .unwrap_or((80, 24));
         let cwd = self.expand(&req.cwd);
-        self.session
-            .spawn(req.program, req.args, cwd.clone(), cols, rows, pane)?;
+        let req = SpawnRequest {
+            cwd: cwd.clone(),
+            ..req
+        };
+        self.session.spawn(req, cols, rows, pane)?;
         self.forget_pending(pane);
         self.starting.insert(pane);
         self.spawn_dirs.insert(pane, cwd);
         self.refresh_chrome(cx);
         cx.notify();
         Ok(())
+    }
+
+    /// New terminal: a login shell (`kind=shell`) in the focused agent's
+    /// folder, else the last-used one, else home (a remote daemon's own
+    /// directory, as it is unknown here). It opens in a new split when the
+    /// focused pane shows an agent and one fits, else in the focused pane,
+    /// and that pane is focused.
+    pub fn new_terminal(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let focused_agent = self.layout.agent(self.focused);
+        let focused_cwd = focused_agent
+            .and_then(|id| self.agents.iter().find(|r| r.info.id == id))
+            .map(|r| r.info.cwd.as_str());
+        let recent = self
+            .gui_state
+            .recent_dirs
+            .get(&self.target.to_string())
+            .map_or(&[][..], Vec::as_slice);
+        let home = match self.target {
+            Target::Local => self.home.to_string_lossy().into_owned(),
+            Target::Ssh { .. } => String::new(),
+        };
+        let cwd = terminal_dir(focused_cwd, recent, &home);
+        let shell = std::env::var("SHELL").ok();
+        let req = new_terminal(&self.target, shell.as_deref(), cwd);
+        if focused_agent.is_some() {
+            self.split(Axis::Horizontal, cx);
+        }
+        self.spawn(req, cx)
     }
 
     /// `~` is the home directory for a local daemon; remote paths are the
@@ -1068,7 +1082,7 @@ impl AppState {
     }
 
     /// Shows `text` in the error toast, until dismissed.
-    fn show_error(&mut self, text: String, cx: &mut Context<Self>) {
+    pub(super) fn show_error(&mut self, text: String, cx: &mut Context<Self>) {
         eprintln!("fleet-gui: {text}");
         self.error = Some(text);
         self.error_is_connection = false;

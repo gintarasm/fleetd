@@ -799,9 +799,7 @@ mod tests {
 
         fn spawn(
             &self,
-            _program: String,
-            _args: Vec<String>,
-            _cwd: String,
+            _req: crate::core::spawn::SpawnRequest,
             _cols: u16,
             _rows: u16,
             _pane: PaneId,

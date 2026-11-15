@@ -19,8 +19,8 @@ use super::context_menu::{self, MenuLine};
 use super::controls::appear;
 use super::keymap::{
     ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
-    FocusRight, FocusUp, Kill, NewAgent, Paste, Remove, Restart, RestartPane, SplitDown,
-    SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart, RestartPane,
+    SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
@@ -525,6 +525,22 @@ impl Workspace {
         self.open_new_agent(window, cx);
     }
 
+    /// ⌘T: a plain login shell, focused (see [`AppState::new_terminal`]).
+    pub fn open_new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        if let Err(e) = self.app.update(cx, |a, cx| a.new_terminal(cx)) {
+            self.app.update(cx, |a, cx| a.show_error(e, cx));
+        }
+        self.focus_current(window, cx);
+        cx.notify();
+    }
+
+    fn new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_new_terminal(window, cx);
+    }
+
     fn sheet_event(
         &mut self,
         sheet: &Entity<NewAgentSheet>,
@@ -895,6 +911,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FocusPane3, w, cx| this.focus_number(3, w, cx)))
             .on_action(cx.listener(|this, _: &FocusPane4, w, cx| this.focus_number(4, w, cx)))
             .on_action(cx.listener(Self::new_agent))
+            .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::kill))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
@@ -969,6 +986,7 @@ mod tests {
     use crate::core::menus::{MenuEntry, PaneMenuItem, RowMenuItem};
     use crate::core::pane::PaneModel;
     use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
+    use crate::core::spawn::SpawnRequest;
     use crate::core::state::GuiState;
     use crate::core::target::Target;
 
@@ -987,9 +1005,7 @@ mod tests {
         Forget(Vec<u64>),
         ClearExited,
         Spawn {
-            program: String,
-            args: Vec<String>,
-            cwd: String,
+            req: SpawnRequest,
             size: (u16, u16),
             pane: PaneId,
         },
@@ -1060,9 +1076,7 @@ mod tests {
 
         fn spawn(
             &self,
-            program: String,
-            args: Vec<String>,
-            cwd: String,
+            req: SpawnRequest,
             cols: u16,
             rows: u16,
             pane: PaneId,
@@ -1071,9 +1085,7 @@ mod tests {
                 return Err(e);
             }
             self.calls.lock().unwrap().push(Call::Spawn {
-                program,
-                args,
-                cwd,
+                req,
                 size: (cols, rows),
                 pane,
             });
@@ -1423,9 +1435,12 @@ mod tests {
 
         s.cx.simulate_keystrokes("enter");
         assert!(fake.calls().contains(&Call::Spawn {
-            program: "claude".into(),
-            args: vec!["--append-system-prompt".into(), "be brief".into()],
-            cwd: "/r1".into(),
+            req: SpawnRequest {
+                program: "claude".into(),
+                args: vec!["--append-system-prompt".into(), "be brief".into()],
+                cwd: "/r1".into(),
+                labels: Default::default(),
+            },
             size: s.app.read_with(s.cx, |a, cx| {
                 a.pane_view(PaneId(1)).unwrap().read(cx).grid().unwrap()
             }),
@@ -1446,9 +1461,12 @@ mod tests {
             a.pane_view(PaneId(1)).unwrap().read(cx).grid().unwrap()
         });
         assert!(fake.calls().contains(&Call::Spawn {
-            program: "sh".into(),
-            args: vec!["-c".into(), "echo hi".into()],
-            cwd: "/tmp".into(),
+            req: SpawnRequest {
+                program: "sh".into(),
+                args: vec!["-c".into(), "echo hi".into()],
+                cwd: "/tmp".into(),
+                labels: Default::default(),
+            },
             size,
             pane: PaneId(1),
         }));
@@ -1476,6 +1494,53 @@ mod tests {
         let shown = s.app.read_with(s.cx, |a, _| a.layout().agent(PaneId(1)));
         assert_eq!(shown, Some(9));
         assert_eq!(recent(&mut s), ["/tmp", "/r1", "/a"]);
+    }
+
+    /// ⌘T: a login shell labelled `kind=shell`, in the last-used folder
+    /// for an empty pane, then in the focused agent's folder, in a new
+    /// split that takes the focus.
+    #[gpui::test]
+    fn new_terminal_spawns_a_shell_and_focuses_it(cx: &mut TestAppContext) {
+        use crate::core::spawn::{KIND_LABEL, SHELL_KIND};
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = GuiState::default();
+        state.recent_dirs.insert("local".into(), vec!["/r1".into()]);
+        state.save(dir.path()).unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup_with(cx, &fake, dir.path(), GuiConfig::default());
+        let spawns = |fake: &Fake| -> Vec<(SpawnRequest, PaneId)> {
+            fake.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    Call::Spawn { req, pane, .. } => Some((req, pane)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        s.cx.simulate_keystrokes("cmd-t");
+        let got = spawns(&fake);
+        assert_eq!(got.len(), 1);
+        let (req, pane) = &got[0];
+        assert_eq!((req.cwd.as_str(), *pane), ("/r1", PaneId(1)));
+        assert_eq!(req.args, ["-l"]);
+        assert_eq!(req.labels[KIND_LABEL], SHELL_KIND);
+        assert!(s.ws.read_with(s.cx, |w, _| w.sheet().is_none()));
+
+        // Pane 1 now shows an agent in /a: the next one splits.
+        agents(&mut s, &fake, vec![row(9, "/a", 1)]);
+        attach_model(&fake, PaneId(1), 9);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("cmd-t");
+        let got = spawns(&fake);
+        assert_eq!(got.len(), 2);
+        let (req, pane) = &got[1];
+        assert_eq!((req.cwd.as_str(), *pane), ("/a", PaneId(2)));
+        let (focused, shown) = s
+            .app
+            .read_with(s.cx, |a, _| (a.focused(), a.layout().agent(PaneId(1))));
+        assert_eq!((focused, shown), (PaneId(2), Some(9)));
     }
 
     fn spawn_via_sheet(s: &mut Setup<'_>, dir: &str) {

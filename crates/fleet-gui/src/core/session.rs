@@ -26,6 +26,7 @@ use super::backoff::Backoff;
 use super::launch::{find_tool, update_available};
 use super::pane::PaneModel;
 use super::pane_link::PaneLink;
+use super::spawn::SpawnRequest;
 use super::target::{Connected, Target, connect};
 
 /// How the control connection introduces itself.
@@ -517,17 +518,16 @@ impl Session {
     /// `SpawnedAttached` into that pane; a failure as [`UiEvent::Error`].
     pub fn spawn(
         &self,
-        program: String,
-        args: Vec<String>,
-        cwd: String,
+        req: SpawnRequest,
         cols: u16,
         rows: u16,
         pane: PaneId,
     ) -> Result<(), String> {
         let spawn = SpawnAgent {
-            program,
-            args,
-            cwd,
+            program: req.program,
+            args: req.args,
+            cwd: req.cwd,
+            labels: req.labels,
             cols: cols.into(),
             rows: rows.into(),
             attach: true,
@@ -1479,14 +1479,12 @@ mod tests {
             super::super::pane::PaneState::Disconnected
         );
         assert!(lock(&handle.inner.panes).is_empty());
-        let r = handle.spawn(
-            "/bin/true".into(),
-            Vec::new(),
-            "/".into(),
-            80,
-            24,
-            PaneId(1),
-        );
+        let req = SpawnRequest {
+            program: "/bin/true".into(),
+            cwd: "/".into(),
+            ..Default::default()
+        };
+        let r = handle.spawn(req, 80, 24, PaneId(1));
         assert!(r.is_err());
     }
 }
