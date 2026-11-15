@@ -101,10 +101,13 @@ fn spawn_then_ls_shows_running() {
     let mut lines = ls.lines();
     assert_eq!(
         lines.next().unwrap().split_whitespace().collect::<Vec<_>>(),
-        ["ID", "STATE", "EXIT", "PROGRAM"]
+        ["ID", "NAME", "STATE", "EXIT", "PROGRAM"]
     );
     let row: Vec<_> = lines.next().unwrap().split_whitespace().collect();
-    assert_eq!(row, [id.as_str(), "running", "-", "cat"]);
+    assert_eq!(row.len(), 5, "{row:?}");
+    assert_eq!([row[0], row[2], row[3], row[4]], [id.as_str(), "running", "-", "cat"]);
+    // The default name: the cwd's basename (no prompt) and an animal.
+    assert!(row[1].starts_with("fleetcli-"), "{row:?}");
     assert!(lines.next().is_none());
 }
 
@@ -117,8 +120,8 @@ fn kill_then_ls_shows_exited() {
     let ls = d.ok(&["ls"]);
     let row: Vec<_> = ls.lines().nth(1).unwrap().split_whitespace().collect();
     assert_eq!(row[0], id);
-    assert_eq!(row[1], "exited");
-    assert_ne!(row[2], "-", "exit code shown: {ls}");
+    assert_eq!(row[2], "exited");
+    assert_ne!(row[3], "-", "exit code shown: {ls}");
 }
 
 #[test]
@@ -943,6 +946,7 @@ fn skill_examples_run() {
         ("history", "--plain"),
         ("send", "--enter"),
         ("spawn", "--cwd"),
+        ("spawn", "--name"),
         ("kill", ""),
     ] {
         assert!(
@@ -1152,4 +1156,112 @@ fn restart_and_rm_against_an_old_daemon_say_so() {
         );
         daemon.join().unwrap();
     }
+}
+
+fn ls_json(d: &Daemon) -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+    v.as_array().unwrap().clone()
+}
+
+fn name_of(d: &Daemon, id: &str) -> serde_json::Value {
+    ls_json(d)
+        .into_iter()
+        .find(|a| a["id"].to_string() == id)
+        .expect("agent listed")["labels"]["name"]
+        .clone()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn spawn_sets_a_generated_name_unique_among_live_agents() {
+    let d = Daemon::start();
+    let a = d.ok(&["spawn", "--", "sh", "-c", "fix the SIGTERM race; cat"]);
+    let b = d.ok(&["spawn", "--", "sh", "-c", "fix the SIGTERM race; cat"]);
+    let (na, nb) = (name_of(&d, a.trim()), name_of(&d, b.trim()));
+    let (na, nb) = (na.as_str().unwrap(), nb.as_str().unwrap());
+    assert!(na.starts_with("sigterm-"), "{na}");
+    assert!(nb.starts_with("sigterm-"), "{nb}");
+    assert_ne!(na, nb);
+}
+
+#[test]
+fn spawn_name_sets_the_name_label_and_refuses_bad_names() {
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--name", "lto-falcon", "--", "cat"]);
+    assert_eq!(name_of(&d, id.trim()), "lto-falcon");
+    // An explicit name label counts as the name too.
+    let id = d.ok(&["spawn", "--label", "name=by-label", "--", "cat"]);
+    assert_eq!(name_of(&d, id.trim()), "by-label");
+    let out = d.fleet(&["spawn", "--name", "42", "--", "cat"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("all digits"), "{}", stderr(&out));
+    let out = d.fleet(&["spawn", "--name", "a", "--label", "name=b", "--", "cat"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(ls_json(&d).len(), 2, "nothing spawned for a refused name");
+}
+
+#[test]
+fn rename_sets_only_the_name() {
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--label", "role=test", "--", "cat"]);
+    let id = id.trim();
+    d.ok(&["rename", id, "shell-heron"]);
+    assert_eq!(name_of(&d, id), "shell-heron");
+    // By its name, too.
+    d.ok(&["rename", "shell-heron", "omp-badger"]);
+    assert_eq!(name_of(&d, id), "omp-badger");
+    let a = ls_json(&d).remove(0);
+    assert_eq!(a["labels"]["role"], "test");
+    let out = d.fleet(&["rename", id, "  "]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn commands_take_a_name_and_report_ambiguous_or_unknown_ones() {
+    let d = Daemon::start();
+    let id = d.ok(&["spawn", "--name", "lto-falcon", "--", "cat"]);
+    let id = id.trim().to_string();
+    d.ok(&["send", "--enter", "lto-falcon", "hello"]);
+    wait_for("screen by name", || {
+        let out = d.fleet(&["screen", "lto-falcon"]);
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("hello")
+    });
+    d.ok(&["history", "lto-falcon", "--lines", "5"]);
+    d.ok(&["attach", "--snapshot-only", "lto-falcon"]);
+    d.ok(&["label", "lto-falcon", "a=b"]);
+
+    d.ok(&["spawn", "--name", "twin", "--", "cat"]);
+    d.ok(&["spawn", "--name", "twin", "--", "cat"]);
+    let out = d.fleet(&["kill", "twin"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("ambiguous"), "{}", stderr(&out));
+    let out = d.fleet(&["screen", "falcon"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("no agent named") && stderr(&out).contains("lto-falcon"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Ended agents by name: kill, then restart and rm.
+    d.ok(&["kill", "lto-falcon"]);
+    wait_for("exited", || {
+        ls_json(&d)
+            .iter()
+            .any(|a| a["id"].to_string() == id && a["state"] == "exited")
+    });
+    let new_id = d.ok(&["restart", "lto-falcon"]).trim().to_string();
+    assert_ne!(new_id, id);
+    assert_eq!(name_of(&d, &new_id), "lto-falcon");
+    d.ok(&["kill", "lto-falcon"]);
+    wait_for("exited again", || {
+        ls_json(&d)
+            .iter()
+            .any(|a| a["id"].to_string() == new_id && a["state"] == "exited")
+    });
+    d.ok(&["rm", "lto-falcon"]);
+    assert!(ls_json(&d).iter().all(|a| a["id"].to_string() != new_id));
 }

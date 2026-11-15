@@ -16,6 +16,7 @@ use fleet_proto::{
 };
 use fleet_proto::{request, response};
 
+use fleet_client::names::{self, NAME_LABEL};
 use fleet_client::{Connection, Error, Restart, Result, TOO_OLD, restart_daemon};
 
 /// Pause between `fleet send`'s text and its `--enter` Return, long enough
@@ -46,6 +47,9 @@ enum Command {
         /// Label as k=v (repeatable)
         #[arg(long = "label", value_name = "K=V")]
         labels: Vec<String>,
+        /// The agent's name (the `name` label; default: generated from the command)
+        #[arg(long)]
+        name: Option<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -60,16 +64,25 @@ enum Command {
     },
     /// Set or remove labels on an agent
     Label {
-        id: u64,
+        /// Agent id or name
+        agent: String,
         /// Labels to set, as k=v
         set: Vec<String>,
         /// Label keys to remove
         #[arg(long = "rm", num_args = 1.., value_name = "K")]
         remove: Vec<String>,
     },
+    /// Rename an agent (sets its `name` label)
+    Rename {
+        /// Agent id or name
+        agent: String,
+        /// The new name
+        name: String,
+    },
     /// Print an agent's history, oldest first, then its current screen
     History {
-        id: u64,
+        /// Agent id or name
+        agent: String,
         /// Only the last N lines
         #[arg(long)]
         lines: Option<usize>,
@@ -78,20 +91,27 @@ enum Command {
         plain: bool,
     },
     /// Print the visible text of an agent's current screen
-    Screen { id: u64 },
+    Screen {
+        /// Agent id or name
+        agent: String,
+    },
     /// Kill an agent
-    Kill { id: u64 },
+    Kill {
+        /// Agent id or name
+        agent: String,
+    },
     /// Restart an exited agent (same command, cwd and labels; new id). Its environment is not restored.
     Restart {
-        id: u64,
+        /// Agent id or name
+        agent: String,
         /// Attach to the new agent
         #[arg(long)]
         attach: bool,
     },
     /// Remove exited or lost agents and their history
     Rm {
-        /// Agents to remove (must be exited or lost)
-        ids: Vec<u64>,
+        /// Agents to remove, by id or name (must be exited or lost)
+        ids: Vec<String>,
         /// Remove every exited or lost agent instead
         #[arg(long, conflicts_with = "ids", required_unless_present = "ids")]
         exited: bool,
@@ -101,7 +121,8 @@ enum Command {
     },
     /// Send text to an agent's terminal
     Send {
-        id: u64,
+        /// Agent id or name
+        agent: String,
         text: String,
         /// Append a carriage return
         #[arg(long)]
@@ -109,7 +130,8 @@ enum Command {
     },
     /// Attach to an agent interactively (Ctrl-\ detaches)
     Attach {
-        id: u64,
+        /// Agent id or name
+        agent: String,
         /// Print the snapshot and exit, without touching the terminal
         #[arg(long, hide = true)]
         snapshot_only: bool,
@@ -225,6 +247,7 @@ fn print_json(agents: &[AgentInfo]) {
 fn print_table(agents: &[AgentInfo]) {
     let mut rows = vec![[
         "ID".to_string(),
+        "NAME".into(),
         "STATE".into(),
         "EXIT".into(),
         "PROGRAM".into(),
@@ -236,15 +259,71 @@ fn print_table(agents: &[AgentInfo]) {
             .join(" ");
         rows.push([
             a.id.to_string(),
+            names::name_of(a).unwrap_or("-").to_owned(),
             state_name(a).into(),
             a.exit_code.map_or("-".into(), |c| c.to_string()),
             program,
         ]);
     }
     let width = |col: usize| rows.iter().map(|r| r[col].len()).max().unwrap_or(0);
-    let (w0, w1, w2) = (width(0), width(1), width(2));
+    let (w0, w1, w2, w3) = (width(0), width(1), width(2), width(3));
     for r in &rows {
-        println!("{:<w0$}  {:<w1$}  {:<w2$}  {}", r[0], r[1], r[2], r[3]);
+        println!(
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {}",
+            r[0], r[1], r[2], r[3], r[4]
+        );
+    }
+}
+
+fn list_agents(client: &mut Connection) -> Result<Vec<AgentInfo>> {
+    match client.call(request::Kind::List(ListAgents::default()))? {
+        response::Kind::Agents(list) => Ok(list.agents),
+        _ => Err(Error::Protocol("unexpected reply to list".into())),
+    }
+}
+
+/// The id of the agent `arg` names: an id as it is, a name looked up
+/// (ADR 0052).
+fn agent_id(client: &mut Connection, arg: &str) -> Result<u64> {
+    let agents = if names::is_id(arg) {
+        Vec::new()
+    } else {
+        list_agents(client)?
+    };
+    names::resolve(&agents, arg).map_err(Error::Server)
+}
+
+/// The spawn's name: `--name` or a `name` label (not both), checked; else
+/// the generated default, unique among the live agents.
+fn spawn_name(
+    client: &mut Connection,
+    name: Option<String>,
+    labels: &HashMap<String, String>,
+    program: &str,
+    args: &[String],
+    cwd: &str,
+) -> Result<String> {
+    let given = match (name, labels.get(NAME_LABEL)) {
+        (Some(_), Some(_)) => {
+            return Err(Error::Server(
+                "give the name with --name or --label name=..., not both".into(),
+            ));
+        }
+        (Some(n), None) => Some(n),
+        (None, Some(n)) => Some(n.clone()),
+        (None, None) => None,
+    };
+    match given {
+        Some(n) => names::check_name(&n).map_err(Error::Server),
+        None => {
+            let agents = list_agents(client)?;
+            Ok(names::default_name(
+                program,
+                args,
+                cwd,
+                &names::live_names(&agents),
+            ))
+        }
     }
 }
 
@@ -339,11 +418,12 @@ fn run(cli: Cli) -> Result<u8> {
             rows,
             cwd,
             labels,
+            name,
             mut command,
         } => {
             let (tc, tr) = crossterm::terminal::size().unwrap_or((80, 24));
             let program = command.remove(0);
-            let labels = parse_labels(&labels)?;
+            let mut labels = parse_labels(&labels)?;
             let cwd = match cwd {
                 Some(p) if p.is_absolute() => p,
                 Some(p) => std::env::current_dir()?.join(p),
@@ -351,6 +431,8 @@ fn run(cli: Cli) -> Result<u8> {
             }
             .to_string_lossy()
             .into_owned();
+            let name = spawn_name(&mut client, name, &labels, &program, &command, &cwd)?;
+            labels.insert(NAME_LABEL.to_owned(), name);
             let spawn = SpawnAgent {
                 program,
                 args: command,
@@ -373,20 +455,45 @@ fn run(cli: Cli) -> Result<u8> {
                 _ => return Err(Error::Protocol("unexpected reply to list".into())),
             }
         }
-        Command::Label { id, set, remove } => {
+        Command::Label { agent, set, remove } => {
             let set = parse_labels(&set)?;
+            if let Some(n) = set.get(NAME_LABEL) {
+                names::check_name(n).map_err(Error::Server)?;
+            }
+            let agent_id = agent_id(&mut client, &agent)?;
             client.call(request::Kind::SetLabels(SetLabels {
-                agent_id: id,
+                agent_id,
                 set,
                 remove,
             }))?;
         }
-        Command::History { id, lines, plain } => history::history(client, id, lines, plain)?,
-        Command::Screen { id } => history::screen(client, id)?,
-        Command::Kill { id } => {
-            client.call(request::Kind::Kill(KillAgent { agent_id: id }))?;
+        Command::Rename { agent, name } => {
+            let name = names::check_name(&name).map_err(Error::Server)?;
+            let agent_id = agent_id(&mut client, &agent)?;
+            client.call(request::Kind::SetLabels(SetLabels {
+                agent_id,
+                set: HashMap::from([(NAME_LABEL.to_owned(), name)]),
+                remove: Vec::new(),
+            }))?;
         }
-        Command::Restart { id, attach } => {
+        Command::History {
+            agent,
+            lines,
+            plain,
+        } => {
+            let id = agent_id(&mut client, &agent)?;
+            history::history(client, id, lines, plain)?
+        }
+        Command::Screen { agent } => {
+            let id = agent_id(&mut client, &agent)?;
+            history::screen(client, id)?
+        }
+        Command::Kill { agent } => {
+            let agent_id = agent_id(&mut client, &agent)?;
+            client.call(request::Kind::Kill(KillAgent { agent_id }))?;
+        }
+        Command::Restart { agent, attach } => {
+            let id = agent_id(&mut client, &agent)?;
             let req = RestartAgent {
                 agent_id: id,
                 ..Default::default()
@@ -413,6 +520,10 @@ fn run(cli: Cli) -> Result<u8> {
             exited,
             selector,
         } => {
+            let ids = ids
+                .iter()
+                .map(|a| agent_id(&mut client, a))
+                .collect::<Result<Vec<_>>>()?;
             let req = ForgetAgents {
                 ids,
                 exited_only: exited,
@@ -436,7 +547,8 @@ fn run(cli: Cli) -> Result<u8> {
                 _ => return Err(Error::Protocol("unexpected reply to rm".into())),
             }
         }
-        Command::Send { id, text, enter } => {
+        Command::Send { agent, text, enter } => {
+            let id = agent_id(&mut client, &agent)?;
             // The Return goes as its own write, a moment after the text: TUIs
             // such as Claude Code read text and Return arriving together as a
             // paste, and leave it typed but unsubmitted.
@@ -456,10 +568,16 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }
         Command::Attach {
-            id,
-            snapshot_only: true,
-        } => attach::snapshot_only(client, id)?,
-        Command::Attach { id, .. } => return attach_interactive(client, id),
+            agent,
+            snapshot_only,
+        } => {
+            let id = agent_id(&mut client, &agent)?;
+            if snapshot_only {
+                attach::snapshot_only(client, id)?;
+            } else {
+                return attach_interactive(client, id);
+            }
+        }
         Command::Logs { lines, follow } => logs(client, lines, follow)?,
         Command::Daemon {
             cmd: DaemonCmd::Restart { binary },
