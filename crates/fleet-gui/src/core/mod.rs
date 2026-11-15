@@ -4,6 +4,7 @@ pub mod backoff;
 pub mod config;
 pub mod icons;
 pub mod keys;
+pub mod kill;
 pub mod launch;
 pub mod layout;
 pub mod menus;

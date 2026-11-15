@@ -17,10 +17,13 @@ pub enum Icon {
     Terminal,
     Server,
     Folder,
+    /// Kill an agent: not the pane's Close (×), which only detaches.
+    Stop,
+    Check,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 11] = [
+    pub const ALL: [Icon; 13] = [
         Icon::Plus,
         Icon::Close,
         Icon::SplitRight,
@@ -32,6 +35,8 @@ impl Icon {
         Icon::Terminal,
         Icon::Server,
         Icon::Folder,
+        Icon::Stop,
+        Icon::Check,
     ];
 
     /// The Lucide name, which is the file's stem.
@@ -48,6 +53,8 @@ impl Icon {
             Icon::Terminal => "terminal",
             Icon::Server => "server",
             Icon::Folder => "folder-open",
+            Icon::Stop => "circle-stop",
+            Icon::Check => "check",
         }
     }
 
@@ -65,6 +72,8 @@ impl Icon {
             Icon::Terminal => "icons/terminal.svg",
             Icon::Server => "icons/server.svg",
             Icon::Folder => "icons/folder-open.svg",
+            Icon::Stop => "icons/circle-stop.svg",
+            Icon::Check => "icons/check.svg",
         }
     }
 

@@ -61,6 +61,9 @@ pub struct GuiConfig {
     pub font_family: String,
     pub font_size: f32,
     pub option_as_meta: bool,
+    /// Ask before killing an agent; the question's "Don't ask again"
+    /// turns it off ([`save_confirm_kill`]).
+    pub confirm_kill: bool,
 }
 
 impl Default for GuiConfig {
@@ -71,6 +74,7 @@ impl Default for GuiConfig {
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
             option_as_meta: true,
+            confirm_kill: true,
         }
     }
 }
@@ -112,6 +116,20 @@ pub fn load_config(state_dir: &Path) -> Result<GuiConfig, ConfigError> {
 
 /// Sets `[gui] connection`, leaving comments and every other key as they were.
 pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
+    save_gui_key(
+        state_dir,
+        "connection",
+        toml_edit::value(target.to_string()),
+    )
+}
+
+/// Sets `[gui] confirm_kill`, leaving comments and every other key as they
+/// were.
+pub fn save_confirm_kill(state_dir: &Path, confirm: bool) -> io::Result<()> {
+    save_gui_key(state_dir, "confirm_kill", toml_edit::value(confirm))
+}
+
+fn save_gui_key(state_dir: &Path, key: &str, value: toml_edit::Item) -> io::Result<()> {
     let path = config_path(state_dir);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -128,7 +146,7 @@ pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
         doc["gui"] = toml_edit::table();
     }
     let gui = doc["gui"].as_table_like_mut().expect("gui is a table");
-    gui.insert("connection", toml_edit::value(target.to_string()));
+    gui.insert(key, value);
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o777);
     write_atomic(&path, doc.to_string().as_bytes(), mode)

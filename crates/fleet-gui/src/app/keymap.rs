@@ -28,6 +28,7 @@ actions!(
         SwitchFleetd,
         InstallSkill,
         RestartPane,
+        KillPane,
         SelectAll,
         Cut,
         Undo,
@@ -80,6 +81,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
+        // Kills the focused pane's agent (asking first); ⌘W only detaches.
+        KeyBinding::new("cmd-shift-w", KillPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),

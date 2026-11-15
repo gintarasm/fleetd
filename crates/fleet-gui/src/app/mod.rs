@@ -8,6 +8,7 @@ mod controls;
 mod fonts;
 mod icons;
 mod keymap;
+mod kill_sheet;
 mod native;
 mod new_agent;
 mod pane_view;
