@@ -1,6 +1,7 @@
 //! fleetd: the single-instance node daemon, serving the fleet protocol on a
 //! unix socket in the state dir.
 
+pub mod handoff;
 pub mod logging;
 mod server;
 pub mod stdio;
@@ -185,6 +186,9 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
         return Err(StartupError::SocketPathTooLong(socket_path));
     }
 
+    // The lock is ours, so no other fleetd is mid-restart on this dir.
+    handoff::remove_stale(&cfg.state_dir);
+
     match fs::remove_file(&socket_path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -244,7 +248,12 @@ impl Daemon {
         .await
         .map_err(io::Error::other)??;
         let node = Arc::new(node);
-        let server = server::Server::new(Arc::clone(&node));
+        // Task 6 passes the summary of a restart; a fresh start restored nothing.
+        let server = server::Server::new(
+            Arc::clone(&node),
+            handoff::Identity::current(),
+            fleet_proto::RestoreSummary::default(),
+        );
         let signal = loop {
             tokio::select! {
                 _ = term.recv() => break "SIGTERM",

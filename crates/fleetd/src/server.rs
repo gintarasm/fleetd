@@ -25,7 +25,7 @@ use fleet_proto::{
     Ack, AgentList, AgentRemoved, AgentResized, AttachOk, AttachRole, Event, ForgetAgents,
     Forgotten, Frame, FrameCodec, HandshakeReject, HelloOk, HistoryPage, Lagged, LogLine, LogLines,
     MAX_FRAME, PROTOCOL_VERSION, ReadHistory, ReadLogs, Request, Response, RestartAgent, Restarted,
-    SpawnAgent, SpawnedAttached, event, request, response,
+    RestoreSummary, SpawnAgent, SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -35,6 +35,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
+use crate::handoff::Identity;
 use crate::logging;
 
 /// Concurrent connections served; more are rejected.
@@ -60,13 +61,23 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub(crate) struct Server {
     node: Arc<Node>,
+    /// The `HelloOk` every handshake answers with (identity and restore summary
+    /// do not change while the daemon runs).
+    hello: Arc<HelloOk>,
     slots: Arc<Semaphore>,
 }
 
 impl Server {
-    pub(crate) fn new(node: Arc<Node>) -> Self {
+    pub(crate) fn new(node: Arc<Node>, identity: Identity, restore: RestoreSummary) -> Self {
         Server {
             node,
+            hello: Arc::new(HelloOk {
+                protocol_version: PROTOCOL_VERSION,
+                server: "fleetd".into(),
+                instance: identity.instance,
+                binary: Some(Box::new(identity.binary)),
+                restore: (restore != RestoreSummary::default()).then(|| Box::new(restore)),
+            }),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         }
     }
@@ -75,7 +86,12 @@ impl Server {
     pub(crate) fn accept(&self, stream: UnixStream) {
         match Arc::clone(&self.slots).try_acquire_owned() {
             Ok(slot) => {
-                tokio::spawn(connection(Arc::clone(&self.node), stream, slot));
+                tokio::spawn(connection(
+                    Arc::clone(&self.node),
+                    Arc::clone(&self.hello),
+                    stream,
+                    slot,
+                ));
             }
             Err(_) => {
                 warn!(
@@ -99,7 +115,12 @@ async fn reject(writer: &mut Writer, reason: String) {
 
 /// Reads the `Hello` and answers it; the client's name if the connection
 /// may proceed.
-async fn handshake(conn: ConnId, reader: &mut Reader, writer: &mut Writer) -> Option<String> {
+async fn handshake(
+    conn: ConnId,
+    hello_ok: &HelloOk,
+    reader: &mut Reader,
+    writer: &mut Writer,
+) -> Option<String> {
     let reject_reason = |reason: &str| {
         warn!(conn = conn.0, reason, "handshake rejected");
     };
@@ -131,11 +152,7 @@ async fn handshake(conn: ConnId, reader: &mut Reader, writer: &mut Writer) -> Op
         reject(writer, reason).await;
         return None;
     }
-    let ok = Frame::HelloOk(HelloOk {
-        protocol_version: PROTOCOL_VERSION,
-        server: "fleetd".into(),
-        ..Default::default()
-    });
+    let ok = Frame::HelloOk(hello_ok.clone());
     match tokio::time::timeout(HANDSHAKE_WRITE_TIMEOUT, writer.send(ok)).await {
         Ok(Ok(())) => Some(hello.client),
         _ => {
@@ -145,7 +162,12 @@ async fn handshake(conn: ConnId, reader: &mut Reader, writer: &mut Writer) -> Op
     }
 }
 
-async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePermit) {
+async fn connection(
+    node: Arc<Node>,
+    hello: Arc<HelloOk>,
+    stream: UnixStream,
+    _slot: OwnedSemaphorePermit,
+) {
     let (rd, wr) = stream.into_split();
     let mut reader = FramedRead::new(rd, FrameCodec::with_max(HELLO_MAX_FRAME));
     let mut writer = FramedWrite::new(wr, FrameCodec::new());
@@ -155,7 +177,7 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
     let removed = node.removed_events();
     let activity = node.activity_events();
     let id = ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
-    let Some(client) = handshake(id, &mut reader, &mut writer).await else {
+    let Some(client) = handshake(id, &hello, &mut reader, &mut writer).await else {
         return;
     };
     // `?`: the name is the client's, so it is quoted and escaped.

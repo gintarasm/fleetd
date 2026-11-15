@@ -13,6 +13,16 @@ fn fatal(msg: &str) {
 }
 
 fn main() -> ExitCode {
+    // First, before logging or any state dir: the old daemon runs this on the
+    // new binary and it must touch nothing (no lock, no log, no directory).
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == "--handoff-check")
+    {
+        print!("{}", fleetd::handoff::check_output());
+        return ExitCode::SUCCESS;
+    }
+
     let mut cfg = Config::default();
     let mut stdio = false;
     let mut args = std::env::args_os().skip(1);
