@@ -594,7 +594,7 @@ impl Layout {
         }
         let lo = (first.min_extent(*axis, min) / len).max(MIN_RATIO);
         let hi = (1.0 - second.min_extent(*axis, min) / len).min(1.0 - MIN_RATIO);
-        if !(lo <= hi) {
+        if lo.is_nan() || hi.is_nan() || lo > hi || !at.is_finite() {
             return false;
         }
         let r = ((at - start) / len).clamp(lo, hi);
@@ -913,7 +913,11 @@ mod tests {
     }
 
     fn rect(l: &Layout, pane: PaneId) -> Rect {
-        l.rects(W, H).into_iter().find(|(p, _)| *p == pane).unwrap().1
+        l.rects(W, H)
+            .into_iter()
+            .find(|(p, _)| *p == pane)
+            .unwrap()
+            .1
     }
 
     #[test]
@@ -999,6 +1003,8 @@ mod tests {
         let (mut l, ..) = side_by_side();
         let split = l.dividers(W, H)[0].split;
         assert!(!l.move_divider(split, 50.0, 150.0, H, MIN));
+        assert_eq!(l.ratio(split), Some(0.5));
+        assert!(!l.move_divider(split, f32::NAN, W, H, MIN));
         assert_eq!(l.ratio(split), Some(0.5));
     }
 

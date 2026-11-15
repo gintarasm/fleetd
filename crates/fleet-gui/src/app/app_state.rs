@@ -17,12 +17,12 @@ use super::theme::Theme;
 use super::workspace::Workspace;
 use crate::core::config::GuiConfig;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
-use crate::core::style::chrome;
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::sidebar::{ended, tilde};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
+use crate::core::style::chrome;
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
 
@@ -904,7 +904,14 @@ impl AppState {
 
     /// Moves `split`'s divider to `at` (pixels along its axis, in a
     /// `w` × `h` pane area), every pane keeping [`chrome::PANE_MIN`].
-    pub fn move_divider(&mut self, split: SplitId, at: f32, w: f32, h: f32, cx: &mut Context<Self>) {
+    pub fn move_divider(
+        &mut self,
+        split: SplitId,
+        at: f32,
+        w: f32,
+        h: f32,
+        cx: &mut Context<Self>,
+    ) {
         if self.layout.move_divider(split, at, w, h, chrome::PANE_MIN) {
             self.layout_changed(cx);
         }
