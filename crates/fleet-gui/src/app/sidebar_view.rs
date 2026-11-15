@@ -55,6 +55,8 @@ pub struct SidebarData<'a> {
     pub mark: &'a dyn Fn(u64) -> TabMark,
     /// Exited or lost agents (what Clear exited removes).
     pub ended: usize,
+    /// A newer fleetd is on disk: the footer offers to restart into it.
+    pub update_available: bool,
 }
 
 /// The Clear exited button's tooltip; `None` while it is disabled.
@@ -65,6 +67,9 @@ pub fn clear_exited_tooltip(ended: usize) -> Option<String> {
         n => Some(format!("Remove {n} exited agents")),
     }
 }
+
+/// The footer notice while a newer fleetd is on disk.
+pub const UPDATE_NOTICE: &str = "fleetd update available";
 
 /// A plain text tooltip.
 struct Tooltip {
@@ -139,6 +144,39 @@ pub fn render_sidebar(
         .hover(|s| s.bg(theme.header_bg).text_color(theme.fg()))
         .child("+ New agent")
         .on_click(cx.listener(|this, _, window, cx| this.open_new_agent(window, cx)));
+    // Agents keep running through the restart, so the notice is a
+    // suggestion, not a warning.
+    let update = data.update_available.then(|| {
+        div()
+            .id("fleetd-update")
+            .debug_selector(|| "fleetd-update".to_owned())
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .mx(px(4.))
+            .px(px(10.))
+            .py(px(4.))
+            .text_size(px(11.))
+            .text_color(theme.dim_text)
+            .child(UPDATE_NOTICE)
+            .child(
+                div()
+                    .id("fleetd-update-restart")
+                    .debug_selector(|| "fleetd-update-restart".to_owned())
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .text_color(theme.fg())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.header_bg))
+                    .child("Restart")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.app().read(cx).restart_daemon();
+                    })),
+            )
+    });
     let tooltip = clear_exited_tooltip(data.ended);
     let enabled = tooltip.is_some();
     let tooltip_theme = *theme;
@@ -190,6 +228,7 @@ pub fn render_sidebar(
                 .overflow_y_scroll()
                 .children(groups),
         )
+        .children(update)
         .child(new_agent)
 }
 

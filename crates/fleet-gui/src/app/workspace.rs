@@ -121,6 +121,13 @@ impl Workspace {
             this.app.update(cx, |a, cx| a.set_theme(theme, cx));
             window.refresh();
         });
+        // Coming back to the window is when a fleetd installed meanwhile
+        // is worth noticing (one stat, never per frame).
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.app.update(cx, |a, cx| a.refresh_update_available(cx));
+            }
+        });
         let theme = Theme::for_appearance(window.appearance());
         app.update(cx, |a, cx| {
             a.set_theme(theme, cx);
@@ -153,7 +160,7 @@ impl Workspace {
             epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
-            _subscriptions: vec![observe, appearance],
+            _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
         ws
@@ -690,7 +697,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
         let theme = self.app.read(cx).theme;
-        let (rows, home, error, titles, marks) = {
+        let (rows, home, error, titles, marks, update_available) = {
             let app = self.app.read(cx);
             (
                 app.agents.clone(),
@@ -698,6 +705,7 @@ impl Render for Workspace {
                 app.error.clone(),
                 app.titles.clone(),
                 app.tab_marks(),
+                app.update_available,
             )
         };
         let mark = move |id: u64| marks.get(&id).copied().unwrap_or(TabMark::None);
@@ -708,6 +716,7 @@ impl Render for Workspace {
             titles: &titles,
             mark: &mark,
             ended: rows.iter().filter(|r| ended(r)).count(),
+            update_available,
         };
         let sidebar = render_sidebar(&data, &theme, cx);
         super::bench::sidebar_drawn(window);
@@ -878,6 +887,8 @@ mod tests {
         listed: std::sync::atomic::AtomicBool,
         lists: std::sync::atomic::AtomicU64,
         replaced: Mutex<HashMap<u64, u64>>,
+        update_available: std::sync::atomic::AtomicBool,
+        daemon_restarts: std::sync::atomic::AtomicUsize,
     }
 
     impl Fake {
@@ -909,6 +920,16 @@ mod tests {
 
         fn lists(&self) -> u64 {
             self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn update_available(&self) -> bool {
+            self.update_available
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn restart_daemon(&self) {
+            self.daemon_restarts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn spawn(
@@ -1453,6 +1474,71 @@ mod tests {
         let shown = s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
         assert_eq!(shown.as_deref(), Some("spawn failed: no such directory"));
         assert!(s.cx.debug_bounds("error-toast").is_some());
+    }
+
+    #[gpui::test]
+    fn update_notice_offers_restart_and_outcomes_show_as_toasts(cx: &mut TestAppContext) {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let s = setup(cx, &fake, dir.path());
+        let shown = |s: &Setup<'_>| s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
+        assert!(s.cx.debug_bounds("fleetd-update").is_none());
+
+        // A newer binary is noticed on the next connect, and Restart asks
+        // the session to restart.
+        fake.update_available.store(true, Ordering::SeqCst);
+        s.ui.try_send(UiEvent::Connection(ConnState::Connected))
+            .unwrap();
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("fleetd-update").is_some());
+        let restart = s.cx.debug_bounds("fleetd-update-restart").unwrap();
+        s.cx.simulate_click(restart.center(), Modifiers::none());
+        assert_eq!(fake.daemon_restarts.load(Ordering::SeqCst), 1);
+
+        // After the restart the binary matches again (gpui keeps the bounds
+        // of elements it once drew, so the app's flag is what is checked);
+        // the toast says what happened, in the CLI's words.
+        fake.update_available.store(false, Ordering::SeqCst);
+        s.ui.try_send(UiEvent::DaemonRestarted(
+            fleet_client::RestartOutcome::Restarted { kept: 2 },
+        ))
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(
+            shown(&s).as_deref(),
+            Some("fleetd restarted: 2 agents kept")
+        );
+        assert!(!s.app.read_with(s.cx, |a, _| a.update_available));
+        s.ui.try_send(UiEvent::DaemonRestarted(
+            fleet_client::RestartOutcome::Partial {
+                kept: 1,
+                ended: 1,
+                ids: Some(vec![3]),
+            },
+        ))
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(
+            shown(&s).as_deref(),
+            Some("fleetd restarted: 1 kept, 1 could not be restored and were ended (ids 3)")
+        );
+        s.ui.try_send(UiEvent::DaemonRestartFailed("exec failed".into()))
+            .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(
+            shown(&s).as_deref(),
+            Some("fleetd restart failed: exec failed; the old fleetd is still running")
+        );
+        s.ui.try_send(UiEvent::DaemonRestartFailed(
+            fleet_client::did_not_come_back(),
+        ))
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(
+            shown(&s).as_deref(),
+            Some("fleetd did not come back within 10 s")
+        );
     }
 
     #[gpui::test]

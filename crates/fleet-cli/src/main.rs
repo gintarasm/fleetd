@@ -11,12 +11,15 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use fleet_proto::{
-    AgentInfo, AgentState, ForgetAgents, HelloOk, KillAgent, ListAgents, RestartAgent,
-    RestartDaemon, SendInput, SetLabels, SpawnAgent,
+    AgentInfo, AgentState, ForgetAgents, KillAgent, ListAgents, RestartAgent, RestartDaemon,
+    SendInput, SetLabels, SpawnAgent,
 };
 use fleet_proto::{request, response};
 
-use fleet_client::{Connection, Error, Result};
+use fleet_client::{
+    Connection, Error, RESTART_WAIT, RestartOutcome, Result, TOO_OLD, did_not_come_back,
+    restart_failed, restart_outcome,
+};
 
 #[derive(Parser)]
 #[command(name = "fleet", about = "Manage agents run by fleetd")]
@@ -241,66 +244,6 @@ fn old_daemon(e: Error) -> Error {
     }
 }
 
-/// How long the CLI waits for the restarted daemon to answer.
-const RECONNECT: Duration = Duration::from_secs(10);
-
-const TOO_OLD: &str = "this fleetd is too old to restart itself; stop it once (pkill fleetd) \
-                       and the next client starts the new one";
-
-fn restart_failed(reason: &str) -> String {
-    format!("fleetd restart failed: {reason}; the old fleetd is still running")
-}
-
-/// What the daemon that answered after a restart tells us, as the line to
-/// print and the exit code; `None` while it is still the old, not yet
-/// thawed daemon (same instance, no `restart_error`).
-///
-/// `agents` is what the old daemon reported in `RestartingDaemon`. Success
-/// needs positive proof: the instance changed, the summary names `old_instance`
-/// as its predecessor, nothing failed or fell back, and exactly `agents` were
-/// kept. A new instance without a summary (or one for another predecessor,
-/// e.g. the exec'd binary crashed and a later client started a fresh daemon)
-/// kept nothing we can vouch for, so it reads as all `agents` ended. A
-/// `fell_back` daemon started fresh and ended every agent. Ids come from
-/// `failed` when it lists any, else they are unknown.
-fn restart_outcome(old_instance: u64, agents: u32, hello: &HelloOk) -> Option<(String, u8)> {
-    if hello.instance == old_instance {
-        // exec failed after `RestartingDaemon`: the old daemon thawed.
-        let err = hello.restore.as_deref().map_or("", |r| &r.restart_error);
-        return (!err.is_empty()).then(|| (restart_failed(err), 1));
-    }
-    let agents = agents as usize;
-    let partial = |kept: usize, ended: usize, failed: &[u64]| {
-        let ids = if failed.is_empty() {
-            "unknown".to_string()
-        } else {
-            failed
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        (
-            format!(
-                "fleetd restarted: {kept} kept, {ended} could not be restored and were ended (ids {ids})"
-            ),
-            1,
-        )
-    };
-    Some(match hello.restore.as_deref() {
-        Some(r) if r.previous_instance == old_instance => {
-            if r.fell_back {
-                partial(0, agents, &r.failed)
-            } else if r.failed.is_empty() && r.kept.len() == agents {
-                (format!("fleetd restarted: {agents} agents kept"), 0)
-            } else {
-                partial(r.kept.len(), agents.saturating_sub(r.kept.len()), &r.failed)
-            }
-        }
-        _ => partial(0, agents, &[]),
-    })
-}
-
 /// `fleet daemon restart`: asks the daemon to exec into `binary`, waits for
 /// whichever daemon answers next and reports what it says. Success goes to
 /// stdout, every other outcome to stderr with exit 1.
@@ -326,27 +269,28 @@ fn daemon_restart(mut client: Connection, sock: &Path, binary: Option<PathBuf>) 
         Err(e) => return Err(e),
     };
     drop(client);
-    let deadline = Instant::now() + RECONNECT;
+    let deadline = Instant::now() + RESTART_WAIT;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         // The handshake may block while the process is between exec and
         // serving, so it gets what is left of the budget.
         if let Ok(c) =
             Connection::unix_with_timeout(sock, "fleet", left.max(Duration::from_millis(100)))
-            && let Some((line, code)) = restart_outcome(old_instance, agents, c.hello())
         {
-            if code == 0 {
-                println!("{line}");
-            } else {
-                eprintln!("{line}");
+            match restart_outcome(old_instance, agents, c.hello()) {
+                RestartOutcome::Pending => {}
+                done if done.is_success() => {
+                    println!("{done}");
+                    return Ok(0);
+                }
+                other => {
+                    eprintln!("{other}");
+                    return Ok(1);
+                }
             }
-            return Ok(code);
         }
         if Instant::now() >= deadline {
-            return Err(Error::Protocol(format!(
-                "fleetd did not come back within {} s",
-                RECONNECT.as_secs()
-            )));
+            return Err(Error::Protocol(did_not_come_back()));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -501,136 +445,6 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("fleet: {e}");
             ExitCode::from(1)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fleet_proto::RestoreSummary;
-
-    fn hello(instance: u64, restore: Option<RestoreSummary>) -> HelloOk {
-        HelloOk {
-            instance,
-            restore: restore.map(Box::new),
-            ..Default::default()
-        }
-    }
-
-    fn restore(previous: u64, kept: &[u64], failed: &[u64], fell_back: bool) -> RestoreSummary {
-        RestoreSummary {
-            previous_instance: previous,
-            kept: kept.to_vec(),
-            failed: failed.to_vec(),
-            fell_back,
-            ..Default::default()
-        }
-    }
-
-    const PARTIAL: &str = "could not be restored and were ended";
-
-    #[test]
-    fn outcome_table() {
-        // (old instance, agents, hello, expected)
-        type Case = (u64, u32, HelloOk, Option<(String, u8)>);
-        let cases: Vec<Case> = vec![
-            // Success only with full proof.
-            (
-                5,
-                2,
-                hello(6, Some(restore(5, &[1, 2], &[], false))),
-                Some(("fleetd restarted: 2 agents kept".into(), 0)),
-            ),
-            (
-                5,
-                0,
-                hello(6, Some(restore(5, &[], &[], false))),
-                Some(("fleetd restarted: 0 agents kept".into(), 0)),
-            ),
-            // No summary, or another predecessor: nothing vouched for.
-            (
-                5,
-                2,
-                hello(6, None),
-                Some((
-                    format!("fleetd restarted: 0 kept, 2 {PARTIAL} (ids unknown)"),
-                    1,
-                )),
-            ),
-            (
-                5,
-                2,
-                hello(7, Some(restore(6, &[1, 2], &[], false))),
-                Some((
-                    format!("fleetd restarted: 0 kept, 2 {PARTIAL} (ids unknown)"),
-                    1,
-                )),
-            ),
-            // Failed ids listed.
-            (
-                5,
-                3,
-                hello(6, Some(restore(5, &[1], &[3, 7], false))),
-                Some((
-                    format!("fleetd restarted: 1 kept, 2 {PARTIAL} (ids 3,7)"),
-                    1,
-                )),
-            ),
-            // Fewer kept + failed than agents: the rest are unaccounted for.
-            (
-                5,
-                3,
-                hello(6, Some(restore(5, &[1], &[], false))),
-                Some((
-                    format!("fleetd restarted: 1 kept, 2 {PARTIAL} (ids unknown)"),
-                    1,
-                )),
-            ),
-            // Fell back: everything ended.
-            (
-                5,
-                3,
-                hello(6, Some(restore(5, &[], &[], true))),
-                Some((
-                    format!("fleetd restarted: 0 kept, 3 {PARTIAL} (ids unknown)"),
-                    1,
-                )),
-            ),
-            (
-                5,
-                3,
-                hello(6, Some(restore(5, &[], &[1, 2, 3], true))),
-                Some((
-                    format!("fleetd restarted: 0 kept, 3 {PARTIAL} (ids 1,2,3)"),
-                    1,
-                )),
-            ),
-            // Same instance: exec failed and thawed, or not thawed yet.
-            (
-                5,
-                2,
-                hello(
-                    5,
-                    Some(RestoreSummary {
-                        restart_error: "exec failed".into(),
-                        ..Default::default()
-                    }),
-                ),
-                Some((
-                    "fleetd restart failed: exec failed; the old fleetd is still running".into(),
-                    1,
-                )),
-            ),
-            (5, 2, hello(5, None), None),
-            (5, 2, hello(5, Some(restore(4, &[], &[], false))), None),
-        ];
-        for (old, agents, h, want) in cases {
-            assert_eq!(
-                restart_outcome(old, agents, &h),
-                want,
-                "{old} {agents} {h:?}"
-            );
         }
     }
 }

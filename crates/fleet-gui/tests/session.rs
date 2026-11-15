@@ -11,7 +11,10 @@ use fleet_gui::core::launch::start_local;
 use fleet_gui::core::pane::{PaneModel, PaneState};
 use fleet_gui::core::session::{ConnState, PaneId, Session, UiEvent};
 use fleet_gui::core::target::{Target, connect};
-use fleet_proto::{AgentState, Attach, ListAgents, SpawnAgent, request, response};
+use fleet_proto::{
+    AgentList, AgentState, Attach, Frame, HelloOk, ListAgents, Response, RestartingDaemon,
+    RestoreSummary, SpawnAgent, request, response,
+};
 use fleet_term::{Palette, Terminal};
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -448,5 +451,203 @@ fn close_pane_detaches_without_killing() {
     s.close_pane(pane);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(d.agent_state(id), AgentState::Running);
+    s.shutdown();
+}
+
+/// A scripted fleetd on a unix socket: one handshake per connection, from
+/// `hellos` in order (the last repeats), `List` answered with no agents,
+/// and `RestartDaemon` answered by `on_restart` (`None`: an old daemon's
+/// "empty request"), after which the connection is dropped, as an exec
+/// would.
+struct FakeFleetd {
+    dir: tempfile::TempDir,
+}
+
+impl FakeFleetd {
+    fn start(
+        hellos: Vec<HelloOk>,
+        on_restart: Option<response::Kind>,
+        wait_before_serving_again: Duration,
+    ) -> FakeFleetd {
+        use bytes::BytesMut;
+        use fleet_proto::FrameCodec;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use tokio_util::codec::{Decoder, Encoder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("fleetd.sock")).unwrap();
+        std::thread::spawn(move || {
+            for (served, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                if served > 0 && wait_before_serving_again > Duration::ZERO {
+                    // Only the first reconnect after the restart waits.
+                    if served == 1 {
+                        std::thread::sleep(wait_before_serving_again);
+                    }
+                }
+                let hello = hellos[served.min(hellos.len() - 1)].clone();
+                let on_restart = on_restart.clone();
+                std::thread::spawn(move || {
+                    let mut buf = BytesMut::new();
+                    let mut chunk = [0u8; 4096];
+                    let mut greeted = false;
+                    let send = |stream: &mut std::os::unix::net::UnixStream, f: Frame| {
+                        let mut out = BytesMut::new();
+                        FrameCodec::new().encode(f, &mut out).unwrap();
+                        stream.write_all(&out).is_ok()
+                    };
+                    loop {
+                        while let Some(frame) = FrameCodec::new().decode(&mut buf).unwrap() {
+                            match frame {
+                                Frame::Hello(_) if !greeted => {
+                                    greeted = true;
+                                    if !send(&mut stream, Frame::HelloOk(hello.clone())) {
+                                        return;
+                                    }
+                                }
+                                Frame::Request(r) => {
+                                    let kind = match r.kind {
+                                        Some(request::Kind::RestartDaemon(_)) => {
+                                            let kind = on_restart.clone().unwrap_or_else(|| {
+                                                response::Kind::Error(fleet_proto::Error {
+                                                    message: "empty request".into(),
+                                                })
+                                            });
+                                            let restarting =
+                                                matches!(kind, response::Kind::RestartingDaemon(_));
+                                            send(
+                                                &mut stream,
+                                                Frame::Response(Response {
+                                                    id: r.id,
+                                                    kind: Some(kind),
+                                                }),
+                                            );
+                                            if restarting {
+                                                return; // exec: the connection ends
+                                            }
+                                            continue;
+                                        }
+                                        Some(request::Kind::List(_)) => {
+                                            response::Kind::Agents(AgentList::default())
+                                        }
+                                        _ => continue,
+                                    };
+                                    send(
+                                        &mut stream,
+                                        Frame::Response(Response {
+                                            id: r.id,
+                                            kind: Some(kind),
+                                        }),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                });
+            }
+        });
+        FakeFleetd { dir }
+    }
+}
+
+fn hello(instance: u64, restore: Option<RestoreSummary>) -> HelloOk {
+    HelloOk {
+        instance,
+        restore: restore.map(Box::new),
+        ..Default::default()
+    }
+}
+
+fn start_session_in(dir: &Path) -> (Session, Events) {
+    let (tx, rx) = async_channel::unbounded();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    std::thread::spawn(move || {
+        while let Ok(e) = rx.recv_blocking() {
+            if !matches!(e, UiEvent::PaneChanged(_)) {
+                sink.lock().unwrap().push(e);
+            }
+        }
+    });
+    (
+        Session::start(Target::Local, dir.to_owned(), tx),
+        Events(events),
+    )
+}
+
+fn connected(events: &Events) {
+    wait_until("the control connection", || {
+        events.has(|e| *e == UiEvent::Connection(ConnState::Connected))
+    });
+}
+
+#[test]
+fn restart_reports_kept_agents_after_reconnect() {
+    let kept = RestoreSummary {
+        previous_instance: 5,
+        kept: vec![1, 2],
+        ..Default::default()
+    };
+    let fake = FakeFleetd::start(
+        vec![hello(5, None), hello(6, Some(kept))],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        // The daemon is away for a moment, as during an exec.
+        Duration::from_millis(500),
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestarted(_)))
+    });
+    assert!(events.has(|e| {
+        *e == UiEvent::DaemonRestarted(fleet_client::RestartOutcome::Restarted { kept: 2 })
+    }));
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_))));
+    s.shutdown();
+}
+
+#[test]
+fn restart_with_same_instance_reports_failure() {
+    let thawed = RestoreSummary {
+        restart_error: "exec failed".into(),
+        ..Default::default()
+    };
+    let fake = FakeFleetd::start(
+        vec![hello(5, None), hello(5, Some(thawed))],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    assert!(events.has(|e| *e == UiEvent::DaemonRestartFailed("exec failed".into())));
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestarted(_))));
+    s.shutdown();
+}
+
+#[test]
+fn restart_of_an_old_daemon_reports_it_is_too_old() {
+    let fake = FakeFleetd::start(vec![hello(5, None)], None, Duration::ZERO);
+    let (s, events) = start_session_in(fake.dir.path());
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    assert!(events.has(|e| *e == UiEvent::DaemonRestartFailed(fleet_client::TOO_OLD.into())));
     s.shutdown();
 }

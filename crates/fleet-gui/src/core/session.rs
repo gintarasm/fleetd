@@ -12,14 +12,18 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fleet_client::{Closer, Connection, FrameReader, Sender};
+use fleet_client::{
+    Closer, Connection, FrameReader, RESTART_WAIT, RestartOutcome, Sender, TOO_OLD,
+    did_not_come_back, restart_failed, restart_outcome,
+};
 use fleet_proto::{
-    AgentInfo, AgentState, ForgetAgents, Frame, KillAgent, ListAgents, Response, RestartAgent,
-    SpawnAgent, event, request, response,
+    AgentInfo, AgentState, BinaryIdentity, ForgetAgents, Frame, HelloOk, KillAgent, ListAgents,
+    Response, RestartAgent, RestartDaemon, SpawnAgent, event, request, response,
 };
 use fleet_term::Palette;
 
 use super::backoff::Backoff;
+use super::launch::{find_tool, update_available};
 use super::pane::PaneModel;
 use super::pane_link::PaneLink;
 use super::target::{Connected, Target, connect};
@@ -41,6 +45,65 @@ pub(crate) fn error_text(message: String) -> String {
         DAEMON_TOO_OLD.into()
     } else {
         message
+    }
+}
+
+/// What the toast says for a [`UiEvent::DaemonRestartFailed`] reason: a
+/// daemon's own reason gets the CLI's wrapper (it is still running); the
+/// too-old and timed-out copy stands alone, as in the CLI.
+pub fn restart_failure_text(reason: &str) -> String {
+    if reason == TOO_OLD || reason == did_not_come_back() {
+        reason.to_owned()
+    } else {
+        restart_failed(reason)
+    }
+}
+
+/// The verb tracked for a `RestartDaemon` on the control connection.
+const RESTART_DAEMON: &str = "restart fleetd";
+
+/// What the session knows of the fleetd on its control connection.
+#[derive(Default)]
+struct DaemonState {
+    /// From the latest handshake; `None` while disconnected.
+    instance: Option<u64>,
+    /// The binary that daemon runs from (`None` from an older fleetd).
+    binary: Option<BinaryIdentity>,
+    /// A restart asked for and not yet decided.
+    restart: Option<PendingRestart>,
+    /// Hands out [`PendingRestart::token`]s.
+    restarts: u64,
+}
+
+/// A restart in flight. It ends when a handshake decides it
+/// ([`restart_outcome`] other than `Pending`), the daemon refuses, or
+/// [`RESTART_WAIT`] passes.
+struct PendingRestart {
+    /// Names this restart to its timer, so a later restart is not cut short
+    /// by an earlier one's.
+    token: u64,
+    /// The instance whose handshake we saw before asking.
+    old_instance: u64,
+    /// `RestartingDaemon.agents`, once the old daemon has answered.
+    agents: Option<u32>,
+}
+
+impl DaemonState {
+    /// A handshake arrived: remember it and, if a restart is waiting on
+    /// the old daemon's answer, decide it. `Pending` (the old daemon, not
+    /// yet thawed) keeps waiting.
+    fn on_handshake(&mut self, hello: &HelloOk) -> Option<UiEvent> {
+        self.instance = Some(hello.instance);
+        self.binary = hello.binary.as_deref().cloned();
+        let pending = self.restart.as_ref()?;
+        let outcome = restart_outcome(pending.old_instance, pending.agents?, hello);
+        let event = match outcome {
+            RestartOutcome::Pending => return None,
+            RestartOutcome::Failed(reason) => UiEvent::DaemonRestartFailed(reason),
+            done => UiEvent::DaemonRestarted(done),
+        };
+        self.restart = None;
+        Some(event)
     }
 }
 
@@ -73,6 +136,15 @@ pub enum UiEvent {
     /// Connecting failed (once per outage); moot once connected again.
     ConnectionError(String),
     Error(String),
+    /// The restart [`Session::restart_daemon`] asked for finished and the
+    /// new fleetd answered: [`RestartOutcome::Restarted`] when every agent
+    /// was kept, [`RestartOutcome::Partial`] when some were ended. The
+    /// toast text is the outcome's `Display`, which is the CLI's line.
+    DaemonRestarted(RestartOutcome),
+    /// The restart did not happen (the daemon refused or could not exec and
+    /// is still running; it is too old; or none answered in time). Show it
+    /// with [`restart_failure_text`].
+    DaemonRestartFailed(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +382,7 @@ enum ControlCmd {
     Restart(u64),
     Forget(Vec<u64>),
     ClearExited,
+    RestartDaemon(String),
     Stop,
 }
 
@@ -319,6 +392,7 @@ struct Inner {
     control: Mutex<mpsc::Sender<ControlCmd>>,
     control_stop: Arc<Stop>,
     control_conn: Arc<Mutex<Option<ConnHandle>>>,
+    daemon: Arc<Mutex<DaemonState>>,
     panes: Mutex<HashMap<PaneId, PaneLink>>,
     palette: Mutex<Palette>,
     shut_down: AtomicBool,
@@ -368,6 +442,7 @@ impl Session {
             control: Mutex::new(tx.clone()),
             control_stop: Arc::default(),
             control_conn: Arc::default(),
+            daemon: Arc::default(),
             panes: Mutex::default(),
             palette: Mutex::new(DEFAULT_PALETTE),
             shut_down: AtomicBool::new(false),
@@ -386,6 +461,7 @@ impl Session {
             cmds: tx,
             stop: Arc::clone(&inner.control_stop),
             conn: Arc::clone(&inner.control_conn),
+            daemon: Arc::clone(&inner.daemon),
             pending,
         };
         thread::Builder::new()
@@ -500,6 +576,78 @@ impl Session {
     /// Forgets these exited agents (running ones are refused by fleetd).
     pub fn forget(&self, ids: Vec<u64>) {
         self.control(ControlCmd::Forget(ids));
+    }
+
+    /// Restarts fleetd into the binary on disk, agents kept: the local
+    /// `fleetd` next to this app (or on `PATH`) for a local target, the
+    /// remote's own for ssh. The outcome arrives as
+    /// [`UiEvent::DaemonRestarted`] or [`UiEvent::DaemonRestartFailed`],
+    /// decided on the next handshake from the instance seen now; the control
+    /// connection reconnects by itself. A restart already in flight is not
+    /// asked for twice.
+    pub fn restart_daemon(&self) {
+        let binary = match self.inner.ctx.target {
+            Target::Local => find_tool("fleetd")
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            Target::Ssh { .. } => String::new(),
+        };
+        let token = {
+            let mut d = lock(&self.inner.daemon);
+            if d.restart.is_some() {
+                return;
+            }
+            let Some(old_instance) = d.instance else {
+                drop(d);
+                self.inner
+                    .ctx
+                    .notify(UiEvent::Error("not connected to fleetd".into()));
+                return;
+            };
+            d.restarts += 1;
+            let token = d.restarts;
+            d.restart = Some(PendingRestart {
+                token,
+                old_instance,
+                agents: None,
+            });
+            token
+        };
+        let (ctx, daemon, stop) = (
+            Arc::clone(&self.inner.ctx),
+            Arc::clone(&self.inner.daemon),
+            Arc::clone(&self.inner.control_stop),
+        );
+        let _ = thread::Builder::new()
+            .name("gui-restart-timer".into())
+            .spawn(move || {
+                if stop.wait(RESTART_WAIT) {
+                    return;
+                }
+                let mut d = lock(&daemon);
+                if d.restart.as_ref().is_some_and(|p| p.token == token) {
+                    d.restart = None;
+                    drop(d);
+                    ctx.notify(UiEvent::DaemonRestartFailed(did_not_come_back()));
+                }
+            });
+        self.control(ControlCmd::RestartDaemon(binary));
+    }
+
+    /// Whether the fleetd binary on disk differs from the one the connected
+    /// daemon runs ([`update_available`]). Always `false` for ssh targets,
+    /// and before the first handshake or for an older fleetd that does not
+    /// report its binary. This stats the file: ask on connect and on window
+    /// focus, not every frame.
+    pub fn update_available(&self) -> bool {
+        let Some(running) = lock(&self.inner.daemon).binary.clone() else {
+            return false;
+        };
+        update_available(
+            &self.inner.ctx.target,
+            &running,
+            find_tool("fleetd").as_deref(),
+        )
     }
 
     /// Forgets every exited or lost agent on the target.
@@ -650,6 +798,7 @@ struct ControlReader {
     cmds: mpsc::Sender<ControlCmd>,
     stop: Arc<Stop>,
     conn: Arc<Mutex<Option<ConnHandle>>>,
+    daemon: Arc<Mutex<DaemonState>>,
     pending: ControlPending,
 }
 
@@ -679,13 +828,18 @@ impl ControlReader {
                         }
                         *slot = Some(h);
                     }
+                    let decided = lock(&self.daemon).on_handshake(c.conn.hello());
                     let (mut reader, sender) = c.conn.split();
                     let _ = self.cmds.send(ControlCmd::Connected(sender));
+                    if let Some(event) = decided {
+                        self.ctx.notify(event);
+                    }
                     self.ctx.notify(UiEvent::Connection(ConnState::Connected));
                     while let Ok(batch) = read_batch(&mut reader) {
                         self.apply(batch);
                     }
                     let _ = self.cmds.send(ControlCmd::Disconnected);
+                    lock(&self.daemon).instance = None;
                     if let Some(h) = lock(&self.conn).take() {
                         h.finish();
                     }
@@ -729,6 +883,29 @@ impl ControlReader {
                     }) => {
                         sb.set_list(list.agents, list.replaced, Instant::now());
                         changed = true;
+                    }
+                    Frame::Response(Response {
+                        kind: Some(response::Kind::RestartingDaemon(r)),
+                        ..
+                    }) => {
+                        // The old daemon is about to exec; the next handshake
+                        // decides the outcome against this count.
+                        if let Some(p) = lock(&self.daemon).restart.as_mut() {
+                            p.agents = Some(r.agents);
+                        }
+                    }
+                    Frame::Response(Response {
+                        kind: Some(response::Kind::Error(e)),
+                        ..
+                    }) if verb == Some(RESTART_DAEMON) => {
+                        // Refused before exec: the daemon is still serving.
+                        lock(&self.daemon).restart = None;
+                        let reason = if e.message == UNKNOWN_REQUEST {
+                            TOO_OLD.to_owned()
+                        } else {
+                            e.message
+                        };
+                        self.ctx.notify(UiEvent::DaemonRestartFailed(reason));
                     }
                     Frame::Response(Response {
                         kind: Some(response::Kind::Error(e)),
@@ -874,6 +1051,13 @@ fn control_writer(
                     request::Kind::Forget(Box::new(forget)),
                 );
             }
+            Some(ControlCmd::RestartDaemon(binary)) => {
+                send_tracked(
+                    &mut sender,
+                    RESTART_DAEMON,
+                    request::Kind::RestartDaemon(RestartDaemon { binary }),
+                );
+            }
             Some(ControlCmd::ClearExited) => {
                 let forget = ForgetAgents {
                     exited_only: true,
@@ -937,6 +1121,7 @@ mod tests {
             cmds: mpsc::channel().0,
             stop: Arc::default(),
             conn: Arc::default(),
+            daemon: Arc::default(),
             pending: Arc::default(),
         };
         (r, events)

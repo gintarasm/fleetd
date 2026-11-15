@@ -18,6 +18,11 @@ use fleet_proto::{
 };
 use tokio_util::codec::{Decoder, Encoder};
 
+mod restart;
+pub use restart::{
+    RESTART_WAIT, RestartOutcome, TOO_OLD, did_not_come_back, restart_failed, restart_outcome,
+};
+
 #[derive(Debug)]
 pub enum Error {
     NotRunning,
