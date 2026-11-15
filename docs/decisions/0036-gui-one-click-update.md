@@ -1,4 +1,4 @@
-# 0034 — GUI: one-click Update fleetd in the titlebar
+# 0036 — GUI: one-click Update fleetd in the titlebar
 
 **Status:** accepted · 2026-11-15 (M2d)
 
