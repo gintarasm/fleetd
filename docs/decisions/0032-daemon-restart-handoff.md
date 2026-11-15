@@ -18,9 +18,9 @@ Rejected: handing fds to a separate new process over a unix socket (0013's sketc
 
 ### Protocol (additive; `PROTOCOL_VERSION` stays 2)
 
-- `Request::RestartDaemon { binary }`; empty `binary` means the `fleetd` on the daemon's `PATH`. Answered with `RestartingDaemon { agents }` only after the pre-flight check and the freeze succeeded, immediately before `exec`. Every earlier failure is an `Error` and the daemon resumes.
+- `Request::RestartDaemon { binary }`; empty `binary` means the binary the daemon itself runs from (the path in its `HelloOk.binary`), taken at restart time, so a build rebuilt or reinstalled at that path is what it restarts onto; if nothing executable is there any more the check refuses it ("not an executable file"), with no fallback to `PATH` (user's decision, 2026-11-15). A name without `/` is looked up on the daemon's `PATH`; `fleet` sends any other path absolute, resolved against its own working directory, since the daemon's may be `/`. Answered with `RestartingDaemon { agents }` only after the pre-flight check and the freeze succeeded, immediately before `exec`. Every earlier failure is an `Error` and the daemon resumes.
 - `HelloOk` gains `instance` (a random `u64` per process start), `binary` (`BinaryIdentity`: path, dev, ino, size, mtime of the running executable, one `stat`) and `restore` (`RestoreSummary`: `previous_instance`, `kept`, `failed`, `fell_back`, `restart_error`).
-- An old daemon answers "empty request"; clients print "this fleetd is too old to restart itself; stop it once (`pkill fleetd`) and the next client starts the new one". `Frame` stays at 88 bytes (`frame_stays_small`).
+- An old daemon answers "empty request"; clients print "this fleetd is too old to restart itself; stop it once (`fleetd --force-stop`, or `scripts/install.sh --force-stop`) and the next client starts the new one". `Frame` stays at 88 bytes (`frame_stays_small`).
 
 ### Handoff record
 
@@ -49,14 +49,18 @@ With a handoff fd the daemon skips "mark running as lost" for the recorded agent
 
 If the record is unusable or restore fails, the daemon logs it, signals the recorded agents as a shutdown would, marks them exited and starts normally (`fell_back`). A half-restored daemon is worse than a clean one. Ending the agents of a failed restore can delay startup by up to 2.5 s.
 
+The pids in `FLEETD_HANDOFF_PIDS` are the safety net for everything else. Once the node has opened from the record, every listed pid that is still a child and not a kept agent's is ended, as a record that lists fewer agents leaves them to no one. If the start fails before the node has opened (an error or a panic while opening it, a `serve` error before it, the runtime failing to build), every listed child is ended (SIGTERM, SIGKILL after the shutdown grace, reaped), the agents still running in the store are marked lost and the process exits. Only children of the process are signalled, so a stray variable cannot kill arbitrary process groups.
+
+A panic in the old daemon's restart after the freeze is undone like any failure: a guard thaws the node and removes the record on the way out, and the requester gets an `Error` ("internal error (…)").
+
 ### Telling the outcome
 
-One decision, `restart_outcome` in `fleet-client`, is shared by the CLI and the GUI, so both print identical words and agree on success. Success needs positive proof: a new instance whose summary names the old instance as predecessor, nothing failed or fell back, and exactly the announced number of agents kept. Missing summary, another predecessor or too few kept is a partial result (`fleetd restarted: K kept, M could not be restored and were ended (ids …)`, exit 1; "(ids unknown)" when the summary lists none). The same instance with a `restart_error` is `fleetd restart failed: <reason>; the old fleetd is still running`; the same instance without one is still waiting. Wait is bounded at 10 s.
+One decision, `restart_outcome` in `fleet-client`, is shared by the CLI and the GUI, so both print identical words and agree on success. Success needs positive proof: a new instance whose summary names the old instance as predecessor, nothing failed or fell back, and exactly the announced number of agents kept. Missing summary, another predecessor or too few kept is a partial result (`fleetd restarted: K kept, M could not be restored and were ended (ids …)`, exit 1; "(ids unknown)" when the summary lists none). The same instance with a `restart_error` is `fleetd restart failed: <reason>; the old fleetd is still running`; the same instance without one is still waiting. The wait is bounded at 10 s from `RestartingDaemon`. The GUI, which does not block on the request, also bounds the answer itself at 6 s (the 2 s check plus the 3 s freeze, plus a margin); either timeout reads "fleetd did not come back within 10 s".
 
 ### Clients
 
 - `fleet daemon restart [--binary <path>]`; `scripts/install.sh` runs it after building.
-- GUI: **Restart fleetd** in the status menu, local and SSH targets alike (SSH sends an empty `binary`). The sidebar shows "fleetd update available" when the local daemon's `BinaryIdentity` differs from the `fleetd` the GUI would launch (dev/ino/size/mtime, so the same file reached by a symlink is the same build). The check runs on connect and window focus and never for SSH targets.
+- GUI: **Restart fleetd** in the status menu, local and SSH targets alike (SSH sends an empty `binary`, so the remote daemon restarts onto its own binary's path). The sidebar shows "fleetd update available" when the local daemon's `BinaryIdentity` differs from the `fleetd` the GUI would launch (dev/ino/size/mtime, so the same file reached by a symlink is the same build). The check runs on connect and window focus and never for SSH targets.
 - `fleetd --upgrade` and `fleetd --force-stop` (and the prompt in a terminal) act when another fleetd holds the lock. To keep fleetd from linking `fleet-client` (binary 6.84 to 6.98 MB and idle RSS about +1%, a gated regression), fleetd only does the cheap same-build check and then `exec`s the sibling `fleet daemon upgrade` (hidden; same directory as `fleetd`, else `PATH`), which shares the restart loop. Without a `fleet` it prints the old message plus "install fleet next to fleetd to upgrade from here". `--force-stop` sends SIGTERM to the pid holding the lock (`lsof`, else `fuser`), never SIGKILL, waits 5 s and names the pid if it stays. Both flags are ignored with `--stdio`.
 - `scripts/install.sh` builds, installs and restarts; a daemon too old to restart is left alone unless `--force-stop` is given.
 
@@ -71,7 +75,7 @@ One decision, `restart_outcome` in `fleet-client`, is shared by the CLI and the 
 
 - Between clearing close-on-exec on the listener and lock and the `execve` (the login-env capture can spawn then), a forked child could inherit them. The window is short; closing it needs the capture moved out of that interval.
 - A SIGTERM that arrives during a freeze which then execs successfully is lost; the new daemon does not see it.
-- A panic in the restart coordinator after the freeze leaves the node frozen while the daemon serves on.
+- A record that lists fewer agents than it was passed pids for leaves each left-out agent's terminal fd open, unclaimed, in the new daemon; the agent itself is ended.
 - A requester that disconnects before its answer does not cancel the restart.
 - portable-pty reports any death by signal as exit code 1, so adopted agents do too.
 - The Bash/Claude Code sandbox silently drops signals sent to processes outside it, so `pkill fleetd` from a sandboxed shell exits 0 and does nothing. Stop a daemon from an ordinary terminal.

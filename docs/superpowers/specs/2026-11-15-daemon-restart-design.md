@@ -21,7 +21,7 @@ They also want agents, later, to survive a fleetd **crash** or kill. That is not
 ## Non-goals
 
 - Surviving a fleetd crash, `kill -9`, or a new binary that passes the check and then dies while restoring. In those cases agents are lost, as today.
-- Remote nodes upgrading themselves or each other: uploading binaries, or noticing a remote update (M5, `docs/plan.md`). A remote daemon can still be restarted onto the binary already on its `PATH` (see SSH targets).
+- Remote nodes upgrading themselves or each other: uploading binaries, or noticing a remote update (M5, `docs/plan.md`). A remote daemon can still be restarted onto the binary already at its own path (see SSH targets).
 - Downgrades across handoff-format versions (a newer format the old binary cannot read is simply refused by the check).
 - Keeping client connections open across the restart. They drop and reconnect.
 
@@ -43,7 +43,7 @@ The user chose 1 now, with the code prepared for 3.
 
 ### Requesting a restart
 
-- New request `RestartDaemon { string binary = 1; }`. Empty `binary` means "the `fleetd` on the daemon's `PATH`", resolved by the daemon. *(Call, from the builder check:)* it is answered only once the pre-flight check **and** the freeze have succeeded, immediately before `exec`, with `RestartingDaemon { uint32 agents = 1; }` (the number of agents in the handoff record). Any failure before that point is answered with an `Error`, and the daemon resumes (see Failure before exec).
+- New request `RestartDaemon { string binary = 1; }`. Empty `binary` means "the binary the daemon itself runs from" (the path in its `HelloOk.binary`), resolved by the daemon at restart time, so a file rebuilt at that path is picked up; if that path no longer exists the check refuses it, with no `PATH` fallback *(user's decision, 2026-11-15; this replaced "the `fleetd` on the daemon's `PATH`")*. *(Call, from the builder check:)* it is answered only once the pre-flight check **and** the freeze have succeeded, immediately before `exec`, with `RestartingDaemon { uint32 agents = 1; }` (the number of agents in the handoff record). Any failure before that point is answered with an `Error`, and the daemon resumes (see Failure before exec).
 - **Every daemon start has an instance token**, a random `u64`, sent in `HelloOk` *(call)*. A daemon started from a handoff also keeps a **restore summary** until the next restart: the old token, and the agent ids kept, failed and (on fallback) ended. It is reported in `HelloOk`, or in a new response to a status request; the builder decides which. A client tells the outcomes apart like this:
   - **Same token after reconnecting:** the `exec` never happened, so the restart failed. The summary names the reason.
   - **New token with a full summary:** success.
@@ -53,8 +53,8 @@ The user chose 1 now, with the code prepared for 3.
   - `fleetd restarted: N kept, M could not be restored and were ended (ids …)`. Exit code 1.
   - `fleetd restart failed: <reason>; the old fleetd is still running`. Exit code 1.
 - GUI: **Restart fleetd** in the status menu (core `status_menu`), and on the update notice (below). The GUI passes the `fleetd` it would itself launch (`core::launch::find_tool("fleetd")`, the same rule it uses to start one). While the daemon is restarting the GUI shows its usual reconnecting state; once reconnected, panes re-attach as after any reconnect.
-- **SSH targets** *(user's decision)*: the GUI offers **Restart fleetd** for an SSH target too, sending an empty `binary`, so the remote daemon restarts into the `fleetd` on its own `PATH` (for example, after a `cargo install` on that machine). The "update available" check runs for the local target only; for an SSH target, the GUI never compares binaries and never shows the notice.
-- **A daemon too old to know the request** answers "empty request"; the CLI and GUI say "this fleetd is too old to restart itself; stop it once (`pkill fleetd`) and the next client starts the new one". (The running daemon on the user's Mac is such a daemon: the first move onto this feature costs one last agent-ending restart.)
+- **SSH targets** *(user's decision)*: the GUI offers **Restart fleetd** for an SSH target too, sending an empty `binary`, so the remote daemon restarts onto its own binary's path, as now on disk (for example, after a `cargo install` on that machine replaced it). The "update available" check runs for the local target only; for an SSH target, the GUI never compares binaries and never shows the notice.
+- **A daemon too old to know the request** answers "empty request"; the CLI and GUI say "this fleetd is too old to restart itself; stop it once (`fleetd --force-stop`, or `scripts/install.sh --force-stop`) and the next client starts the new one". (The running daemon on the user's Mac is such a daemon: the first move onto this feature costs one last agent-ending restart.)
 
 ### Pre-flight check (before anything irreversible)
 

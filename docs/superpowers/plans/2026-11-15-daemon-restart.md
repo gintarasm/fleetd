@@ -22,7 +22,7 @@
   - CLI success: `fleetd restarted: N agents kept`
   - CLI partial: `fleetd restarted: N kept, M could not be restored and were ended (ids …)` (exit 1; ids comma-separated)
   - CLI failure: `fleetd restart failed: <reason>; the old fleetd is still running` (exit 1)
-  - Too-old daemon (CLI and GUI): `this fleetd is too old to restart itself; stop it once (pkill fleetd) and the next client starts the new one`
+  - Too-old daemon (CLI and GUI): `this fleetd is too old to restart itself; stop it once (fleetd --force-stop, or scripts/install.sh --force-stop) and the next client starts the new one`
   - Requests refused while freezing: `fleetd is restarting`
   - Restart refused while spawns, restarts or forgets are still in flight at the deadline: `agents are starting; try again`
   - Second concurrent restart: `a restart is already in progress`
@@ -184,7 +184,7 @@
 **Interfaces:**
 - Consumes: Tasks 1, 4, 5.
 - Produces:
-  - Server: `RestartDaemon` is passed to the serve loop over a channel (one in flight; a second gets `Error("a restart is already in progress")`). The serve loop: resolves `binary` (empty → `fleetd` on the daemon's `PATH`), `run_check(binary, 2 s)`, stops accepting, `node.prepare_handoff(now + 3 s)`, writes the record, answers the requester `RestartingDaemon{agents}`, waits for that frame to be flushed (bounded 200 ms), then `handoff::exec`. Any failure before `execve` returns: `node.thaw()`, accept again, answer `Error(reason)` if not answered yet, and keep `restart_error = reason` in the `RestoreSummary` served from then on.
+  - Server: `RestartDaemon` is passed to the serve loop over a channel (one in flight; a second gets `Error("a restart is already in progress")`). The serve loop: resolves `binary` (empty → `fleetd` on the daemon's `PATH`; since changed: empty → the daemon's own binary path, see Task 7), `run_check(binary, 2 s)`, stops accepting, `node.prepare_handoff(now + 3 s)`, writes the record, answers the requester `RestartingDaemon{agents}`, waits for that frame to be flushed (bounded 200 ms), then `handoff::exec`. Any failure before `execve` returns: `node.thaw()`, accept again, answer `Error(reason)` if not answered yet, and keep `restart_error = reason` in the `RestoreSummary` served from then on.
   - `handoff::exec(binary: &Path, state_dir: &Path, record_fd: OwnedFd, keep: &[RawFd]) -> io::Error` (returns only on failure): clears close-on-exec on `keep` and the record fd, sets `FLEETD_HANDOFF_FD=<record fd>`, `execve(binary, [binary, "--state-dir", state_dir])` with the daemon's own environment; on failure restores close-on-exec and returns the error.
   - `main`: if `FLEETD_HANDOFF_FD` is set, remove it from the environment first (before logging, before the login-env capture), `take_record`, adopt `listener_fd`/`lock_fd` (`from_raw_fd`, set close-on-exec), `Node::open_with_handoff`, serve with `RestoreSummary{previous_instance, kept, failed, fell_back:false}`. If the record cannot be read: log it, `remove_stale`, and start normally with `fell_back = true`. The agents are still this process's children, holding inherited PTY fds, and must not be left running untracked. So `exec` also sets **`FLEETD_HANDOFF_PIDS`** to a comma-separated list of the agents' pids, and the new daemon always removes it from its environment along with `FLEETD_HANDOFF_FD`. On fallback, the new daemon:
     1. Sends SIGTERM to each of those process groups, then SIGKILL after `SHUTDOWN_GRACE`.
@@ -216,7 +216,7 @@
 
 **Interfaces:**
 - Consumes: `Connection::hello()` (Task 1); `RestartDaemon`/`RestartingDaemon` (Task 6).
-- Produces: `fleet daemon restart [--binary <path>]` (clap: `Daemon { #[command(subcommand)] cmd: DaemonCmd }`, `DaemonCmd::Restart { binary: Option<PathBuf> }`). Default binary: empty string (the daemon's `PATH`) *(plan's call — matches the GUI's SSH behaviour; `--binary` overrides)*. Flow: remember `hello().instance`; send; on `RestartingDaemon{agents}` reconnect with retries for up to 10 s; compare instance and read `restore`; print exactly one Global Constraints message. "empty request" → the too-old message, exit 1.
+- Produces: `fleet daemon restart [--binary <path>]` (clap: `Daemon { #[command(subcommand)] cmd: DaemonCmd }`, `DaemonCmd::Restart { binary: Option<PathBuf> }`). Default binary: empty string *(plan's call — matches the GUI's SSH behaviour; `--binary` overrides)*. Empty now means the binary the daemon runs from, re-resolved at restart time, with no `PATH` fallback *(user's decision, 2026-11-15; it was "the daemon's `PATH`")*; a relative `--binary` path is made absolute against the CLI's working directory before sending. Flow: remember `hello().instance`; send; on `RestartingDaemon{agents}` reconnect with retries for up to 10 s; compare instance and read `restore`; print exactly one Global Constraints message. "empty request" → the too-old message, exit 1.
 
 - [ ] **Step 1: Write failing tests** against a real `fleetd` in a temp state dir: success prints `fleetd restarted: 1 agents kept` for one agent *(the copy is fixed; do not pluralise)*; a failing `--binary` prints `fleetd restart failed: check failed (exit 3); the old fleetd is still running` and exits 1; a fake server answering "empty request" prints the too-old message.
 - [ ] **Step 2: Run** `cargo test -p fleet-cli --test daemon_restart` — FAIL.
