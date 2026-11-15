@@ -24,7 +24,13 @@ fn take_handoff(cfg: &Config, handed: &Handed) -> std::io::Result<Daemon> {
     })?;
     let rec = handoff::take_record(fd, &cfg.state_dir)?;
     let (listener, lock) = handoff::adopt_listener_and_lock(&rec, &cfg.socket_path())?;
-    Ok(Daemon::adopted(cfg, listener, lock, rec))
+    Ok(Daemon::adopted(
+        cfg,
+        listener,
+        lock,
+        rec,
+        handed.pids.clone(),
+    ))
 }
 
 /// The `fleet` that sits next to this binary, else the first on `PATH`.

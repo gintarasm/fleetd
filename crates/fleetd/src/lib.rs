@@ -155,8 +155,9 @@ enum Origin {
     /// (see [`Daemon::fell_back`]).
     FellBack,
     /// Started by a predecessor's `exec` from this record (see
-    /// [`Daemon::adopted`]).
-    Handoff(HandoffRecord),
+    /// [`Daemon::adopted`]), with the pids it passed: ended if this start
+    /// fails before the node has adopted them (see `restart::HandedAgents`).
+    Handoff(HandoffRecord, restart::HandedAgents),
 }
 
 /// Makes `dir` (and missing parents) exist with mode 0700. The common case,
@@ -232,17 +233,23 @@ impl Daemon {
     /// `rec`: the instance lock and the listener are the predecessor's,
     /// inherited (see [`handoff::adopt_listener_and_lock`]), so nothing is
     /// bound or locked; [`Daemon::serve`] adopts the record's agents.
+    ///
+    /// `pids` are the agents' pids the predecessor passed (see
+    /// [`handoff::Handed`]). Every one the node has not adopted is ended:
+    /// once it opens, those the record left out; if the daemon is dropped or
+    /// `serve` fails before then, all of them.
     pub fn adopted(
         cfg: &Config,
         listener: StdUnixListener,
         lock: File,
         rec: HandoffRecord,
+        pids: Vec<i32>,
     ) -> Daemon {
         Daemon {
             lock,
             listener,
             socket_path: cfg.socket_path(),
-            origin: Origin::Handoff(rec),
+            origin: Origin::Handoff(rec, restart::HandedAgents::new(pids, cfg.state_dir.clone())),
         }
     }
 
@@ -293,9 +300,11 @@ impl Daemon {
             // Restart-only code runs on blocking threads (see `restart`):
             // kept out of `serve`'s own code, which is paged in on every
             // start (idle RSS is gated).
-            Origin::Handoff(rec) => restart::open_from_handoff(state_dir.clone(), rec, shell)
-                .await
-                .map_err(io::Error::other)??,
+            Origin::Handoff(rec, handed) => {
+                restart::open_from_handoff(state_dir.clone(), rec, handed, shell)
+                    .await
+                    .map_err(io::Error::other)??
+            }
             origin => {
                 // In the background, overlapping opening the store; the
                 // first spawn waits for it (bounded), nothing else does.

@@ -11,9 +11,11 @@
 //! startup code is paged in on every start, where the idle daemon's
 //! resident memory is gated (ADR 0014).
 
+use std::any::Any;
 use std::io;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,14 +40,27 @@ pub(crate) type Checked = (RestartRequest, PathBuf, Result<(), String>);
 
 /// Opens the node from a predecessor's handoff record, then starts the
 /// login-env capture: the handed-over terminals are claimed before the
-/// capture opens a terminal of its own.
+/// capture opens a terminal of its own. `handed` (the pids the predecessor
+/// passed) is settled once the node is open (see [`HandedAgents::opened`]); if
+/// this fails or panics first, dropping it ends them all.
 pub(crate) fn open_from_handoff(
     state_dir: PathBuf,
     rec: HandoffRecord,
+    handed: HandedAgents,
     shell: Option<PathBuf>,
 ) -> JoinHandle<io::Result<(Node, RestoreSummary)>> {
     tokio::task::spawn_blocking(move || {
+        let pid_of: Vec<(u64, i32)> = rec.agents.iter().map(|a| (a.id, a.pid)).collect();
         let (node, kept, failed) = Node::open_with_handoff(&state_dir, rec.agents)?;
+        handoff::test_panic("FLEETD_TEST_PANIC_OPENING_HANDOFF");
+        // A repeated id keeps its first entry (see `open_with_handoff`), so
+        // the first pid listed for a kept id is the kept agent's.
+        let kept_pids: Vec<i32> = kept
+            .iter()
+            .filter_map(|id| pid_of.iter().find(|(i, _)| i == id).map(|&(_, pid)| pid))
+            .collect();
+        // Before the capture starts a child of its own.
+        handed.opened(&kept_pids);
         let login_env = LoginEnv::capture_in_background(shell, LOGIN_ENV_TIMEOUT);
         info!(
             kept = kept.len(),
@@ -61,6 +76,60 @@ pub(crate) fn open_from_handoff(
         };
         Ok((node.with_base_env(login_env), restore))
     })
+}
+
+/// The agents a predecessor's `exec` handed to this process, by the pids
+/// it passed in [`handoff::HANDOFF_PIDS_ENV`]: its children, holding the
+/// terminals it inherited. Until the node has opened from the record and
+/// adopted those it lists ([`HandedAgents::opened`]), nothing else tracks them.
+///
+/// Dropped before that, because the start ended early (`serve` failed
+/// before the node opened, opening it failed or panicked, or the runtime
+/// could not be built), it ends every one that is still a child of this
+/// process (SIGTERM to its group, SIGKILL after the shutdown grace, reaped)
+/// and marks every agent the store has running as lost, so none runs on
+/// untracked whichever way the process goes. It may block for that grace,
+/// also on a runtime thread: only on a failed start.
+pub(crate) struct HandedAgents {
+    pids: Vec<i32>,
+    state_dir: PathBuf,
+}
+
+impl HandedAgents {
+    pub(crate) fn new(pids: Vec<i32>, state_dir: PathBuf) -> HandedAgents {
+        HandedAgents { pids, state_dir }
+    }
+
+    /// The node is open with `kept` (the pids of the agents it adopted):
+    /// ends every other handed pid still a child of this process, which a
+    /// record listing fewer agents than the pids left to no one.
+    fn opened(mut self, kept: &[i32]) {
+        // Kept pids are left out before `end_children` looks at them: it
+        // reaps an exited child, which would take a kept agent's exit status
+        // from its reader.
+        let extra: Vec<i32> = std::mem::take(&mut self.pids)
+            .into_iter()
+            .filter(|pid| !kept.contains(pid))
+            .collect();
+        let ended = handoff::end_children(&extra);
+        if ended > 0 {
+            warn!(
+                agents = ended,
+                "the handoff record left out running agents; ended them"
+            );
+        }
+    }
+}
+
+impl Drop for HandedAgents {
+    fn drop(&mut self) {
+        if self.pids.is_empty() {
+            return;
+        }
+        let ended = handoff::end_children(&self.pids);
+        let lost = Node::mark_left_running_lost(&self.state_dir);
+        warn!(agents = ended, lost = ?lost, "the handoff was not adopted; ended its agents");
+    }
 }
 
 /// Resolves the restart's binary and checks it with `--handoff-check` on
@@ -110,13 +179,18 @@ impl Restart {
     /// is answered and the failure recorded. The serve loop awaits it
     /// without accepting: connections wait in the listener's backlog for
     /// whichever daemon serves next.
+    ///
+    /// A panic in the restart is caught and answered like any failure (the
+    /// handoff undone, see [`Restart::run`]): the requester gets an `Error`,
+    /// not a dropped reply.
     pub(crate) fn finish(self, (req, binary, checked): Checked) -> JoinHandle<()> {
         tokio::task::spawn_blocking(move || {
             let mut reply = Some(req.reply);
             let reason = match checked {
                 Ok(()) => {
                     info!("restart: check passed");
-                    self.run(&binary, &mut reply)
+                    let run = AssertUnwindSafe(|| self.run(&binary, &mut reply));
+                    std::panic::catch_unwind(run).unwrap_or_else(|panic| panicked(&*panic))
                 }
                 Err(reason) => reason,
             };
@@ -137,7 +211,9 @@ impl Restart {
     /// Returns only if something failed before or at the `exec`, with the
     /// reason, everything undone: the node thawed, requests admitted again,
     /// no record left. `reply` is still there if the requester was not
-    /// answered yet.
+    /// answered yet. A panic once the node is frozen undoes the same on its
+    /// way out ([`Undo`]): otherwise every reader would stay parked, input
+    /// fail and every spawn be refused until the daemon was killed.
     fn run(
         &self,
         binary: &std::path::Path,
@@ -146,7 +222,8 @@ impl Restart {
         let started = Instant::now();
         let frozen_unix_ms = unix_ms();
         let deadline = started + FREEZE_DEADLINE;
-        let Some(stopped) = self.restarts.stop_requests(deadline) else {
+        // Dropped last: requests are admitted only once the node thawed.
+        let Some(_stopped) = self.restarts.stop_requests(deadline) else {
             return "agents are starting; try again".into();
         };
         let agents = match self.node.prepare_handoff(deadline) {
@@ -154,6 +231,13 @@ impl Restart {
             // Nothing stays frozen (see `prepare_handoff`).
             Err(e) => return e.to_string(),
         };
+        // From here every way out of `run` but the `exec` (a return or a
+        // panic) undoes the handoff.
+        let _undo = Undo {
+            node: &self.node,
+            state_dir: &self.state_dir,
+        };
+        handoff::test_panic("FLEETD_TEST_PANIC_AFTER_FREEZE");
         let mut keep = vec![self.listener_fd, self.lock_fd];
         keep.extend(agents.iter().filter_map(|a| match a.terminal {
             Some(handoff_agent::Terminal::Fd(fd)) => Some(fd),
@@ -161,7 +245,7 @@ impl Restart {
         }));
         let pids: Vec<i32> = agents.iter().map(|a| a.pid).collect();
         let count = agents.len() as u32;
-        let rec = HandoffRecord {
+        let mut rec = HandoffRecord {
             version: HANDOFF_VERSION,
             listener_fd: self.listener_fd,
             lock_fd: self.lock_fd,
@@ -169,7 +253,8 @@ impl Restart {
             agents,
             frozen_unix_ms,
         };
-        let reason = match handoff::write_record(&self.state_dir, &rec) {
+        handoff::test_short_record(&mut rec);
+        match handoff::write_record(&self.state_dir, &rec) {
             Ok(record_fd) => {
                 drop(rec);
                 handoff::test_corrupt_record(&self.state_dir);
@@ -193,12 +278,32 @@ impl Restart {
                 format!("exec {}: {e}", binary.display())
             }
             Err(e) => format!("writing the handoff record: {e}"),
-        };
-        handoff::remove_stale(&self.state_dir);
-        self.node.thaw();
-        drop(stopped);
-        reason
+        }
     }
+}
+
+/// Undoes a prepared handoff when dropped: removes the record, if written,
+/// and thaws the node.
+struct Undo<'a> {
+    node: &'a Node,
+    state_dir: &'a Path,
+}
+
+impl Drop for Undo<'_> {
+    fn drop(&mut self) {
+        handoff::remove_stale(self.state_dir);
+        self.node.thaw();
+    }
+}
+
+/// The reason given for a restart that panicked.
+fn panicked(panic: &(dyn Any + Send)) -> String {
+    let what = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a panic");
+    format!("internal error ({what})")
 }
 
 fn unix_ms() -> i64 {

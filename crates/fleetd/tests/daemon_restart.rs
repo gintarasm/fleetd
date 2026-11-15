@@ -3,7 +3,9 @@
 //! agents carried over; refusals and failures leave it serving.
 //!
 //! The tests' daemon is a debug build, so its test hooks
-//! (`FLEETD_TEST_RESTART_DELAY_MS`, `FLEETD_TEST_CORRUPT_HANDOFF`) work.
+//! (`FLEETD_TEST_RESTART_DELAY_MS`, `FLEETD_TEST_CORRUPT_HANDOFF`,
+//! `FLEETD_TEST_SHORT_HANDOFF`, `FLEETD_TEST_PANIC_AFTER_FREEZE`,
+//! `FLEETD_TEST_PANIC_OPENING_HANDOFF`) work.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -40,8 +42,13 @@ impl Daemon {
     }
 
     fn start_with(env: &[(&str, &str)]) -> Self {
+        Self::start_from(fleetd(), env)
+    }
+
+    /// Runs the daemon from `binary`.
+    fn start_from(binary: &Path, env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_fleetd"))
+        let child = Command::new(binary)
             // Never the developer's real login shell.
             .env("FLEETD_LOGIN_ENV", "off")
             .envs(env.iter().copied())
@@ -98,8 +105,12 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        // A reaped child's pid may be someone else's by now.
+        if self.child.try_wait().ok().flatten().is_some() {
+            return;
+        }
         // SIGTERM, so the daemon ends its agents.
-        // SAFETY: plain signal to our child.
+        // SAFETY: plain signal to our child, not yet reaped.
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
@@ -392,6 +403,21 @@ fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// The process `pid` no longer exists (not even as a zombie).
+fn assert_gone(pid: i32) {
+    assert!(!pid_alive(pid), "agent {pid} still exists");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+/// The agent's state as the store on disk has it.
+fn stored_state(dir: &Path, id: u64) -> fleet_node::store::AgentState {
+    let store = fleet_node::store::Store::open(&dir.join("state.db")).unwrap();
+    store.agent(id).unwrap().expect("agent row").state
+}
+
 /// The pid an agent printed as `pid=N`.
 fn shown_pid(c: &mut Client, id: u64) -> i32 {
     let text = c.wait_screen(id, "pid", |l| l.starts_with("pid="));
@@ -466,7 +492,9 @@ fn failed_check_refuses_and_keeps_serving() {
 
 #[test]
 fn exec_failure_thaws() {
-    const N: u32 = 8_000;
+    // Writes for about 4 s, past the restart (1.5 s delay, then the exec
+    // fails): still running when it is looked at, also under load.
+    const N: u32 = 20_000;
     let mut daemon = Daemon::start_with(&[("FLEETD_TEST_RESTART_DELAY_MS", "1500")]);
     let checked = daemon.path().join("checked");
     let bin = script(
@@ -617,13 +645,101 @@ fn corrupt_record_falls_back() {
         assert_eq!(c.agent(id).state, AgentState::Lost as i32);
     }
     for pid in pids {
-        assert!(!pid_alive(pid), "agent {pid} still exists");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+        assert_gone(pid);
     }
     // The fallback daemon serves as any fresh one.
     let next = c.sh("exit 0");
     assert_eq!(c.wait_exit_code(next), 0);
+}
+
+#[test]
+fn panic_after_freeze_thaws_and_keeps_serving() {
+    const N: u32 = 8_000;
+    let mut daemon = Daemon::start_with(&[("FLEETD_TEST_PANIC_AFTER_FREEZE", "1")]);
+    let (mut c, hello) = daemon.connect();
+    let shell = c.sh(SHELL);
+    let writer = c.sh(&numbered_writer(N));
+    c.wait_screen(shell, "ready", |l| l == "ready");
+    c.wait_screen(writer, "output", past_200);
+
+    // The restart panics once the agents are frozen: answered with an
+    // Error, everything undone.
+    let id = c.restart_daemon(fleetd());
+    let e = error_message(c.response(id));
+    assert!(e.contains("internal error"), "{e}");
+    daemon.assert_same_process();
+    assert_eq!(c.agent(shell).state, AgentState::Running as i32);
+    c.input(shell, b"echo thawed\n");
+    c.wait_screen(shell, "thawed", |l| l == "thawed");
+    assert_eq!(c.wait_exit_code(writer), 0);
+    assert_no_gap(&mut c, writer, N);
+    // Spawns are admitted again (the handoff gate is open).
+    let next = c.sh("exit 0");
+    assert_eq!(c.wait_exit_code(next), 0);
+    let (_, again) = daemon.connect();
+    assert_eq!(again.instance, hello.instance);
+    let restore = again.restore.as_deref().expect("restore summary");
+    assert!(
+        restore.restart_error.contains("internal error"),
+        "{restore:?}"
+    );
+}
+
+#[test]
+fn agent_left_out_of_the_record_is_ended() {
+    let mut daemon = Daemon::start_with(&[("FLEETD_TEST_SHORT_HANDOFF", "1")]);
+    let (mut c, hello) = daemon.connect();
+    let ids = [
+        c.sh("echo pid=$$; exec sleep 100"),
+        c.sh("echo pid=$$; exec sleep 100"),
+    ];
+    let pids = ids.map(|id| shown_pid(&mut c, id));
+    let req = c.restart_daemon(fleetd());
+    assert_eq!(restarting_agents(c.response(req)), 2);
+
+    // The record lists one agent; both pids were passed.
+    let (mut c, after) = daemon.reconnect_new(hello.instance);
+    daemon.assert_same_process();
+    let restore = after.restore.as_deref().expect("restore summary");
+    assert_eq!(restore.kept.len(), 1, "{restore:?}");
+    let kept = ids.iter().position(|&id| id == restore.kept[0]).unwrap();
+    let (left_out, left_out_pid) = (ids[1 - kept], pids[1 - kept]);
+    assert_gone(left_out_pid);
+    assert_eq!(c.agent(left_out).state, AgentState::Lost as i32);
+    assert!(pid_alive(pids[kept]));
+    assert_eq!(c.agent(ids[kept]).state, AgentState::Running as i32);
+}
+
+#[test]
+fn panic_opening_the_handoff_ends_every_agent() {
+    let mut daemon = Daemon::start_with(&[("FLEETD_TEST_PANIC_OPENING_HANDOFF", "1")]);
+    let (mut c, _) = daemon.connect();
+    let ids = [
+        c.sh("echo pid=$$; exec sleep 100"),
+        c.sh("echo pid=$$; exec sleep 100"),
+    ];
+    let pids = ids.map(|id| shown_pid(&mut c, id));
+    let req = c.restart_daemon(fleetd());
+    assert_eq!(restarting_agents(c.response(req)), 2);
+
+    // The successor panics with the agents adopted: it ends them all, marks
+    // any still running in the store lost and exits.
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the daemon never exited");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    for pid in pids {
+        assert_gone(pid);
+    }
+    // Lost, or exited if its reader recorded the exit first: the agents
+    // were adopted before the panic.
+    for id in ids {
+        let state = stored_state(daemon.path(), id);
+        assert_ne!(state, fleet_node::store::AgentState::Running, "agent {id}");
+    }
 }

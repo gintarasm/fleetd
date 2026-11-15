@@ -299,13 +299,11 @@ fn file_type(fd: RawFd) -> Option<libc::mode_t> {
 /// fd above 2 (their terminals, the record, the old listener and lock), so
 /// a normal start follows with nothing of the handoff left open.
 ///
-/// Only pids that are children of this process are signalled: an exec
-/// keeps the agents as children, and a stray variable must not make the
-/// daemon kill arbitrary process groups. Call before opening any file of
-/// this process's own (before logging): every fd above 2 is closed.
+/// Only pids that are children of this process are signalled (see
+/// [`end_children`]). Call before opening any file of this process's own
+/// (before logging): every fd above 2 is closed.
 pub fn abandon(pids: &[i32]) {
-    let children: Vec<i32> = pids.iter().copied().filter(|&p| is_child(p)).collect();
-    fleet_node::end_unadopted(&children);
+    end_children(pids);
     let fds: Vec<RawFd> = match fs::read_dir("/dev/fd") {
         Ok(dir) => dir
             .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
@@ -318,6 +316,17 @@ pub fn abandon(pids: &[i32]) {
         // left are inherited ones no one will use.
         unsafe { libc::close(fd) };
     }
+}
+
+/// Ends those of `pids` that are children of this process (SIGTERM to each
+/// group, SIGKILL after the shutdown grace, reaped); how many that was.
+/// Only children: an exec keeps the agents as children, and a stray
+/// variable or a bad record must not make the daemon kill arbitrary process
+/// groups. A pid that has exited is reaped by the check and not counted.
+pub fn end_children(pids: &[i32]) -> usize {
+    let children: Vec<i32> = pids.iter().copied().filter(|&p| is_child(p)).collect();
+    fleet_node::end_unadopted(&children);
+    children.len()
 }
 
 /// Whether `pid` is a child of this process (reaping it if it has exited:
@@ -376,4 +385,26 @@ pub(crate) fn test_corrupt_record(state_dir: &Path) {
     }
     #[cfg(not(debug_assertions))]
     let _ = state_dir;
+}
+
+/// Test hook: panics if the environment variable `var` is set, to test that
+/// a panic at that point leaves nothing behind.
+pub(crate) fn test_panic(var: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(var).is_some() {
+        panic!("test hook {var}");
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = var;
+}
+
+/// Test hook: with `FLEETD_TEST_SHORT_HANDOFF` set, the record leaves out
+/// its last agent (whose pid is still passed), as a bad record might.
+pub(crate) fn test_short_record(rec: &mut HandoffRecord) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("FLEETD_TEST_SHORT_HANDOFF").is_some() {
+        rec.agents.pop();
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = rec;
 }

@@ -1788,6 +1788,15 @@ impl Node {
         })
     }
 
+    /// Marks every agent the store under `state_dir` has running as lost,
+    /// without opening the node; how many. For a daemon that took over a
+    /// predecessor's agents and ended them before it could open its node (a
+    /// failed handoff-origin start), so the store does not say they run.
+    pub fn mark_left_running_lost(state_dir: &Path) -> io::Result<usize> {
+        let store = Store::open(&state_dir.join("state.db")).map_err(store_err)?;
+        store.mark_running_as_lost().map_err(store_err)
+    }
+
     /// Uses `env` as the base of agents' environments instead of the
     /// daemon's own. The first spawn waits for a capture still running.
     pub fn with_base_env(mut self, env: LoginEnv) -> Node {
