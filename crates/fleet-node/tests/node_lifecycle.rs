@@ -180,13 +180,18 @@ fn open_deletes_orphan_scrollback_rings() {
     let kept_ring = sb.join(format!("{kept}.ring"));
     let orphan = sb.join(format!("{}.ring", kept + 41));
     let other = sb.join("notes.txt");
-    for f in [&kept_ring, &orphan, &other] {
+    // Names that parse as an id but are not how fleetd writes one.
+    let padded = sb.join(format!("0{}.ring", kept + 41));
+    let signed = sb.join(format!("+{}.ring", kept + 41));
+    for f in [&kept_ring, &orphan, &other, &padded, &signed] {
         std::fs::write(f, b"secret output").unwrap();
     }
     let node = Node::open(dir.path()).unwrap();
     assert!(kept_ring.exists(), "a ring with a store row is kept");
     assert!(!orphan.exists(), "a ring without a store row is deleted");
     assert!(other.exists(), "files that are not rings are left alone");
+    assert!(padded.exists(), "non-canonical names are left alone");
+    assert!(signed.exists(), "non-canonical names are left alone");
     drop(node);
 }
 

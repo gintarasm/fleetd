@@ -1421,20 +1421,35 @@ fn prune_history_dirs(dir: &Path, keep: &HashSet<u64>) -> io::Result<()> {
 /// forget or restart that failed to delete it, or a crash in between): rings
 /// hold raw output, which may contain secrets.
 fn prune_orphan_rings(dir: &Path, rows: &HashSet<u64>) -> io::Result<()> {
+    let entries = std::fs::read_dir(dir)?.map(|e| e.map(|e| e.path()));
+    prune_ring_paths(entries, rows);
+    Ok(())
+}
+
+/// [`prune_orphan_rings`] over `entries`, best effort: an unreadable entry
+/// is logged and skipped. Only canonical names (`7.ring`, not `007.ring`)
+/// are rings.
+fn prune_ring_paths(entries: impl IntoIterator<Item = io::Result<PathBuf>>, rows: &HashSet<u64>) {
     let mut pruned = 0usize;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let id = name
-            .to_str()
+    for entry in entries {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(error = %e, "reading a scrollback directory entry failed");
+                continue;
+            }
+        };
+        let id = path
+            .file_name()
+            .and_then(|n| n.to_str())
             .and_then(|n| n.strip_suffix(".ring"))
-            .and_then(|n| n.parse::<u64>().ok());
+            .and_then(|n| n.parse::<u64>().ok().filter(|id| id.to_string() == n));
         if id.is_some_and(|id| !rows.contains(&id)) {
-            match std::fs::remove_file(entry.path()) {
+            match std::fs::remove_file(&path) {
                 Ok(()) => pruned += 1,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    warn!(path = ?entry.path(), error = %e, "removing orphan scrollback failed")
+                    warn!(path = ?path, error = %e, "removing orphan scrollback failed")
                 }
             }
         }
@@ -1442,7 +1457,6 @@ fn prune_orphan_rings(dir: &Path, rows: &HashSet<u64>) -> io::Result<()> {
     if pruned > 0 {
         info!(rings = pruned, "deleted scrollback of unknown agents");
     }
-    Ok(())
 }
 
 /// The agents whose history [`Node::open`] keeps: running ones and the
@@ -2394,6 +2408,19 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruning_skips_unreadable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("7.ring");
+        std::fs::write(&orphan, b"secret output").unwrap();
+        let entries = vec![
+            Err(io::Error::other("unreadable entry")),
+            Ok(orphan.clone()),
+        ];
+        prune_ring_paths(entries, &HashSet::new());
+        assert!(!orphan.exists(), "later entries are still pruned");
+    }
 
     #[test]
     fn forget_refuses_agent_still_live_after_its_row_says_exited() {
