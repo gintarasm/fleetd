@@ -329,7 +329,7 @@ fn run(cli: Cli) -> Result<u8> {
                 selector: parse_labels(&selector)?,
             };
             match client
-                .call(request::Kind::Forget(req))
+                .call(request::Kind::Forget(Box::new(req)))
                 .map_err(old_daemon)?
             {
                 response::Kind::Forgotten(f) => {

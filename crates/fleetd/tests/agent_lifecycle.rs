@@ -167,11 +167,11 @@ impl Client {
     }
 
     fn forget(&mut self, ids: &[u64], exited_only: bool) -> Forgotten {
-        match self.request(request::Kind::Forget(ForgetAgents {
+        match self.request(request::Kind::Forget(Box::new(ForgetAgents {
             ids: ids.to_vec(),
             exited_only,
             selector: HashMap::new(),
-        })) {
+        }))) {
             response::Kind::Forgotten(f) => f,
             other => panic!("forget failed: {other:?}"),
         }
@@ -472,11 +472,11 @@ fn forget_that_fails_midway_announces_what_it_forgot() {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;"
         ),
     );
-    match a.request(request::Kind::Forget(ForgetAgents {
+    match a.request(request::Kind::Forget(Box::new(ForgetAgents {
         ids: vec![e1, e2],
         exited_only: false,
         selector: HashMap::new(),
-    })) {
+    }))) {
         response::Kind::Error(e) => assert!(e.message.contains("injected"), "{}", e.message),
         other => panic!("expected Error, got {other:?}"),
     }
