@@ -16,6 +16,7 @@ use gpui::{
 use super::app_state::AppState;
 use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
 use super::context_menu::{self, MenuLine};
+use super::controls::appear;
 use super::keymap::{
     ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
     FocusRight, FocusUp, Kill, NewAgent, Paste, Remove, Restart, RestartPane, SplitDown,
@@ -34,7 +35,7 @@ use crate::core::menus::{
 };
 use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
-use crate::core::style::{chrome, radius, space, text};
+use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::target::Target;
 use crate::core::titlebar::{Link, bar_title, window_title};
 
@@ -104,6 +105,8 @@ pub struct Workspace {
     drawn: Vec<PaneId>,
     /// The window title last set.
     window_title: String,
+    /// Reduce Motion is on (read at launch and on appearance changes).
+    reduce_motion: bool,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -124,6 +127,7 @@ impl Workspace {
         });
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
             let theme = window_theme(window);
+            this.reduce_motion = native::reduce_motion();
             this.app.update(cx, |a, cx| a.set_theme(theme, cx));
             window.refresh();
         });
@@ -159,6 +163,7 @@ impl Workspace {
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
             window_title: String::new(),
+            reduce_motion: native::reduce_motion(),
             _subscriptions: vec![observe, appearance],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -740,13 +745,11 @@ impl Render for Workspace {
         let bar = render_bar(&bar, &theme, cx);
         super::bench::sidebar_drawn(window);
         let panes = self.render_panes(cx);
+        let reduce_motion = self.reduce_motion;
         let toast = error.map(|e| {
-            div()
+            let card = div()
                 .id("error")
                 .debug_selector(|| "error-toast".to_owned())
-                .absolute()
-                .bottom(px(space::LG))
-                .right(px(space::LG))
                 .max_w(px(480.))
                 .px(px(space::MD))
                 .py(px(space::SM))
@@ -762,7 +765,18 @@ impl Render for Workspace {
                 .child(SharedString::from(format!("{e}   ✕")))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.app.update(cx, |a, cx| a.dismiss_error(cx));
-                }))
+                }));
+            div()
+                .absolute()
+                .bottom(px(space::LG))
+                .right(px(space::LG))
+                .child(appear(
+                    div().child(card),
+                    "toast-appear",
+                    motion::SHEET_OFFSET,
+                    motion::TOAST_MS,
+                    reduce_motion,
+                ))
         });
         let connect = self
             .connect
@@ -780,8 +794,14 @@ impl Render for Workspace {
                         // A card sized to its content, not a full-height column.
                         .items_start()
                         .justify_center()
-                        .pt(px(120.))
-                        .child(sheet.clone()),
+                        .pt(px(chrome::BAR_HEIGHT + space::XL))
+                        .child(appear(
+                            div().child(sheet.clone()),
+                            "connect-appear",
+                            -motion::SHEET_OFFSET,
+                            motion::SHEET_MS,
+                            reduce_motion,
+                        )),
                 )
                 .with_priority(3)
             });
@@ -796,8 +816,15 @@ impl Render for Workspace {
                     .flex()
                     .items_start()
                     .justify_center()
-                    .pt(px(80.))
-                    .child(sheet.clone()),
+                    // Hung from the bar, like an AppKit sheet.
+                    .pt(px(chrome::BAR_HEIGHT + space::SM))
+                    .child(appear(
+                        div().child(sheet.clone()),
+                        "sheet-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
             )
             .with_priority(2)
         });

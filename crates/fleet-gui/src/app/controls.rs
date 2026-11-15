@@ -1,16 +1,19 @@
 //! Shared controls in the macOS style: push buttons, sheet cards, field
 //! labels and list rows, drawn with the theme's tokens.
 
+use std::time::Duration;
+
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Div, ElementId, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, div, px,
+    Animation, AnimationExt, AnyElement, Div, ElementId, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, div,
+    px,
 };
 
 use super::icons;
 use super::theme::{Theme, Typography};
 use crate::core::icons::Icon;
-use crate::core::style::{chrome, radius, space, text};
+use crate::core::style::{chrome, motion, radius, space, text};
 
 /// The default (accent-filled) button or a plain one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,3 +179,18 @@ pub fn icon_button(id: &'static str, icon: Icon, theme: &Theme, enabled: bool) -
 
 /// The hover group of an icon button (the icon brightens with its button).
 const ICON_BUTTON_GROUP: &str = "icon-button";
+
+/// `el` fading in while it slides `from` px (down if negative) into place,
+/// over `ms` milliseconds, easing out; as is when `reduce_motion`.
+/// Restarts each time `id` first appears.
+pub fn appear(el: Div, id: &'static str, from: f32, ms: u64, reduce_motion: bool) -> AnyElement {
+    if reduce_motion {
+        return el.into_any_element();
+    }
+    el.with_animation(
+        id,
+        Animation::new(Duration::from_millis(ms)).with_easing(motion::ease_out),
+        move |el, t| el.opacity(t).mt(px(from * (1.0 - t))),
+    )
+    .into_any_element()
+}

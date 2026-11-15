@@ -45,3 +45,10 @@ pub fn reduce_transparency() -> bool {
     MainThreadMarker::new().is_some()
         && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency()
 }
+
+/// System Settings › Accessibility › Display › Reduce motion: sheets and
+/// the toast then appear without sliding.
+pub fn reduce_motion() -> bool {
+    MainThreadMarker::new().is_some()
+        && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
