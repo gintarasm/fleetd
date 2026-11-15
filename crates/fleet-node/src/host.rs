@@ -50,7 +50,8 @@ pub trait AgentHost: Send + Sync {
         sink: Box<dyn OutputSink>,
     ) -> io::Result<AgentId>;
 
-    /// Takes over a running agent another daemon froze.
+    /// Takes over a running agent another daemon froze. The host owns
+    /// `spec.terminal` from this call on, also when it fails.
     fn adopt(&self, spec: AdoptSpec, sink: Box<dyn OutputSink>) -> io::Result<AgentId>;
 
     /// Writes `bytes` to the agent's terminal input, blocking while its input
