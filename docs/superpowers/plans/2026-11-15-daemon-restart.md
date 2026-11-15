@@ -289,3 +289,54 @@
 - [ ] **Step 4: Run** `sh scripts/install-test.sh`. It should PASS on macOS. On Linux, run it in Docker `rust:1.99.1` too.
 - [ ] **Step 5: Update `README.md`.** The Install section opens with `scripts/install.sh`, then lists the flags and the update loop `git pull && scripts/install.sh`.
 - [ ] **Step 6: Commit** `feat: scripts/install.sh builds, installs and restarts fleetd onto the new build`
+
+### Task 11: `fleetd` offers to upgrade a running daemon
+
+*(Added 2026-11-15 at the user's request; the design was approved in conversation.)*
+
+**Files:**
+- Modify: `crates/fleetd/src/main.rs` (the `AlreadyRunning` branch, plus new flags)
+- Create: `crates/fleetd/src/upgrade.rs`
+- Modify: `README.md` (the "Running the daemon" section)
+- Test: `crates/fleetd/tests/upgrade.rs`
+
+**Interfaces:**
+- Consumes:
+  - `fleet_client::Connection::unix` and `hello()` (Task 1);
+  - `RestartDaemon` and `RestartingDaemon` (Task 6);
+  - `fleet_client::restart_outcome` and its `Display` (Task 8, R12);
+  - `Identity::current()` (Task 5);
+  - the instance lock and the `<state-dir>/fleetd.lock` holder.
+- Produces: `fleetd [--upgrade] [--force-stop] [--state-dir <dir>]`. The flags apply only when another fleetd holds the lock. They are ignored with `--stdio`, which never prompts.
+  1. **Same build:** connect to the socket. If `hello().binary` equals this binary's identity (path, dev, ino, size, mtime_ns), behave as today: print `fleetd already running` and exit 2.
+  2. **Different build that supports restart:** stdin and stderr are both terminals and there is no flag, so print the two lines below to stderr and read `y`/`yes`, case-insensitive. Anything else means no.
+     ```
+     fleetd is already running a different build (<path of running binary>, N agents).
+     Restart it onto this binary? Agents keep running. [y/N]
+     ```
+     - **`--upgrade`:** no prompt.
+     - **Yes:** send `RestartDaemon{binary: <this binary's absolute path>}`, then reconnect and decide exactly as `fleet daemon restart` does. Print the outcome line and exit with its code: 0 for success, 1 otherwise.
+     - **No:** print `left the running fleetd as it is` and exit 2.
+  3. **Too old to restart itself** (it answers "empty request"):
+     - print `the running fleetd is too old to restart itself; stopping it ends its N agents`;
+     - in a terminal without a flag, ask `Stop it? [y/N]`; `--force-stop` means no prompt.
+     - **Yes:** send SIGTERM to the pid holding the lock, found via `lsof -t` or the platform equivalent, then wait up to 5 s for the socket to disappear.
+       - **It stopped:** print `stopped the old fleetd`, then continue the normal start: take the lock and serve.
+       - **It is still running:** print `the old fleetd (pid P) did not stop; stop it with kill -9 P and run fleetd again` and exit 1. Never send SIGKILL itself.
+     - **No:** exit 2.
+  4. **Different build, no terminal and no flag:** print `fleetd already running (a different build; run fleetd --upgrade to restart it onto this one)` and exit 2.
+  5. **Connection fails:** if the socket can't be connected although the lock is held, fall back to today's message and exit 2.
+- N, the agent count, is the number of `running` agents in the daemon's `ListAgents` reply.
+
+- [ ] **Step 1: Write failing tests** in `tests/upgrade.rs`. Each runs a real fleetd from `CARGO_BIN_EXE_fleetd` on a temp state dir. No test uses a terminal, so prompts are tested through a test hook (R9 style: `cfg(debug_assertions)` plus an env var that supplies the answer), or by factoring `decide()` as a pure function with a unit-test table.
+  - `same_build_prints_already_running`: exit 2, today's text.
+  - `upgrade_flag_restarts_onto_this_binary`: start a daemon from a copy of the binary at another path (a different identity), spawn `sh`, then run `fleetd --upgrade`. Expect `fleetd restarted: 1 agents kept` and exit 0. The agent is still running, and the daemon's binary path is now the new one.
+  - `different_build_without_tty_or_flag_explains`: exit 2 and the text from step 4.
+  - `too_old_daemon_without_force_stop_is_left_running`: a fake old daemon that answers "empty request" (copy the pattern from `fleet-cli/tests/daemon_restart.rs`) is left running, with exit 2.
+  - `force_stop_that_does_not_stop_says_so`: a fake old daemon that ignores SIGTERM produces the `did not stop` text and exit 1 within about 6 s, and no SIGKILL is sent (the fake is still alive).
+  - `decide()` table: same build; different build with or without a flag, with yes or no; too old with or without `--force-stop`.
+- [ ] **Step 2: Run** `cargo test -p fleetd --test upgrade`. Expect FAIL.
+- [ ] **Step 3: Implement it in `upgrade.rs`**, called from `main`'s `AlreadyRunning` branch only, so the normal start path is unchanged (`fleetd_cold_start_ns` and `fleetd_startup_instructions` must not move).
+- [ ] **Step 4: Run** `cargo test -p fleetd`. Expect PASS. Then run the wall suite and compare it.
+- [ ] **Step 5:** In the README "Running the daemon" section, add one paragraph on `--upgrade` and `--force-stop`.
+- [ ] **Step 6: Commit** with the message `feat(fleetd): offer to restart a running daemon of another build onto this one`.
