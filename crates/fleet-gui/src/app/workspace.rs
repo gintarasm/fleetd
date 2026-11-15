@@ -976,7 +976,9 @@ fn now_ms() -> i64 {
 mod tests {
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use fleet_proto::{AgentInfo, AgentState, AttachOk};
     use fleet_term::Palette;
@@ -985,7 +987,7 @@ mod tests {
         TestAppContext, TouchPhase, VisualTestContext, point,
     };
 
-    use super::Workspace;
+    use super::{Workspace, now_ms};
     use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
     use crate::app::keymap::{Kill, bind_keys};
     use crate::app::pane_view::InputSink;
@@ -1675,6 +1677,67 @@ mod tests {
         let shown = s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
         assert_eq!(shown.as_deref(), Some("spawn failed: no such directory"));
         assert!(s.cx.debug_bounds("error-toast").is_some());
+    }
+
+    /// Issue #41: a row shows the agent's last line under its name, and
+    /// its run time, or how it ended, on the right.
+    #[gpui::test]
+    fn rows_show_last_line_and_run_time_or_exit(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let mut running = row(1, "/w", now_ms() - 125_000);
+        running.last_line = "compiling\tfleetd\n".into();
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                running,
+                ended(2, "/w", 2, AgentState::Exited),
+                ended(3, "/w", 3, AgentState::Lost),
+            ],
+        );
+        assert!(s.cx.debug_bounds("meta-1-2m").is_some());
+        assert!(s.cx.debug_bounds("preview-1-compiling fleetd").is_some());
+        assert!(s.cx.debug_bounds("meta-2-exit 3").is_some());
+        assert!(s.cx.debug_bounds("meta-3-lost").is_some());
+    }
+
+    /// Issue #41: output alone redraws a row at most once a second (on the
+    /// sidebar's tick); a change of state redraws at once.
+    #[gpui::test]
+    fn output_alone_waits_for_the_tick(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1)]);
+        let notified = Arc::new(AtomicUsize::new(0));
+        let n = notified.clone();
+        let _sub = s.cx.update(|_, cx| {
+            cx.observe(&s.app, move |_, _| {
+                n.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        let mut printed = row(1, "/w", 1);
+        printed.last_line = "new output".into();
+        // Quiet output: the status stays idle (a new status redraws at once).
+        printed.last_output_unix_ms = Some(now_ms() - 60_000);
+        agents(&mut s, &fake, vec![printed.clone()]);
+        assert_eq!(notified.load(Ordering::SeqCst), 0);
+        // The data is current (statuses read it); only the redraw waits.
+        let line = s.app.read_with(s.cx, |a, _| a.agents[0].last_line.clone());
+        assert_eq!(line, "new output");
+        s.cx.executor().advance_clock(Duration::from_secs(1));
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("preview-1-new output").is_some());
+
+        let mut exited = printed;
+        exited.info.set_state(AgentState::Exited);
+        exited.info.exit_code = Some(0);
+        agents(&mut s, &fake, vec![exited]);
+        assert!(notified.load(Ordering::SeqCst) > 0);
+        assert!(s.cx.debug_bounds("meta-1-exit 0").is_some());
     }
 
     /// Issue #32: a bell where you are not looking flashes the pane, marks

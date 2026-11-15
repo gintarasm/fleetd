@@ -18,6 +18,7 @@ use super::workspace::Workspace;
 use crate::core::config::GuiConfig;
 use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::{PaneModel, PaneState};
+use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::sidebar::{ended, tilde};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
@@ -542,7 +543,12 @@ impl AppState {
         for event in batch {
             match event {
                 UiEvent::AgentsChanged => {
-                    self.agents = self.session.agents();
+                    let rows = self.session.agents();
+                    // Output alone is drawn on the next one-second tick
+                    // (issue #41): a printing agent's row redraws at most
+                    // once a second.
+                    let quiet = only_activity_changed(&self.agents, &rows);
+                    self.agents = rows;
                     let agents = &self.agents;
                     self.bells
                         .retain(|id| agents.iter().any(|r| r.info.id == *id));
@@ -553,8 +559,10 @@ impl AppState {
                             layout |= self.follow_list(cx);
                         }
                     }
-                    chrome = true;
-                    cx.notify();
+                    if !quiet {
+                        chrome = true;
+                        cx.notify();
+                    }
                 }
                 UiEvent::PaneChanged(pane) => {
                     let Some(view) = self.panes.get(&pane).cloned() else {
