@@ -111,6 +111,8 @@ pub struct Tokens {
     pub marked: Rgba,
     pub danger: Rgba,
     pub success: Rgba,
+    /// An agent that needs you (the system orange, accessible variant).
+    pub warning: Rgba,
     pub shadow: Rgba,
 }
 
@@ -208,6 +210,7 @@ impl Tokens {
             marked: rgb(0x3a3d44),
             danger: rgb(0xff6961),
             success: rgb(0x32d74b),
+            warning: rgb(0xffb340),
             shadow: rgba(0x000000, 0.45),
         }
     }
@@ -233,6 +236,7 @@ impl Tokens {
             marked: rgb(0xdde4ee),
             danger: rgb(0xd70015),
             success: rgb(0x248a3d),
+            warning: rgb(0xc93400),
             shadow: rgba(0x000000, 0.18),
         }
     }

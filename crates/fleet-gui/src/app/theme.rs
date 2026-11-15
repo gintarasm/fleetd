@@ -32,6 +32,7 @@ pub struct Theme {
     pub marked: Hsla,
     pub danger: Hsla,
     pub success: Hsla,
+    pub warning: Hsla,
     pub shadow: Hsla,
 }
 
@@ -59,6 +60,7 @@ impl Theme {
             marked: hsla(t.marked),
             danger: hsla(t.danger),
             success: hsla(t.success),
+            warning: hsla(t.warning),
             shadow: hsla(t.shadow),
         }
     }

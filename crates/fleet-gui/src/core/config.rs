@@ -61,6 +61,9 @@ pub struct GuiConfig {
     pub font_family: String,
     pub font_size: f32,
     pub option_as_meta: bool,
+    /// macOS notifications when an agent needs you or ends while the
+    /// window is not focused (ADR 0042). Off unless asked for.
+    pub notifications: bool,
 }
 
 impl Default for GuiConfig {
@@ -71,6 +74,7 @@ impl Default for GuiConfig {
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
             option_as_meta: true,
+            notifications: false,
         }
     }
 }
@@ -112,6 +116,15 @@ pub fn load_config(state_dir: &Path) -> Result<GuiConfig, ConfigError> {
 
 /// Sets `[gui] connection`, leaving comments and every other key as they were.
 pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
+    save_gui_key(state_dir, "connection", toml_edit::value(target.to_string()))
+}
+
+/// Sets `[gui] notifications`, leaving comments and every other key as they were.
+pub fn save_notifications(state_dir: &Path, on: bool) -> io::Result<()> {
+    save_gui_key(state_dir, "notifications", toml_edit::value(on))
+}
+
+fn save_gui_key(state_dir: &Path, key: &str, value: toml_edit::Item) -> io::Result<()> {
     let path = config_path(state_dir);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -128,7 +141,7 @@ pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
         doc["gui"] = toml_edit::table();
     }
     let gui = doc["gui"].as_table_like_mut().expect("gui is a table");
-    gui.insert("connection", toml_edit::value(target.to_string()));
+    gui.insert(key, value);
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o777);
     write_atomic(&path, doc.to_string().as_bytes(), mode)
@@ -173,6 +186,7 @@ mod tests {
         assert_eq!(c.font_family, "SF Mono");
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
+        assert!(!c.notifications);
         assert_eq!(c.connection, None);
     }
 
@@ -242,5 +256,19 @@ mod tests {
         let c = load_config(dir.path()).unwrap();
         assert_eq!(c.font_size, 15.0);
         assert_eq!(c.connection, Some(Target::Local));
+    }
+
+    #[test]
+    fn save_notifications_round_trips_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\nfont_size = 15 # big\n");
+        save_notifications(dir.path(), true).unwrap();
+        let c = load_config(dir.path()).unwrap();
+        assert!(c.notifications);
+        assert_eq!(c.font_size, 15.0);
+        save_notifications(dir.path(), false).unwrap();
+        assert!(!load_config(dir.path()).unwrap().notifications);
+        let out = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(out.contains("font_size = 15 # big"), "{out}");
     }
 }
