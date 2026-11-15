@@ -697,12 +697,13 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
         let theme = self.app.read(cx).theme;
-        let (rows, home, error, titles, marks, update_available) = {
+        let (rows, home, error, notice, titles, marks, update_available) = {
             let app = self.app.read(cx);
             (
                 app.agents.clone(),
                 app.home.clone(),
                 app.error.clone(),
+                app.notice.clone(),
                 app.titles.clone(),
                 app.tab_marks(),
                 app.update_available,
@@ -721,7 +722,9 @@ impl Render for Workspace {
         let sidebar = render_sidebar(&data, &theme, cx);
         super::bench::sidebar_drawn(window);
         let panes = self.render_panes(cx);
-        let toast = error.map(|e| {
+        // An error wins over a neutral notice; the notice has no red border.
+        let is_error = error.is_some();
+        let toast = error.or(notice).map(|e| {
             div()
                 .id("error")
                 .debug_selector(|| "error-toast".to_owned())
@@ -733,7 +736,11 @@ impl Render for Workspace {
                 .py(px(6.))
                 .rounded(px(6.))
                 .border_1()
-                .border_color(theme.resolve(fleet_term::Color::Named(1), true))
+                .border_color(if is_error {
+                    theme.resolve(fleet_term::Color::Named(1), true)
+                } else {
+                    theme.dim_text
+                })
                 .bg(theme.header_bg)
                 .text_color(theme.fg())
                 .text_size(px(12.))
@@ -1505,10 +1512,11 @@ mod tests {
         ))
         .unwrap();
         s.cx.run_until_parked();
-        assert_eq!(
-            shown(&s).as_deref(),
-            Some("fleetd restarted: 2 agents kept")
-        );
+        // Success is a neutral notice, not an error.
+        assert_eq!(shown(&s), None);
+        let notice = s.app.read_with(s.cx, |a, _| a.notice().map(str::to_owned));
+        assert_eq!(notice.as_deref(), Some("fleetd restarted: 2 agents kept"));
+        assert!(s.cx.debug_bounds("error-toast").is_some());
         assert!(!s.app.read_with(s.cx, |a, _| a.update_available));
         s.ui.try_send(UiEvent::DaemonRestarted(
             fleet_client::RestartOutcome::Partial {

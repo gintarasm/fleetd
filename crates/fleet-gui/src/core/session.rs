@@ -393,6 +393,9 @@ struct Inner {
     control_stop: Arc<Stop>,
     control_conn: Arc<Mutex<Option<ConnHandle>>>,
     daemon: Arc<Mutex<DaemonState>>,
+    /// How long a restart waits for the new daemon ([`RESTART_WAIT`]; a
+    /// test hook shortens it).
+    restart_wait: Mutex<Duration>,
     panes: Mutex<HashMap<PaneId, PaneLink>>,
     palette: Mutex<Palette>,
     shut_down: AtomicBool,
@@ -443,6 +446,7 @@ impl Session {
             control_stop: Arc::default(),
             control_conn: Arc::default(),
             daemon: Arc::default(),
+            restart_wait: Mutex::new(RESTART_WAIT),
             panes: Mutex::default(),
             palette: Mutex::new(DEFAULT_PALETTE),
             shut_down: AtomicBool::new(false),
@@ -613,6 +617,7 @@ impl Session {
             });
             token
         };
+        let wait = *lock(&self.inner.restart_wait);
         let (ctx, daemon, stop) = (
             Arc::clone(&self.inner.ctx),
             Arc::clone(&self.inner.daemon),
@@ -621,7 +626,7 @@ impl Session {
         let _ = thread::Builder::new()
             .name("gui-restart-timer".into())
             .spawn(move || {
-                if stop.wait(RESTART_WAIT) {
+                if stop.wait(wait) {
                     return;
                 }
                 let mut d = lock(&daemon);
@@ -748,6 +753,13 @@ impl Session {
         for link in &links {
             link.force_close();
         }
+    }
+
+    /// Test hook: how long a restart waits for the new daemon.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_restart_wait_for_test(&self, d: Duration) {
+        *lock(&self.inner.restart_wait) = d;
     }
 
     /// Test hook: the pane's reader stops reading for `d` (to force a
@@ -1076,6 +1088,97 @@ fn control_writer(
 
 #[cfg(test)]
 mod tests {
+    fn hello_of(instance: u64, restore: Option<fleet_proto::RestoreSummary>) -> HelloOk {
+        HelloOk {
+            instance,
+            restore: restore.map(Box::new),
+            ..Default::default()
+        }
+    }
+
+    fn pending(old_instance: u64, agents: Option<u32>) -> DaemonState {
+        DaemonState {
+            restart: Some(PendingRestart {
+                token: 1,
+                old_instance,
+                agents,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn handshake_attribution_table() {
+        use fleet_proto::RestoreSummary;
+        let kept = |previous: u64, ids: &[u64]| RestoreSummary {
+            previous_instance: previous,
+            kept: ids.to_vec(),
+            ..Default::default()
+        };
+        let thawed = RestoreSummary {
+            restart_error: "exec failed".into(),
+            ..Default::default()
+        };
+        // (state, handshake, event, restart still pending afterwards)
+        type Case = (DaemonState, HelloOk, Option<UiEvent>, bool);
+        let cases: Vec<Case> = vec![
+            // A handshake before RestartingDaemon (agents unknown) decides
+            // nothing, whatever it says.
+            (
+                pending(5, None),
+                hello_of(6, Some(kept(5, &[1, 2]))),
+                None,
+                true,
+            ),
+            (
+                pending(5, None),
+                hello_of(5, Some(thawed.clone())),
+                None,
+                true,
+            ),
+            // No restart in flight: nothing to report.
+            (
+                DaemonState::default(),
+                hello_of(6, Some(kept(5, &[1]))),
+                None,
+                false,
+            ),
+            // Decided.
+            (
+                pending(5, Some(2)),
+                hello_of(6, Some(kept(5, &[1, 2]))),
+                Some(UiEvent::DaemonRestarted(RestartOutcome::Restarted {
+                    kept: 2,
+                })),
+                false,
+            ),
+            (
+                pending(5, Some(2)),
+                hello_of(6, None),
+                Some(UiEvent::DaemonRestarted(RestartOutcome::Partial {
+                    kept: 0,
+                    ended: 2,
+                    ids: None,
+                })),
+                false,
+            ),
+            (
+                pending(5, Some(2)),
+                hello_of(5, Some(thawed)),
+                Some(UiEvent::DaemonRestartFailed("exec failed".into())),
+                false,
+            ),
+            // The old daemon, not yet thawed: keep waiting.
+            (pending(5, Some(2)), hello_of(5, None), None, true),
+        ];
+        for (mut state, hello, want, still_pending) in cases {
+            assert_eq!(state.on_handshake(&hello), want, "{hello:?}");
+            assert_eq!(state.restart.is_some(), still_pending, "{hello:?}");
+            // Every handshake is remembered.
+            assert_eq!(state.instance, Some(hello.instance));
+        }
+    }
+
     use super::*;
     use fleet_proto::{AgentList, AgentRemoved, Event};
 

@@ -278,6 +278,9 @@ pub struct AppState {
     pub(super) agents: Vec<AgentRow>,
     /// The last error, shown until dismissed or replaced.
     pub(super) error: Option<String>,
+    /// A neutral message (a successful restart), shown when there is no
+    /// error; dismissed the same way.
+    pub(super) notice: Option<String>,
     /// `error` is a failure to connect, cleared once connected.
     error_is_connection: bool,
     /// A config error from launch, still shown after the first connect.
@@ -346,6 +349,7 @@ impl AppState {
             error: None,
             error_is_connection: false,
             config_error: None,
+            notice: None,
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
             requested: HashMap::new(),
@@ -500,6 +504,10 @@ impl AppState {
         self.error.as_deref()
     }
 
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
     fn target_key(&self) -> String {
         self.target.to_string()
     }
@@ -577,11 +585,19 @@ impl AppState {
                 UiEvent::DaemonRestarted(outcome) => {
                     // The new daemon may be older or newer than the disk again.
                     self.refresh_update_available(cx);
-                    self.show_notice(outcome.to_string(), cx);
+                    // Success is good news: a neutral toast. Ended agents
+                    // make it a problem: the error toast.
+                    if outcome.is_success() {
+                        eprintln!("fleet-gui: {outcome}");
+                        self.notice = Some(outcome.to_string());
+                        cx.notify();
+                    } else {
+                        self.show_error(outcome.to_string(), cx);
+                    }
                     chrome = true;
                 }
                 UiEvent::DaemonRestartFailed(reason) => {
-                    self.show_notice(restart_failure_text(&reason), cx);
+                    self.show_error(restart_failure_text(&reason), cx);
                     chrome = true;
                 }
                 UiEvent::Error(e) => {
@@ -1023,8 +1039,8 @@ impl AppState {
         }
     }
 
-    /// Shows `text` in the toast (the error slot, until dismissed).
-    fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+    /// Shows `text` in the error toast, until dismissed.
+    fn show_error(&mut self, text: String, cx: &mut Context<Self>) {
         eprintln!("fleet-gui: {text}");
         self.error = Some(text);
         self.error_is_connection = false;
@@ -1101,6 +1117,7 @@ impl AppState {
 
     pub(super) fn dismiss_error(&mut self, cx: &mut Context<Self>) {
         self.error = None;
+        self.notice = None;
         self.error_is_connection = false;
         cx.notify();
     }

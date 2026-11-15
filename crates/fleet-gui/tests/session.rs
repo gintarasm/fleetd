@@ -651,3 +651,42 @@ fn restart_of_an_old_daemon_reports_it_is_too_old() {
     assert!(events.has(|e| *e == UiEvent::DaemonRestartFailed(fleet_client::TOO_OLD.into())));
     s.shutdown();
 }
+
+#[test]
+fn restart_that_never_settles_times_out_once_and_a_second_ask_is_ignored() {
+    // The daemon acknowledges the restart but the "new" one is still the
+    // old instance with no `restart_error`: never decided.
+    let fake = FakeFleetd::start(
+        vec![hello(5, None)],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_restart_wait_for_test(Duration::from_millis(600));
+    connected(&events);
+    s.restart_daemon();
+    // Asked again while pending: ignored (no second timer, no second event).
+    s.restart_daemon();
+    wait_until("the timeout", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    std::thread::sleep(Duration::from_millis(900));
+    let failures: Vec<_> = events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        failures,
+        vec![UiEvent::DaemonRestartFailed(
+            "fleetd did not come back within 10 s".into()
+        )]
+    );
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestarted(_))));
+    s.shutdown();
+}
