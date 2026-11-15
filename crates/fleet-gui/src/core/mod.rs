@@ -6,6 +6,7 @@ pub mod icons;
 pub mod keys;
 pub mod launch;
 pub mod layout;
+pub mod menus;
 pub mod mouse;
 pub mod pane;
 mod pane_link;

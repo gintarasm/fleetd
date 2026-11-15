@@ -3,6 +3,7 @@
 mod app_state;
 mod bench;
 mod connect;
+mod context_menu;
 mod controls;
 mod icons;
 mod keymap;
@@ -104,6 +105,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
             }
         }
         resident::install(cx);
+        context_menu::install(cx);
 
         // Detach only, well inside gpui's 100 ms quit budget; agents run on.
         cx.on_app_quit(move |cx| {

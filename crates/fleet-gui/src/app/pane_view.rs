@@ -225,6 +225,11 @@ pub enum PaneEvent {
     Close,
     /// The exit banner's Restart: the ended agent again, in this pane.
     Restart,
+    /// A right-click asks for the pane's context menu: on the header, or
+    /// on the grid (`on_grid`) while the agent does not take the mouse.
+    ContextMenu {
+        on_grid: bool,
+    },
 }
 
 impl EventEmitter<PaneEvent> for PaneView {}
@@ -314,6 +319,16 @@ impl PaneView {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    /// Some text is selected (the context menu's Copy).
+    pub fn has_selection(&self) -> bool {
+        self.model().has_selection()
+    }
+
+    /// The pane's agent exited or is gone (the context menu's Restart).
+    pub fn restartable(&self) -> bool {
+        restartable(&self.chrome, self.model().state())
     }
 
     fn model(&self) -> MutexGuard<'_, PaneModel> {
@@ -412,6 +427,11 @@ impl PaneView {
             if let Some(bytes) = bytes {
                 self.send(bytes, cx);
             }
+            return;
+        }
+        if button == MouseButton::Right {
+            drop(model);
+            cx.emit(PaneEvent::ContextMenu { on_grid: true });
             return;
         }
         if button != MouseButton::Left {
@@ -640,6 +660,10 @@ impl Render for PaneView {
         };
         let header = div()
             .id("pane-header")
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ContextMenu { on_grid: false })),
+            )
             .flex()
             .flex_row()
             .flex_none()

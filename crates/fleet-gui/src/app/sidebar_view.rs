@@ -246,9 +246,7 @@ fn render_tab(
         .on_click(cx.listener(move |this, _, window, cx| this.show_agent(id, window, cx)))
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                this.open_row_menu(id, ev.position, cx);
-            }),
+            cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
 }
 

@@ -6,19 +6,20 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Pixels, Point, PromptButton, PromptLevel, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored, deferred, div, point, px,
-    relative, size,
+    Action, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
+    IntoElement, ParentElement, PromptButton, PromptLevel, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px, relative,
+    size,
 };
 
 use super::app_state::AppState;
 use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
+use super::context_menu::{self, MenuLine};
 use super::keymap::{
-    ClosePane, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
-    FocusUp, Kill, NewAgent, Remove, Restart, RestartPane, SplitDown, SplitRight, ToggleMaximize,
-    WORKSPACE_CONTEXT,
+    ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
+    FocusRight, FocusUp, Kill, NewAgent, Paste, Remove, Restart, RestartPane, SplitDown,
+    SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
@@ -28,6 +29,9 @@ use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar};
 use crate::core::config::save_connection;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
+use crate::core::menus::{
+    MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
+};
 use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
 use crate::core::style::{chrome, radius, space, text};
@@ -83,30 +87,15 @@ pub fn open_main_window(cx: &mut App) {
     }
 }
 
-/// A right-click menu on a sidebar row.
-struct RowMenu {
-    agent_id: u64,
-    at: Point<Pixels>,
-}
-
-/// An item of the row menu.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MenuItem {
-    OpenSplit,
-    Kill,
-    Restart,
-    Remove,
-}
-
 /// The window's root view, over [`AppState`].
 pub struct Workspace {
     app: Entity<AppState>,
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
     /// The connect sheet, over everything else.
     connect: Option<(Entity<ConnectSheet>, [Subscription; 2])>,
-    menu: Option<RowMenu>,
     /// The [`AppState::session_epoch`] last seen; a change closes the
-    /// new-agent sheet and the row menu.
+    /// new-agent sheet, and a pick from a context menu opened before is
+    /// dropped.
     epoch: u64,
     /// Each pane's view, its focus handle, and its focus-in and
     /// header-button subscriptions.
@@ -122,14 +111,12 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // A switch (from any path) restores another layout: the new-agent
-        // sheet and the row menu would target panes that are gone.
+        // sheet and an open context menu would target panes that are gone.
         let observe = cx.observe_in(&app, window, |this, app, window, cx| {
             let epoch = app.read(cx).session_epoch();
             if epoch != this.epoch {
                 this.epoch = epoch;
-                let sheet = this.sheet.take();
-                let menu = this.menu.take();
-                if sheet.is_some() || menu.is_some() {
+                if this.sheet.take().is_some() {
                     this.focus_current(window, cx);
                 }
             }
@@ -168,7 +155,6 @@ impl Workspace {
             _ticker: ticker,
             sheet: None,
             connect: None,
-            menu: None,
             epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
@@ -203,9 +189,9 @@ impl Workspace {
             .is_some_and(|(sheet, _)| !sheet.read(cx).quiet)
     }
 
-    /// A sheet or a menu is open over the panes.
+    /// A sheet is open over the panes.
     fn modal(&self) -> bool {
-        self.sheet.is_some() || self.menu.is_some() || self.connect.is_some()
+        self.sheet.is_some() || self.connect.is_some()
     }
 
     /// Opens the connect sheet (or brings it up), showing `reason`.
@@ -215,7 +201,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.menu = None;
         self.sheet = None;
         if let Some((sheet, _)) = &self.connect {
             let sheet = sheet.clone();
@@ -380,21 +365,111 @@ impl Workspace {
         pane
     }
 
-    pub fn open_row_menu(&mut self, agent_id: u64, at: Point<Pixels>, cx: &mut Context<Self>) {
-        self.menu = Some(RowMenu { agent_id, at });
-        cx.notify();
+    /// The sidebar row's native context menu (at the right-click being
+    /// handled).
+    pub fn open_row_menu(&mut self, agent_id: u64, cx: &mut Context<Self>) {
+        let items = self.menu_items(agent_id, cx);
+        let lines = context_menu::lines(&items, |item| MenuLine {
+            title: item.title().to_owned(),
+            enabled: true,
+            shortcut: None,
+        });
+        let epoch = self.epoch;
+        context_menu::show(lines, cx, move |index, cx| {
+            if let Some(MenuEntry::Item(item)) = items.get(index).copied() {
+                with_workspace(cx, |ws, window, cx| {
+                    ws.row_menu_pick(agent_id, item, epoch, window, cx);
+                });
+            }
+        });
     }
 
-    fn close_menu(&mut self, cx: &mut Context<Self>) {
-        self.menu = None;
-        cx.notify();
+    /// An item picked from a row's menu opened in session `epoch`.
+    pub(crate) fn row_menu_pick(
+        &mut self,
+        agent_id: u64,
+        item: RowMenuItem,
+        epoch: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if epoch != self.epoch || self.modal() {
+            return;
+        }
+        match item {
+            RowMenuItem::OpenSplit => self.open_menu_split(agent_id, window, cx),
+            RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
+            RowMenuItem::Restart => self.restart(&Restart { agent_id }, window, cx),
+            RowMenuItem::Remove => self.remove(&Remove { agent_id }, window, cx),
+        }
+    }
+
+    /// A pane's native context menu: on its header, or on its grid
+    /// (`on_grid`, adding Copy and Paste).
+    fn open_pane_menu(&mut self, pane: PaneId, on_grid: bool, cx: &mut Context<Self>) {
+        let state = {
+            let app = self.app.read(cx);
+            let view = app.pane_view(pane).map(|v| v.read(cx));
+            PaneMenuState {
+                on_grid,
+                has_selection: view.is_some_and(|v| v.has_selection()),
+                can_split: app.layout.panes().len() < MAX_PANES,
+                maximized: app.maximized == Some(pane),
+                restartable: view.is_some_and(|v| v.restartable()),
+            }
+        };
+        let items = pane_menu(state);
+        let lines = context_menu::lines(&items, |(item, enabled)| MenuLine {
+            title: item.title().to_owned(),
+            enabled,
+            shortcut: item.shortcut(),
+        });
+        let epoch = self.epoch;
+        context_menu::show(lines, cx, move |index, cx| {
+            if let Some(MenuEntry::Item((item, true))) = items.get(index).copied() {
+                with_workspace(cx, |ws, window, cx| {
+                    ws.pane_menu_pick(pane, item, epoch, window, cx);
+                });
+            }
+        });
+    }
+
+    /// An item picked from `pane`'s menu opened in session `epoch`.
+    pub(crate) fn pane_menu_pick(
+        &mut self,
+        pane: PaneId,
+        item: PaneMenuItem,
+        epoch: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if epoch != self.epoch || self.modal() {
+            return;
+        }
+        let event = match item {
+            PaneMenuItem::Copy | PaneMenuItem::Paste => {
+                self.focus_pane(pane, window, cx);
+                let action: Box<dyn Action> = if item == PaneMenuItem::Copy {
+                    Box::new(Copy)
+                } else {
+                    Box::new(Paste)
+                };
+                window.dispatch_action(action, cx);
+                return;
+            }
+            PaneMenuItem::SplitRight => PaneEvent::SplitRight,
+            PaneMenuItem::SplitDown => PaneEvent::SplitDown,
+            PaneMenuItem::Maximize | PaneMenuItem::Restore => PaneEvent::ToggleMaximize,
+            PaneMenuItem::Restart => PaneEvent::Restart,
+            PaneMenuItem::Close => PaneEvent::Close,
+        };
+        self.pane_event(pane, event, window, cx);
     }
 
     pub fn open_new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.connect.is_some() {
             return;
         }
-        self.menu = None;
         if let Some((sheet, _)) = &self.sheet {
             sheet.read(cx).focus(window, cx);
             return;
@@ -438,7 +513,6 @@ impl Workspace {
 
     /// Asks before killing: only Kill kills.
     fn kill(&mut self, action: &Kill, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
         let agent_id = action.agent_id;
         let label = self.app.read(cx).label(agent_id);
         let answer = window.prompt(
@@ -460,14 +534,12 @@ impl Workspace {
 
     /// Restarts an ended agent from the row menu: no confirmation.
     fn restart(&mut self, action: &Restart, _: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
         self.app.read(cx).restart(action.agent_id);
         cx.notify();
     }
 
     /// Forgets an ended agent from the row menu: no confirmation.
     fn remove(&mut self, action: &Remove, _: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
         self.app.read(cx).forget(action.agent_id);
         cx.notify();
     }
@@ -488,7 +560,6 @@ impl Workspace {
     }
 
     fn open_menu_split(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        self.menu = None;
         if self
             .app
             .update(cx, |a, cx| a.open_in_new_split(agent_id, cx))
@@ -557,6 +628,7 @@ impl Workspace {
             PaneEvent::ToggleMaximize => self.toggle_maximize(&ToggleMaximize, window, cx),
             PaneEvent::Close => self.close_pane(&ClosePane, window, cx),
             PaneEvent::Restart => self.restart_pane(&RestartPane, window, cx),
+            PaneEvent::ContextMenu { on_grid } => self.open_pane_menu(pane, on_grid, cx),
         }
     }
 
@@ -610,100 +682,13 @@ impl Workspace {
         )
     }
 
-    /// The row menu's items for `agent_id`: Open in new split (while a
-    /// pane can be added), then Kill for a running agent, or Restart and
-    /// Remove for one that exited or is lost.
-    fn menu_items(&self, agent_id: u64, cx: &App) -> Vec<MenuItem> {
+    /// The row menu for `agent_id`: Open in New Split (while a pane can
+    /// be added), then Kill for a running agent, or Restart and Remove for
+    /// one that exited or is lost.
+    fn menu_items(&self, agent_id: u64, cx: &App) -> Vec<MenuEntry<RowMenuItem>> {
         let app = self.app.read(cx);
-        let mut items = Vec::new();
-        if app.layout.panes().len() < MAX_PANES {
-            items.push(MenuItem::OpenSplit);
-        }
         let is_ended = app.agents.iter().any(|r| r.info.id == agent_id && ended(r));
-        if is_ended {
-            items.extend([MenuItem::Restart, MenuItem::Remove]);
-        } else {
-            items.push(MenuItem::Kill);
-        }
-        items
-    }
-
-    fn render_menu(
-        &self,
-        menu: &RowMenu,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let agent_id = menu.agent_id;
-        let item = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .debug_selector(move || format!("menu-{id}"))
-                .px(px(space::SM))
-                .py(px(space::XS))
-                .rounded(px(radius::SM))
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.accent).text_color(gpui::white()))
-                .child(label)
-        };
-        let mut items = div()
-            .id("row-menu")
-            .occlude()
-            .flex()
-            .flex_col()
-            .p(px(space::XS))
-            .min_w(px(160.))
-            .rounded(px(radius::MD))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.raised)
-            .shadow_lg()
-            .text_color(theme.text)
-            .type_style(text::BODY);
-        for entry in self.menu_items(agent_id, cx) {
-            let el =
-                match entry {
-                    MenuItem::OpenSplit => item("open-split", "Open in new split").on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.open_menu_split(agent_id, window, cx);
-                        }),
-                    ),
-                    MenuItem::Kill => {
-                        item("kill", "Kill").on_click(cx.listener(move |this, _, window, cx| {
-                            this.kill(&Kill { agent_id }, window, cx)
-                        }))
-                    }
-                    MenuItem::Restart => item("restart", "Restart").on_click(cx.listener(
-                        move |this, _, window, cx| this.restart(&Restart { agent_id }, window, cx),
-                    )),
-                    MenuItem::Remove => item("remove", "Remove").on_click(cx.listener(
-                        move |this, _, window, cx| this.remove(&Remove { agent_id }, window, cx),
-                    )),
-                };
-            items = items.child(el);
-        }
-        // A click anywhere else closes the menu.
-        let backdrop = div()
-            .id("menu-backdrop")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_menu(cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| this.close_menu(cx)),
-            );
-        deferred(
-            div()
-                .absolute()
-                .inset_0()
-                .child(backdrop)
-                .child(anchored().position(menu.at).child(items)),
-        )
-        .with_priority(1)
+        row_menu(app.layout.panes().len() < MAX_PANES, is_ended)
     }
 }
 
@@ -779,10 +764,6 @@ impl Render for Workspace {
                     this.app.update(cx, |a, cx| a.dismiss_error(cx));
                 }))
         });
-        let menu = self
-            .menu
-            .as_ref()
-            .map(|m| self.render_menu(m, &theme, cx).into_any_element());
         let connect = self
             .connect
             .as_ref()
@@ -859,7 +840,6 @@ impl Render for Workspace {
                     .child(panes),
             )
             .children(toast)
-            .children(menu)
             .children(sheet)
             .children(connect)
     }
@@ -875,6 +855,17 @@ fn window_theme(window: &Window) -> Theme {
     match native::accent_color() {
         Some((r, g, b)) => theme.with_accent(gpui::Rgba { r, g, b, a: 1.0 }.into()),
         None => theme,
+    }
+}
+
+/// Runs `f` on the workspace window, if it is open (a context menu's
+/// pick arrives with only the app).
+fn with_workspace(
+    cx: &mut App,
+    f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>),
+) {
+    if let Some(handle) = AppState::global(cx).and_then(|a| a.read(cx).window) {
+        let _ = handle.update(cx, f);
     }
 }
 
@@ -894,10 +885,10 @@ mod tests {
     use fleet_term::Palette;
     use gpui::{
         AppContext, Entity, Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent,
-        TestAppContext, TouchPhase, VisualTestContext, point, px,
+        TestAppContext, TouchPhase, VisualTestContext, point,
     };
 
-    use super::{MenuItem, Workspace};
+    use super::Workspace;
     use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
     use crate::app::keymap::{Kill, bind_keys};
     use crate::app::pane_view::InputSink;
@@ -905,6 +896,7 @@ mod tests {
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
     use crate::core::layout::Layout;
+    use crate::core::menus::{MenuEntry, PaneMenuItem, RowMenuItem};
     use crate::core::pane::PaneModel;
     use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
     use crate::core::state::GuiState;
@@ -1666,16 +1658,13 @@ mod tests {
     }
 
     #[gpui::test]
-    fn switching_target_closes_the_new_agent_sheet_and_the_row_menu(cx: &mut TestAppContext) {
+    fn switching_target_closes_the_sheet_and_drops_stale_menu_picks(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(Fake::default());
-        let s = setup(cx, &fake, dir.path());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![ended(7, "/w", 1, AgentState::Exited)]);
         s.cx.simulate_keystrokes("cmd-d cmd-n");
-        s.ws.update(s.cx, |ws, cx| {
-            ws.open_row_menu(7, Point::default(), cx);
-        });
-        let open =
-            s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some() && ws.menu.is_some());
+        let (open, epoch) = s.ws.read_with(s.cx, |ws, _| (ws.sheet.is_some(), ws.epoch));
         assert!(open);
         // A direct switch (not through the connect sheet).
         let other = Arc::new(Fake::default());
@@ -1687,12 +1676,16 @@ mod tests {
         s.app
             .update(s.cx, |a, cx| a.replace_session(session, rx, target, cx));
         s.cx.run_until_parked();
-        let closed =
-            s.ws.read_with(s.cx, |ws, _| ws.sheet.is_none() && ws.menu.is_none());
-        assert!(
-            closed,
-            "the sheet and the menu targeted the old layout's panes"
-        );
+        let closed = s.ws.read_with(s.cx, |ws, _| ws.sheet.is_none());
+        assert!(closed, "the sheet targeted the old layout's panes");
+        // A pick from a menu opened before the switch does nothing.
+        s.ws.update_in(s.cx, |ws, window, cx| {
+            ws.row_menu_pick(7, RowMenuItem::Remove, epoch, window, cx);
+            ws.pane_menu_pick(PaneId(1), PaneMenuItem::Close, epoch, window, cx);
+        });
+        s.cx.run_until_parked();
+        assert!(!fake.calls().iter().any(|c| matches!(c, Call::Forget(_))));
+        assert!(!other.calls().contains(&Call::Forget(vec![7])));
     }
 
     #[gpui::test]
@@ -1790,11 +1783,24 @@ mod tests {
         s.cx.debug_bounds(selector).is_some()
     }
 
-    fn open_menu(s: &mut Setup<'_>, agent_id: u64) {
-        s.ws.update(s.cx, |ws, cx| {
-            ws.open_row_menu(agent_id, point(px(20.), px(20.)), cx)
+    /// Picks `item` from `agent_id`'s row menu (the native menu itself
+    /// cannot be shown headless).
+    fn pick_row(s: &mut Setup<'_>, agent_id: u64, item: RowMenuItem) {
+        s.ws.update_in(s.cx, |ws, window, cx| {
+            let epoch = ws.epoch;
+            ws.row_menu_pick(agent_id, item, epoch, window, cx);
         });
         s.cx.run_until_parked();
+    }
+
+    fn row_items(s: &mut Setup<'_>, agent_id: u64) -> Vec<RowMenuItem> {
+        s.ws.read_with(s.cx, |w, cx| w.menu_items(agent_id, cx))
+            .into_iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item(i) => Some(i),
+                MenuEntry::Separator => None,
+            })
+            .collect()
     }
 
     fn shown(s: &mut Setup<'_>, pane: PaneId) -> Option<u64> {
@@ -1815,25 +1821,68 @@ mod tests {
                 ended(6, "/w", 3, AgentState::Lost),
             ],
         );
-        // Drawn bounds outlive a frame in gpui's test window, so absence is
-        // checked as the menu lists its items, presence also as drawn.
-        let items = |s: &mut Setup<'_>, id: u64| s.ws.read_with(s.cx, |w, cx| w.menu_items(id, cx));
-        assert_eq!(items(&mut s, 7), [MenuItem::OpenSplit, MenuItem::Kill]);
-        open_menu(&mut s, 7);
-        assert!(drawn(&mut s, "menu-open-split") && drawn(&mut s, "menu-kill"));
+        assert_eq!(
+            row_items(&mut s, 7),
+            [RowMenuItem::OpenSplit, RowMenuItem::Kill]
+        );
         for id in [8, 6] {
             assert_eq!(
-                items(&mut s, id),
-                [MenuItem::OpenSplit, MenuItem::Restart, MenuItem::Remove]
+                row_items(&mut s, id),
+                [
+                    RowMenuItem::OpenSplit,
+                    RowMenuItem::Restart,
+                    RowMenuItem::Remove
+                ]
             );
         }
-        open_menu(&mut s, 6);
-        assert!(drawn(&mut s, "menu-restart") && drawn(&mut s, "menu-remove"));
-        // Restart asks for nothing: it goes out at once and closes the menu.
-        click(&mut s, "menu-restart");
+        // Restart asks for nothing: it goes out at once.
+        pick_row(&mut s, 6, RowMenuItem::Restart);
         assert!(!s.cx.has_pending_prompt());
         assert_eq!(fake.calls().last(), Some(&Call::Restart(6)));
-        assert!(s.ws.read_with(s.cx, |w, _| w.menu.is_none()));
+        // Kill asks first.
+        pick_row(&mut s, 7, RowMenuItem::Kill);
+        assert!(s.cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    fn row_menu_open_in_new_split_adds_a_pane(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        pick_row(&mut s, 7, RowMenuItem::OpenSplit);
+        assert_eq!(panes(&mut s).len(), 2);
+        let pane = focused(&mut s);
+        assert_eq!(shown(&mut s, pane), Some(7));
+        // With four panes the menu no longer offers it.
+        s.cx.simulate_keystrokes("cmd-d cmd-d");
+        assert_eq!(row_items(&mut s, 7), [RowMenuItem::Kill]);
+    }
+
+    #[gpui::test]
+    fn pane_menu_picks_act_on_their_pane(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        s.cx.simulate_keystrokes("cmd-d");
+        let [first, second] = panes(&mut s)[..] else {
+            panic!("two panes")
+        };
+        let pick = |s: &mut Setup<'_>, pane, item| {
+            s.ws.update_in(s.cx, |ws, window, cx| {
+                let epoch = ws.epoch;
+                ws.pane_menu_pick(pane, item, epoch, window, cx);
+            });
+            s.cx.run_until_parked();
+        };
+        pick(&mut s, first, PaneMenuItem::Maximize);
+        assert_eq!(s.app.read_with(s.cx, |a, _| a.maximized()), Some(first));
+        pick(&mut s, first, PaneMenuItem::Restore);
+        assert_eq!(s.app.read_with(s.cx, |a, _| a.maximized()), None);
+        pick(&mut s, second, PaneMenuItem::Close);
+        assert_eq!(panes(&mut s), [first]);
+        pick(&mut s, first, PaneMenuItem::SplitDown);
+        assert_eq!(panes(&mut s).len(), 2);
     }
 
     #[gpui::test]
@@ -1842,11 +1891,9 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let mut s = setup(cx, &fake, dir.path());
         agents(&mut s, &fake, vec![ended(8, "/w", 2, AgentState::Exited)]);
-        open_menu(&mut s, 8);
-        click(&mut s, "menu-remove");
+        pick_row(&mut s, 8, RowMenuItem::Remove);
         assert!(!s.cx.has_pending_prompt());
         assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![8])));
-        assert!(s.ws.read_with(s.cx, |w, _| w.menu.is_none()));
     }
 
     #[gpui::test]
