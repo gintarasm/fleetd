@@ -273,8 +273,14 @@ impl Terminal {
         let cells = &grid[Line(row as i32)];
         let link = cells[Column(col)].hyperlink()?;
         let same = |c: usize| cells[Column(c)].hyperlink().as_ref() == Some(&link);
-        let start = (0..col).rev().take_while(|&c| same(c)).last().unwrap_or(col);
-        let end = (col + 1..grid.columns()).find(|&c| !same(c)).unwrap_or(grid.columns());
+        let start = (0..col)
+            .rev()
+            .take_while(|&c| same(c))
+            .last()
+            .unwrap_or(col);
+        let end = (col + 1..grid.columns())
+            .find(|&c| !same(c))
+            .unwrap_or(grid.columns());
         Some((link.uri().to_owned(), to_u16(start), to_u16(end)))
     }
 

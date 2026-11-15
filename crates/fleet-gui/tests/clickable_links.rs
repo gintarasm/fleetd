@@ -92,7 +92,10 @@ impl Fs {
     }
 }
 
-fn file_at(text: &str, col: u16, fs: &Fs) -> Option<(u16, u16, PathBuf, Option<u32>, Option<u32>)> {
+/// A file link: its columns, path, line and column.
+type FileLink = (u16, u16, PathBuf, Option<u32>, Option<u32>);
+
+fn file_at(text: &str, col: u16, fs: &Fs) -> Option<FileLink> {
     let is_file = |p: &Path| fs.is_file(p);
     let files = Files {
         cwd: Path::new("/work"),

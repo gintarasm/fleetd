@@ -16,7 +16,7 @@ Agents print PR URLs and `path:line` locations constantly. The owner wants to op
   2. An `http://` or `https://` URL in the text, minus trailing punctuation and unbalanced closing brackets.
   3. A path, `path`, `path:line` or `path:line:col`, containing `/` or `.`, relative to the agent's recorded cwd (or absolute, or `~/`), and naming an existing regular file. git's `a/` and `b/` prefixes are tried off too.
 - **Local only for files.** File paths are linked only when the GUI is connected to the local fleetd: a remote agent's paths are not on this machine. URLs work everywhere.
-- **Opening.** URLs go to the system (`open_url`, the default browser). Files open in the editor named by `[gui] editor` in `config.toml`, else `$VISUAL`, else `$EDITOR`. Known GUI editors get the line and column (`code -g`, `zed path:l:c`, `subl`, `mate -l`, JetBrains `--line`, `emacsclient +l:c`, `bbedit +l`); unknown ones get the file. With no editor, or a terminal editor (vim, nvim, hx, nano, …) that would have no terminal, the file opens in the default text editor (`open -t`).
+- **Opening.** URLs go to the system (`open_url`, the default browser). Files open in the editor named by `[gui] editor` in `config.toml`, else `$VISUAL`, else `$EDITOR`. Known GUI editors get the line and column (`code -g`, `zed path:l:c`, `subl`, `mate -l`, JetBrains `--line`, `emacsclient +l:c`, `bbedit +l`); unknown ones get the file. With no editor, or a terminal editor (vim, nvim, hx, nano, …) that would have no terminal, the file opens in the default text editor (`open -t`). An editor that cannot start (an app launched from the Dock has a short `PATH`) falls back the same way; `[gui] editor` can name it by full path.
 - **Core.** Detection and the editor command line live in `src/core/links.rs` (toolkit-free); the pane view only tracks ⌘ and the pointer, draws the underline and runs the command.
 
 ## Consequences
@@ -24,5 +24,6 @@ Agents print PR URLs and `path:line` locations constantly. The owner wants to op
 - Detection costs one row scan and at most three `stat`s per pointer move with ⌘ held; nothing without ⌘, nothing while drawing.
 - A link is one row: a URL soft-wrapped onto the next row is cut at the row's end (rows carry no WRAPLINE marker, [0005](0005-terminal-state-on-node.md)).
 - OSC 8 links exist only on cells written live: a snapshot (reattach) and history lines carry no hyperlinks, so there only text URLs and paths are found.
+- gpui sends modifier changes along the keyboard focus path only, so pressing or releasing ⌘ without moving the pointer updates the underline in the focused pane; another pane catches up on the next pointer move (a ⌘-click there still checks the link afresh).
 - Relative paths resolve against the cwd the agent was spawned in; a shell that later `cd`s elsewhere resolves against the old directory.
 - Opening a file in a terminal editor inside a new fleet pane is a possible follow-up.

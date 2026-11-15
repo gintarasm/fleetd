@@ -160,10 +160,8 @@ fn url_in(token: &[char], at: usize) -> Option<(usize, usize)> {
     let (byte, scheme_len) = start;
     let s = text[..byte].chars().count();
     let mut e = token.len();
-    loop {
-        let Some(&last) = token[..e].last() else {
-            break;
-        };
+    while e > s {
+        let last = token[e - 1];
         let url = &token[s..e];
         let unbalanced = |open: char, close: char| {
             last == close
