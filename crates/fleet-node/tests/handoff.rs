@@ -457,3 +457,80 @@ fn agents_exiting_around_the_freeze_record_their_codes() {
         assert_eq!(state_of(&new, id), (AgentState::Exited as i32, Some(7)));
     }
 }
+
+/// The file `fd` is open on, as (device, inode); `None` if it is closed.
+fn fd_file(fd: i32) -> Option<(u64, u64)> {
+    // SAFETY: fstat with a valid out-pointer; it fails on a closed fd.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+}
+
+#[test]
+fn record_naming_a_non_terminal_fd_leaves_it_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = Node::open(dir.path()).unwrap();
+    let id = spawn_sh(&old, "echo ready; exec sleep 100");
+    wait_for_line(&old, id, "ready");
+    let mut agents = old.prepare_handoff(Instant::now() + DEADLINE).unwrap();
+    drop(old);
+    let pid = agents[0].pid;
+    // One of the daemon's own files, say its log.
+    let file = std::fs::File::create(dir.path().join("own.log")).unwrap();
+    let own = std::os::fd::AsRawFd::as_raw_fd(&file);
+    let before = fd_file(own);
+    agents[0].terminal = Some(HandoffTerminal::Fd(own));
+    let (new, kept, failed) = Node::open_with_handoff(dir.path(), agents).unwrap();
+    assert!(kept.is_empty());
+    assert_eq!(failed, vec![id]);
+    assert_eq!(fd_file(own), before, "the daemon's file was closed");
+    assert_eq!(state_of(&new, id), (AgentState::Exited as i32, Some(-1)));
+    assert!(!pid_alive(pid));
+    drop(file);
+}
+
+#[test]
+fn record_naming_one_fd_twice_claims_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = Node::open(dir.path()).unwrap();
+    let a = spawn_sh(&old, "echo ready; while read l; do eval \"$l\"; done");
+    let b = spawn_sh(&old, "echo ready; exec sleep 100");
+    wait_for_line(&old, a, "ready");
+    wait_for_line(&old, b, "ready");
+    let mut agents = dup_fds(old.prepare_handoff(Instant::now() + DEADLINE).unwrap());
+    drop(old);
+    agents.sort_by_key(|x| x.id);
+    let b_pid = agents[1].pid;
+    agents[1].terminal = agents[0].terminal.clone();
+    let (new, kept, failed) = Node::open_with_handoff(dir.path(), agents).unwrap();
+    assert_eq!(kept, vec![a]);
+    assert_eq!(failed, vec![b]);
+    assert!(!pid_alive(b_pid));
+    new.input(a, ConnId(1), b"echo still\n").unwrap();
+    wait_for_line(&new, a, "still");
+    new.shutdown();
+}
+
+#[test]
+fn record_repeating_an_id_registers_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = Node::open(dir.path()).unwrap();
+    let id = spawn_sh(&old, "echo ready; while read l; do eval \"$l\"; done");
+    wait_for_line(&old, id, "ready");
+    let first = old.prepare_handoff(Instant::now() + DEADLINE).unwrap();
+    drop(old);
+    let copy = dup_fds(first.clone());
+    let pid = first[0].pid;
+    let mut agents = dup_fds(first);
+    agents.extend(copy);
+    let (new, kept, failed) = Node::open_with_handoff(dir.path(), agents).unwrap();
+    assert_eq!(kept, vec![id]);
+    assert!(failed.is_empty());
+    assert!(pid_alive(pid), "the kept agent was ended");
+    assert_eq!(state_of(&new, id).0, AgentState::Running as i32);
+    let listed = new.list().unwrap();
+    assert_eq!(listed.iter().filter(|x| x.id == id).count(), 1);
+    new.input(id, ConnId(1), b"echo once\n").unwrap();
+    wait_for_line(&new, id, "once");
+    new.shutdown();
+    assert_eq!(state_of(&new, id).0, AgentState::Exited as i32);
+}

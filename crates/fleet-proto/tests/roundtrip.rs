@@ -291,6 +291,7 @@ fn handoff_record_round_trips() {
         listener_fd: 3,
         lock_fd: 4,
         previous_instance: 7,
+        frozen_unix_ms: 1,
         agents: vec![
             HandoffAgent {
                 id: 1,

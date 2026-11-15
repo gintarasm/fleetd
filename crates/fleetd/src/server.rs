@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -25,12 +25,15 @@ use fleet_proto::{
     Ack, AgentList, AgentRemoved, AgentResized, AttachOk, AttachRole, Event, ForgetAgents,
     Forgotten, Frame, FrameCodec, HandshakeReject, HelloOk, HistoryPage, Lagged, LogLine, LogLines,
     MAX_FRAME, PROTOCOL_VERSION, ReadHistory, ReadLogs, Request, Response, RestartAgent, Restarted,
-    RestoreSummary, SpawnAgent, SpawnedAttached, event, request, response,
+    RestartingDaemon, RestoreSummary, SpawnAgent, SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
+use tokio::sync::{
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+    broadcast, mpsc, oneshot,
+};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
@@ -48,6 +51,9 @@ const HELLO_MAX_FRAME: usize = 4 * 1024;
 const HANDSHAKE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Frames queued for a connection's writer.
 const OUTBOX_CAPACITY: usize = 256;
+/// How long the connection that asked for a restart waits for its
+/// `RestartingDaemon` to be written before it lets the `exec` go ahead.
+pub(crate) const RESTART_FLUSH: Duration = Duration::from_millis(200);
 
 type Writer = FramedWrite<OwnedWriteHalf, FrameCodec>;
 type Reader = FramedRead<OwnedReadHalf, FrameCodec>;
@@ -61,22 +67,102 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub(crate) struct Server {
     node: Arc<Node>,
-    /// The `HelloOk` every handshake answers with (identity and restore summary
-    /// do not change while the daemon runs).
-    hello: Arc<HelloOk>,
+    shared: Arc<Shared>,
     slots: Arc<Semaphore>,
 }
 
+/// A `RestartDaemon` handed to the serve loop, the one restart coordinator.
+pub(crate) struct RestartRequest {
+    pub(crate) binary: String,
+    pub(crate) reply: oneshot::Sender<RestartReply>,
+}
+
+pub(crate) enum RestartReply {
+    /// Answered with an `Error`; the daemon serves on.
+    Refused(String),
+    /// Answered with `RestartingDaemon`; `flushed` is sent once the answer
+    /// is written (or [`RESTART_FLUSH`] passed), and the `exec` follows.
+    Restarting {
+        agents: u32,
+        flushed: oneshot::Sender<()>,
+    },
+}
+
+/// What every connection shares with the serve loop.
+struct Shared {
+    /// The `HelloOk` every handshake answers with; only its restore summary
+    /// changes, when a restart fails.
+    hello: Mutex<Arc<HelloOk>>,
+    restarts: mpsc::Sender<RestartRequest>,
+    /// A restart was asked for and has not failed (one that succeeds ends
+    /// in `exec`): a second is refused.
+    restart_pending: AtomicBool,
+    /// The node is being frozen for a restart: requests are refused.
+    stopped: AtomicBool,
+    /// Held shared while a request is handled (input aside, see
+    /// [`Connection::handle`]) and exclusively by a restart from before the
+    /// freeze until it fails, so no request changes the node (a resize
+    /// after the snapshot would leave a stale size in the record).
+    requests: Arc<RwLock<()>>,
+}
+
+fn restarting() -> response::Kind {
+    error("fleetd is restarting".into())
+}
+
+impl Shared {
+    fn hello(&self) -> Arc<HelloOk> {
+        Arc::clone(&lock(&self.hello))
+    }
+
+    /// Admits a request: `None` while requests are stopped. Waits while a
+    /// restart is stopping them (then holds them until it fails, see
+    /// [`Server::stop_requests`]).
+    async fn admit(&self) -> Option<OwnedRwLockReadGuard<()>> {
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = Arc::clone(&self.requests).read_owned().await;
+        (!self.stopped.load(Ordering::Acquire)).then_some(guard)
+    }
+}
+
+/// Requests stopped for a restart; dropping it lets them in again.
+pub(crate) struct RequestsStopped {
+    shared: Arc<Shared>,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
+impl Drop for RequestsStopped {
+    fn drop(&mut self) {
+        // Before the guard is released, so a request that was waiting for
+        // it is admitted.
+        self.shared.stopped.store(false, Ordering::Release);
+    }
+}
+
 impl Server {
-    pub(crate) fn new(node: Arc<Node>, identity: Identity, restore: RestoreSummary) -> Self {
+    pub(crate) fn new(
+        node: Arc<Node>,
+        identity: Identity,
+        restore: RestoreSummary,
+        restarts: mpsc::Sender<RestartRequest>,
+    ) -> Self {
+        let hello = HelloOk {
+            protocol_version: PROTOCOL_VERSION,
+            server: "fleetd".into(),
+            instance: identity.instance,
+            binary: Some(Box::new(identity.binary)),
+            restore: (restore != RestoreSummary::default()).then(|| Box::new(restore)),
+        };
         Server {
             node,
-            hello: Arc::new(HelloOk {
-                protocol_version: PROTOCOL_VERSION,
-                server: "fleetd".into(),
-                instance: identity.instance,
-                binary: Some(Box::new(identity.binary)),
-                restore: (restore != RestoreSummary::default()).then(|| Box::new(restore)),
+            shared: Arc::new(Shared {
+                hello: Mutex::new(Arc::new(hello)),
+                restarts,
+                restart_pending: AtomicBool::new(false),
+                stopped: AtomicBool::new(false),
+                requests: Arc::new(RwLock::new(())),
             }),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         }
@@ -88,7 +174,7 @@ impl Server {
             Ok(slot) => {
                 tokio::spawn(connection(
                     Arc::clone(&self.node),
-                    Arc::clone(&self.hello),
+                    Arc::clone(&self.shared),
                     stream,
                     slot,
                 ));
@@ -105,6 +191,45 @@ impl Server {
                 });
             }
         }
+    }
+
+    /// Refuses every request from now on with "fleetd is restarting" and
+    /// waits until `deadline` for those being handled to finish. `None`
+    /// (requests admitted again) if some are still running then. Input is
+    /// not waited for: the freeze itself ends a write stuck on an agent.
+    pub(crate) async fn stop_requests(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Option<RequestsStopped> {
+        self.shared.stopped.store(true, Ordering::Release);
+        let requests = Arc::clone(&self.shared.requests);
+        match tokio::time::timeout_at(deadline, requests.write_owned()).await {
+            Ok(guard) => Some(RequestsStopped {
+                shared: Arc::clone(&self.shared),
+                _guard: guard,
+            }),
+            Err(_) => {
+                self.shared.stopped.store(false, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    /// A restart failed before its `exec` (or the `exec` did): handshakes
+    /// report `reason` from now on (same instance, so a reconnecting
+    /// client knows the old daemon serves on), and a new restart may be
+    /// asked for.
+    pub(crate) fn restart_failed(&self, reason: &str) {
+        {
+            let mut hello = lock(&self.shared.hello);
+            let mut next = (**hello).clone();
+            next.restore = Some(Box::new(RestoreSummary {
+                restart_error: reason.to_owned(),
+                ..Default::default()
+            }));
+            *hello = Arc::new(next);
+        }
+        self.shared.restart_pending.store(false, Ordering::Release);
     }
 }
 
@@ -164,10 +289,11 @@ async fn handshake(
 
 async fn connection(
     node: Arc<Node>,
-    hello: Arc<HelloOk>,
+    shared: Arc<Shared>,
     stream: UnixStream,
     _slot: OwnedSemaphorePermit,
 ) {
+    let hello = shared.hello();
     let (rd, wr) = stream.into_split();
     let mut reader = FramedRead::new(rd, FrameCodec::with_max(HELLO_MAX_FRAME));
     let mut writer = FramedWrite::new(wr, FrameCodec::new());
@@ -190,15 +316,17 @@ async fn connection(
     let (removed_tx, mut removed_rx) = mpsc::unbounded_channel();
     let mut conn = Connection {
         node,
+        shared,
         id,
         outbox,
         forwarders: HashMap::new(),
         attached: Arc::new(Mutex::new(HashSet::new())),
         removed_pending: HashSet::new(),
         log_follower: None,
+        restarting: None,
     };
+    let writer = tokio::spawn(write_frames(id, writer, rx));
     let tasks = Tasks(vec![
-        tokio::spawn(write_frames(id, writer, rx)),
         tokio::spawn(forward_exits(
             exits,
             conn.outbox.clone(),
@@ -221,6 +349,9 @@ async fn connection(
                     if !conn.handle(req).await {
                         break "write failed".to_string();
                     }
+                    if conn.restarting.is_some() {
+                        break "fleetd is restarting".to_string();
+                    }
                 }
                 Some(Ok(_)) => break "unexpected frame from client".to_string(),
                 Some(Err(e)) => break format!("read error: {e}"),
@@ -230,9 +361,20 @@ async fn connection(
     };
     info!(conn = id.0, reason, "connection closed");
     // Dropping `conn` and `tasks` aborts the forwarders (dropping their
-    // subscriptions) and the writer, closing the socket.
+    // subscriptions and outbox senders).
+    let restarting = conn.restarting.take();
     drop(conn);
     drop(tasks);
+    match restarting {
+        // The writer ends once it has written what is queued, the
+        // `RestartingDaemon` last: then the `exec` may go ahead.
+        Some(flushed) => {
+            let _ = tokio::time::timeout(RESTART_FLUSH, writer).await;
+            let _ = flushed.send(());
+        }
+        // Closes the socket.
+        None => writer.abort(),
+    }
 }
 
 /// Aborts its tasks when dropped.
@@ -248,6 +390,7 @@ impl Drop for Tasks {
 
 struct Connection {
     node: Arc<Node>,
+    shared: Arc<Shared>,
     id: ConnId,
     outbox: mpsc::Sender<Frame>,
     /// Output forwarder per attached agent.
@@ -261,6 +404,10 @@ struct Connection {
     removed_pending: HashSet<u64>,
     /// Streams new log lines while the client follows the log.
     log_follower: Option<JoinHandle<()>>,
+    /// Set once this connection's restart was answered `RestartingDaemon`:
+    /// the connection ends, and tells the serve loop when the answer is
+    /// written.
+    restarting: Option<oneshot::Sender<()>>,
 }
 
 impl Drop for Connection {
@@ -298,8 +445,29 @@ fn error(message: String) -> response::Kind {
 
 impl Connection {
     /// Answers one request; `false` once the writer is gone.
+    ///
+    /// While a restart freezes the node every request is refused with
+    /// "fleetd is restarting"; one already running holds the freeze off
+    /// until it finishes, except input, which the freeze interrupts when it
+    /// is stuck on an agent's full input queue.
     async fn handle(&mut self, req: Request) -> bool {
         self.sweep_removed().await;
+        let _admitted = match &req.kind {
+            Some(request::Kind::RestartDaemon(r)) => {
+                let binary = r.binary.clone();
+                return self.restart_daemon(req.id, binary).await;
+            }
+            Some(request::Kind::Input(_)) => {
+                if self.shared.stopped.load(Ordering::Acquire) {
+                    return self.respond(req.id, restarting()).await;
+                }
+                None
+            }
+            _ => match self.shared.admit().await {
+                Some(admitted) => Some(admitted),
+                None => return self.respond(req.id, restarting()).await,
+            },
+        };
         let kind = match req.kind {
             None => error("empty request".into()),
             Some(request::Kind::Spawn(spawn)) if spawn.attach => {
@@ -359,10 +527,36 @@ impl Connection {
             }
             Some(request::Kind::Restart(r)) => return self.restart(req.id, r).await,
             Some(request::Kind::Forget(f)) => return self.forget(req.id, *f).await,
-            // Answered for real once the restart path lands.
-            Some(request::Kind::RestartDaemon(_)) => error("restart not supported yet".into()),
+            Some(request::Kind::RestartDaemon(_)) => unreachable!("handled above"),
         };
         self.respond(req.id, kind).await
+    }
+
+    /// Hands a restart to the serve loop and answers with its outcome. One
+    /// at a time: while one is pending, another is refused at once.
+    async fn restart_daemon(&mut self, id: u64, binary: String) -> bool {
+        if self.shared.restart_pending.swap(true, Ordering::AcqRel) {
+            return self
+                .respond(id, error("a restart is already in progress".into()))
+                .await;
+        }
+        info!(conn = self.id.0, "restart requested");
+        let (reply, answer) = oneshot::channel();
+        let req = RestartRequest { binary, reply };
+        // Gone only while the daemon stops.
+        let stopping = || error("fleetd is stopping".into());
+        if self.shared.restarts.send(req).await.is_err() {
+            return self.respond(id, stopping()).await;
+        }
+        match answer.await {
+            Ok(RestartReply::Refused(reason)) => self.respond(id, error(reason)).await,
+            Ok(RestartReply::Restarting { agents, flushed }) => {
+                self.restarting = Some(flushed);
+                let reply = response::Kind::RestartingDaemon(RestartingDaemon { agents });
+                self.respond(id, reply).await
+            }
+            Err(_) => self.respond(id, stopping()).await,
+        }
     }
 
     async fn respond(&self, id: u64, kind: response::Kind) -> bool {
@@ -939,17 +1133,102 @@ mod tests {
     }
 
     fn test_conn(node: Arc<Node>) -> (Connection, mpsc::Receiver<Frame>) {
+        let (_, conn, rx) = test_server_conn(node);
+        (conn, rx)
+    }
+
+    /// A server and one connection of it.
+    fn test_server_conn(node: Arc<Node>) -> (Server, Connection, mpsc::Receiver<Frame>) {
         let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
+        let (restarts, _) = mpsc::channel(1);
+        let server = Server::new(
+            Arc::clone(&node),
+            Identity::current(),
+            RestoreSummary::default(),
+            restarts,
+        );
         let conn = Connection {
             node,
+            shared: Arc::clone(&server.shared),
             id: ConnId(u64::MAX),
             outbox,
             forwarders: HashMap::new(),
             attached: Arc::new(Mutex::new(HashSet::new())),
             removed_pending: HashSet::new(),
             log_follower: None,
+            restarting: None,
         };
-        (conn, rx)
+        (server, conn, rx)
+    }
+
+    /// The response to the next request sent, skipping other frames.
+    async fn answer(
+        conn: &mut Connection,
+        rx: &mut mpsc::Receiver<Frame>,
+        kind: request::Kind,
+    ) -> response::Kind {
+        assert!(
+            conn.handle(Request {
+                id: 9,
+                kind: Some(kind)
+            })
+            .await
+        );
+        loop {
+            if let Some(Frame::Response(r)) = rx.recv().await {
+                return r.kind.unwrap();
+            }
+        }
+    }
+
+    fn is_restarting(kind: &response::Kind) -> bool {
+        matches!(kind, response::Kind::Error(e) if e.message == "fleetd is restarting")
+    }
+
+    #[tokio::test]
+    async fn requests_are_refused_while_stopped_for_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(Node::open(dir.path()).unwrap());
+        let (server, mut conn, mut rx) = test_server_conn(node);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let stopped = server.stop_requests(deadline).await.unwrap();
+        let resize = request::Kind::Resize(fleet_proto::Resize {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+        });
+        assert!(is_restarting(&answer(&mut conn, &mut rx, resize).await));
+        let input = request::Kind::Input(fleet_proto::SendInput {
+            agent_id: 1,
+            data: b"x".to_vec(),
+        });
+        assert!(is_restarting(&answer(&mut conn, &mut rx, input).await));
+        drop(stopped);
+        let list = request::Kind::List(Default::default());
+        assert!(matches!(
+            answer(&mut conn, &mut rx, list).await,
+            response::Kind::Agents(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stopping_waits_for_requests_being_handled() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(Node::open(dir.path()).unwrap());
+        let (server, mut conn, mut rx) = test_server_conn(node);
+        // A request being handled holds the stop off past its deadline...
+        let handled = server.shared.admit().await.unwrap();
+        let soon = tokio::time::Instant::now() + Duration::from_millis(50);
+        assert!(server.stop_requests(soon).await.is_none());
+        // ...after which requests are admitted again.
+        drop(handled);
+        let list = request::Kind::List(Default::default());
+        assert!(matches!(
+            answer(&mut conn, &mut rx, list).await,
+            response::Kind::Agents(_)
+        ));
+        let later = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert!(server.stop_requests(later).await.is_some());
     }
 
     /// A stand-in forwarder for `id` that runs until the sender is used.

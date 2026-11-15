@@ -2549,44 +2549,64 @@ impl Node {
     /// the snapshot. Every other agent left running is marked lost, as by
     /// [`Node::open`].
     ///
-    /// Owns every fd the record names (as an `exec` passes them on). One the
-    /// process does not have open when this is called is never touched, and
-    /// its agent fails, so a stale record cannot make the node close one of
-    /// its own files.
+    /// Owns every fd the record names (as an `exec` passes them on) that is
+    /// a terminal. One the process does not have open when this is called,
+    /// or that is not a terminal, is never touched, and its agent fails, so
+    /// a stale or corrupt record cannot make the node close one of its own
+    /// files (or the daemon's listener, lock or log).
     ///
     /// Returns the node and the ids kept and failed. An agent that fails to
     /// be restored is ended (SIGTERM to its group, SIGKILL after
     /// [`SHUTDOWN_GRACE`]) and recorded as exited with code -1, as when
     /// waiting for an agent fails. If the node cannot be opened at all,
     /// every agent in the record is ended so none runs untracked.
+    ///
+    /// A corrupt record may name one fd or one id twice. A later entry
+    /// naming an fd already claimed fails like any agent without a
+    /// terminal. A later entry repeating an id is dropped (its fd, if
+    /// claimed, closed) without touching that id's row, which belongs to
+    /// the first entry, so no id is registered twice; its process is ended
+    /// unless a kept agent has the same pid.
     pub fn open_with_handoff(
         state_dir: &Path,
         agents: Vec<HandoffAgent>,
     ) -> io::Result<(Node, Vec<u64>, Vec<u64>)> {
         // Before the node opens any file of its own.
-        let claimed: Vec<(HandoffAgent, Option<OwnedFd>)> = agents
-            .into_iter()
-            .map(|mut agent| {
-                let fd = handoff::claim_terminal(agent.terminal.take());
-                (agent, fd)
-            })
-            .collect();
+        let mut fds = HashSet::new();
+        let mut ids = HashSet::new();
+        let mut repeated = Vec::new();
+        let mut claimed: Vec<(HandoffAgent, Option<OwnedFd>)> = Vec::new();
+        for mut agent in agents {
+            let fd = handoff::claim_terminal(agent.terminal.take(), &mut fds);
+            if ids.insert(agent.id) {
+                claimed.push((agent, fd));
+            } else {
+                warn!(
+                    agent = agent.id,
+                    "the handoff record repeats an agent; ending the copy"
+                );
+                repeated.push(agent.pid);
+            }
+        }
         let keep: Vec<u64> = claimed.iter().map(|(a, _)| a.id).collect();
         let node = match Self::open_sparing(state_dir, &keep) {
             Ok(node) => node,
             Err(e) => {
-                let pids: Vec<i32> = claimed.iter().map(|(a, _)| a.pid).collect();
+                let mut pids: Vec<i32> = claimed.iter().map(|(a, _)| a.pid).collect();
+                pids.extend(repeated);
                 drop(claimed);
                 handoff::end_unrestored(&pids, SHUTDOWN_GRACE);
                 return Err(e);
             }
         };
         let (mut kept, mut failed) = (Vec::new(), Vec::new());
+        let mut kept_pids = HashSet::new();
         for (agent, fd) in claimed {
             match node.restore_agent(&agent, fd) {
                 Ok(()) => {
                     info!(agent = agent.id, "agent restored");
                     kept.push(agent.id);
+                    kept_pids.insert(agent.pid);
                 }
                 Err(e) => {
                     warn!(agent = agent.id, error = %e, "restoring the agent failed; ending it");
@@ -2594,7 +2614,13 @@ impl Node {
                 }
             }
         }
-        let pids: Vec<i32> = failed.iter().map(|a| a.pid).collect();
+        // Never a kept agent's process, whatever else the record says.
+        let pids: Vec<i32> = failed
+            .iter()
+            .map(|a| a.pid)
+            .chain(repeated)
+            .filter(|pid| !kept_pids.contains(pid))
+            .collect();
         handoff::end_unrestored(&pids, SHUTDOWN_GRACE);
         let failed: Vec<u64> = failed.into_iter().map(|a| a.id).collect();
         for &id in &failed {

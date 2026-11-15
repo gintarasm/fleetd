@@ -9,6 +9,7 @@
 //! [`Node::open_with_handoff`](crate::node::Node::open_with_handoff) use them.
 
 use fleet_proto::handoff::handoff_agent::Terminal;
+use std::collections::HashSet;
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::{Condvar, Mutex, MutexGuard};
@@ -115,23 +116,43 @@ impl HandoffGate {
     }
 }
 
-/// Takes ownership of the PTY master a record names, if it is an fd open in
-/// this process. Called for every agent before the node opens anything: an
-/// fd number not open on entry (a stale or corrupt record) is never claimed,
-/// so it cannot later name, and close, one of the node's own files.
-/// `None` for a closed fd, a negative one, or a holder socket (not supported
-/// yet).
-pub(crate) fn claim_terminal(terminal: Option<Terminal>) -> Option<OwnedFd> {
+/// Takes ownership of the PTY master a record names, if it is a terminal
+/// open in this process and not already `claimed` (the fds taken so far
+/// from the same record). Called for every agent before the node opens
+/// anything: an fd number not open on entry (a stale or corrupt record) is
+/// never claimed, so it cannot later name, and close, one of the node's own
+/// files. The terminal check keeps a record from naming one of the
+/// daemon's own fds that are open by then (the listener, the lock, the log),
+/// and the `claimed` check from making two owners of one fd (a double
+/// close). `None` for any of those, a negative fd, or a holder socket (not
+/// supported yet).
+pub(crate) fn claim_terminal(
+    terminal: Option<Terminal>,
+    claimed: &mut HashSet<RawFd>,
+) -> Option<OwnedFd> {
     let fd: RawFd = match terminal? {
         Terminal::Fd(fd) if fd >= 0 => fd,
         Terminal::Fd(_) | Terminal::HolderSocket(_) => return None,
     };
-    // SAFETY: fcntl on any integer is memory-safe; it fails on a closed fd.
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+    // SAFETY: fcntl and isatty on any integer are memory-safe; both fail on
+    // a closed fd.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 || unsafe { libc::isatty(fd) } != 1 {
         return None;
     }
-    // SAFETY: the fd is open, and the record hands it to this node.
+    if !claimed.insert(fd) {
+        return None;
+    }
+    // SAFETY: the fd is open, a terminal, claimed once, and the record
+    // hands it to this node.
     Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Ends agents a predecessor daemon left to this process that it does not
+/// adopt (a handoff whose record could not be read): SIGTERM to each
+/// process group, [`SHUTDOWN_GRACE`](crate::node::SHUTDOWN_GRACE) to exit,
+/// then SIGKILL; each is reaped, as they are this process's children.
+pub fn end_unadopted(pids: &[i32]) {
+    end_unrestored(pids, crate::node::SHUTDOWN_GRACE);
 }
 
 /// Ends agents a handoff named that could not be restored, as a shutdown
@@ -232,14 +253,41 @@ mod tests {
     }
 
     #[test]
-    fn only_open_fds_are_claimed() {
-        assert!(claim_terminal(None).is_none());
-        assert!(claim_terminal(Some(Terminal::Fd(-1))).is_none());
-        assert!(claim_terminal(Some(Terminal::HolderSocket("/x".into()))).is_none());
+    fn only_open_terminals_are_claimed_once() {
+        let mut claimed = HashSet::new();
+        assert!(claim_terminal(None, &mut claimed).is_none());
+        assert!(claim_terminal(Some(Terminal::Fd(-1)), &mut claimed).is_none());
+        let socket = Some(Terminal::HolderSocket("/x".into()));
+        assert!(claim_terminal(socket, &mut claimed).is_none());
+        // Open, but not a terminal: left alone.
         let (r, w) = std::io::pipe().unwrap();
-        let fd = std::os::fd::IntoRawFd::into_raw_fd(r);
-        let claimed = claim_terminal(Some(Terminal::Fd(fd))).unwrap();
-        assert_eq!(std::os::fd::AsRawFd::as_raw_fd(&claimed), fd);
-        drop((claimed, w));
+        let pipe = std::os::fd::AsRawFd::as_raw_fd(&r);
+        assert!(claim_terminal(Some(Terminal::Fd(pipe)), &mut claimed).is_none());
+        // SAFETY: fcntl on an fd we own.
+        assert!(
+            unsafe { libc::fcntl(pipe, libc::F_GETFD) } >= 0,
+            "pipe closed"
+        );
+        drop((r, w));
+
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty with valid out-pointers and no name/termios/size.
+        let r = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(r, 0, "openpty");
+        let claimed_fd = claim_terminal(Some(Terminal::Fd(master)), &mut claimed).unwrap();
+        assert_eq!(std::os::fd::AsRawFd::as_raw_fd(&claimed_fd), master);
+        // The same fd again: no second owner.
+        assert!(claim_terminal(Some(Terminal::Fd(master)), &mut claimed).is_none());
+        drop(claimed_fd);
+        // SAFETY: closing the slave we opened.
+        unsafe { libc::close(slave) };
     }
 }

@@ -9,6 +9,9 @@ message HandoffRecord {
   int32 lock_fd = 3;
   uint64 previous_instance = 4;
   repeated HandoffAgent agents = 5;
+  // When the predecessor froze its agents (unix ms), for logging how long
+  // the restart kept them frozen.
+  int64 frozen_unix_ms = 6;
 }
 
 message HandoffAgent {
