@@ -256,3 +256,36 @@
 - [ ] **Step 1: Write ADR 0032**: context, decision (exec in place, record format, freeze mechanism, refusals, fallback, identity, SSH behaviour), what a restart loses (reattach limits; retained exited snapshots not carried), the `AgentHost` seam and the `holder_socket` slot for crash survival, consequences (first upgrade from a pre-0032 daemon ends agents once).
 - [ ] **Step 2: Update the other docs** as listed; README gives `fleet daemon restart` and the GUI menu item.
 - [ ] **Step 3: Commit** `docs: ADR 0032 daemon restart with agents surviving`
+
+### Task 10: `scripts/install.sh` — build, install, move the daemon onto the new build
+
+*(Added 2026-11-15 at the user's request; design approved in conversation.)*
+
+**Files:**
+- Create: `scripts/install.sh` (POSIX `sh`, `set -eu`, like `scripts/bundle-macos.sh`)
+- Modify: `README.md` (Install section leads with `scripts/install.sh`; the `cargo install` route stays as the alternative)
+- Test: `scripts/install-test.sh` (runs `install.sh` against temp dirs; invoked manually and from the task report — not wired into CI)
+
+**Interfaces:**
+- Consumes: `scripts/bundle-macos.sh` (builds `target/release/fleetd.app`); `fleet daemon restart --binary <path>` and its messages and exit codes (Task 7); the too-old-daemon message (Global Constraints).
+- Produces: `scripts/install.sh [--app-dir <dir>] [--bin-dir <dir>] [--force-stop] [--state-dir <dir>]`:
+  1. **macOS:** run `scripts/bundle-macos.sh`, then replace `<app-dir>/fleetd.app` (default `/Applications`). Copy to a temporary name in `<app-dir>` and rename over the old copy, so a failed copy never leaves a half-installed app.
+  2. **Linux:** `cargo build --release -p fleetd -p fleet-cli`, then copy both into `<bin-dir>`, replacing them atomically (temp name, then rename). There is no app.
+  3. **macOS links:** `<bin-dir>/fleetd` and `<bin-dir>/fleet` (default `~/.local/bin`, created if missing) become symlinks to `<app-dir>/fleetd.app/Contents/MacOS/{fleetd,fleet}`. A regular file already at either path is replaced only when it is a fleetd/fleet binary (it answers `--version` or `--handoff-check`); otherwise the script stops and names the file. Print a warning line if `<bin-dir>` is not on `PATH`.
+  4. **Daemon:** with `fleet` from `<bin-dir>`, check for a running daemon on `--state-dir` (default `~/.fleet`) by connecting (a `fleet ls` that succeeds).
+     - **None running:** print `no fleetd running; the next client starts the new one`.
+     - **Running:** run `fleet daemon restart --binary <bin-dir>/fleetd` and pass through its message and exit code.
+     - **Too old to restart itself:** print the too-old message and exit 1. With `--force-stop`, first print `stopping fleetd: its running agents will end`, then send SIGTERM to the pid holding `<state-dir>/fleetd.lock` (`lsof -t`), wait up to 5 s for the socket to go away, and print `fleetd stopped; the next client starts the new one`.
+  5. Every step echoes one line saying what it did, such as `installed /Applications/fleetd.app` or `linked ~/.local/bin/fleetd -> …`.
+
+- [ ] **Step 1: Write `scripts/install-test.sh`.** Run `install.sh --app-dir $tmp/apps --bin-dir $tmp/bin --state-dir $tmp/state` with no daemon running, then assert:
+  - the app exists, or on Linux the binaries exist;
+  - the links resolve and `fleet --help` runs;
+  - the output contains `no fleetd running`.
+
+  Then start `fleetd --state-dir $tmp/state` from the installed binary, spawn `sh`, and run `install.sh` again with the same flags. Assert that it prints `fleetd restarted: 1 agents kept` and that the agent is still `running`. Last, place a non-fleet file at `$tmp/bin/fleet` and assert that the script stops with that path named.
+- [ ] **Step 2: Run** `sh scripts/install-test.sh`. It should FAIL, because there is no `install.sh` yet.
+- [ ] **Step 3: Implement `scripts/install.sh`.**
+- [ ] **Step 4: Run** `sh scripts/install-test.sh`. It should PASS on macOS. On Linux, run it in Docker `rust:1.99.1` too.
+- [ ] **Step 5: Update `README.md`.** The Install section opens with `scripts/install.sh`, then lists the flags and the update loop `git pull && scripts/install.sh`.
+- [ ] **Step 6: Commit** `feat: scripts/install.sh builds, installs and restarts fleetd onto the new build`
