@@ -99,8 +99,10 @@ if [ "$os" = Darwin ]; then
 else
   echo "building fleetd and fleet..."
   cargo build --release -p fleetd -p fleet-cli
+  # cargo honours CARGO_TARGET_DIR; copying from ./target would pick up a stale
+  # (or foreign) build.
   for b in fleetd fleet; do
-    install_file "target/release/$b" "$bin_dir/$b"
+    install_file "${CARGO_TARGET_DIR:-target}/release/$b" "$bin_dir/$b"
     echo "installed $bin_dir/$b"
   done
 fi
@@ -135,9 +137,19 @@ if [ "$force_stop" -eq 0 ]; then
   exit 1
 fi
 echo "stopping fleetd: its running agents will end"
-pids=$(lsof -t "$state_dir/fleetd.lock" 2>/dev/null || true)
-[ -n "$pids" ] || die "no process holds $state_dir/fleetd.lock; stop fleetd by hand"
-[ "$(echo "$pids" | wc -l)" -eq 1 ] || die "more than one process holds $state_dir/fleetd.lock ($(echo $pids)); stop fleetd by hand"
+lock="$state_dir/fleetd.lock"
+if command -v lsof >/dev/null 2>&1; then
+  pids=$(lsof -t "$lock" 2>/dev/null || true)
+elif command -v fuser >/dev/null 2>&1; then
+  pids=$(fuser "$lock" 2>/dev/null || true)
+else
+  die "cannot find which process runs fleetd: neither lsof nor fuser is installed; stop fleetd by hand (pkill fleetd)"
+fi
+pids=$(echo $pids)
+[ -n "$pids" ] || die "no process holds $lock; stop fleetd by hand"
+case "$pids" in
+  *" "*) die "more than one process holds $lock ($pids); stop fleetd by hand" ;;
+esac
 kill -TERM "$pids"
 i=0
 while [ -e "$sock" ]; do
