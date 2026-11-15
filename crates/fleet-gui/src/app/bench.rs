@@ -13,7 +13,9 @@
 //! In bench mode the connect sheet never shows: a failed connect exits
 //! [`EXIT_NO_FLEETD`]; a bench that does not finish within [`WATCHDOG`]
 //! exits [`EXIT_TIMEOUT`]. The window floats above other apps' windows
-//! ([`window_opened`]): an occluded window presents no frames.
+//! ([`window_opened`]): an occluded window presents no frames. The main
+//! thread runs at user-interactive QoS ([`interactive_qos`]) however the
+//! GUI was launched.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -105,6 +107,7 @@ pub fn init() {
     let on = mode.is_some();
     let _ = MODE.set(mode);
     if on {
+        interactive_qos();
         std::thread::spawn(|| {
             std::thread::sleep(WATCHDOG);
             eprintln!(
@@ -112,6 +115,23 @@ pub fn init() {
             );
             std::process::exit(EXIT_TIMEOUT);
         });
+    }
+}
+
+/// Runs the calling (main) thread at user-interactive QoS, as AppKit does
+/// for an app LaunchServices knows (launched from Finder, `open` or a
+/// terminal app). Under a launchd job (the self-hosted CI runner) the app
+/// gets no task role and its main thread stays at default QoS (priority
+/// 31-37 instead of 46), so 50 flooding agents and fleetd take the CPU from
+/// it: `input_to_render_flood50_ns` read 28-40 ms there against ~11 ms
+/// from a terminal. GCD work the main thread submits inherits its QoS.
+fn interactive_qos() {
+    // SAFETY: plain libpthread call on the current thread.
+    let r = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    if r != 0 {
+        eprintln!("fleet-gui: bench: cannot raise the main thread's QoS (error {r})");
     }
 }
 
