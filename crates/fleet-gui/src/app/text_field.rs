@@ -41,25 +41,12 @@ pub struct TextField {
     caret_on: bool,
     /// The field was focused when last drawn (only then does it blink).
     drawn_focused: bool,
-    _blink: Task<()>,
+    /// The blink timer, while the field is focused.
+    blink: Option<Task<()>>,
 }
 
 impl TextField {
     pub fn new(text: String, placeholder: &str, cx: &mut Context<Self>) -> Self {
-        let blink = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(BLINK).await;
-                let alive = this.update(cx, |f, cx| {
-                    if f.drawn_focused {
-                        f.caret_on = !f.caret_on;
-                        cx.notify();
-                    }
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
         TextField {
             edit: TextEdit::new(text),
             focus: cx.focus_handle(),
@@ -69,8 +56,39 @@ impl TextField {
             selecting: false,
             caret_on: true,
             drawn_focused: false,
-            _blink: blink,
+            blink: None,
         }
+    }
+
+    /// Starts the caret blinking from its shown half (again, after an
+    /// edit, so it stays solid while typing). The task ends once the
+    /// field is drawn unfocused; the next focused frame starts it again.
+    fn start_blink(&mut self, cx: &mut Context<Self>) {
+        self.caret_on = true;
+        self.blink = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK).await;
+                let go_on = this.update(cx, |f, cx| {
+                    if !f.drawn_focused {
+                        f.caret_on = true;
+                        f.blink = None;
+                        return false;
+                    }
+                    f.caret_on = !f.caret_on;
+                    cx.notify();
+                    true
+                });
+                if !matches!(go_on, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The caret is blinking (the field was drawn focused).
+    #[cfg(test)]
+    fn is_blinking(&self) -> bool {
+        self.blink.is_some()
     }
 
     pub fn text(&self) -> &str {
@@ -90,6 +108,9 @@ impl TextField {
     /// After any edit or caret move: the caret shows at once.
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.caret_on = true;
+        if self.blink.is_some() {
+            self.start_blink(cx);
+        }
         cx.notify();
     }
 
@@ -378,7 +399,14 @@ impl Element for TextLine {
             underline: None,
             strikethrough: None,
         };
-        let runs = match edit.marked() {
+        // Clamped: a stale range must never cut the text off a char.
+        let marked = edit.marked().filter(|m| {
+            m.start <= m.end
+                && m.end <= shown.len()
+                && shown.is_char_boundary(m.start)
+                && shown.is_char_boundary(m.end)
+        });
+        let runs = match marked {
             Some(m) if !edit.text().is_empty() => [
                 TextRun {
                     len: m.start,
@@ -480,10 +508,13 @@ impl Element for TextLine {
         });
         let line = p.line.clone();
         let (scroll_x, focused) = (p.scroll_x, p.focused);
-        self.field.update(cx, |f, _| {
+        self.field.update(cx, |f, cx| {
             f.last = Some((line, bounds));
             f.scroll_x = scroll_x;
             f.drawn_focused = focused;
+            if focused && f.blink.is_none() {
+                f.start_blink(cx);
+            }
         });
     }
 }
@@ -571,7 +602,7 @@ impl EntityInputHandler for TextField {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{ClipboardItem, Entity, TestAppContext, VisualTestContext};
+    use gpui::{ClipboardItem, Entity, EntityInputHandler, TestAppContext, VisualTestContext};
 
     use super::TextField;
     use crate::app::keymap::bind_keys;
@@ -637,6 +668,41 @@ mod tests {
         assert_eq!(text(&view, cx), "claude --y");
         cx.simulate_keystrokes("ctrl-a ctrl-k");
         assert_eq!(text(&view, cx), "");
+    }
+
+    #[gpui::test]
+    fn select_all_and_cut_while_composing_then_composing_again(cx: &mut TestAppContext) {
+        let (view, cx) = field(cx, "abc");
+        view.update_in(cx, |f, window, cx| {
+            f.replace_and_mark_text_in_range(None, "にほ", None, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-a cmd-x");
+        view.update_in(cx, |f, window, cx| {
+            f.replace_and_mark_text_in_range(None, "に", None, window, cx);
+            f.replace_text_in_range(None, "日", window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(text(&view, cx), "日");
+    }
+
+    #[gpui::test]
+    fn blinks_only_while_focused(cx: &mut TestAppContext) {
+        let (view, cx) = field(cx, "abc");
+        assert!(view.read_with(cx, |f, _| f.is_blinking()));
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        cx.executor().advance_clock(super::BLINK * 2);
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |f, _| f.is_blinking()));
+        // Typing keeps the caret solid: an edit restarts the shown half.
+        cx.update(|window, cx| window.focus(view.read(cx).focus_handle()));
+        cx.run_until_parked();
+        cx.executor().advance_clock(super::BLINK);
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |f, _| f.caret_on));
+        cx.simulate_input("d");
+        assert!(view.read_with(cx, |f, _| f.caret_on));
     }
 
     #[gpui::test]

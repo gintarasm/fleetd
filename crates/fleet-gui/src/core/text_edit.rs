@@ -109,6 +109,7 @@ impl TextEdit {
     }
 
     pub fn select_all(&mut self) {
+        self.marked = None;
         self.anchor = 0;
         self.caret = self.text.len();
         self.last = None;
@@ -118,6 +119,7 @@ impl TextEdit {
     /// keeps the anchor (Shift, or a drag).
     pub fn set_caret(&mut self, at: usize, extend: bool) {
         let at = self.floor(at);
+        self.marked = None;
         self.caret = at;
         if !extend {
             self.anchor = at;
@@ -136,6 +138,7 @@ impl TextEdit {
         let Some((pos, c)) = hit else {
             return;
         };
+        self.marked = None;
         let (start, end) = if is_word(c) {
             let start = self.text[..pos]
                 .char_indices()
@@ -454,7 +457,9 @@ impl TextEdit {
 
     /// Records the state before an edit of `kind`, unless it continues
     /// the last edit of the same kind (typing a word undoes as one).
+    /// Every edit but the IME's own ends a composition.
     fn checkpoint(&mut self, kind: EditKind) {
+        self.marked = None;
         let joins = kind != EditKind::Other && self.last == Some(kind);
         if !joins {
             self.undo.push(self.snapshot());
@@ -556,6 +561,28 @@ mod tests {
         e.move_caret(M::Right, false);
         e.delete_to_end();
         assert_eq!(e.text(), "t");
+    }
+
+    #[test]
+    fn edits_while_composing_drop_the_stale_marked_text() {
+        let mut e = TextEdit::new("abc");
+        e.replace_and_mark_utf16(None, "にほん", None);
+        e.select_all();
+        assert_eq!(e.cut().as_deref(), Some("abcにほん"));
+        assert_eq!(e.marked(), None);
+        e.replace_and_mark_utf16(None, "に", None);
+        assert_eq!(e.text(), "に");
+        e.replace_utf16(None, "日");
+        assert_eq!(e.text(), "日");
+        // Every other edit too.
+        e.replace_and_mark_utf16(None, "x", None);
+        e.set_text("");
+        assert_eq!(e.marked(), None);
+        e.replace_and_mark_utf16(None, "y", None);
+        e.backspace();
+        assert_eq!(e.marked(), None);
+        e.replace_utf16(None, "z");
+        assert_eq!(e.text(), "z");
     }
 
     #[test]
