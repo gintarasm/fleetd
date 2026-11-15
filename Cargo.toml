@@ -10,3 +10,10 @@ all = "warn"
 # `stalled_terminal_gets_lagged_exit_2` needs the subscriber to lag within 3 s).
 [profile.dev.package.fleet-term]
 opt-level = 2
+
+# Whole-program optimisation: cuts `fleetd`'s resident `__TEXT` and so its idle
+# RSS (issue #19, ADR 0040). `panic` stays `unwind`: the restart handoff relies on
+# `catch_unwind` (`crates/fleetd/src/restart.rs`).
+[profile.release]
+lto = "fat"
+codegen-units = 1

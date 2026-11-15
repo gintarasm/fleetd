@@ -24,3 +24,4 @@ fleet-client = { path = "../fleet-client" }
 libc = "0.2.191"
 rusqlite = { version = "0.42.0", features = ["bundled"] }
 tempfile = "3.27.0"
+toml = "1.2.1"
