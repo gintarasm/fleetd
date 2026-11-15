@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::config::{DEFAULT_FONT_FAMILY, GuiConfig, save_gui_values};
+use super::glass::GlassChoice;
 use super::theme::Appearance;
 
 /// The window backdrop's default blur radius in points, a little over
@@ -152,6 +153,7 @@ pub enum Change {
     OptionAsMeta(bool),
     DefaultCommand(Vec<String>),
     DefaultDir(String),
+    Glass(GlassChoice),
 }
 
 /// Rounds to two decimals, so repeated steps do not drift.
@@ -195,6 +197,7 @@ impl Change {
             Change::OptionAsMeta(v) => set(&mut c.option_as_meta, v, "option_as_meta"),
             Change::DefaultCommand(v) => set(&mut c.default_command, v, "default_command"),
             Change::DefaultDir(v) => set(&mut c.default_dir, v.trim().to_owned(), "default_dir"),
+            Change::Glass(v) => set(&mut c.glass, v, "glass"),
         }
     }
 }
@@ -226,6 +229,7 @@ fn value_of(c: &GuiConfig, key: &str) -> Option<toml_edit::Value> {
             .collect::<toml_edit::Array>()
             .into(),
         "default_dir" => c.default_dir.as_str().into(),
+        "glass" => c.glass.as_str().into(),
         _ => return None,
     })
 }

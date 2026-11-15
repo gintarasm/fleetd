@@ -2,6 +2,7 @@
 
 pub mod backoff;
 pub mod config;
+pub mod glass;
 pub mod icons;
 pub mod keys;
 pub mod launch;

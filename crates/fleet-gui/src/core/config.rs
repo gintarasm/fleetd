@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::glass::GlassChoice;
 use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, ThemeChoice};
 use super::state::write_atomic;
 use super::target::Target;
@@ -76,6 +77,8 @@ pub struct GuiConfig {
     pub notifications: bool,
     /// The New agent sheet's directory; empty: the most recent one.
     pub default_dir: String,
+    /// Liquid glass behind the window or its chrome (macOS 26; ADR 0049).
+    pub glass: GlassChoice,
 }
 
 impl Default for GuiConfig {
@@ -93,6 +96,7 @@ impl Default for GuiConfig {
             confirm_kill: true,
             notifications: true,
             default_dir: String::new(),
+            glass: GlassChoice::Off,
         }
     }
 }
