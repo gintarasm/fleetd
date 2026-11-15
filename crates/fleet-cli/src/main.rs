@@ -254,13 +254,26 @@ fn old_daemon(e: Error) -> Error {
     }
 }
 
+/// A `--binary` as the daemon should get it. The daemon resolves a relative
+/// path against its own working directory (`/` for one the GUI started),
+/// which is not where the path was typed, so a path is made absolute here,
+/// against this command's. A bare name (no `/`) is sent as it is, for the
+/// daemon to look up on its `PATH`, as a shell would.
+fn binary_for_daemon(binary: &Path) -> String {
+    let is_name = !binary.as_os_str().as_encoded_bytes().contains(&b'/');
+    let binary = match std::path::absolute(binary) {
+        Ok(abs) if !is_name => abs,
+        // Only an empty path fails; the daemon refuses it.
+        _ => binary.to_path_buf(),
+    };
+    binary.to_string_lossy().into_owned()
+}
+
 /// `fleet daemon restart`: asks the daemon to exec into `binary`, waits for
 /// whichever daemon answers next and reports what it says. Success goes to
 /// stdout, every other outcome to stderr with exit 1.
 fn daemon_restart(client: Connection, sock: &Path, binary: Option<PathBuf>) -> Result<u8> {
-    let binary = binary
-        .map(|b| b.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let binary = binary.map(|b| binary_for_daemon(&b)).unwrap_or_default();
     Ok(match restart_daemon(client, sock, "fleet", &binary)? {
         Restart::TooOld => {
             eprintln!("{TOO_OLD}");
@@ -309,7 +322,7 @@ fn run(cli: Cli) -> Result<u8> {
         };
         return Ok(upgrade::run(
             &state_dir(&cli),
-            &binary.to_string_lossy(),
+            &binary_for_daemon(binary),
             flags,
         ));
     }
@@ -449,5 +462,21 @@ fn main() -> ExitCode {
             eprintln!("fleet: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_binary_path_is_sent_absolute_and_a_name_as_it_is() {
+        let cwd = std::env::current_dir().unwrap();
+        let sent = binary_for_daemon(Path::new("target/release/fleetd"));
+        assert_eq!(Path::new(&sent), cwd.join("target/release/fleetd"));
+        let sent = binary_for_daemon(Path::new("./fleetd"));
+        assert!(Path::new(&sent).is_absolute(), "{sent}");
+        assert_eq!(binary_for_daemon(Path::new("/opt/fleetd")), "/opt/fleetd");
+        assert_eq!(binary_for_daemon(Path::new("fleetd")), "fleetd");
     }
 }

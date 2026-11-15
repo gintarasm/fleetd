@@ -40,8 +40,14 @@ struct Daemon {
 
 impl Daemon {
     fn start() -> Self {
+        Self::start_from(fleetd_bin())
+    }
+
+    /// Runs the daemon from `binary`, in `/` as when the GUI starts it.
+    fn start_from(binary: &Path) -> Self {
         let dir = TempDir::new().unwrap();
-        let child = Command::new(fleetd_bin())
+        let child = Command::new(binary)
+            .current_dir("/")
             // Never the developer's real login shell.
             .env("FLEETD_LOGIN_ENV", "off")
             .arg("--state-dir")
@@ -75,7 +81,13 @@ impl Drop for Daemon {
 }
 
 fn fleet(dir: &Path, args: &[&str]) -> Output {
+    fleet_in(Path::new("."), dir, args)
+}
+
+/// [`fleet`], run in `cwd`.
+fn fleet_in(cwd: &Path, dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_fleet"))
+        .current_dir(cwd)
         .arg("--state-dir")
         .arg(dir)
         .args(args)
@@ -114,6 +126,23 @@ fn restart_keeps_the_running_agent() {
     let ls = text(&fleet(d.dir.path(), &["ls"]).stdout);
     let row: Vec<_> = ls.lines().nth(1).unwrap().split_whitespace().collect();
     assert_eq!(&row[..2], [id, "running"], "{ls}");
+}
+
+#[test]
+fn relative_binary_resolves_where_fleet_runs_not_where_the_daemon_does() {
+    let d = Daemon::start();
+    // `<profile>/fleetd` from the target dir, as typed in a checkout; the
+    // daemon runs in `/`.
+    let bin = fleetd_bin();
+    let profile = bin.parent().unwrap();
+    let relative = Path::new(profile.file_name().unwrap()).join("fleetd");
+    let out = fleet_in(
+        profile.parent().unwrap(),
+        d.dir.path(),
+        &["daemon", "restart", "--binary", relative.to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "fleetd restarted: 0 agents kept\n");
 }
 
 #[test]
@@ -186,7 +215,7 @@ fn old_daemon_gets_the_too_old_message() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         text(&out.stderr),
-        "this fleetd is too old to restart itself; stop it once (pkill fleetd) and the next client starts the new one\n"
+        "this fleetd is too old to restart itself; stop it once (fleetd --force-stop, or scripts/install.sh --force-stop) and the next client starts the new one\n"
     );
     assert!(out.stdout.is_empty());
 }
