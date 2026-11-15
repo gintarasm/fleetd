@@ -9,7 +9,7 @@ use super::app_state::AppState;
 use super::connect::switch_fleetd;
 use super::status_item::{install_status_item, set_accessory};
 use super::workspace::open_main_window;
-use crate::core::launch::{install_skill, skill_install_command};
+use crate::core::launch::{install_skill, installed_for, skill_install_command};
 use crate::core::status_menu::{StatusEntry, StatusMenuState};
 
 /// Installs the status item and drops the Dock icon when the last window
@@ -114,8 +114,9 @@ impl Drop for InFlight {
     }
 }
 
-/// Runs `fleet skill install` for the current target off the UI thread,
-/// then shows the installed path or the error in an alert. Asked again
+/// Runs `fleet skill install --agent detected` for the current target off
+/// the UI thread, then shows which agents it installed for (and the paths)
+/// or the error in an alert. Asked again
 /// while one runs, it does nothing.
 pub(super) fn install_agent_skill(cx: &mut App) {
     let Some(app) = AppState::global(cx) else {
@@ -140,15 +141,15 @@ pub(super) fn install_agent_skill(cx: &mut App) {
         let _ = cx.update(|cx| {
             show_window(cx);
             let (level, message, detail) = match &result {
-                Ok(path) => (PromptLevel::Info, "Agent skill installed", path.as_str()),
+                Ok(paths) => (PromptLevel::Info, installed_for(paths), paths.as_str()),
                 Err(e) => (
                     PromptLevel::Critical,
-                    "Could not install the agent skill",
+                    "Could not install the agent skill".to_owned(),
                     e.as_str(),
                 ),
             };
             with_workspace(cx, |_, window, cx| {
-                let answer = window.prompt(level, message, Some(detail), &["OK"], cx);
+                let answer = window.prompt(level, &message, Some(detail), &["OK"], cx);
                 cx.spawn(async move |_, _| {
                     let _ = answer.await;
                 })

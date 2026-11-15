@@ -61,21 +61,44 @@ pub fn update_available(target: &Target, running: &BinaryIdentity, local: Option
         != (running.dev, running.ino, running.size, running.mtime_ns)
 }
 
-/// `fleet skill install` for `target`: the sibling (or `PATH`) `fleet`
-/// locally, `ssh <dest> sh -lc 'fleet skill install'` remotely.
+/// `fleet skill install --agent detected` for `target` (every agent whose
+/// home folder exists there): the sibling (or `PATH`) `fleet` locally,
+/// `ssh <dest> sh -lc 'fleet skill install --agent detected'` remotely.
 pub fn skill_install_command(target: &Target, state_dir: &Path) -> std::io::Result<Command> {
     match target {
         Target::Local => {
             let mut cmd = Command::new(find_tool("fleet").unwrap_or_else(|| "fleet".into()));
-            cmd.args(["skill", "install"]);
+            cmd.args(["skill", "install", "--agent", "detected"]);
             Ok(cmd)
         }
-        Target::Ssh { dest } => ssh_remote(dest, "fleet skill install", state_dir),
+        Target::Ssh { dest } => ssh_remote(dest, "fleet skill install --agent detected", state_dir),
+    }
+}
+
+/// "Agent skill installed for Claude Code and omp": the agents named by the paths a
+/// `fleet skill install` printed, one per line.
+pub fn installed_for(paths: &str) -> String {
+    let names: Vec<&str> = paths
+        .lines()
+        .filter_map(|p| {
+            if p.ends_with("/.claude/skills/fleet/SKILL.md") {
+                Some("Claude Code")
+            } else if p.ends_with("/.omp/agent/skills/fleet/SKILL.md") {
+                Some("omp")
+            } else {
+                None
+            }
+        })
+        .collect();
+    match names.as_slice() {
+        [] => "Agent skill installed".to_owned(),
+        [one] => format!("Agent skill installed for {one}"),
+        [rest @ .., last] => format!("Agent skill installed for {} and {last}", rest.join(", ")),
     }
 }
 
 /// Runs `cmd` (a [`skill_install_command`]) to completion: the printed
-/// path, or why it failed. Blocks, so call it off the UI thread.
+/// paths, or why it failed. Blocks, so call it off the UI thread.
 pub fn install_skill(mut cmd: Command) -> Result<String, String> {
     let out = cmd
         .stdin(Stdio::null())
@@ -235,9 +258,42 @@ mod tests {
             .collect();
         assert_eq!(
             args[args.len() - 2..],
-            ["me@box", "sh -lc 'fleet skill install'"]
+            ["me@box", "sh -lc 'fleet skill install --agent detected'"]
         );
         assert!(args.contains(&"ControlMaster=auto".to_owned()));
+    }
+
+    #[test]
+    fn local_skill_install_covers_detected_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = skill_install_command(&Target::Local, dir.path()).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["skill", "install", "--agent", "detected"]);
+    }
+
+    #[test]
+    fn installed_for_names_each_agent() {
+        let both = "/h/.claude/skills/fleet/SKILL.md\n/h/.omp/agent/skills/fleet/SKILL.md";
+        assert_eq!(
+            installed_for(both),
+            "Agent skill installed for Claude Code and omp"
+        );
+        assert_eq!(
+            installed_for("/h/.omp/agent/skills/fleet/SKILL.md"),
+            "Agent skill installed for omp"
+        );
+        assert_eq!(
+            installed_for("/h/.claude/skills/fleet/SKILL.md\n"),
+            "Agent skill installed for Claude Code"
+        );
+        // An older `fleet` that printed something else: no names.
+        assert_eq!(
+            installed_for("/odd/place/SKILL.md"),
+            "Agent skill installed"
+        );
     }
 
     #[test]
