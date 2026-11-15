@@ -18,7 +18,7 @@ use super::bench;
 use super::controls::{
     ButtonKind, button, error_text, field_label, list_row, list_well, sheet_card, sheet_title,
 };
-use super::new_agent::TextField;
+use super::text_field::TextField;
 use super::theme::{Typography, current as theme};
 use super::workspace::Workspace;
 use crate::core::launch::{find_fleetd, start_local};

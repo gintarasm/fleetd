@@ -15,6 +15,7 @@ mod sidebar_view;
 mod status_item;
 mod tail_text;
 mod terminal_element;
+mod text_field;
 mod theme;
 mod titlebar_view;
 mod workspace;
@@ -69,15 +70,30 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
         cx.on_action(|_: &keymap::Quit, cx| cx.quit());
         cx.on_action(|_: &keymap::SwitchFleetd, cx| switch_fleetd(cx));
         cx.on_action(|_: &keymap::InstallSkill, cx| resident::install_agent_skill(cx));
-        cx.set_menus(vec![Menu {
-            name: "fleet".into(),
-            items: vec![
-                MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),
-                MenuItem::action("Install agent skill", keymap::InstallSkill),
-                MenuItem::separator(),
-                MenuItem::action("Quit fleet", keymap::Quit),
-            ],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "fleet".into(),
+                items: vec![
+                    MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),
+                    MenuItem::action("Install agent skill", keymap::InstallSkill),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit fleet", keymap::Quit),
+                ],
+            },
+            Menu {
+                // AppKit adds AutoFill, Dictation and Emoji & Symbols to it.
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Undo", keymap::Undo),
+                    MenuItem::action("Redo", keymap::Redo),
+                    MenuItem::separator(),
+                    MenuItem::action("Cut", keymap::Cut),
+                    MenuItem::action("Copy", keymap::Copy),
+                    MenuItem::action("Paste", keymap::Paste),
+                    MenuItem::action("Select All", keymap::SelectAll),
+                ],
+            },
+        ]);
         connect::install_backend(backend, cx);
         let theme = Theme::for_appearance(cx.window_appearance());
         let shown = saved.clone().unwrap_or(Target::Local);
