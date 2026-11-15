@@ -1,10 +1,10 @@
-//! What `fleetd` does when another fleetd already holds the instance lock:
-//! tell a daemon of the same build from one of another, and offer (or, with
-//! `--upgrade`, do) the restart onto this binary; stop a daemon too old to
-//! restart itself (`--force-stop`) and take over.
-//!
-//! Only `main`'s `AlreadyRunning` branch calls this, so the normal start path
-//! does no work for it. `--stdio` never gets here and ignores the flags.
+//! `fleet daemon upgrade` (hidden): what `fleetd` does when another fleetd
+//! already holds the instance lock. `fleetd` execs this with its own path
+//! (ADR R13: the flow lives here so fleetd's binary and idle RSS do not grow).
+//! It tells a daemon of the same build from one of another, and offers (or,
+//! with `--yes`, does) the restart onto `--binary`; it stops a daemon too old
+//! to restart itself (`--force-stop`) and then execs `<binary> --state-dir
+//! <dir>` so the new fleetd takes over in the user's terminal.
 //!
 //! Decisions, in the code's order:
 //! - A daemon is "too old" when its handshake names no binary (every
@@ -17,16 +17,14 @@
 //!   the lock is then free, and `startup` replaces a leftover socket.
 
 use std::io::{BufRead, IsTerminal};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use fleet_client::{Connection, Restart, restart_daemon};
 use fleet_proto::{AgentState, BinaryIdentity, ListAgents, request, response};
-use tracing::{info, warn};
-
-use crate::Config;
-use crate::handoff::current_binary;
 
 /// How long a stopped daemon gets to exit after SIGTERM.
 const STOP_WAIT: Duration = Duration::from_secs(5);
@@ -35,10 +33,10 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// look at).
 const ALREADY_RUNNING: &str = "fleetd already running";
 
-/// The command-line flags that apply here.
+/// The command-line flags that apply here (`--yes` is fleetd's `--upgrade`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
-    /// `--upgrade`: restart a daemon of another build onto this one, no prompt.
+    /// `--yes`: restart a daemon of another build onto this one, no prompt.
     pub upgrade: bool,
     /// `--force-stop`: stop a daemon too old to restart itself, no prompt.
     pub force_stop: bool,
@@ -100,12 +98,24 @@ pub fn decide(running: Running, flags: Flags, interactive: bool) -> Decision {
     }
 }
 
-/// What `main` does after [`on_already_running`].
+/// What to do after the old daemon was stopped.
 pub enum Next {
     /// Exit with this code.
     Exit(u8),
-    /// The old daemon is gone: take the lock and serve.
+    /// The old daemon is gone: exec the new fleetd.
     Start,
+}
+
+/// The identity of the file at `path`, as `fleetd` reports its own.
+fn identity_of(path: &str) -> std::io::Result<BinaryIdentity> {
+    let m = std::fs::metadata(path)?;
+    Ok(BinaryIdentity {
+        path: path.to_string(),
+        dev: m.dev(),
+        ino: m.ino(),
+        size: m.size(),
+        mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+    })
 }
 
 fn classify(theirs: &BinaryIdentity, mine: &BinaryIdentity) -> Running {
@@ -164,8 +174,23 @@ fn running_agents(conn: &mut Connection) -> Option<usize> {
 
 /// Handles the lock being held by another fleetd. Prints what it did (stdout
 /// for a successful restart, stderr otherwise).
-pub fn on_already_running(cfg: &Config, flags: Flags) -> Next {
-    let sock = cfg.socket_path();
+pub fn run(state_dir: &Path, binary: &str, flags: Flags) -> u8 {
+    match on_already_running(state_dir, binary, flags) {
+        Next::Exit(code) => code,
+        Next::Start => {
+            // Only returns if the exec failed.
+            let err = Command::new(binary)
+                .arg("--state-dir")
+                .arg(state_dir)
+                .exec();
+            eprintln!("fleetd: cannot start {binary}: {err}");
+            1
+        }
+    }
+}
+
+fn on_already_running(state_dir: &Path, binary: &str, flags: Flags) -> Next {
+    let sock = state_dir.join("fleetd.sock");
     let plain = || {
         eprintln!("{ALREADY_RUNNING}");
         Next::Exit(2)
@@ -174,12 +199,9 @@ pub fn on_already_running(cfg: &Config, flags: Flags) -> Next {
     let Ok(conn) = Connection::unix(&sock, "fleetd") else {
         return plain();
     };
-    let mine = match current_binary() {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(error = %e, "cannot identify this binary; not comparing it with the running daemon");
-            return plain();
-        }
+    // Cannot identify the new binary: nothing to compare with.
+    let Ok(mine) = identity_of(binary) else {
+        return plain();
     };
     let running = classify(
         conn.hello().binary.as_ref().unwrap_or(&Default::default()),
@@ -247,7 +269,7 @@ pub fn on_already_running(cfg: &Config, flags: Flags) -> Next {
                     return Next::Exit(1);
                 }
             },
-            Decision::Stop => return stop_old(cfg),
+            Decision::Stop => return stop_old(state_dir),
         }
     }
 }
@@ -300,8 +322,8 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 /// Stops the lock holder with SIGTERM and waits for it to exit.
-fn stop_old(cfg: &Config) -> Next {
-    let lock = cfg.lock_path();
+fn stop_old(state_dir: &Path) -> Next {
+    let lock = state_dir.join("fleetd.lock");
     let pid = match lock_holders(&lock).as_deref() {
         Ok([pid]) => *pid,
         Ok([]) => {
@@ -325,7 +347,6 @@ fn stop_old(cfg: &Config) -> Next {
             return Next::Exit(1);
         }
     };
-    info!(pid, "stopping the old fleetd with SIGTERM");
     // SAFETY: a plain signal to the process that holds our lock file.
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let deadline = Instant::now() + STOP_WAIT;

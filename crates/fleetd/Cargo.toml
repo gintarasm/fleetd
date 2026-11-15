@@ -8,7 +8,6 @@ workspace = true
 
 [dependencies]
 bytes = "1.12.1"
-fleet-client = { version = "0.1.0", path = "../fleet-client" }
 fleet-node = { version = "0.1.0", path = "../fleet-node" }
 fleet-proto = { version = "0.1.0", path = "../fleet-proto" }
 fs4 = "1.1.0"
@@ -21,6 +20,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "std"] }
 
 [dev-dependencies]
+fleet-client = { path = "../fleet-client" }
 libc = "0.2.191"
 rusqlite = { version = "0.42.0", features = ["bundled"] }
 tempfile = "3.27.0"

@@ -25,6 +25,20 @@ use tokio_util::codec::{Decoder, Encoder};
 
 const FLEETD: &str = env!("CARGO_BIN_EXE_fleetd");
 
+/// Builds `fleet` once, next to `fleetd`: `fleetd` execs it to decide (cargo
+/// only builds this crate's own binaries for its integration tests).
+fn ensure_fleet_built() {
+    static BUILT: std::sync::Once = std::sync::Once::new();
+    BUILT.call_once(|| {
+        let mut cmd = Command::new(env!("CARGO"));
+        cmd.args(["build", "-p", "fleet-cli", "--message-format=short"]);
+        if !cfg!(debug_assertions) {
+            cmd.arg("--release");
+        }
+        assert!(cmd.status().expect("cargo build").success());
+    });
+}
+
 fn wait_for(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while !done() {
@@ -87,6 +101,7 @@ impl Drop for Daemon {
 /// Runs `fleetd` against `dir` with `args`, stdin closed (so no terminal),
 /// and `answer` as the prompt hook's answer if given.
 fn fleetd(dir: &Path, args: &[&str], answer: Option<&str>) -> Output {
+    ensure_fleet_built();
     let mut cmd = Command::new(FLEETD);
     cmd.env("FLEETD_LOGIN_ENV", "off")
         .env_remove("FLEETD_TEST_UPGRADE_ANSWER")
@@ -139,6 +154,26 @@ fn same_build_prints_already_running() {
     let out = fleetd(d.dir.path(), &["--upgrade"], Some("y"));
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(text(&out.stderr), "fleetd already running\n");
+}
+
+#[test]
+fn without_fleet_it_says_so() {
+    let (_keep, other) = other_build();
+    let d = Daemon::start_bin(&other);
+    // This copy has no `fleet` beside it, and PATH has none.
+    let out = Command::new(&other)
+        .env("PATH", "")
+        .arg("--state-dir")
+        .arg(d.dir.path())
+        .arg("--upgrade")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        text(&out.stderr),
+        "fleetd already running (install fleet next to fleetd to upgrade from here)\n"
+    );
 }
 
 #[test]

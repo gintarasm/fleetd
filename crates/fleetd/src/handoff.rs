@@ -56,8 +56,7 @@ fn random_u64() -> Option<u64> {
     Some(u64::from_ne_bytes(buf))
 }
 
-/// The identity of the running executable.
-pub(crate) fn current_binary() -> io::Result<BinaryIdentity> {
+fn current_binary() -> io::Result<BinaryIdentity> {
     let path = std::env::current_exe()?;
     let m = fs::metadata(&path)?;
     Ok(BinaryIdentity {

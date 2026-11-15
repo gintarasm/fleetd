@@ -3,6 +3,7 @@
 mod attach;
 mod history;
 mod skill;
+mod upgrade;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -129,6 +130,19 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DaemonCmd {
+    /// What `fleetd` runs when another fleetd already holds the lock
+    #[command(hide = true)]
+    Upgrade {
+        /// The fleetd binary to restart the running daemon onto
+        #[arg(long)]
+        binary: PathBuf,
+        /// Restart without asking
+        #[arg(long)]
+        yes: bool,
+        /// Stop a daemon too old to restart itself, without asking
+        #[arg(long)]
+        force_stop: bool,
+    },
     /// Restart fleetd into a new binary; running agents keep running
     Restart {
         /// The fleetd binary to restart into (default: `fleetd` on the daemon's PATH)
@@ -280,6 +294,25 @@ fn run(cli: Cli) -> Result<u8> {
     if let Command::Skill(args) = cli.command {
         return skill::run(args).map(|()| 0);
     }
+    if let Command::Daemon {
+        cmd:
+            DaemonCmd::Upgrade {
+                binary,
+                yes,
+                force_stop,
+            },
+    } = &cli.command
+    {
+        let flags = upgrade::Flags {
+            upgrade: *yes,
+            force_stop: *force_stop,
+        };
+        return Ok(upgrade::run(
+            &state_dir(&cli),
+            &binary.to_string_lossy(),
+            flags,
+        ));
+    }
     let sock = state_dir(&cli).join("fleetd.sock");
     let mut client = Connection::unix(&sock, "fleet")?;
     match cli.command {
@@ -401,7 +434,10 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Daemon {
             cmd: DaemonCmd::Restart { binary },
         } => return daemon_restart(client, &sock, binary),
-        Command::Skill(_) => unreachable!("handled before connecting"),
+        Command::Daemon {
+            cmd: DaemonCmd::Upgrade { .. },
+        }
+        | Command::Skill(_) => unreachable!("handled before connecting"),
     }
     Ok(0)
 }

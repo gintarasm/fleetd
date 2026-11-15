@@ -3,7 +3,6 @@ use std::process::ExitCode;
 
 use fleetd::handoff::{self, Handed};
 use fleetd::logging::{self, DAEMON_LOG, STDIO_LOG};
-use fleetd::upgrade::{self, Flags, Next};
 use fleetd::{Config, Daemon, StartupError, raise_fd_limit, startup};
 use tracing::{error, info, warn};
 
@@ -28,6 +27,48 @@ fn take_handoff(cfg: &Config, handed: &Handed) -> std::io::Result<Daemon> {
     Ok(Daemon::adopted(cfg, listener, lock, rec))
 }
 
+/// The `fleet` that sits next to this binary, else the first on `PATH`.
+fn find_fleet() -> Option<PathBuf> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("fleet")));
+    beside.filter(|p| p.is_file()).or_else(|| {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join("fleet"))
+            .find(|p| p.is_file())
+    })
+}
+
+/// Another fleetd holds the lock. Whether it is this build, or a different
+/// one to offer a restart onto, is `fleet daemon upgrade`'s to decide (the
+/// flow is not in this binary; ADR R13), so this execs it. Without a `fleet`
+/// it says so and exits 2.
+fn offer_upgrade(cfg: &Config, upgrade: bool, force_stop: bool) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+    let (Some(fleet), Ok(me)) = (find_fleet(), std::env::current_exe()) else {
+        eprintln!("fleetd already running (install fleet next to fleetd to upgrade from here)");
+        return ExitCode::from(2);
+    };
+    let mut cmd = std::process::Command::new(&fleet);
+    cmd.arg("--state-dir")
+        .arg(&cfg.state_dir)
+        .args(["daemon", "upgrade", "--binary"])
+        .arg(me);
+    if upgrade {
+        cmd.arg("--yes");
+    }
+    if force_stop {
+        cmd.arg("--force-stop");
+    }
+    // Only returns if the exec failed.
+    let err = cmd.exec();
+    eprintln!(
+        "fleetd already running (cannot run {}: {err})",
+        fleet.display()
+    );
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     // Before anything else (logging, the login-env capture, any thread):
     // the handoff variables leave the environment, so no agent, capture or
@@ -48,16 +89,16 @@ fn main() -> ExitCode {
     let mut cfg = Config::default();
     let mut stdio = false;
     // Used only when another fleetd holds the lock; ignored with --stdio.
-    let mut flags = Flags::default();
+    let (mut upgrade, mut force_stop) = (false, false);
     let mut args = std::env::args_os().skip(1);
     // Usage errors go to stderr only: there is no state dir to log to yet.
     while let Some(arg) = args.next() {
         if arg == "--stdio" {
             stdio = true;
         } else if arg == "--upgrade" {
-            flags.upgrade = true;
+            upgrade = true;
         } else if arg == "--force-stop" {
-            flags.force_stop = true;
+            force_stop = true;
         } else if arg == "--state-dir" {
             let Some(dir) = args.next() else {
                 eprintln!("fleetd: --state-dir requires a path");
@@ -120,17 +161,7 @@ fn main() -> ExitCode {
         Ok(d) => d,
         Err(StartupError::AlreadyRunning) => {
             info!(state_dir = ?cfg.state_dir, "another fleetd holds the instance lock; exiting");
-            match upgrade::on_already_running(&cfg, flags) {
-                Next::Exit(code) => return ExitCode::from(code),
-                // The old daemon was stopped: take over.
-                Next::Start => match startup(&cfg) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        fatal(&e.to_string());
-                        return ExitCode::FAILURE;
-                    }
-                },
-            }
+            return offer_upgrade(&cfg, upgrade, force_stop);
         }
         Err(e) => {
             fatal(&e.to_string());
