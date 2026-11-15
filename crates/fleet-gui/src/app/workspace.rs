@@ -398,6 +398,12 @@ impl Workspace {
         if epoch != self.epoch || self.modal() {
             return;
         }
+        // The agent may have changed since the menu opened (a Kill for an
+        // agent that exited meanwhile): only what the menu offers now.
+        let offered = self.menu_items(agent_id, cx);
+        if !offered.contains(&MenuEntry::Item(item)) {
+            return;
+        }
         match item {
             RowMenuItem::OpenSplit => self.open_menu_split(agent_id, window, cx),
             RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
@@ -1884,6 +1890,51 @@ mod tests {
         // With four panes the menu no longer offers it.
         s.cx.simulate_keystrokes("cmd-d cmd-d");
         assert_eq!(row_items(&mut s, 7), [RowMenuItem::Kill]);
+    }
+
+    #[gpui::test]
+    fn row_menu_pick_is_checked_against_the_agent_now(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        // The menu offered Kill; the agent exited before the pick.
+        agents(&mut s, &fake, vec![ended(7, "/w", 1, AgentState::Exited)]);
+        pick_row(&mut s, 7, RowMenuItem::Kill);
+        assert!(!s.cx.has_pending_prompt(), "no Kill for an exited agent");
+        // Remove picked for an agent the list now shows running.
+        agents(&mut s, &fake, vec![row(8, "/w", 2)]);
+        pick_row(&mut s, 8, RowMenuItem::Remove);
+        assert!(!fake.calls().iter().any(|c| matches!(c, Call::Forget(_))));
+        // An unknown agent offers no Restart either.
+        pick_row(&mut s, 99, RowMenuItem::Restart);
+        assert!(!fake.calls().contains(&Call::Restart(99)));
+    }
+
+    #[gpui::test]
+    fn pane_menu_restart_restarts_the_ended_agent_in_place(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.ws.update_in(s.cx, |ws, window, cx| {
+            let epoch = ws.epoch;
+            ws.pane_menu_pick(PaneId(1), PaneMenuItem::Restart, epoch, window, cx);
+        });
+        s.cx.run_until_parked();
+        let size = s.app.read_with(s.cx, |a, cx| {
+            a.pane_view(PaneId(1)).unwrap().read(cx).grid().unwrap()
+        });
+        assert!(fake.calls().contains(&Call::RestartInPane {
+            pane: PaneId(1),
+            agent_id: 5,
+            size,
+        }));
     }
 
     #[gpui::test]
