@@ -9,7 +9,7 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
     IntoElement, MouseButton, ParentElement, Pixels, Point, PromptButton, PromptLevel, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, anchored, deferred, div, px, relative, size,
+    WindowBounds, WindowOptions, anchored, deferred, div, point, px, relative, size,
 };
 
 use super::app_state::AppState;
@@ -19,16 +19,19 @@ use super::keymap::{
     FocusUp, Kill, NewAgent, Remove, Restart, RestartPane, SplitDown, SplitRight, ToggleMaximize,
     WORKSPACE_CONTEXT,
 };
+use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
 use super::theme::{Theme, Typography};
+use super::titlebar_view::{BarData, render_bar};
 use crate::core::config::save_connection;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
 use crate::core::style::{chrome, radius, space, text};
 use crate::core::target::Target;
+use crate::core::titlebar::{Link, bar_title, window_title};
 
 /// Between pane cards, and around them.
 const PANE_GAP: f32 = chrome::PANE_GAP;
@@ -45,16 +48,20 @@ pub fn open_main_window(cx: &mut App) {
     {
         return;
     }
+    let lights = chrome::traffic_lights_origin(chrome::BAR_HEIGHT);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
             size(px(1200.), px(760.)),
             cx,
         ))),
+        // The unified bar: our own, under AppKit's traffic lights.
         titlebar: Some(TitlebarOptions {
             title: Some("fleet".into()),
-            ..Default::default()
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(lights.0), px(lights.1))),
         }),
+        window_min_size: Some(size(px(640.), px(400.))),
         ..Default::default()
     };
     let state = app.clone();
@@ -97,6 +104,8 @@ pub struct Workspace {
     pane_focus: HashMap<PaneId, (EntityId, FocusHandle, [Subscription; 2])>,
     /// The panes drawn by the last render.
     drawn: Vec<PaneId>,
+    /// The window title last set.
+    window_title: String,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -118,11 +127,11 @@ impl Workspace {
             cx.notify();
         });
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
-            let theme = Theme::for_appearance(window.appearance());
+            let theme = window_theme(window);
             this.app.update(cx, |a, cx| a.set_theme(theme, cx));
             window.refresh();
         });
-        let theme = Theme::for_appearance(window.appearance());
+        let theme = window_theme(window);
         app.update(cx, |a, cx| {
             a.set_theme(theme, cx);
             // The list is often in before the window: draw it at once.
@@ -154,6 +163,7 @@ impl Workspace {
             epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
+            window_title: String::new(),
             _subscriptions: vec![observe, appearance],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -709,9 +719,31 @@ impl Render for Workspace {
             now_ms: now_ms(),
             titles: &titles,
             mark: &mark,
-            ended: rows.iter().filter(|r| ended(r)).count(),
         };
         let sidebar = render_sidebar(&data, &theme, cx);
+        let ended_rows = rows.iter().filter(|r| ended(r)).count();
+        let bar = {
+            let app = self.app.read(cx);
+            let link = if !app.is_live() {
+                Link::Connecting
+            } else if app.is_reconnecting() {
+                Link::Reconnecting
+            } else {
+                Link::Live
+            };
+            let title = bar_title(app.target(), link, rows.len() - ended_rows, ended_rows);
+            let window_title = window_title(&title);
+            if self.window_title != window_title {
+                window.set_window_title(&window_title);
+                self.window_title = window_title;
+            }
+            BarData {
+                title,
+                ended: ended_rows,
+                fullscreen: window.is_fullscreen(),
+            }
+        };
+        let bar = render_bar(&bar, &theme, cx);
         super::bench::sidebar_drawn(window);
         let panes = self.render_panes(cx);
         let toast = error.map(|e| {
@@ -785,7 +817,7 @@ impl Render for Workspace {
             .size_full()
             .relative()
             .flex()
-            .flex_row()
+            .flex_col()
             .bg(theme.window)
             .text_color(theme.text)
             .on_action(cx.listener(Self::toggle_maximize))
@@ -807,12 +839,29 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
-            .child(sidebar)
-            .child(panes)
+            .child(bar)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .child(sidebar)
+                    .child(panes),
+            )
             .children(toast)
             .children(menu)
             .children(sheet)
             .children(connect)
+    }
+}
+
+/// The theme for the window's appearance, in the user's accent colour.
+fn window_theme(window: &Window) -> Theme {
+    let theme = Theme::for_appearance(window.appearance());
+    match native::accent_color() {
+        Some((r, g, b)) => theme.with_accent(gpui::Rgba { r, g, b, a: 1.0 }.into()),
+        None => theme,
     }
 }
 
@@ -2050,6 +2099,29 @@ mod tests {
         list(&mut s, &fake, vec![]);
         list(&mut s, &fake, vec![]);
         assert_eq!(shown(&mut s, PaneId(1)), Some(6));
+    }
+
+    #[gpui::test]
+    fn bar_new_agent_button_opens_the_sheet_and_the_title_counts_agents(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![row(7, "/w", 1), ended(8, "/w", 2, AgentState::Exited)],
+        );
+        assert!(drawn(&mut s, "titlebar") && drawn(&mut s, "bar-target"));
+        let title = s.ws.read_with(s.cx, |ws, _| ws.window_title.clone());
+        assert_eq!(title, "fleet — This Mac");
+        // The bar sits above the sidebar's first tab.
+        let bar = s.cx.debug_bounds("titlebar").unwrap();
+        let tab = s.cx.debug_bounds("tab-7").unwrap();
+        assert!(bar.bottom() <= tab.top());
+        click(&mut s, "new-agent");
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
     }
 
     #[gpui::test]

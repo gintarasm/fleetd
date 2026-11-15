@@ -3,8 +3,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Div, ElementId, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, div, px,
+    Div, ElementId, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::theme::{Theme, Typography};
@@ -138,4 +138,33 @@ pub fn error_text(message: impl IntoElement, theme: &Theme) -> Div {
         .type_style(text::CALLOUT)
         .text_color(theme.danger)
         .child(message)
+}
+
+/// A square toolbar button holding a glyph; `enabled: false` draws it
+/// dimmed (the caller adds no click handler then). A press on it never
+/// reaches what is behind it (the bar's window drag).
+pub fn icon_button(
+    id: &'static str,
+    glyph: &'static str,
+    theme: &Theme,
+    enabled: bool,
+) -> Stateful<Div> {
+    let theme = *theme;
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(chrome::ICON_BUTTON))
+        .rounded(px(radius::MD))
+        .text_color(theme.secondary)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(glyph)
+        .when(enabled, |b| {
+            b.cursor_pointer()
+                .hover(move |s| s.bg(theme.hover).text_color(theme.text))
+                .active(move |s| s.bg(theme.pressed))
+        })
+        .when(!enabled, |b| b.text_color(theme.tertiary))
 }

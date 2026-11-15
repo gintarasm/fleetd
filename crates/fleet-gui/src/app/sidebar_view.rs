@@ -1,5 +1,5 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
-//! directory, "Clear exited" above them and "+ New agent" at the bottom.
+//! directory. (New agent and Clear exited live in the unified bar.)
 //! A click shows the agent in the focused pane; a right-click offers Open
 //! in new split, and Kill (running) or Restart and Remove (ended).
 
@@ -9,8 +9,8 @@ use std::path::Path;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, px,
 };
 
 use super::tail_text::tail_text;
@@ -51,8 +51,6 @@ pub struct SidebarData<'a> {
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
     pub mark: &'a dyn Fn(u64) -> TabMark,
-    /// Exited or lost agents (what Clear exited removes).
-    pub ended: usize,
 }
 
 /// The Clear exited button's tooltip; `None` while it is disabled.
@@ -126,60 +124,22 @@ pub fn render_sidebar(
                 .children(tabs)
         })
         .collect();
-    let new_agent = div()
-        .id("new-agent")
-        .flex_none()
-        .mx(px(space::SM))
-        .px(px(space::SM))
-        .py(px(space::XS + space::XXS))
-        .rounded(px(radius::MD))
-        .text_color(theme.secondary)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.hover).text_color(theme.text))
-        .active(|s| s.bg(theme.pressed))
-        .child("+ New agent")
-        .on_click(cx.listener(|this, _, window, cx| this.open_new_agent(window, cx)));
-    let tooltip = clear_exited_tooltip(data.ended);
-    let enabled = tooltip.is_some();
-    let tooltip_theme = *theme;
-    let clear = div()
-        .id("clear-exited")
-        .debug_selector(|| "clear-exited".to_owned())
-        .px(px(space::SM))
-        .py(px(space::XXS))
-        .rounded(px(radius::SM))
-        .type_style(text::SUBHEADLINE)
-        .text_color(theme.secondary)
-        .child("Clear exited")
-        .when(!enabled, |s| s.text_color(theme.tertiary))
-        .when_some(tooltip, |s, text| {
-            let text = SharedString::from(text);
-            s.cursor_pointer()
-                .hover(|s| s.bg(theme.hover).text_color(theme.text))
-                .active(|s| s.bg(theme.pressed))
-                .tooltip(move |_, cx| {
-                    let (text, theme) = (text.clone(), tooltip_theme);
-                    cx.new(|_| Tooltip { text, theme }).into()
-                })
-                .on_click(cx.listener(|this, _, _, cx| this.clear_exited(cx)))
-        });
-    let header = div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .justify_end()
-        .px(px(space::SM))
-        .child(clear);
+    let empty = data.rows.is_empty().then(|| {
+        div()
+            .px(px(space::SM))
+            .pt(px(space::MD))
+            .type_style(text::CALLOUT)
+            .text_color(theme.tertiary)
+            .child("No agents yet. Press ⌘N to start one.")
+    });
     div()
         .flex()
         .flex_col()
         .flex_none()
         .w(px(chrome::SIDEBAR_WIDTH))
         .h_full()
-        .py(px(space::SM))
         .text_color(theme.text)
         .type_style(text::BODY)
-        .child(header)
         .child(
             div()
                 .id("tabs")
@@ -190,9 +150,9 @@ pub fn render_sidebar(
                 .px(px(space::SM))
                 .pb(px(space::SM))
                 .overflow_y_scroll()
+                .children(empty)
                 .children(groups),
         )
-        .child(new_agent)
 }
 
 fn render_tab(

@@ -1,5 +1,5 @@
-//! The menu-bar status item and the activation policy: the only AppKit
-//! (objc2) code in the app. The menu is rebuilt from
+//! The menu-bar status item and the activation policy, in AppKit (objc2;
+//! the rest of the app's AppKit calls are in `native`). The menu is rebuilt from
 //! [`status_menu`] each time it opens; a pick goes into a channel that a
 //! foreground gpui task hands to [`super::resident::handle`].
 

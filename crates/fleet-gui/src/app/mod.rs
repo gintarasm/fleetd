@@ -5,6 +5,7 @@ mod bench;
 mod connect;
 mod controls;
 mod keymap;
+mod native;
 mod new_agent;
 mod pane_view;
 mod resident;
@@ -13,6 +14,7 @@ mod status_item;
 mod tail_text;
 mod terminal_element;
 mod theme;
+mod titlebar_view;
 mod workspace;
 
 use std::path::PathBuf;

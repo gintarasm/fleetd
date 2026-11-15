@@ -17,4 +17,5 @@ pub mod status_menu;
 pub mod style;
 pub mod target;
 pub mod theme;
+pub mod titlebar;
 pub mod truncate;
