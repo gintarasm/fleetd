@@ -1,0 +1,27 @@
+syntax = "proto3";
+package fleet.handoff.v1;
+
+// Written by a daemon that is about to `exec` a new binary and read by the
+// successor. File descriptors are inherited across the exec by number.
+message HandoffRecord {
+  uint32 version = 1;
+  int32 listener_fd = 2;
+  int32 lock_fd = 3;
+  uint64 previous_instance = 4;
+  repeated HandoffAgent agents = 5;
+}
+
+message HandoffAgent {
+  uint64 id = 1;
+  int32 pid = 2;
+  uint32 cols = 3;
+  uint32 rows = 4;
+  // Serialised terminal state, so the successor can redraw the screen.
+  bytes snapshot = 5;
+  oneof terminal {
+    // The pty master, inherited.
+    int32 fd = 6;
+    // A separate holder process owns the pty; reach it at this socket.
+    string holder_socket = 7;
+  }
+}

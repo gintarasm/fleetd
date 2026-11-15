@@ -134,6 +134,7 @@ async fn handshake(conn: ConnId, reader: &mut Reader, writer: &mut Writer) -> Op
     let ok = Frame::HelloOk(HelloOk {
         protocol_version: PROTOCOL_VERSION,
         server: "fleetd".into(),
+        ..Default::default()
     });
     match tokio::time::timeout(HANDSHAKE_WRITE_TIMEOUT, writer.send(ok)).await {
         Ok(Ok(())) => Some(hello.client),
@@ -336,6 +337,8 @@ impl Connection {
             }
             Some(request::Kind::Restart(r)) => return self.restart(req.id, r).await,
             Some(request::Kind::Forget(f)) => return self.forget(req.id, f).await,
+            // Answered for real once the restart path lands.
+            Some(request::Kind::RestartDaemon(_)) => error("restart not supported yet".into()),
         };
         self.respond(req.id, kind).await
     }

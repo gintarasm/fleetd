@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use fleet_proto::{
-    Event, Frame, FrameCodec, Hello, PROTOCOL_VERSION, ReadLogs, Request, event, request, response,
+    Event, Frame, FrameCodec, Hello, HelloOk, PROTOCOL_VERSION, ReadLogs, Request, event, request,
+    response,
 };
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -131,6 +132,8 @@ pub struct Connection {
     reader: FrameReader,
     sender: Sender,
     closer: Option<Closer>,
+    /// The server's handshake reply: instance, binary identity, restore summary.
+    hello: HelloOk,
 }
 
 /// Shuts a unix-socket connection down from any thread, ending a blocked
@@ -149,6 +152,11 @@ impl Closer {
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Connection {
+    /// The `HelloOk` the server answered the handshake with.
+    pub fn hello(&self) -> &HelloOk {
+        &self.hello
+    }
+
     /// Handshakes over an already-open byte stream as `client_name` (shown in
     /// the daemon's log), within [`HANDSHAKE_TIMEOUT`]. On a timeout the
     /// handshake thread keeps `read` and `write` until the peer closes the
@@ -206,6 +214,7 @@ impl Connection {
                 next_id: 1,
             },
             closer: None,
+            hello: HelloOk::default(),
         };
         let mut out = BytesMut::new();
         FrameCodec::new()
@@ -220,7 +229,10 @@ impl Connection {
         conn.sender.stream.write_all(&out)?;
         conn.sender.stream.flush()?;
         match conn.reader.read_frame()? {
-            Some(Frame::HelloOk(_)) => Ok(conn),
+            Some(Frame::HelloOk(ok)) => {
+                conn.hello = ok;
+                Ok(conn)
+            }
             Some(Frame::Reject(r)) => Err(Error::Protocol(format!("rejected: {}", r.reason))),
             Some(_) => Err(Error::Protocol("unexpected reply to hello".into())),
             None => Err(Error::Protocol("closed during handshake".into())),
