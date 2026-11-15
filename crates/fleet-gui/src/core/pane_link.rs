@@ -865,6 +865,7 @@ mod tests {
                     Frame::HelloOk(HelloOk {
                         protocol_version: PROTOCOL_VERSION,
                         server: "fake".into(),
+                        ..Default::default()
                     }),
                     &mut out,
                 )

@@ -3,9 +3,10 @@
 mod attach;
 mod history;
 mod skill;
+mod upgrade;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -15,7 +16,7 @@ use fleet_proto::{
 };
 use fleet_proto::{request, response};
 
-use fleet_client::{Connection, Error, Result};
+use fleet_client::{Connection, Error, Restart, Result, TOO_OLD, restart_daemon};
 
 #[derive(Parser)]
 #[command(name = "fleet", about = "Manage agents run by fleetd")]
@@ -118,8 +119,36 @@ enum Command {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Manage the fleetd daemon itself
+    Daemon {
+        #[command(subcommand)]
+        cmd: DaemonCmd,
+    },
     /// Install the agent skill that teaches agents to use `fleet`
     Skill(skill::SkillArgs),
+}
+
+#[derive(Subcommand)]
+enum DaemonCmd {
+    /// What `fleetd` runs when another fleetd already holds the lock
+    #[command(hide = true)]
+    Upgrade {
+        /// The fleetd binary to restart the running daemon onto
+        #[arg(long)]
+        binary: PathBuf,
+        /// Restart without asking
+        #[arg(long)]
+        yes: bool,
+        /// Stop a daemon too old to restart itself, without asking
+        #[arg(long)]
+        force_stop: bool,
+    },
+    /// Restart fleetd into a new binary; running agents keep running
+    Restart {
+        /// The fleetd binary to restart into (default: the daemon's own binary, as now on disk)
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
 }
 
 /// Prints `lines`; `false` once stdout is closed (e.g. piped into `head`).
@@ -225,6 +254,43 @@ fn old_daemon(e: Error) -> Error {
     }
 }
 
+/// A `--binary` as the daemon should get it. The daemon resolves a relative
+/// path against its own working directory (`/` for one the GUI started),
+/// which is not where the path was typed, so a path is made absolute here,
+/// against this command's. A bare name (no `/`) is sent as it is, for the
+/// daemon to look up on its `PATH`, as a shell would.
+fn binary_for_daemon(binary: &Path) -> String {
+    let is_name = !binary.as_os_str().as_encoded_bytes().contains(&b'/');
+    let binary = match std::path::absolute(binary) {
+        Ok(abs) if !is_name => abs,
+        // Only an empty path fails; the daemon refuses it.
+        _ => binary.to_path_buf(),
+    };
+    binary.to_string_lossy().into_owned()
+}
+
+/// `fleet daemon restart`: asks the daemon to exec into `binary` (none:
+/// the binary the daemon runs from, as rebuilt), waits for whichever daemon
+/// answers next and reports what it says. Success goes to stdout, every
+/// other outcome to stderr with exit 1.
+fn daemon_restart(client: Connection, sock: &Path, binary: Option<PathBuf>) -> Result<u8> {
+    let binary = binary.map(|b| binary_for_daemon(&b)).unwrap_or_default();
+    Ok(match restart_daemon(client, sock, "fleet", &binary)? {
+        Restart::TooOld => {
+            eprintln!("{TOO_OLD}");
+            1
+        }
+        Restart::Outcome(done) if done.is_success() => {
+            println!("{done}");
+            0
+        }
+        Restart::Outcome(other) => {
+            eprintln!("{other}");
+            1
+        }
+    })
+}
+
 /// Attaches interactively; the exit code of `fleet attach`.
 fn attach_interactive(client: Connection, id: u64) -> Result<u8> {
     Ok(match attach::run(client, id)? {
@@ -242,7 +308,27 @@ fn run(cli: Cli) -> Result<u8> {
     if let Command::Skill(args) = cli.command {
         return skill::run(args).map(|()| 0);
     }
-    let mut client = Connection::unix(&state_dir(&cli).join("fleetd.sock"), "fleet")?;
+    if let Command::Daemon {
+        cmd:
+            DaemonCmd::Upgrade {
+                binary,
+                yes,
+                force_stop,
+            },
+    } = &cli.command
+    {
+        let flags = upgrade::Flags {
+            upgrade: *yes,
+            force_stop: *force_stop,
+        };
+        return Ok(upgrade::run(
+            &state_dir(&cli),
+            &binary_for_daemon(binary),
+            flags,
+        ));
+    }
+    let sock = state_dir(&cli).join("fleetd.sock");
+    let mut client = Connection::unix(&sock, "fleet")?;
     match cli.command {
         Command::Spawn {
             cols,
@@ -359,7 +445,13 @@ fn run(cli: Cli) -> Result<u8> {
         } => attach::snapshot_only(client, id)?,
         Command::Attach { id, .. } => return attach_interactive(client, id),
         Command::Logs { lines, follow } => logs(client, lines, follow)?,
-        Command::Skill(_) => unreachable!("handled before connecting"),
+        Command::Daemon {
+            cmd: DaemonCmd::Restart { binary },
+        } => return daemon_restart(client, &sock, binary),
+        Command::Daemon {
+            cmd: DaemonCmd::Upgrade { .. },
+        }
+        | Command::Skill(_) => unreachable!("handled before connecting"),
     }
     Ok(0)
 }
@@ -371,5 +463,21 @@ fn main() -> ExitCode {
             eprintln!("fleet: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_binary_path_is_sent_absolute_and_a_name_as_it_is() {
+        let cwd = std::env::current_dir().unwrap();
+        let sent = binary_for_daemon(Path::new("target/release/fleetd"));
+        assert_eq!(Path::new(&sent), cwd.join("target/release/fleetd"));
+        let sent = binary_for_daemon(Path::new("./fleetd"));
+        assert!(Path::new(&sent).is_absolute(), "{sent}");
+        assert_eq!(binary_for_daemon(Path::new("/opt/fleetd")), "/opt/fleetd");
+        assert_eq!(binary_for_daemon(Path::new("fleetd")), "fleetd");
     }
 }

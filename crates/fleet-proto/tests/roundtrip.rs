@@ -205,6 +205,7 @@ fn roundtrip_every_kind() {
         Frame::HelloOk(HelloOk {
             protocol_version: PROTOCOL_VERSION,
             server: "s".into(),
+            ..Default::default()
         }),
         Frame::Reject(HandshakeReject { reason: "r".into() }),
         Frame::Output {
@@ -239,4 +240,77 @@ fn roundtrip_every_kind() {
 #[test]
 fn frame_is_small() {
     assert!(std::mem::size_of::<fleet_proto::Frame>() <= 136);
+}
+
+#[test]
+fn restart_daemon_frames_round_trip() {
+    let req = Frame::Request(Request {
+        id: 1,
+        kind: Some(request::Kind::RestartDaemon(fleet_proto::RestartDaemon {
+            binary: "/x/fleetd".into(),
+        })),
+    });
+    assert_eq!(roundtrip(req.clone()), req);
+
+    let resp = Frame::Response(Response {
+        id: 1,
+        kind: Some(response::Kind::RestartingDaemon(
+            fleet_proto::RestartingDaemon { agents: 3 },
+        )),
+    });
+    assert_eq!(roundtrip(resp.clone()), resp);
+
+    let ok = Frame::HelloOk(HelloOk {
+        protocol_version: PROTOCOL_VERSION,
+        server: "s".into(),
+        instance: 9,
+        binary: Some(Box::new(fleet_proto::BinaryIdentity {
+            path: "/x/fleetd".into(),
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: -4,
+        })),
+        restore: Some(Box::new(fleet_proto::RestoreSummary {
+            previous_instance: 8,
+            kept: vec![1, 2],
+            failed: vec![3],
+            fell_back: true,
+            restart_error: "boom".into(),
+        })),
+    });
+    assert_eq!(roundtrip(ok.clone()), ok);
+}
+
+#[test]
+fn handoff_record_round_trips() {
+    use fleet_proto::handoff::{HandoffAgent, HandoffRecord, handoff_agent::Terminal};
+    use prost::Message;
+    let rec = HandoffRecord {
+        version: fleet_proto::HANDOFF_VERSION,
+        listener_fd: 3,
+        lock_fd: 4,
+        previous_instance: 7,
+        frozen_unix_ms: 1,
+        agents: vec![
+            HandoffAgent {
+                id: 1,
+                pid: 100,
+                cols: 80,
+                rows: 24,
+                snapshot: vec![1, 2, 3],
+                terminal: Some(Terminal::Fd(7)),
+            },
+            HandoffAgent {
+                id: 2,
+                pid: 101,
+                cols: 100,
+                rows: 30,
+                snapshot: vec![],
+                terminal: Some(Terminal::HolderSocket("/s".into())),
+            },
+        ],
+    };
+    let got = HandoffRecord::decode(rec.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(got, rec);
 }

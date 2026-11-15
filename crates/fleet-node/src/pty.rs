@@ -1,17 +1,33 @@
 //! PTY host: spawns agents in pseudo-terminals and drains their output.
 //!
 //! Each agent gets a reader thread that counts its output and hands it to an
-//! [`OutputSink`]; input, resize and kill go through [`PtyHost`].
+//! [`OutputSink`]; input, resize and kill go through [`PtyHost`], which
+//! implements [`AgentHost`]. An agent is either spawned by the host or adopted
+//! from another daemon that froze it; both run on the same reader and input
+//! path and differ only in how the host reaps the child (see
+//! [`PtyHost::adopt`]).
+//!
+//! Freezing (for a daemon restart) must cost the output path nothing: the
+//! reader still makes one blocking `read` per chunk and only adds an atomic
+//! load of the host's `frozen` flag before it. A freeze sets the flag and
+//! interrupts each reader and input writer with [`FREEZE_SIGNAL`], whose
+//! handler is installed without `SA_RESTART`, so a blocked `read` or `write`
+//! returns EINTR having consumed nothing. A reader parks only between reads,
+//! never holding bytes its sink has not had. (Reading non-blocking and
+//! sleeping in `poll` on the master and a stop pipe was tried first: a reader
+//! that keeps up with its agent then pays EAGAIN + `poll` + `read` per wake-up,
+//! which cost +77% host CPU per MiB in the 50-agent flood.)
 
+use crate::host::{AdoptSpec, AgentHost, FrozenAgent, TerminalHandle};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::io::{self, Read};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 const READ_BUF: usize = 64 * 1024;
@@ -34,8 +50,9 @@ pub struct AgentId(pub u64);
 pub struct AgentStats {
     pub bytes_read: u64,
     /// `None` while running. Once finished it is always `Some`: the process
-    /// exit code, or the status reported by the PTY layer when the child was
-    /// killed by a signal (non-zero; 128 + signal number on Unix).
+    /// exit code, or 1 when the child was killed by a signal (whatever the
+    /// signal: portable-pty's `ExitStatus::exit_code` encoding, which adopted
+    /// agents follow too), or -1 when it could not be reaped.
     pub exit_code: Option<i32>,
 }
 
@@ -93,30 +110,30 @@ struct InputPort {
     /// Set by [`AgentInput::close`]. A writer that holds the lock while it is
     /// set closes the fd itself, so closing never waits for a blocked write.
     closed: AtomicBool,
+    freeze: Arc<Freeze>,
 }
 
 impl AgentInput {
-    /// The input and the reader's handle to the same duplicate of the master.
-    fn new(master: &dyn MasterPty) -> io::Result<(Self, Arc<File>)> {
-        let fd = master
-            .as_raw_fd()
-            .ok_or_else(|| io::Error::other("PTY master has no fd"))?;
-        // SAFETY: the master owns this fd and outlives the borrow.
-        let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
-        let file = Arc::new(file);
+    /// The input and the reader's handle to the same duplicate of `master`.
+    fn new(master: BorrowedFd<'_>, freeze: &Arc<Freeze>) -> io::Result<(Self, Arc<File>)> {
+        let file = Arc::new(File::from(master.try_clone_to_owned()?));
         let input = Self(Arc::new(InputPort {
             file: Mutex::new(Some(Arc::clone(&file))),
             closed: AtomicBool::new(false),
+            freeze: Arc::clone(freeze),
         }));
         Ok((input, file))
     }
 
     /// Writes all of `bytes`, blocking while the agent's input queue is full.
+    /// Fails with "fleetd is restarting" while the host is frozen, also when
+    /// the freeze comes mid-way (the rest of `bytes` is dropped).
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         let written = {
             let file = lock(&self.0.file);
             let file = file.as_ref().ok_or_else(exited)?;
-            (&**file).write_all(bytes)
+            let freeze = &self.0.freeze;
+            freeze.as_writer(|| write_unless_frozen(file.as_raw_fd(), bytes, freeze))
         };
         if self.0.closed.load(Ordering::SeqCst) {
             self.release();
@@ -172,6 +189,33 @@ impl AgentInput {
     }
 }
 
+/// Writes all of `bytes` to the blocking `fd` until done or the host is
+/// frozen. Not `Write::write_all`: that retries the EINTR a freeze causes.
+fn write_unless_frozen(fd: RawFd, mut bytes: &[u8], freeze: &Freeze) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if freeze.is_frozen() {
+            return Err(restarting());
+        }
+        // SAFETY: write on an open fd, with a valid buffer.
+        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        match usize::try_from(n) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(_) => {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restarting() -> io::Error {
+    io::Error::other("fleetd is restarting")
+}
+
 fn exited() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "agent has exited")
 }
@@ -185,10 +229,329 @@ struct Agent {
     exit_code: Mutex<Option<i32>>,
     /// Child pid; the child is a session (and process group) leader.
     pid: Option<u32>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// portable-pty's handle on a spawned child, for when it reports no pid;
+    /// `None` for an adopted agent, whose pid is always known.
+    killer: Option<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
     /// `None` once the agent has exited (closed to release the fd).
-    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    master: Mutex<Option<Master>>,
     input: AgentInput,
+}
+
+impl Agent {
+    /// Ends a child no reader thread will ever reap or drain.
+    fn stop_unattended(&self) {
+        match (
+            &self.killer,
+            self.pid.and_then(|p| libc::pid_t::try_from(p).ok()),
+        ) {
+            (Some(killer), _) => drop(lock(killer).kill()),
+            // SAFETY: killpg has no memory-safety preconditions.
+            (None, Some(pgid)) => drop(unsafe { libc::killpg(pgid, libc::SIGKILL) }),
+            (None, None) => {}
+        }
+    }
+}
+
+/// An agent's PTY master.
+enum Master {
+    /// Opened by this host for an agent it spawned.
+    Spawned(Box<dyn MasterPty + Send>),
+    /// Inherited from the daemon that froze the agent.
+    Adopted(OwnedFd),
+}
+
+impl Master {
+    fn raw_fd(&self) -> Option<RawFd> {
+        match self {
+            Self::Spawned(master) => master.as_raw_fd(),
+            Self::Adopted(fd) => Some(fd.as_raw_fd()),
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        match self {
+            Self::Spawned(master) => master
+                .resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(io::Error::other),
+            Self::Adopted(fd) => set_window_size(fd.as_fd(), cols, rows),
+        }
+    }
+}
+
+/// `TIOCSWINSZ`, as portable-pty's own resize does it.
+fn set_window_size(fd: BorrowedFd<'_>, cols: u16, rows: u16) -> io::Result<()> {
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: ioctl on an open fd with a pointer to a valid winsize.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCSWINSZ as _, &size) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Takes ownership of an inherited fd and marks it close-on-exec, so agents
+/// spawned later do not inherit it. Fails, owning nothing, if `fd` is not
+/// open. Leaves its blocking mode alone: readers are blocking (see the module
+/// docs), and the daemon that froze the agent left it blocking.
+fn take_inherited_fd(fd: RawFd) -> io::Result<OwnedFd> {
+    // SAFETY: fcntl on any integer is memory-safe; it fails on a closed fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is open and the caller hands it to us.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// Reaps `pid`, a child of this process, and returns its exit code encoded
+/// as portable-pty encodes a spawned child's (by going through the same
+/// `std::process::ExitStatus` conversion), so an agent reports one code for
+/// one kind of death whichever daemon spawned it.
+fn reap(pid: libc::pid_t) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    let mut status = 0;
+    loop {
+        // SAFETY: waitpid with a valid out-pointer.
+        let reaped = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if reaped == pid {
+            let status = std::process::ExitStatus::from_raw(status);
+            return portable_pty::ExitStatus::from(status).exit_code() as i32;
+        }
+        if reaped < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return -1; // not our child (ECHILD), as when portable-pty's wait fails
+    }
+}
+
+/// Interrupts readers and input writers for a freeze. Nothing else in fleetd
+/// uses it; agents get the default disposition back when they exec.
+const FREEZE_SIGNAL: libc::c_int = libc::SIGUSR2;
+
+/// How often a freeze re-sends [`FREEZE_SIGNAL`] to a thread that has not
+/// stopped yet: a signal that lands between the `frozen` check and the
+/// blocking call it guards is lost.
+const FREEZE_RESEND: Duration = Duration::from_millis(5);
+
+extern "C" fn on_freeze_signal(_: libc::c_int) {}
+
+/// Installs the no-op [`FREEZE_SIGNAL`] handler once per process, without
+/// `SA_RESTART`, so the syscall it interrupts fails with EINTR.
+fn install_freeze_handler() -> io::Result<()> {
+    static INSTALLED: OnceLock<Result<(), i32>> = OnceLock::new();
+    let installed = INSTALLED.get_or_init(|| {
+        // SAFETY: a zeroed sigaction with an empty mask and no flags is valid;
+        // the handler is async-signal-safe (it does nothing).
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_freeze_signal as extern "C" fn(libc::c_int) as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(FREEZE_SIGNAL, &action, std::ptr::null_mut()) < 0 {
+                return Err(io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            }
+        }
+        Ok(())
+    });
+    installed.map_err(io::Error::from_raw_os_error)
+}
+
+/// A thread to interrupt. `pthread_t` is a pointer on macOS, so not `Send`;
+/// it is only ever passed to `pthread_kill`, while the thread is known to be
+/// alive (registered under [`Freeze::state`]).
+#[derive(Clone, Copy)]
+struct Thread(libc::pthread_t);
+
+// SAFETY: see `Thread`; the value is an opaque id, never dereferenced.
+unsafe impl Send for Thread {}
+
+impl Thread {
+    fn current() -> Self {
+        // SAFETY: pthread_self has no preconditions.
+        Self(unsafe { libc::pthread_self() })
+    }
+
+    fn interrupt(self) {
+        // SAFETY: the thread is alive (see `Thread`) and the signal handled.
+        unsafe { libc::pthread_kill(self.0, FREEZE_SIGNAL) };
+    }
+}
+
+/// Host-wide freeze state, shared by every reader thread and input.
+#[derive(Default)]
+struct Freeze {
+    /// Mirrors `state.frozen` for the check before every read and write.
+    frozen: AtomicBool,
+    state: Mutex<FreezeState>,
+    /// Signalled when a reader parks or stops, a writer leaves, and on thaw.
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct FreezeState {
+    frozen: bool,
+    /// Readers whose agent's output has not ended, by agent.
+    readers: HashMap<AgentId, Reader>,
+    /// Threads inside [`AgentInput::write_all`], by a token of their own.
+    writers: HashMap<u64, Thread>,
+    next_writer: u64,
+}
+
+#[derive(Default)]
+struct Reader {
+    /// `None` until the reader thread has started.
+    thread: Option<Thread>,
+    parked: bool,
+}
+
+impl Freeze {
+    fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    /// Called first by a reader thread, so a freeze can interrupt it. The
+    /// guard deregisters it when dropped, also when the thread unwinds (a
+    /// panicking sink): a dead thread left registered would be signalled by
+    /// every later freeze and, never parking, make each one time out.
+    fn reader_started(&self, id: AgentId) -> ReaderGuard<'_> {
+        if let Some(reader) = lock(&self.state).readers.get_mut(&id) {
+            reader.thread = Some(Thread::current());
+        }
+        ReaderGuard { freeze: self, id }
+    }
+
+    /// Called by a reader that saw `frozen`: acknowledges and waits for thaw.
+    fn park(&self, id: AgentId) {
+        let mut state = lock(&self.state);
+        if let Some(reader) = state.readers.get_mut(&id) {
+            reader.parked = true;
+        }
+        self.cv.notify_all();
+        while state.frozen {
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        if let Some(reader) = state.readers.get_mut(&id) {
+            reader.parked = false;
+        }
+    }
+
+    /// Called by a reader once its agent's output has ended (and by a spawn
+    /// whose reader never started).
+    fn reader_done(&self, id: AgentId) {
+        lock(&self.state).readers.remove(&id);
+        self.cv.notify_all();
+    }
+
+    /// Runs `write` registered as a writer a freeze interrupts; deregistered
+    /// by a guard, so also if `write` unwinds.
+    fn as_writer<T>(&self, write: impl FnOnce() -> T) -> T {
+        let token = {
+            let mut state = lock(&self.state);
+            let token = state.next_writer;
+            state.next_writer += 1;
+            state.writers.insert(token, Thread::current());
+            token
+        };
+        let _writing = WriterGuard {
+            freeze: self,
+            token,
+        };
+        write()
+    }
+
+    /// Freezes and waits until every reader has parked or seen its output
+    /// end and every writer has left; returns the agents of parked readers.
+    /// Past `deadline`, thaws and fails with `TimedOut`.
+    fn freeze(&self, deadline: Instant) -> io::Result<Vec<AgentId>> {
+        install_freeze_handler()?;
+        let mut state = lock(&self.state);
+        if state.frozen {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "already frozen",
+            ));
+        }
+        state.frozen = true;
+        self.frozen.store(true, Ordering::SeqCst);
+        loop {
+            let mut waiting = false;
+            for reader in state.readers.values().filter(|r| !r.parked) {
+                waiting = true;
+                // One not yet started sees the flag before its first read.
+                if let Some(thread) = reader.thread {
+                    thread.interrupt();
+                }
+            }
+            for &thread in state.writers.values() {
+                waiting = true;
+                thread.interrupt();
+            }
+            if !waiting {
+                return Ok(state.readers.keys().copied().collect());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.thaw_locked(&mut state);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "agents did not stop in time",
+                ));
+            }
+            state = self
+                .cv
+                .wait_timeout(state, left.min(FREEZE_RESEND))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    fn thaw(&self) {
+        self.thaw_locked(&mut lock(&self.state));
+    }
+
+    fn thaw_locked(&self, state: &mut FreezeState) {
+        state.frozen = false;
+        self.frozen.store(false, Ordering::SeqCst);
+        self.cv.notify_all();
+    }
+}
+
+/// Deregisters a reader thread when dropped; see [`Freeze::reader_started`].
+struct ReaderGuard<'a> {
+    freeze: &'a Freeze,
+    id: AgentId,
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        self.freeze.reader_done(self.id);
+    }
+}
+
+/// Deregisters a writer thread when dropped; see [`Freeze::as_writer`].
+struct WriterGuard<'a> {
+    freeze: &'a Freeze,
+    token: u64,
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.freeze.state).writers.remove(&self.token);
+        self.freeze.cv.notify_all();
+    }
 }
 
 /// Shared "an agent finished" signal for `wait_all`.
@@ -231,6 +594,7 @@ pub struct PtyHost {
     next_id: AtomicU64,
     agents: Mutex<HashMap<AgentId, Arc<Agent>>>,
     signal: Arc<Signal>,
+    freeze: Arc<Freeze>,
 }
 
 impl PtyHost {
@@ -259,7 +623,7 @@ impl PtyHost {
         &self,
         spec: CommandSpec,
         base: Option<&[(OsString, OsString)]>,
-        mut sink: Box<dyn OutputSink>,
+        sink: Box<dyn OutputSink>,
     ) -> io::Result<AgentId> {
         let pair = open_pty(PtySize {
             rows: spec.rows,
@@ -281,31 +645,101 @@ impl PtyHost {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        let master_fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| io::Error::other("PTY master has no fd"))?;
         // Before the spawn, so a failure here leaves no child behind.
-        let (input, reader) = AgentInput::new(&*pair.master)?;
+        // SAFETY: `pair.master` owns this fd and outlives the borrow.
+        let (input, reader) =
+            AgentInput::new(unsafe { BorrowedFd::borrow_raw(master_fd) }, &self.freeze)?;
         let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
         // Close our copy of the slave so readers see EOF once the child exits.
         drop(pair.slave);
 
-        let id = AgentId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let agent = Arc::new(Agent {
+        let agent = Agent {
             bytes_read: AtomicU64::new(0),
             exit_code: Mutex::new(None),
             pid: child.process_id(),
-            killer: Mutex::new(child.clone_killer()),
-            master: Mutex::new(Some(pair.master)),
+            killer: Some(Mutex::new(child.clone_killer())),
+            master: Mutex::new(Some(Master::Spawned(pair.master))),
             input,
-        });
+        };
+        self.run(agent, reader, sink, move || match child.wait() {
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => -1,
+        })
+    }
+
+    /// Takes over a running agent that another daemon froze, as if this host
+    /// had spawned it: same reader, input, freeze, kill and stats. The host
+    /// owns `spec.terminal` from this call on, also when it fails.
+    ///
+    /// `spec.pid` must be a child of this process (an exec keeps children),
+    /// reaped with `waitpid` once its output ends, in place of portable-pty's
+    /// `Child::wait`; one that has already exited is reaped the same way. The
+    /// terminal is set to `spec.cols` × `spec.rows`, which also checks that it
+    /// is a terminal.
+    pub fn adopt(&self, spec: AdoptSpec, sink: Box<dyn OutputSink>) -> io::Result<AgentId> {
+        let master = match spec.terminal {
+            TerminalHandle::Fd(fd) => take_inherited_fd(fd)?,
+            // A holder process's socket (`TerminalHandle::HolderSocket`) will
+            // be handled here.
+        };
+        // Not 0 or negative: `waitpid` and `killpg` would take those as
+        // "any child" and "our own process group".
+        let pid = libc::pid_t::try_from(spec.pid)
+            .ok()
+            .filter(|&pid| pid > 0)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid agent pid"))?;
+        set_window_size(master.as_fd(), spec.cols, spec.rows)?;
+        let (input, reader) = AgentInput::new(master.as_fd(), &self.freeze)?;
+        let agent = Agent {
+            bytes_read: AtomicU64::new(0),
+            exit_code: Mutex::new(None),
+            pid: Some(spec.pid),
+            killer: None,
+            master: Mutex::new(Some(Master::Adopted(master))),
+            input,
+        };
+        self.run(agent, reader, sink, move || reap(pid))
+    }
+
+    /// Registers `agent` and starts its reader thread, which drains `reader`
+    /// into `sink` until the output ends, then reaps the child with `reap`.
+    /// If the thread cannot start, the child is stopped.
+    fn run(
+        &self,
+        agent: Agent,
+        reader: Arc<File>,
+        mut sink: Box<dyn OutputSink>,
+        reap: impl FnOnce() -> i32 + Send + 'static,
+    ) -> io::Result<AgentId> {
+        let id = AgentId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let agent = Arc::new(agent);
         sink.on_spawn(agent.input.clone());
         *lock(&self.signal.running) += 1;
+        // Listed before the agent, so a freeze that lists it waits for it.
+        lock(&self.freeze.state)
+            .readers
+            .insert(id, Reader::default());
         lock(&self.agents).insert(id, Arc::clone(&agent));
 
         let signal = Arc::clone(&self.signal);
+        let freeze = Arc::clone(&self.freeze);
         let spawned = std::thread::Builder::new()
             .name(format!("pty-reader-{}", id.0))
             .spawn(move || {
+                let reading = freeze.reader_started(id);
                 let mut buf = vec![0u8; READ_BUF];
                 loop {
+                    // Only here, between reads: a freeze never strands bytes
+                    // that were read but not handed to the sink. Its signal
+                    // makes a blocked read fail with EINTR, back to here.
+                    if freeze.is_frozen() {
+                        freeze.park(id);
+                        continue;
+                    }
                     match (&*reader).read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
@@ -320,10 +754,8 @@ impl PtyHost {
                         Err(_) => break, // EIO on Linux once the slave closes
                     }
                 }
-                let code = match child.wait() {
-                    Ok(status) => status.exit_code() as i32,
-                    Err(_) => -1,
-                };
+                drop(reading);
+                let code = reap();
                 *lock(&agent.exit_code) = Some(code);
                 agent.input.close();
                 lock(&agent.master).take();
@@ -334,8 +766,9 @@ impl PtyHost {
         if let Err(e) = spawned {
             // The child would run unattended; stop it.
             if let Some(agent) = lock(&self.agents).remove(&id) {
-                let _ = lock(&agent.killer).kill();
+                agent.stop_unattended();
             }
+            self.freeze.reader_done(id);
             *lock(&self.signal.running) -= 1;
             return Err(e);
         }
@@ -364,15 +797,7 @@ impl PtyHost {
     pub fn resize(&self, id: AgentId, cols: u16, rows: u16) -> io::Result<()> {
         let agent = self.agent(id)?;
         let master = lock(&agent.master);
-        let master = master.as_ref().ok_or_else(exited)?;
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(io::Error::other)
+        master.as_ref().ok_or_else(exited)?.resize(cols, rows)
     }
 
     /// Sends SIGTERM to the agent's process group, so children it started
@@ -396,7 +821,11 @@ impl PtyHost {
             return Ok(());
         }
         let Some(pid) = agent.pid else {
-            return lock(&agent.killer).kill();
+            let killer = agent
+                .killer
+                .as_ref()
+                .ok_or_else(|| io::Error::other("agent has no pid"))?;
+            return lock(killer).kill();
         };
         let pgid = libc::pid_t::try_from(pid).map_err(io::Error::other)?;
         // SAFETY: killpg has no memory-safety preconditions.
@@ -441,5 +870,429 @@ impl PtyHost {
                 .0;
         }
         Ok(())
+    }
+
+    /// See [`AgentHost::freeze`].
+    pub fn freeze(&self, deadline: Instant) -> io::Result<Vec<FrozenAgent>> {
+        let ids = self.freeze.freeze(deadline)?;
+        let frozen = {
+            let agents = lock(&self.agents);
+            ids.into_iter()
+                .map(|id| {
+                    let agent = agents.get(&id).ok_or_else(unknown)?;
+                    let pid = agent
+                        .pid
+                        .ok_or_else(|| io::Error::other("agent has no pid"))?;
+                    let fd = lock(&agent.master)
+                        .as_ref()
+                        .and_then(Master::raw_fd)
+                        .ok_or_else(|| io::Error::other("PTY master has no fd"))?;
+                    Ok(FrozenAgent {
+                        id,
+                        pid,
+                        terminal: TerminalHandle::Fd(fd),
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()
+        };
+        if frozen.is_err() {
+            self.thaw();
+        }
+        frozen
+    }
+
+    /// See [`AgentHost::thaw`].
+    pub fn thaw(&self) {
+        self.freeze.thaw();
+    }
+}
+
+impl AgentHost for PtyHost {
+    fn spawn_with_base_env(
+        &self,
+        spec: CommandSpec,
+        base: Option<&[(OsString, OsString)]>,
+        sink: Box<dyn OutputSink>,
+    ) -> io::Result<AgentId> {
+        PtyHost::spawn_with_base_env(self, spec, base, sink)
+    }
+
+    fn adopt(&self, spec: AdoptSpec, sink: Box<dyn OutputSink>) -> io::Result<AgentId> {
+        PtyHost::adopt(self, spec, sink)
+    }
+
+    fn write_input(&self, id: AgentId, bytes: &[u8]) -> io::Result<()> {
+        PtyHost::write_input(self, id, bytes)
+    }
+
+    fn resize(&self, id: AgentId, cols: u16, rows: u16) -> io::Result<()> {
+        PtyHost::resize(self, id, cols, rows)
+    }
+
+    fn kill(&self, id: AgentId) -> io::Result<()> {
+        PtyHost::kill(self, id)
+    }
+
+    fn force_kill(&self, id: AgentId) -> io::Result<()> {
+        PtyHost::force_kill(self, id)
+    }
+
+    fn remove(&self, id: AgentId) -> io::Result<()> {
+        PtyHost::remove(self, id)
+    }
+
+    fn wait_all(&self, timeout: Duration) -> Result<(), WaitTimeout> {
+        PtyHost::wait_all(self, timeout)
+    }
+
+    fn stats(&self, id: AgentId) -> Option<AgentStats> {
+        PtyHost::stats(self, id)
+    }
+
+    fn freeze(&self, deadline: Instant) -> io::Result<Vec<FrozenAgent>> {
+        PtyHost::freeze(self, deadline)
+    }
+
+    fn thaw(&self) {
+        PtyHost::thaw(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::TerminalHandle;
+
+    fn sh(script: &str) -> CommandSpec {
+        CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    /// Collects an agent's output and its exit code.
+    #[derive(Clone, Default)]
+    struct Collect(Arc<Mutex<Vec<u8>>>, Arc<Mutex<Option<i32>>>);
+
+    impl OutputSink for Collect {
+        fn on_output(&mut self, bytes: &[u8]) {
+            lock(&self.0).extend_from_slice(bytes);
+        }
+        fn on_exit(&mut self, code: i32) {
+            *lock(&self.1) = Some(code);
+        }
+    }
+
+    impl Collect {
+        fn len(&self) -> usize {
+            lock(&self.0).len()
+        }
+
+        fn contains(&self, needle: &[u8]) -> bool {
+            lock(&self.0).windows(needle.len()).any(|w| w == needle)
+        }
+
+        fn exit_code(&self) -> Option<i32> {
+            *lock(&self.1)
+        }
+    }
+
+    /// Polls `done` every 10 ms for up to 5 s.
+    fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn cat() -> CommandSpec {
+        CommandSpec {
+            program: PathBuf::from("/bin/cat"),
+            args: vec![],
+            ..sh("")
+        }
+    }
+
+    /// The code a spawned agent reports when `kill` (SIGTERM) ends it.
+    fn spawned_cat_killed_code() -> i32 {
+        let host = PtyHost::new();
+        let out = Collect::default();
+        let id = host.spawn_with_sink(cat(), Box::new(out.clone())).unwrap();
+        host.kill(id).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+        out.exit_code().unwrap()
+    }
+
+    #[test]
+    fn adopted_agent_reads_writes_and_reports_exit() {
+        let first = PtyHost::new();
+        let pid = {
+            let id = first.spawn(cat()).unwrap();
+            first.agent(id).unwrap().pid.unwrap()
+        };
+        let frozen = first
+            .freeze(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        let TerminalHandle::Fd(fd) = frozen[0].terminal;
+        assert_eq!(frozen[0].pid, pid);
+        // The test owns this duplicate; `first` keeps (and later closes) its own.
+        // SAFETY: `fd` is `first`'s open master, alive while `first` is.
+        let dup = unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .unwrap();
+
+        let second = PtyHost::new();
+        let out = Collect::default();
+        let id = second
+            .adopt(
+                AdoptSpec {
+                    pid,
+                    terminal: TerminalHandle::Fd(std::os::fd::IntoRawFd::into_raw_fd(dup)),
+                    cols: 100,
+                    rows: 30,
+                },
+                Box::new(out.clone()),
+            )
+            .unwrap();
+        second.write_input(id, b"hi\n").unwrap();
+        eventually("the adopted agent's output", || out.contains(b"hi"));
+        assert_eq!(second.stats(id).unwrap().exit_code, None);
+        assert!(second.remove(id).is_err(), "removed a running agent");
+        // Adopting set the size; resizing changes it. `fd` is the same terminal.
+        let size = || {
+            // SAFETY: an all-zero winsize is valid.
+            let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: TIOCGWINSZ on `first`'s open master into a valid winsize.
+            assert_eq!(
+                unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut size) },
+                0
+            );
+            (size.ws_col, size.ws_row)
+        };
+        assert_eq!(size(), (100, 30));
+        second.resize(id, 120, 40).unwrap();
+        assert_eq!(size(), (120, 40));
+
+        second.kill(id).unwrap();
+        second.wait_all(Duration::from_secs(5)).unwrap();
+        // portable-pty reports any death by signal as 1 (its `ExitStatus`
+        // keeps the signal apart), and an adopted agent reports the same.
+        let spawned = spawned_cat_killed_code();
+        assert_eq!(spawned, 1);
+        assert_eq!(out.exit_code(), Some(spawned));
+        assert_eq!(second.stats(id).unwrap().exit_code, Some(spawned));
+        assert!(second.stats(id).unwrap().bytes_read >= 2);
+        second.remove(id).unwrap();
+
+        // `first`'s reader, thawed, sees the output end; its agent was reaped
+        // by `second`, so `first` only has to let go of it.
+        first.thaw();
+        first.wait_all(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn adopted_agent_that_already_exited_is_reaped() {
+        let sh = c"/bin/sh";
+        let argv = [
+            sh.as_ptr(),
+            c"-c".as_ptr(),
+            c"exit 7".as_ptr(),
+            std::ptr::null(),
+        ];
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty with valid out-pointers and no name, termios or size.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "{}", io::Error::last_os_error());
+        // SAFETY: the child calls only async-signal-safe functions, on
+        // arguments prepared before the fork.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "{}", io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: as above.
+            unsafe {
+                libc::setsid();
+                libc::close(master);
+                for fd in 0..3 {
+                    libc::dup2(slave, fd);
+                }
+                libc::close(slave);
+                libc::execv(sh.as_ptr(), argv.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        // SAFETY: closing our copy of the slave, which we own.
+        unsafe { libc::close(slave) };
+        std::thread::sleep(Duration::from_millis(100));
+
+        let host = PtyHost::new();
+        let out = Collect::default();
+        host.adopt(
+            AdoptSpec {
+                pid: u32::try_from(pid).unwrap(),
+                terminal: TerminalHandle::Fd(master),
+                cols: 80,
+                rows: 24,
+            },
+            Box::new(out.clone()),
+        )
+        .unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+        assert_eq!(out.exit_code(), Some(7));
+    }
+
+    #[test]
+    fn freeze_stops_reading_without_losing_bytes() {
+        let host = PtyHost::new();
+        let out = Collect::default();
+        let id = host
+            .spawn_with_sink(
+                sh("i=0; while :; do echo $i; i=$((i+1)); done"),
+                Box::new(out.clone()),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let frozen = host
+            .freeze(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(frozen.len(), 1);
+        let at_freeze = out.len();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(out.len(), at_freeze, "a frozen reader kept reading");
+        host.thaw();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(out.len() > at_freeze, "a thawed reader did not resume");
+        host.force_kill(id).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+
+        let text = String::from_utf8(lock(&out.0).clone()).unwrap();
+        // `\r` is dropped: macOS can turn one `\n` into `\r\r\n` when the
+        // tty's output queue fills mid-conversion (as it does while frozen).
+        let text = text.replace('\r', "");
+        // The last line may be cut short by the kill.
+        let lines: Vec<&str> = text.split('\n').collect();
+        let complete = &lines[..lines.len() - 1];
+        assert!(complete.len() > 10, "too little output: {}", complete.len());
+        for (want, line) in complete.iter().enumerate() {
+            assert_eq!(line.parse::<usize>().ok(), Some(want), "line {want}");
+        }
+    }
+
+    #[test]
+    fn freeze_releases_a_blocked_input_write() {
+        let host = Arc::new(PtyHost::new());
+        let id = host.spawn(sh("sleep 30")).unwrap();
+        let writer = {
+            let host = Arc::clone(&host);
+            // Whole lines: a canonical-mode tty discards a line beyond its
+            // limit instead of blocking, but blocks once its lines fill it.
+            let input = b"xxxxxxx\n".repeat((1 << 20) / 8);
+            std::thread::spawn(move || host.write_input(id, &input))
+        };
+        // Let the write fill the input queue and block.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!writer.is_finished(), "the write did not block");
+        let start = Instant::now();
+        host.freeze(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        let err = writer.join().unwrap().unwrap_err();
+        assert_eq!(err.to_string(), "fleetd is restarting");
+        // New writes fail too while frozen.
+        let err = host.write_input(id, b"x").unwrap_err();
+        assert_eq!(err.to_string(), "fleetd is restarting");
+        host.thaw();
+        host.force_kill(id).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn frozen_agents_name_their_fd_and_pid() {
+        let host = PtyHost::new();
+        let a = host.spawn(sh("sleep 30")).unwrap();
+        let b = host.spawn(sh("sleep 30")).unwrap();
+        let exited = host.spawn(sh("exit 0")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.stats(exited).unwrap().exit_code.is_none() {
+            assert!(Instant::now() < deadline, "agent never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut frozen = host
+            .freeze(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        host.thaw();
+        frozen.sort_by_key(|f| f.id.0);
+        assert_eq!(frozen.len(), 2, "only live agents are frozen");
+        let fds: Vec<_> = frozen
+            .iter()
+            .map(|f| match f.terminal {
+                TerminalHandle::Fd(fd) => fd,
+            })
+            .collect();
+        assert!(fds.iter().all(|&fd| fd >= 0), "{fds:?}");
+        assert_ne!(fds[0], fds[1]);
+        for (f, id) in frozen.iter().zip([a, b]) {
+            assert_eq!(f.id, id);
+            assert_eq!(Some(f.pid), host.agent(id).unwrap().pid);
+        }
+        for id in [a, b] {
+            host.force_kill(id).unwrap();
+        }
+        host.wait_all(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn a_reader_whose_sink_panicked_does_not_hold_a_later_freeze() {
+        struct Panics;
+        impl OutputSink for Panics {
+            fn on_output(&mut self, _bytes: &[u8]) {
+                // Not `panic!`: no panic hook, so no noise in the test output.
+                std::panic::resume_unwind(Box::new("sink bug"));
+            }
+            fn on_exit(&mut self, _code: i32) {}
+        }
+        let host = PtyHost::new();
+        let broken = host
+            .spawn_with_sink(sh("printf x; sleep 30"), Box::new(Panics))
+            .unwrap();
+        let healthy = host.spawn(sh("sleep 30")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&host.freeze.state).readers.contains_key(&broken) {
+            assert!(
+                Instant::now() < deadline,
+                "the dead reader stayed registered"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let frozen = host
+            .freeze(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        host.thaw();
+        let ids: Vec<_> = frozen.iter().map(|f| f.id).collect();
+        assert_eq!(ids, [healthy]);
+        // The broken agent's reader never reaps it, so no `wait_all`.
+        host.force_kill(broken).unwrap();
+        host.force_kill(healthy).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.stats(healthy).unwrap().exit_code.is_none() {
+            assert!(Instant::now() < deadline, "agent never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

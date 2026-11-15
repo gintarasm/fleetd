@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fleet_client::Connection;
+use fleet_proto::BinaryIdentity;
 
 use super::target::{ConnectError, Target, ssh_remote};
 
@@ -24,7 +25,7 @@ pub fn find_fleetd() -> Option<PathBuf> {
 }
 
 /// `name` next to the running executable, else on `PATH`.
-fn find_tool(name: &str) -> Option<PathBuf> {
+pub fn find_tool(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     find_tool_from(name, &exe, &std::env::var_os("PATH").unwrap_or_default())
 }
@@ -37,6 +38,27 @@ fn find_tool_from(name: &str, exe: &Path, path_var: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path_var)
         .map(|d| d.join(name))
         .find(|p| p.is_file())
+}
+
+/// Whether the fleetd on disk at `local` differs from the one `running`
+/// (its `HelloOk.binary`): a new build was installed since it started.
+/// Never for an ssh target, whose fleetd the GUI cannot see. This stats
+/// `local`, so call it when the answer matters (on connect, on window
+/// focus), not per frame. A missing `local` or a failed stat is "no".
+///
+/// The path is not compared: an install replaces the file under the same
+/// path, and the running daemon's `path` may be a different spelling of it.
+pub fn update_available(target: &Target, running: &BinaryIdentity, local: Option<&Path>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if !matches!(target, Target::Local) {
+        return false;
+    }
+    let Some(m) = local.and_then(|p| std::fs::metadata(p).ok()) else {
+        return false;
+    };
+    let mtime_ns = m.mtime() * 1_000_000_000 + m.mtime_nsec();
+    (m.dev(), m.ino(), m.size(), mtime_ns)
+        != (running.dev, running.ino, running.size, running.mtime_ns)
 }
 
 /// `fleet skill install` for `target`: the sibling (or `PATH`) `fleet`
@@ -145,6 +167,58 @@ mod tests {
         assert_eq!(find(&path), Some(b.path().join("fleetd")));
         std::fs::remove_file(b.path().join("fleetd")).unwrap();
         assert_eq!(find(&path), None);
+    }
+
+    fn identity_of(path: &Path) -> fleet_proto::BinaryIdentity {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).unwrap();
+        fleet_proto::BinaryIdentity {
+            path: path.to_string_lossy().into_owned(),
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+        }
+    }
+
+    #[test]
+    fn update_available_never_for_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fleetd");
+        std::fs::write(&bin, "old").unwrap();
+        let running = identity_of(&bin);
+        std::fs::write(&bin, "a different build").unwrap();
+        let ssh = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        assert!(!update_available(&ssh, &running, Some(&bin)));
+        assert!(update_available(&Target::Local, &running, Some(&bin)));
+    }
+
+    #[test]
+    fn update_available_when_binary_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fleetd");
+        std::fs::write(&bin, "old").unwrap();
+        let running = identity_of(&bin);
+        assert!(!update_available(&Target::Local, &running, Some(&bin)));
+        // Same size, later mtime: still a different build.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&bin, "new").unwrap();
+        assert!(update_available(&Target::Local, &running, Some(&bin)));
+        // A replaced file (new inode), as an install does.
+        let running = identity_of(&bin);
+        let tmp = dir.path().join("fleetd.new");
+        std::fs::write(&tmp, "new").unwrap();
+        std::fs::rename(&tmp, &bin).unwrap();
+        assert!(update_available(&Target::Local, &running, Some(&bin)));
+        // Nothing to compare against, or nothing there: no notice.
+        assert!(!update_available(&Target::Local, &running, None));
+        assert!(!update_available(
+            &Target::Local,
+            &running,
+            Some(&dir.path().join("gone"))
+        ));
     }
 
     #[test]

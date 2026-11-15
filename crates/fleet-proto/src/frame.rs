@@ -215,6 +215,7 @@ mod tests {
             Frame::HelloOk(HelloOk {
                 protocol_version: 1,
                 server: "fleetd".into(),
+                ..Default::default()
             }),
             Frame::Reject(HandshakeReject {
                 reason: "version".into(),

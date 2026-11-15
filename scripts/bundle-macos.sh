@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds target/release/fleetd.app (fleet-gui + fleetd + fleet).
+# Builds <target>/release/fleetd.app (fleet-gui + fleetd + fleet), where
+# <target> is CARGO_TARGET_DIR (relative: from the repo root), else target.
 # --icon-only regenerates assets/logo/fleetd.icns from assets/logo/fleetd-icon.svg.
 # Building fleet-gui needs the Metal toolchain: xcodebuild -downloadComponent MetalToolchain
 set -eu
@@ -26,11 +27,19 @@ if [ "${1:-}" = "--icon-only" ]; then
   exit 0
 fi
 
+# Where cargo builds (it runs here, in the repo root): copying from ./target
+# instead would bundle a stale build.
+target_dir=${CARGO_TARGET_DIR:-target}
+case "$target_dir" in
+  /*) ;;
+  *) target_dir="$(pwd)/$target_dir" ;;
+esac
 cargo build --release -p fleet-gui -p fleetd -p fleet-cli
-app=target/release/fleetd.app
+release="$target_dir/release"
+app="$release/fleetd.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/fleet-gui target/release/fleetd target/release/fleet "$app/Contents/MacOS/"
+cp "$release/fleet-gui" "$release/fleetd" "$release/fleet" "$app/Contents/MacOS/"
 [ -f assets/logo/fleetd.icns ] || make_icon
 cp assets/logo/fleetd.icns "$app/Contents/Resources/fleetd.icns"
 version=$(grep -m1 '^version' crates/fleet-gui/Cargo.toml | cut -d'"' -f2)
