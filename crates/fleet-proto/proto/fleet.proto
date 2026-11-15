@@ -5,7 +5,9 @@ message Hello { uint32 protocol_version = 1; string client = 2; }
 message HelloOk {
   uint32 protocol_version = 1;
   string server = 2;
-  // Daemon start counter, bumped on every (re)start of the state directory.
+  // A random token drawn on every daemon process start (a restart too), so
+  // a client can tell the daemon was replaced. Not a counter: values are
+  // only compared for equality.
   uint64 instance = 3;
   // The binary the daemon is running from.
   BinaryIdentity binary = 4;

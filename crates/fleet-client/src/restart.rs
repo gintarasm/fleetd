@@ -24,8 +24,9 @@ pub const RESTART_ANSWER_WAIT: Duration = Duration::from_secs(6);
 
 /// What an old daemon says to a request it does not know, and what a client
 /// says instead.
-pub const TOO_OLD: &str = "this fleetd is too old to restart itself; stop it once (pkill fleetd) \
-                           and the next client starts the new one";
+pub const TOO_OLD: &str = "this fleetd is too old to restart itself; stop it once (fleetd \
+                           --force-stop, or scripts/install.sh --force-stop) and the next client \
+                           starts the new one";
 
 /// What a client says when no daemon answered within [`RESTART_WAIT`].
 pub fn did_not_come_back() -> String {
@@ -139,10 +140,11 @@ pub enum Restart {
     Outcome(RestartOutcome),
 }
 
-/// Asks the daemon on `client` to exec into `binary` (empty: `fleetd` on its
-/// PATH), then waits up to [`RESTART_WAIT`] for whichever daemon answers on
-/// `sock` next and decides with [`restart_outcome`]. `client_name` is how the
-/// reconnects introduce themselves in the daemon's log. `Err` when the
+/// Asks the daemon on `client` to exec into `binary` (empty: the binary the
+/// daemon runs from, as now on disk), then waits up to [`RESTART_WAIT`] for
+/// whichever daemon answers on `sock` next and decides with
+/// [`restart_outcome`]. `client_name` is how the reconnects introduce
+/// themselves in the daemon's log. `Err` when the
 /// request failed in some other way or no daemon came back in time
 /// ([`did_not_come_back`]).
 pub fn restart_daemon(
