@@ -2,7 +2,7 @@
 
 **Status:** accepted · 2026-11-13
 
-**Amended by:** [0021](0021-agent-history.md) (agent history), [0022](0022-protocol-v2.md) (protocol v2: history, lag and activity events, primary client, labels).
+**Amended by:** [0021](0021-agent-history.md) (agent history), [0022](0022-protocol-v2.md) (protocol v2: history, lag and activity events, primary client, labels), [0032](0032-daemon-restart-handoff.md) (a requested restart execs into a new binary and keeps agents; supersedes § Daemon shutdown for that case).
 
 ## Protocol
 

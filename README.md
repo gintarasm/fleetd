@@ -33,7 +33,7 @@ It builds, installs, and moves a running `fleetd` onto the new build with its ag
 - **macOS:** builds the app bundle (needs the Metal toolchain, see below), copies it to `/Applications/fleetd.app`, and links `fleetd` and `fleet` in `~/.local/bin` to the binaries inside it. It stops rather than replace an existing `fleetd` or `fleet` file there that is not ours.
 - **Linux:** builds and copies `fleetd` and `fleet` into `~/.local/bin`. There is no app.
 - **Flags:** `--app-dir <dir>` (default `/Applications`), `--bin-dir <dir>` (default `~/.local/bin`), `--state-dir <dir>` (default `~/.fleet`, the daemon to restart), `--force-stop`.
-- **A daemon too old to restart itself** (built before this feature) is not touched: the script says so and exits 1. Run again with `--force-stop` to stop it (its running agents end); the next client starts the new one. This is needed once.
+- **A daemon too old to restart itself** (built before ADR 0032) is not touched: the script says so and exits 1. Run again with `--force-stop` to stop it (its running agents end). Needed once; see **Updating fleetd**.
 - **No daemon running:** nothing to restart; the next client starts the new one.
 
 Or, with cargo, install both binaries into `~/.cargo/bin`, which rustup normally puts on your `PATH` (this does not restart a running daemon; run `fleet daemon restart` afterwards):
@@ -63,7 +63,7 @@ fleetd --stdio              # bridge stdin/stdout to the daemon, starting one if
 
 - **Foreground process.** `fleetd` runs in the foreground and serves clients on `<state-dir>/fleetd.sock`. To keep it running, start it from a terminal multiplexer or a service manager (a launchd/systemd setup is TBD).
 - **One instance per state directory.** A second `fleetd` on the same directory exits with `fleetd already running` (exit code 2). If the running daemon is a different build, `fleetd` offers to restart it onto this binary (agents keep running); see **Upgrading**.
-- **Upgrading.** When another fleetd holds the lock and runs a different binary, `fleetd` in a terminal asks whether to restart it onto this one (agents keep running); `fleetd --upgrade` does it without asking and prints the same result as `fleet daemon restart`. Without a terminal or flag it only says so and exits 2. A daemon too old to restart itself can only be stopped, which ends its agents: `fleetd` asks, and `fleetd --force-stop` does it without asking (SIGTERM to the pid holding the lock, found with `lsof` or `fuser`; never SIGKILL: if it does not exit within 5 s `fleetd` names the pid and exits 1), then starts normally. The flags are ignored with `--stdio`, which never prompts.
+- **Updating.** See **Updating fleetd** below; a running daemon is never replaced by starting a second one.
 - **Stopping.** SIGTERM, SIGINT (Ctrl-C) or SIGHUP stops every agent: each gets SIGTERM, then 2 s later SIGKILL. Their exits are recorded, then the socket is removed.
 - **Crashes.** If `fleetd` is killed hard, the agents it was running are shown as `lost` on the next start.
 - **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M5).
@@ -79,6 +79,17 @@ The state directory (mode 0700) holds:
 | `scrollback/` | per-agent raw output (8 MiB ring file each) |
 | `history/` | per-agent history: the lines that scrolled off the screen (up to 64 MiB each) |
 | `logs/` | the daemon's log `fleetd.log` (rotated at 10 MiB into `fleetd.log.1` and `.2`, 30 MiB at most) and the `--stdio` bridges' `fleetd-stdio.log` |
+
+### Updating fleetd
+
+A running daemon keeps the binary it started from. Restarting it onto a new build keeps every agent running (same process, id, terminal, screen and history; no output lost; clients reconnect on their own within about a second). Design: [0032](docs/decisions/0032-daemon-restart-handoff.md).
+
+- **`git pull && scripts/install.sh`** builds, installs and restarts the daemon in one step.
+- **`fleet daemon restart [--binary <path>]`** restarts the running daemon onto `<path>` (default: the `fleetd` on its `PATH`). It prints `fleetd restarted: N agents kept` and exits 0. If some agents could not be restored it prints `fleetd restarted: K kept, M could not be restored and were ended (ids …)` and exits 1. If the restart was refused it prints `fleetd restart failed: <reason>; the old fleetd is still running` and exits 1. A refusal costs nothing: the new binary is checked first (`fleetd --handoff-check`), and a daemon that cannot freeze its agents in 3 s, or whose `exec` fails, resumes as before.
+- **GUI:** the status-menu item **Restart fleetd** (also for an SSH target, which restarts the remote daemon onto the `fleetd` on its own `PATH`). When the local daemon runs a different binary from the one the GUI would start, the sidebar shows "fleetd update available" with a Restart action.
+- **`fleetd --upgrade`** does the same from the new binary when another fleetd holds the lock and runs a different build; in a terminal without the flag, `fleetd` asks first. Without a terminal or flag it only says so and exits 2. It needs `fleet` next to `fleetd` (true for the app bundle, `install.sh` and cargo's `target/` directories).
+- **One-time stop of an old daemon.** A daemon built before ADR 0032 cannot restart itself (`fleet daemon restart` says so). Stopping it ends its agents, once: `scripts/install.sh --force-stop` or `fleetd --force-stop` (SIGTERM to the pid holding the lock, found with `lsof` or `fuser`; never SIGKILL: if it does not exit within 5 s `fleetd` names the pid and exits 1), after which the next client starts the new daemon. Do not use `pkill` from a sandboxed shell: it silently drops signals to processes outside the sandbox.
+- **What a restart loses:** the screen is restored as a reattach restores it (not scroll regions, character sets, tab stops, hyperlinks), and the final screens of agents that already exited are not carried over. A crash or `kill -9` still ends agents.
 
 ### Logs
 
@@ -281,7 +292,7 @@ Not yet verified by hand: connecting to a remote host over ssh, the "Start fleet
 
 ### Menu bar
 
-A status item is always present: Show fleetd, the running agents, New agent…, Switch fleetd…, Install agent skill and Quit. The app menu has Switch fleetd…, Install agent skill and Quit too. Closing the window keeps the app resident (the Dock icon hides); Show fleetd brings it back (not yet verified by hand, see above). **Quit only quits the GUI; agents keep running.**
+A status item is always present: Show fleetd, the running agents, New agent…, Switch fleetd…, Restart fleetd, Install agent skill and Quit. The app menu has Switch fleetd…, Install agent skill and Quit too. Closing the window keeps the app resident (the Dock icon hides); Show fleetd brings it back (not yet verified by hand, see above). **Quit only quits the GUI; agents keep running.**
 
 ### Configuration
 
