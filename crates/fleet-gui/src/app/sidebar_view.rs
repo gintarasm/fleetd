@@ -3,7 +3,7 @@
 //! A click shows the agent in the focused pane; a right-click opens the
 //! row's native menu (`core::menus::row_menu`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use fleet_proto::AgentState;
@@ -13,12 +13,14 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, px,
 };
 
+use super::status_dot::status_dot;
 use super::tail_text::tail_text;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
 use crate::core::session::AgentRow;
 pub use crate::core::sidebar::program_name;
 use crate::core::sidebar::{group_agents, since};
+use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
 /// The state mark of a row: ● running, ○ exited `✕code`, `?` lost.
@@ -51,6 +53,11 @@ pub struct SidebarData<'a> {
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
     pub mark: &'a dyn Fn(u64) -> TabMark,
+    /// Each non-shell agent's status (ADR 0042).
+    pub statuses: &'a HashMap<u64, AgentStatus>,
+    /// Agents that rang the bell unseen: their row is tinted.
+    pub bells: &'a HashSet<u64>,
+    pub reduce_motion: bool,
 }
 
 /// A tab's title: the agent's OSC title if a pane knows it, else the
@@ -140,18 +147,41 @@ fn render_tab(
         theme.tertiary
     };
     let title_color = if running { theme.text } else { theme.secondary };
+    let status = data.statuses.get(&id).copied();
+    let mark_el = match status {
+        // A shell keeps its text mark.
+        None => div()
+            .flex_none()
+            .type_style(text::CAPTION)
+            .text_color(dot_color)
+            .child(SharedString::from(state_mark(row))),
+        Some(s) => div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap(px(space::XXS))
+            .debug_selector(move || format!("status-{id}-{}", s.label()))
+            .child(status_dot(s, theme, data.now_ms, data.reduce_motion))
+            .children(
+                row.info
+                    .exit_code
+                    .filter(|c| *c != 0 && s == AgentStatus::Failed)
+                    .map(|c| {
+                        div()
+                            .type_style(text::CAPTION)
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!("✕{c}")))
+                    }),
+            ),
+    };
+    let rang = data.bells.contains(&id);
     let line1 = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::SM - space::XXS))
-        .child(
-            div()
-                .flex_none()
-                .type_style(text::CAPTION)
-                .text_color(dot_color)
-                .child(SharedString::from(state_mark(row))),
-        )
+        .child(mark_el)
         .child(
             div()
                 .flex_1()
@@ -207,6 +237,9 @@ fn render_tab(
         .rounded(px(radius::MD))
         .cursor_pointer()
         .when(mark == TabMark::Focused, |s| s.bg(theme.selected))
+        .when(rang && mark != TabMark::Focused, |s| {
+            s.bg(theme.warning.opacity(0.14))
+        })
         .hover(|s| s.bg(theme.hover))
         .active(|s| s.bg(theme.pressed))
         .child(bar)

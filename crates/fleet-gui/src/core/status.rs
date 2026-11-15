@@ -118,15 +118,9 @@ pub fn looks_like_prompt(line: &str) -> bool {
 }
 
 /// Every non-shell agent's status; `bells` are agents with an unseen bell.
-pub fn statuses(
-    rows: &[AgentRow],
-    bells: &HashSet<u64>,
-    now_ms: i64,
-) -> HashMap<u64, AgentStatus> {
+pub fn statuses(rows: &[AgentRow], bells: &HashSet<u64>, now_ms: i64) -> HashMap<u64, AgentStatus> {
     rows.iter()
-        .filter_map(|r| {
-            agent_status(r, bells.contains(&r.info.id), now_ms).map(|s| (r.info.id, s))
-        })
+        .filter_map(|r| agent_status(r, bells.contains(&r.info.id), now_ms).map(|s| (r.info.id, s)))
         .collect()
 }
 
@@ -167,9 +161,7 @@ impl Alerts {
                         AgentStatus::NeedsYou => {
                             prev.is_some_and(|p| p != AgentStatus::NeedsYou && !p.ended())
                         }
-                        AgentStatus::Done | AgentStatus::Failed => {
-                            prev.is_none_or(|p| !p.ended())
-                        }
+                        AgentStatus::Done | AgentStatus::Failed => prev.is_none_or(|p| !p.ended()),
                         AgentStatus::Working | AgentStatus::Idle => false,
                     }
                 })
@@ -207,6 +199,27 @@ pub fn alert_text(
     (title, body)
 }
 
+/// Whether a status dot draws dimmed at `now_ms`: a working agent's dot
+/// breathes, dimming every other second (driven by the sidebar's
+/// one-second tick, so it costs no animation frames); steady under Reduce
+/// Motion, and for every other status.
+pub fn dot_dimmed(status: AgentStatus, now_ms: i64, reduce_motion: bool) -> bool {
+    status == AgentStatus::Working && !reduce_motion && now_ms.div_euclid(1000) % 2 == 1
+}
+
+/// The notification identifier for agent `agent_id` of session `epoch`
+/// (`AppState::session_epoch`): a newer notification for the same agent
+/// replaces the older one.
+pub fn alert_id(epoch: u64, agent_id: u64) -> String {
+    format!("fleet-agent-{epoch}-{agent_id}")
+}
+
+/// The `(epoch, agent_id)` of an [`alert_id`].
+pub fn alert_agent(identifier: &str) -> Option<(u64, u64)> {
+    let (epoch, id) = identifier.strip_prefix("fleet-agent-")?.split_once('-')?;
+    Some((epoch.parse().ok()?, id.parse().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,9 +250,19 @@ mod tests {
 
     #[test]
     fn quiet_with_a_prompt_needs_you_else_idle() {
-        let r = row(AgentState::Running, None, "Continue? ", Some(NOW - QUIET_MS));
+        let r = row(
+            AgentState::Running,
+            None,
+            "Continue? ",
+            Some(NOW - QUIET_MS),
+        );
         assert_eq!(agent_status(&r, false, NOW), Some(AgentStatus::NeedsYou));
-        let r = row(AgentState::Running, None, "compiling foo", Some(NOW - 60_000));
+        let r = row(
+            AgentState::Running,
+            None,
+            "compiling foo",
+            Some(NOW - 60_000),
+        );
         assert_eq!(agent_status(&r, false, NOW), Some(AgentStatus::Idle));
         // No output seen yet.
         let r = row(AgentState::Running, None, "", None);
@@ -327,9 +350,15 @@ mod tests {
         use AgentStatus::*;
         let mut a = Alerts::default();
         // At launch: nothing is news.
-        assert!(a.update(&HashMap::from([(1, NeedsYou), (2, Done)])).is_empty());
+        assert!(
+            a.update(&HashMap::from([(1, NeedsYou), (2, Done)]))
+                .is_empty()
+        );
         // Still waiting, still done: no repeat.
-        assert!(a.update(&HashMap::from([(1, NeedsYou), (2, Done)])).is_empty());
+        assert!(
+            a.update(&HashMap::from([(1, NeedsYou), (2, Done)]))
+                .is_empty()
+        );
         let s = HashMap::from([(1, Working), (2, Done), (3, Idle)]);
         assert!(a.update(&s).is_empty());
         let s = HashMap::from([(1, NeedsYou), (2, Done), (3, Failed)]);
@@ -341,7 +370,10 @@ mod tests {
         // Idle to needs-you (a bell) is news.
         let s = HashMap::from([(4, Idle)]);
         assert!(a.update(&s).is_empty());
-        assert_eq!(a.update(&HashMap::from([(4, NeedsYou)])), vec![(4, NeedsYou)]);
+        assert_eq!(
+            a.update(&HashMap::from([(4, NeedsYou)])),
+            vec![(4, NeedsYou)]
+        );
     }
 
     #[test]
@@ -351,8 +383,29 @@ mod tests {
         let t = alert_text("claude", AgentStatus::Done, Some(0), "~/w");
         assert_eq!(t, ("claude finished".into(), "~/w".into()));
         let t = alert_text("claude", AgentStatus::Failed, Some(3), "~/w");
-        assert_eq!(t, ("claude failed".into(), "Exited with code 3 · ~/w".into()));
+        assert_eq!(
+            t,
+            ("claude failed".into(), "Exited with code 3 · ~/w".into())
+        );
         let t = alert_text("claude", AgentStatus::Failed, None, "~/w");
         assert_eq!(t.1, "Lost · ~/w");
+    }
+
+    #[test]
+    fn alert_ids_round_trip() {
+        assert_eq!(alert_id(3, 42), "fleet-agent-3-42");
+        assert_eq!(alert_agent(&alert_id(3, 42)), Some((3, 42)));
+        assert_eq!(alert_agent("fleet-agent-3"), None);
+        assert_eq!(alert_agent("other-3-42"), None);
+        assert_eq!(alert_agent("fleet-agent-x-42"), None);
+    }
+
+    #[test]
+    fn only_a_working_dot_breathes_and_not_under_reduce_motion() {
+        assert!(!dot_dimmed(AgentStatus::Working, 0, false));
+        assert!(dot_dimmed(AgentStatus::Working, 1_500, false));
+        assert!(!dot_dimmed(AgentStatus::Working, 2_000, false));
+        assert!(!dot_dimmed(AgentStatus::Working, 1_500, true));
+        assert!(!dot_dimmed(AgentStatus::NeedsYou, 1_500, false));
     }
 }

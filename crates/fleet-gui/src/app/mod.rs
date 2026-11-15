@@ -1,6 +1,7 @@
 //! gpui shell (macOS only).
 
 mod app_state;
+mod attention;
 mod bench;
 mod connect;
 mod context_menu;
@@ -13,6 +14,7 @@ mod new_agent;
 mod pane_view;
 mod resident;
 mod sidebar_view;
+mod status_dot;
 mod status_item;
 mod tail_text;
 mod terminal_element;
@@ -124,6 +126,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
             }
         }
         resident::install(cx);
+        attention::install(cx);
         context_menu::install(cx);
 
         // Detach only, well inside gpui's 100 ms quit budget; agents run on.

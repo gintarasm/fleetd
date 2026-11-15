@@ -22,6 +22,7 @@ use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restar
 use crate::core::sidebar::{ended, tilde};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
+use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
 
@@ -269,6 +270,15 @@ pub struct AppState {
     pub(super) titles: HashMap<u64, String>,
     pub(super) theme: Theme,
     pub(super) agents: Vec<AgentRow>,
+    /// Each non-shell agent's status (ADR 0042), as of the last
+    /// [`AppState::refresh_status`].
+    pub(super) statuses: HashMap<u64, AgentStatus>,
+    /// Agents whose pane rang the bell where you were not looking; cleared
+    /// once a pane showing it is focused in the active window.
+    pub(super) bells: HashSet<u64>,
+    alerts: Alerts,
+    /// The window is open and has focus: no notifications then.
+    window_active: bool,
     /// The last error, shown until dismissed or replaced.
     pub(super) error: Option<String>,
     /// A neutral message (a successful restart), shown when there is no
@@ -341,6 +351,10 @@ impl AppState {
             maximized: None,
             titles: HashMap::new(),
             theme,
+            statuses: HashMap::new(),
+            bells: HashSet::new(),
+            alerts: Alerts::default(),
+            window_active: false,
             error: None,
             error_is_connection: false,
             config_error: None,
@@ -416,6 +430,10 @@ impl AppState {
         self.focused = self.layout.panes()[0];
         self.maximized = None;
         self.titles.clear();
+        // The new target's waiting and ended agents are not news.
+        self.statuses.clear();
+        self.bells.clear();
+        self.alerts = Alerts::default();
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
         self.error_is_connection = false;
@@ -518,12 +536,17 @@ impl AppState {
     }
 
     fn apply_events(&mut self, batch: Vec<UiEvent>, cx: &mut Context<Self>) {
+        let mut status = false;
         let mut chrome = false;
         let mut layout = false;
         for event in batch {
             match event {
                 UiEvent::AgentsChanged => {
                     self.agents = self.session.agents();
+                    let agents = &self.agents;
+                    self.bells
+                        .retain(|id| agents.iter().any(|r| r.info.id == *id));
+                    status = true;
                     if self.live {
                         super::bench::agents_listed();
                         if self.session.listed() {
@@ -538,10 +561,18 @@ impl AppState {
                         continue;
                     };
                     layout |= self.adopt_shown_agent(pane, &view, cx);
-                    let (agent, title) = {
-                        let model = lock(view.read(cx).model_handle());
-                        (model.agent_id(), model.title())
+                    let (agent, title, rang) = {
+                        let mut model = lock(view.read(cx).model_handle());
+                        (model.agent_id(), model.title(), model.take_bell())
                     };
+                    if rang {
+                        view.update(cx, |v, cx| v.flash(cx));
+                        if let Some(id) = agent
+                            && !(self.window_active && pane == self.focused)
+                        {
+                            status |= self.bells.insert(id);
+                        }
+                    }
                     if let Some(id) = agent {
                         let changed = match title {
                             Some(t) => self.titles.insert(id, t.clone()).as_ref() != Some(&t),
@@ -613,6 +644,9 @@ impl AppState {
                     cx.notify();
                 }
             }
+        }
+        if status {
+            self.refresh_status(cx);
         }
         if layout {
             self.layout_changed(cx);
@@ -779,11 +813,83 @@ impl AppState {
         !self.agents.is_empty()
     }
 
-    /// Once a second: the reconnect countdown.
+    /// Once a second: the reconnect countdown, and statuses that age
+    /// (working turns quiet).
     pub fn tick(&mut self, cx: &mut Context<Self>) {
         if self.reconnect_at.is_some() {
             self.refresh_chrome(cx);
         }
+        self.refresh_status(cx);
+    }
+
+    /// Recomputes the statuses (ADR 0042); on a change redraws, and sends
+    /// the notifications it calls for while the window is not focused (if
+    /// they are on).
+    pub fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        let now = statuses(&self.agents, &self.bells, unix_ms());
+        let alerts = self.alerts.update(&now);
+        if now != self.statuses {
+            self.statuses = now;
+            self.refresh_chrome(cx);
+            cx.notify();
+        }
+        if !self.config.notifications || (self.window_active && self.window.is_some()) {
+            return;
+        }
+        for (id, status) in alerts {
+            let Some(row) = self.agents.iter().find(|r| r.info.id == id) else {
+                continue;
+            };
+            let name = self
+                .titles
+                .get(&id)
+                .filter(|t| !t.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| program_name(&row.info.program));
+            let cwd = tilde(&row.info.cwd, &self.home);
+            let detail = match status {
+                AgentStatus::NeedsYou if !row.last_line.trim().is_empty() => row.last_line.trim(),
+                _ => cwd.as_str(),
+            };
+            let (title, body) = alert_text(&name, status, row.info.exit_code, detail);
+            super::attention::post(self.session_epoch, id, &title, &body, cx);
+        }
+    }
+
+    /// Agents that need you, for the Dock badge and the menu bar.
+    pub fn needs_you_count(&self) -> usize {
+        crate::core::status::needs_you_count(&self.statuses)
+    }
+
+    /// The window gained or lost focus (or closed).
+    pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.window_active = active;
+        self.see_focused(cx);
+    }
+
+    /// A bell in the focused pane is seen once the window is active.
+    fn see_focused(&mut self, cx: &mut Context<Self>) {
+        if !self.window_active {
+            return;
+        }
+        if let Some(id) = self.layout.agent(self.focused)
+            && self.bells.remove(&id)
+        {
+            self.refresh_status(cx);
+        }
+    }
+
+    /// Turns notifications on or off and saves it to `config.toml`.
+    pub fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        let on = !self.config.notifications;
+        self.config.notifications = on;
+        if let Err(e) = crate::core::config::save_notifications(&self.state_dir, on) {
+            self.error = Some(format!("cannot save notifications setting: {e}"));
+        }
+        if on {
+            super::attention::request_permission(cx);
+        }
+        cx.notify();
     }
 
     /// Tells each pane its number, agent and connection facts.
@@ -808,6 +914,7 @@ impl AppState {
                 reconnect_in,
                 focused: pane == self.focused,
                 maximized: self.maximized == Some(pane),
+                status: agent.and_then(|id| self.statuses.get(&id).copied()),
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));
@@ -824,6 +931,7 @@ impl AppState {
             self.schedule_save(cx);
         }
         self.refresh_chrome(cx);
+        self.see_focused(cx);
         cx.notify();
     }
 
@@ -853,6 +961,7 @@ impl AppState {
                 self.maximized = None;
             }
             self.refresh_chrome(cx);
+            self.see_focused(cx);
             cx.notify();
         }
     }
@@ -1174,4 +1283,10 @@ impl AppState {
             None => format!("agent {agent_id}"),
         }
     }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }

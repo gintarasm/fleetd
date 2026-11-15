@@ -116,7 +116,11 @@ pub fn load_config(state_dir: &Path) -> Result<GuiConfig, ConfigError> {
 
 /// Sets `[gui] connection`, leaving comments and every other key as they were.
 pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
-    save_gui_key(state_dir, "connection", toml_edit::value(target.to_string()))
+    save_gui_key(
+        state_dir,
+        "connection",
+        toml_edit::value(target.to_string()),
+    )
 }
 
 /// Sets `[gui] notifications`, leaving comments and every other key as they were.
