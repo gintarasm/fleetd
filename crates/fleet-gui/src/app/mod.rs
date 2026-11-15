@@ -15,6 +15,7 @@ mod pane_view;
 mod picker_view;
 mod resident;
 mod sidebar_view;
+mod split_chooser;
 mod status_item;
 mod tail_text;
 mod terminal_element;
@@ -36,6 +37,7 @@ pub use connect::{
 pub use keymap::{CommandPalette, bind_keys, to_key};
 pub use pane_view::{InputSink, PaneChrome, PaneView, grid_size};
 pub use picker_view::{PickerEvent, PickerView};
+pub use split_chooser::{ChooserEvent, SplitChooserView};
 pub use terminal_element::TerminalElement;
 pub use theme::Theme;
 pub use workspace::{Workspace, open_main_window};

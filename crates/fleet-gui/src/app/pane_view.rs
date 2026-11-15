@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
+    AnyView, AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle,
+    Font, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, Subscription, UTF16Selection, Window, div,
     point, px, size,
@@ -238,6 +238,9 @@ pub struct PaneView {
     /// The window whose activation the cursor follows, and that
     /// subscription (renewed when the view moves to a new window).
     activation: Option<(AnyWindowHandle, Subscription)>,
+    /// What to start here, while the pane a split opened is empty (the
+    /// split chooser); drawn in place of [`empty_message`].
+    chooser: Option<AnyView>,
 }
 
 impl PaneView {
@@ -264,6 +267,16 @@ impl PaneView {
             wheel_lines: 0.0,
             pill: None,
             activation: None,
+            chooser: None,
+        }
+    }
+
+    /// Draws `chooser` while the pane has no agent (or no longer).
+    pub fn set_chooser(&mut self, chooser: Option<AnyView>, cx: &mut Context<Self>) {
+        if self.chooser.as_ref().map(AnyView::entity_id) != chooser.as_ref().map(AnyView::entity_id)
+        {
+            self.chooser = chooser;
+            cx.notify();
         }
     }
 
@@ -791,7 +804,9 @@ impl Render for PaneView {
                     .children(restart),
             );
         }
-        if let Some(text) = empty_message(chrome) {
+        if let Some(chooser) = self.chooser.clone().filter(|_| !chrome.has_agent) {
+            grid = grid.child(chooser);
+        } else if let Some(text) = empty_message(chrome) {
             grid = grid.child(
                 div()
                     .absolute()
