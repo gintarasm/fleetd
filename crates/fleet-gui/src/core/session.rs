@@ -868,14 +868,22 @@ fn control_writer(
                     ids,
                     ..Default::default()
                 };
-                send_tracked(&mut sender, "remove", request::Kind::Forget(forget));
+                send_tracked(
+                    &mut sender,
+                    "remove",
+                    request::Kind::Forget(Box::new(forget)),
+                );
             }
             Some(ControlCmd::ClearExited) => {
                 let forget = ForgetAgents {
                     exited_only: true,
                     ..Default::default()
                 };
-                send_tracked(&mut sender, "remove", request::Kind::Forget(forget));
+                send_tracked(
+                    &mut sender,
+                    "remove",
+                    request::Kind::Forget(Box::new(forget)),
+                );
             }
             Some(ControlCmd::Stop) => return,
         }
