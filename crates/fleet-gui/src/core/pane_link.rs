@@ -26,7 +26,7 @@ use super::target::connect;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
 /// A spawn or restart asked for while disconnected is dropped, with an
 /// error, if the connection is not back within this long.
-const DEFERRED_SPAWN_TTL: Duration = Duration::from_secs(5);
+const DEFERRED_LAUNCH_TTL: Duration = Duration::from_secs(5);
 
 enum Outgoing {
     /// A new connection is up; the writer sends on it from now on.
@@ -104,7 +104,7 @@ struct Shared {
     agent: Option<u64>,
     /// The agent the pane showed before a spawn or restart on its way into
     /// it; shown again if that fails.
-    before_spawn: Option<u64>,
+    before_launch: Option<u64>,
     /// The agent the current connection is subscribed to (or attaching).
     subscribed: Option<u64>,
     /// The agent whose attach the model last applied; frames for any other
@@ -430,7 +430,9 @@ fn apply_response(
         (_, Some(response::Kind::SpawnedAttached(sa))) => {
             launched(&mut sh, model, sa.agent, sa.attached)
         }
-        (_, Some(response::Kind::Restarted(r))) => launched(&mut sh, model, r.agent, r.attached),
+        (_, Some(response::Kind::Restarted(restarted))) => {
+            launched(&mut sh, model, restarted.agent, restarted.attached)
+        }
         (Some(Pending::Page { generation }), Some(response::Kind::History(page))) if is_page => {
             drop(sh);
             model.on_page(&page, generation);
@@ -453,9 +455,9 @@ fn apply_response(
         }
         (Some(Pending::Launch(verb)), Some(response::Kind::Error(e))) => {
             // Back to the agent the pane showed before.
-            let restore = sh.agent.is_none() && sh.before_spawn.is_some();
+            let restore = sh.agent.is_none() && sh.before_launch.is_some();
             if restore {
-                sh.agent = sh.before_spawn.take();
+                sh.agent = sh.before_launch.take();
             }
             drop(sh);
             let text = error_text(e.message);
@@ -486,7 +488,7 @@ fn launched(
         return false;
     };
     sh.agent = Some(info.id);
-    sh.before_spawn = None;
+    sh.before_launch = None;
     sh.subscribed = Some(info.id);
     attached(sh, model, &ok);
     true
@@ -506,8 +508,8 @@ struct Writer {
     link: Arc<Link>,
     sender: Option<Sender>,
     /// A spawn or restart asked for while disconnected, and when: sent on
-    /// the next connection unless older than [`DEFERRED_SPAWN_TTL`].
-    deferred_spawn: Option<(Launch, Instant)>,
+    /// the next connection unless older than [`DEFERRED_LAUNCH_TTL`].
+    deferred_launch: Option<(Launch, Instant)>,
     size: Option<(u16, u16)>,
     resize_due: Option<Instant>,
 }
@@ -517,7 +519,7 @@ impl Writer {
         Self {
             link,
             sender: None,
-            deferred_spawn: None,
+            deferred_launch: None,
             size: None,
             resize_due: None,
         }
@@ -527,9 +529,9 @@ impl Writer {
         loop {
             let deadline = [
                 self.resize_due,
-                self.deferred_spawn
+                self.deferred_launch
                     .as_ref()
-                    .map(|(_, at)| *at + DEFERRED_SPAWN_TTL),
+                    .map(|(_, at)| *at + DEFERRED_LAUNCH_TTL),
             ]
             .into_iter()
             .flatten()
@@ -554,32 +556,32 @@ impl Writer {
         }
     }
 
-    /// Sends a resize that is due and drops a deferred spawn that expired.
+    /// Sends a resize that is due and drops a deferred launch that expired.
     fn timers(&mut self) {
         if self.resize_due.is_some_and(|due| due <= Instant::now()) {
             self.resize_due = None;
             self.send_resize();
         }
-        self.expire_deferred_spawn();
+        self.expire_deferred_launch();
     }
 
-    /// A launch deferred for longer than [`DEFERRED_SPAWN_TTL`] is dropped
+    /// A launch deferred for longer than [`DEFERRED_LAUNCH_TTL`] is dropped
     /// with an error; the pane shows its old agent again.
-    fn expire_deferred_spawn(&mut self) {
+    fn expire_deferred_launch(&mut self) {
         if !self
-            .deferred_spawn
+            .deferred_launch
             .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() >= DEFERRED_SPAWN_TTL)
+            .is_some_and(|(_, at)| at.elapsed() >= DEFERRED_LAUNCH_TTL)
         {
             return;
         }
-        let Some((launch, _)) = self.deferred_spawn.take() else {
+        let Some((launch, _)) = self.deferred_launch.take() else {
             return;
         };
         {
             let mut sh = lock(&self.link.shared);
             if sh.agent.is_none() {
-                sh.agent = sh.before_spawn.take();
+                sh.agent = sh.before_launch.take();
             }
         }
         self.link.ctx.notify(UiEvent::Error(format!(
@@ -592,7 +594,7 @@ impl Writer {
     fn handle(&mut self, o: Outgoing) -> bool {
         match o {
             Outgoing::Connected(sender) => {
-                self.expire_deferred_spawn();
+                self.expire_deferred_launch();
                 self.sender = Some(sender);
                 let mut sh = lock(&self.link.shared);
                 sh.subscribed = None;
@@ -606,7 +608,7 @@ impl Writer {
                 sh.epoch += 1;
                 let idle = sh.agent.is_none();
                 drop(sh);
-                if let Some((launch, _)) = self.deferred_spawn.take() {
+                if let Some((launch, _)) = self.deferred_launch.take() {
                     // A newer launch supersedes the one cut off.
                     self.launch(launch);
                 } else if idle {
@@ -634,7 +636,7 @@ impl Writer {
                 {
                     let mut sh = lock(&self.link.shared);
                     sh.agent = Some(agent);
-                    sh.before_spawn = None;
+                    sh.before_launch = None;
                 }
                 self.attach(agent);
             }
@@ -741,13 +743,13 @@ impl Writer {
         {
             let mut sh = lock(&self.link.shared);
             if let Some(old) = sh.agent.take() {
-                sh.before_spawn = Some(old);
+                sh.before_launch = Some(old);
             }
         }
         if self.sender.is_some() {
             self.launch(launch);
         } else {
-            self.deferred_spawn = Some((launch, Instant::now()));
+            self.deferred_launch = Some((launch, Instant::now()));
         }
     }
 
@@ -761,7 +763,7 @@ impl Writer {
             self.send(request::Kind::Detach(Detach { agent_id }));
         }
         let Some(id) = self.sender.as_ref().map(Sender::next_id) else {
-            self.deferred_spawn = Some((launch, Instant::now()));
+            self.deferred_launch = Some((launch, Instant::now()));
             return;
         };
         lock(&self.link.model).on_attaching();
@@ -993,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_spawn_then_reattach_sends_no_attach() {
+    fn deferred_launch_then_reattach_sends_no_attach() {
         let l = link();
         let mut w = Writer::new(Arc::clone(&l));
         let (sender, mut srv) = connected();
@@ -1315,15 +1317,15 @@ mod tests {
     }
 
     #[test]
-    fn deferred_spawn_older_than_its_ttl_is_dropped_with_an_error() {
+    fn deferred_launch_older_than_its_ttl_is_dropped_with_an_error() {
         let (ctx, events) = Ctx::for_test_with_events();
         let l = link_with(ctx);
         let mut w = Writer::new(Arc::clone(&l));
         w.handle(Outgoing::Spawn(spawn_req()));
         let queued = Instant::now()
-            .checked_sub(DEFERRED_SPAWN_TTL + Duration::from_millis(1))
+            .checked_sub(DEFERRED_LAUNCH_TTL + Duration::from_millis(1))
             .unwrap();
-        w.deferred_spawn.as_mut().unwrap().1 = queued;
+        w.deferred_launch.as_mut().unwrap().1 = queued;
         let (sender, mut srv) = connected();
         w.handle(Outgoing::Connected(sender));
         w.handle(Outgoing::Reattach);
