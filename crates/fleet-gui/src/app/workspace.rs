@@ -39,9 +39,6 @@ use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::target::Target;
 use crate::core::titlebar::{Link, bar_title, window_title};
 
-/// Between pane cards, and around them.
-const PANE_GAP: f32 = chrome::PANE_GAP;
-
 /// Opens the workspace window, or brings the open one to the front.
 pub fn open_main_window(cx: &mut App) {
     let Some(app) = AppState::global(cx) else {
@@ -645,8 +642,9 @@ impl Workspace {
         self.focus_current(window, cx);
     }
 
-    /// The pane cards, 8 px apart and from the edges; only the maximized
-    /// one when a pane is maximized (the others stay attached).
+    /// The pane cards, [`chrome::PANE_GAP`] apart and from the edges;
+    /// only the maximized one when a pane is maximized (the others stay
+    /// attached).
     fn render_panes(&mut self, cx: &App) -> impl IntoElement + use<> {
         let app = self.app.read(cx);
         let rects = match app.maximized {
@@ -674,7 +672,7 @@ impl Workspace {
                         .top(relative(r.y))
                         .w(relative(r.w))
                         .h(relative(r.h))
-                        .p(px(PANE_GAP / 2.0))
+                        .p(px(chrome::PANE_GAP / 2.0))
                         .child(view),
                 )
             })
@@ -682,7 +680,7 @@ impl Workspace {
         div().relative().flex_1().h_full().min_w_0().child(
             div()
                 .absolute()
-                .inset(px(PANE_GAP / 2.0))
+                .inset(px(chrome::PANE_GAP / 2.0))
                 .children(children),
         )
     }

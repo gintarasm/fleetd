@@ -1,7 +1,7 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
 //! directory. (New agent and Clear exited live in the unified bar.)
-//! A click shows the agent in the focused pane; a right-click offers Open
-//! in new split, and Kill (running) or Restart and Remove (ended).
+//! A click shows the agent in the focused pane; a right-click opens the
+//! row's native menu (`core::menus::row_menu`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,8 +9,8 @@ use std::path::Path;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::tail_text::tail_text;
@@ -51,37 +51,6 @@ pub struct SidebarData<'a> {
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
     pub mark: &'a dyn Fn(u64) -> TabMark,
-}
-
-/// The Clear exited button's tooltip; `None` while it is disabled.
-pub fn clear_exited_tooltip(ended: usize) -> Option<String> {
-    match ended {
-        0 => None,
-        1 => Some("Remove 1 exited agent".to_owned()),
-        n => Some(format!("Remove {n} exited agents")),
-    }
-}
-
-/// A plain text tooltip.
-pub(super) struct Tooltip {
-    pub text: SharedString,
-    pub theme: Theme,
-}
-
-impl Render for Tooltip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(space::SM))
-            .py(px(space::XS))
-            .rounded(px(radius::MD))
-            .border_1()
-            .border_color(self.theme.border)
-            .bg(self.theme.raised)
-            .shadow_md()
-            .text_color(self.theme.text)
-            .type_style(text::CALLOUT)
-            .child(self.text.clone())
-    }
 }
 
 /// A tab's title: the agent's OSC title if a pane knows it, else the
@@ -257,7 +226,7 @@ fn one_line(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_exited_tooltip, program_name, state_mark};
+    use super::{program_name, state_mark};
     use crate::core::session::AgentRow;
     use fleet_proto::{AgentInfo, AgentState};
 
@@ -272,19 +241,6 @@ mod tests {
             last_line: String::new(),
             last_output_unix_ms: None,
         }
-    }
-
-    #[test]
-    fn clear_exited_tooltip_counts_ended_agents() {
-        assert_eq!(clear_exited_tooltip(0), None);
-        assert_eq!(
-            clear_exited_tooltip(1).as_deref(),
-            Some("Remove 1 exited agent")
-        );
-        assert_eq!(
-            clear_exited_tooltip(3).as_deref(),
-            Some("Remove 3 exited agents")
-        );
     }
 
     #[test]

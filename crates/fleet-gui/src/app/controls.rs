@@ -5,15 +5,37 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AnyElement, Div, ElementId, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, div,
-    px,
+    Animation, AnimationExt, AnyElement, Context, Div, ElementId, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Window, div, px,
 };
 
 use super::icons;
 use super::theme::{Theme, Typography};
 use crate::core::icons::Icon;
 use crate::core::style::{chrome, motion, radius, space, text};
+
+/// A plain text tooltip.
+pub struct Tooltip {
+    pub text: SharedString,
+    pub theme: Theme,
+}
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .rounded(px(radius::MD))
+            .border_1()
+            .border_color(self.theme.border)
+            .bg(self.theme.raised)
+            .shadow_md()
+            .text_color(self.theme.text)
+            .type_style(text::CALLOUT)
+            .child(self.text.clone())
+    }
+}
 
 /// The default (accent-filled) button or a plain one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

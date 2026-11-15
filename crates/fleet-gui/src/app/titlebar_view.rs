@@ -9,10 +9,10 @@ use gpui::{
     StatefulInteractiveElement, Styled, div, px,
 };
 
-use super::controls::icon_button;
+use super::controls::{Tooltip, icon_button};
 use super::icons;
 use super::native;
-use super::sidebar_view::{Tooltip, clear_exited_tooltip};
+
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
 use crate::core::icons::Icon;
@@ -26,6 +26,15 @@ pub struct BarData {
     pub ended: usize,
     /// Full screen hides the traffic lights: no room is kept for them.
     pub fullscreen: bool,
+}
+
+/// The Clear exited button's tooltip; `None` while it is disabled.
+pub fn clear_exited_tooltip(ended: usize) -> Option<String> {
+    match ended {
+        0 => None,
+        1 => Some("Remove 1 exited agent".to_owned()),
+        n => Some(format!("Remove {n} exited agents")),
+    }
 }
 
 pub fn render_bar(
@@ -134,4 +143,22 @@ pub fn render_bar(
         .child(div().flex_1())
         .child(clear)
         .child(new_agent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_exited_tooltip;
+
+    #[test]
+    fn clear_exited_tooltip_counts_ended_agents() {
+        assert_eq!(clear_exited_tooltip(0), None);
+        assert_eq!(
+            clear_exited_tooltip(1).as_deref(),
+            Some("Remove 1 exited agent")
+        );
+        assert_eq!(
+            clear_exited_tooltip(3).as_deref(),
+            Some("Remove 3 exited agents")
+        );
+    }
 }
