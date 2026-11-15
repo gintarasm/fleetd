@@ -85,6 +85,25 @@ pub fn open_main_window(cx: &mut App) {
     }
 }
 
+/// The window backdrop's blur radius in points, a little over AppKit's own
+/// (30).
+const BACKDROP_BLUR: f64 = 40.0;
+
+/// Sets [`BACKDROP_BLUR`]. AppKit builds the blur a few frames after the
+/// window (or a new appearance) first draws, so this tries on each of the
+/// next frames until the blur is there, for a second at most.
+fn stronger_blur(window: &mut Window) {
+    blur_within(window, 60);
+}
+
+fn blur_within(window: &mut Window, frames: u32) {
+    window.on_next_frame(move |window, _| {
+        if native::set_backdrop_blur(window, BACKDROP_BLUR) == 0 && frames > 1 {
+            blur_within(window, frames - 1);
+        }
+    });
+}
+
 /// The window's root view, over [`AppState`].
 pub struct Workspace {
     app: Entity<AppState>,
@@ -123,11 +142,13 @@ impl Workspace {
             cx.notify();
         });
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
+            stronger_blur(window);
             let theme = window_theme(window);
             this.reduce_motion = native::reduce_motion();
             this.app.update(cx, |a, cx| a.set_theme(theme, cx));
             window.refresh();
         });
+        stronger_blur(window);
         let theme = window_theme(window);
         app.update(cx, |a, cx| {
             a.set_theme(theme, cx);
