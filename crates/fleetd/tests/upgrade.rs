@@ -390,6 +390,7 @@ fn too_old_daemon_without_force_stop_is_left_running() {
 #[test]
 fn force_stop_that_does_not_stop_says_so() {
     let mut old = FakeOld::start(true);
+    ensure_fleet_built();
     let started = Instant::now();
     let out = fleetd(old.dir.path(), &["--force-stop"], None);
     assert!(started.elapsed() < Duration::from_secs(8));
