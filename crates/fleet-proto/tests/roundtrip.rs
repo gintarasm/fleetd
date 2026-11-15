@@ -264,20 +264,20 @@ fn restart_daemon_frames_round_trip() {
         protocol_version: PROTOCOL_VERSION,
         server: "s".into(),
         instance: 9,
-        binary: Some(fleet_proto::BinaryIdentity {
+        binary: Some(Box::new(fleet_proto::BinaryIdentity {
             path: "/x/fleetd".into(),
             dev: 1,
             ino: 2,
             size: 3,
             mtime_ns: -4,
-        }),
-        restore: Some(fleet_proto::RestoreSummary {
+        })),
+        restore: Some(Box::new(fleet_proto::RestoreSummary {
             previous_instance: 8,
             kept: vec![1, 2],
             failed: vec![3],
             fell_back: true,
             restart_error: "boom".into(),
-        }),
+        })),
     });
     assert_eq!(roundtrip(ok.clone()), ok);
 }
