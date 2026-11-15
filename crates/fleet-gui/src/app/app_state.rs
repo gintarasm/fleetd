@@ -15,7 +15,8 @@ use super::pane_view::{InputSink, PaneChrome, PaneView};
 use super::sidebar_view::{TabMark, program_name};
 use super::theme::Theme;
 use super::workspace::Workspace;
-use crate::core::config::GuiConfig;
+use crate::core::config::{GuiConfig, load_config};
+use crate::core::settings::{Change, save_changes};
 use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
@@ -1137,6 +1138,64 @@ impl AppState {
             .get(&self.target.to_string())
             .map_or(&[][..], Vec::as_slice);
         dir_choices(recent, &self.agents)
+    }
+
+    pub fn config(&self) -> &GuiConfig {
+        &self.config
+    }
+
+    /// The theme the windows draw with.
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// Settings changes: the changed keys are written to `config.toml`,
+    /// then take effect at once (the panes' font and Option as Meta here;
+    /// the window's look and motion follow through its observer). Nothing
+    /// changes if the file cannot be written.
+    pub fn change_settings(
+        &mut self,
+        changes: Vec<Change>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let mut next = self.config.clone();
+        let keys: Vec<&str> = changes
+            .into_iter()
+            .filter_map(|c| c.apply(&mut next))
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        save_changes(&self.state_dir, &next, &keys)
+            .map_err(|e| format!("cannot save the settings: {e}"))?;
+        if keys.contains(&"theme") {
+            super::native::set_app_appearance(next.theme);
+        }
+        self.set_config(next, cx);
+        Ok(())
+    }
+
+    /// Reads `config.toml` again (the Settings window opening): edits made
+    /// to the file meanwhile take effect. A malformed file is left for the
+    /// next launch to report; the settings in use stay.
+    pub fn reload_config(&mut self, cx: &mut Context<Self>) {
+        if let Ok(c) = load_config(&self.state_dir)
+            && c != self.config
+        {
+            if c.theme != self.config.theme {
+                super::native::set_app_appearance(c.theme);
+            }
+            self.set_config(c, cx);
+        }
+    }
+
+    fn set_config(&mut self, config: GuiConfig, cx: &mut Context<Self>) {
+        self.config = config;
+        for view in self.panes.values() {
+            let config = &self.config;
+            view.update(cx, |v, cx| v.apply_config(config, cx));
+        }
+        cx.notify();
     }
 
     pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {

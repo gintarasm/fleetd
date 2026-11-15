@@ -26,17 +26,19 @@ use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
-use super::theme::{Theme, Typography};
+use super::theme::{Theme, Typography, appearance_of};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
-use crate::core::config::save_connection;
+use crate::core::config::{GuiConfig, save_connection};
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
 };
 use crate::core::session::PaneId;
+use crate::core::settings::{MotionChoice, ThemeChoice};
 use crate::core::sidebar::ended;
 use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::target::Target;
+use crate::core::theme::Tokens;
 use crate::core::titlebar::{Link, bar_title, window_title};
 
 /// Opens the workspace window, or brings the open one to the front.
@@ -85,23 +87,41 @@ pub fn open_main_window(cx: &mut App) {
     }
 }
 
-/// The window backdrop's blur radius in points, a little over AppKit's own
-/// (30).
-const BACKDROP_BLUR: f64 = 40.0;
-
-/// Sets [`BACKDROP_BLUR`]. AppKit builds the blur a few frames after the
-/// window (or a new appearance) first draws, so this tries on each of the
-/// next frames until the blur is there, for a second at most.
-fn stronger_blur(window: &mut Window) {
-    blur_within(window, 60);
+/// Sets the backdrop's blur radius (`[gui] blur`, points). AppKit builds
+/// the blur a few frames after the window (or a new appearance) first
+/// draws, so this tries on each of the next frames until the blur is
+/// there, for a second at most.
+fn stronger_blur(window: &mut Window, radius: f32) {
+    blur_within(window, f64::from(radius), 60);
 }
 
-fn blur_within(window: &mut Window, frames: u32) {
+fn blur_within(window: &mut Window, radius: f64, frames: u32) {
     window.on_next_frame(move |window, _| {
-        if native::set_backdrop_blur(window, BACKDROP_BLUR) == 0 && frames > 1 {
-            blur_within(window, frames - 1);
+        if native::set_backdrop_blur(window, radius) == 0 && frames > 1 {
+            blur_within(window, radius, frames - 1);
         }
     });
+}
+
+/// The settings the window's look and motion follow (re-applied when one
+/// changes).
+#[derive(Clone, Copy, PartialEq)]
+struct Look {
+    theme: ThemeChoice,
+    opacity: f32,
+    blur: f32,
+    motion: MotionChoice,
+}
+
+impl Look {
+    fn of(c: &GuiConfig) -> Self {
+        Look {
+            theme: c.theme,
+            opacity: c.window_opacity,
+            blur: c.blur,
+            motion: c.reduce_motion,
+        }
+    }
 }
 
 /// The window's root view, over [`AppState`].
@@ -121,8 +141,11 @@ pub struct Workspace {
     drawn: Vec<PaneId>,
     /// The window title last set.
     window_title: String,
-    /// Reduce Motion is on (read at launch and on appearance changes).
+    /// Motion is reduced: System Settings' Reduce Motion (read at launch
+    /// and on appearance changes) unless `[gui] reduce_motion` overrides it.
     reduce_motion: bool,
+    /// The settings the window last applied.
+    look: Look,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -139,17 +162,20 @@ impl Workspace {
                     this.focus_current(window, cx);
                 }
             }
+            // Settings changed the look: apply it now.
+            let look = Look::of(app.read(cx).config());
+            if look != this.look {
+                this.look = look;
+                this.apply_look(window, cx);
+            }
             cx.notify();
         });
         let appearance = cx.observe_window_appearance(window, |this, window, cx| {
-            stronger_blur(window);
-            let theme = window_theme(window);
-            this.reduce_motion = native::reduce_motion();
-            this.app.update(cx, |a, cx| a.set_theme(theme, cx));
-            window.refresh();
+            this.apply_look(window, cx);
         });
-        stronger_blur(window);
-        let theme = window_theme(window);
+        let config = app.read(cx).config().clone();
+        stronger_blur(window, config.blur);
+        let theme = window_theme(window, &config);
         // Coming back to the window is when a fleetd installed meanwhile
         // is worth noticing (one stat, never per frame).
         let activation = cx.observe_window_activation(window, |this, window, cx| {
@@ -188,7 +214,8 @@ impl Workspace {
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
             window_title: String::new(),
-            reduce_motion: native::reduce_motion(),
+            reduce_motion: config.reduce_motion.resolve(native::reduce_motion()),
+            look: Look::of(&config),
             _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -197,6 +224,21 @@ impl Workspace {
 
     pub fn app(&self) -> &Entity<AppState> {
         &self.app
+    }
+
+    /// The theme, blur and motion for the system's settings and ours.
+    fn apply_look(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let config = self.app.read(cx).config().clone();
+        stronger_blur(window, config.blur);
+        let theme = window_theme(window, &config);
+        self.reduce_motion = config.reduce_motion.resolve(native::reduce_motion());
+        self.app.update(cx, |a, cx| a.set_theme(theme, cx));
+        window.refresh();
+    }
+
+    /// Motion is reduced (sheets and the toast appear without sliding).
+    pub fn reduces_motion(&self) -> bool {
+        self.reduce_motion
     }
 
     /// The panes the last frame drew (one while maximized).
@@ -514,7 +556,15 @@ impl Workspace {
         let dirs = app.dir_choices();
         let target = app.target.clone();
         let command = app.config.default_command.clone();
-        let sheet = cx.new(|cx| NewAgentSheet::new(&command, dirs, &target, cx));
+        let default_dir = app.config.default_dir.clone();
+        let sheet = cx.new(|cx| {
+            let s = NewAgentSheet::new(&command, dirs, &target, cx);
+            // Settings › Agents: a default folder beats the recent one.
+            if !default_dir.is_empty() {
+                s.dir.update(cx, |f, cx| f.set_text(default_dir, cx));
+            }
+            s
+        });
         let sub = cx.subscribe_in(&sheet, window, Self::sheet_event);
         sheet.read(cx).focus(window, cx);
         self.sheet = Some((sheet, sub));
@@ -566,6 +616,12 @@ impl Workspace {
     /// Asks before killing: only Kill kills.
     fn kill(&mut self, action: &Kill, window: &mut Window, cx: &mut Context<Self>) {
         let agent_id = action.agent_id;
+        // Settings › Behaviour can turn the question off.
+        if !self.app.read(cx).config().confirm_kill {
+            self.app.read(cx).kill(agent_id);
+            cx.notify();
+            return;
+        }
         let label = self.app.read(cx).label(agent_id);
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -932,12 +988,16 @@ impl Render for Workspace {
     }
 }
 
-/// The theme for the window's appearance, in the user's accent colour.
-fn window_theme(window: &Window) -> Theme {
+/// The theme for the window's appearance (or the one `[gui] theme`
+/// picks), its tint at `[gui] window_opacity`, in the user's accent
+/// colour. Reduce Transparency makes it opaque.
+fn window_theme(window: &Window, config: &GuiConfig) -> Theme {
+    let appearance = config.theme.resolve(appearance_of(window.appearance()));
+    let tokens = Tokens::for_appearance(appearance).with_window_opacity(config.window_opacity);
     let theme = if native::reduce_transparency() {
-        Theme::opaque_for_appearance(window.appearance())
+        Theme::from_tokens(&tokens.opaque())
     } else {
-        Theme::for_appearance(window.appearance())
+        Theme::from_tokens(&tokens)
     };
     match native::accent_color() {
         Some((r, g, b)) => theme.with_accent(gpui::Rgba { r, g, b, a: 1.0 }.into()),
@@ -1390,6 +1450,44 @@ mod tests {
             .filter(|c| matches!(c, Call::Kill(_)))
             .collect();
         assert_eq!(kills, [Call::Kill(7)]);
+    }
+
+    #[gpui::test]
+    fn kill_asks_nothing_when_settings_turn_confirmation_off(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let config = GuiConfig {
+            confirm_kill: false,
+            ..GuiConfig::default()
+        };
+        let s = setup_with(cx, &fake, dir.path(), config);
+        s.cx.dispatch_action(Kill { agent_id: 7 });
+        s.cx.run_until_parked();
+        assert!(!s.cx.has_pending_prompt());
+        assert!(fake.calls().contains(&Call::Kill(7)));
+    }
+
+    #[gpui::test]
+    fn new_agent_starts_in_the_default_folder(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = GuiState::default();
+        state.recent_dirs.insert("local".into(), vec!["/r1".into()]);
+        state.save(dir.path()).unwrap();
+        let fake = Arc::new(Fake::default());
+        let config = GuiConfig {
+            default_dir: "/projects".into(),
+            ..GuiConfig::default()
+        };
+        let s = setup_with(cx, &fake, dir.path(), config);
+        s.cx.simulate_keystrokes("cmd-n");
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.sheet().cloned())
+                .expect("sheet open");
+        let (dir_text, dirs) =
+            sheet.read_with(s.cx, |sh, cx| (sh.dir.read(cx).text().to_owned(), sh.dirs.clone()));
+        assert_eq!(dir_text, "/projects");
+        // The recent ones are still offered.
+        assert_eq!(dirs, ["/r1"]);
     }
 
     #[gpui::test]

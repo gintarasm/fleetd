@@ -288,6 +288,24 @@ impl PaneView {
         }
     }
 
+    /// Settings changed: the terminal font and Option as Meta follow at
+    /// once (the next layout resizes the grid if the cells changed).
+    pub fn apply_config(&mut self, config: &GuiConfig, cx: &mut Context<Self>) {
+        self.option_as_meta = config.option_as_meta;
+        let font = terminal_font(&config.font_family, cx);
+        let font_size = px(config.font_size);
+        if font != self.font || font_size != self.font_size {
+            self.font = font;
+            self.font_size = font_size;
+            cx.notify();
+        }
+    }
+
+    /// The terminal font size, in points.
+    pub fn font_size(&self) -> f32 {
+        f32::from(self.font_size)
+    }
+
     /// The cursor turns hollow when the window loses activation. The view
     /// outlives its window (the app is resident), so this follows whichever
     /// window draws it.
