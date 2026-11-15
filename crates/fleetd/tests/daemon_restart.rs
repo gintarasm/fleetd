@@ -5,6 +5,7 @@
 //! The tests' daemon is a debug build, so its test hooks
 //! (`FLEETD_TEST_RESTART_DELAY_MS`, `FLEETD_TEST_CORRUPT_HANDOFF`,
 //! `FLEETD_TEST_SHORT_HANDOFF`, `FLEETD_TEST_PANIC_AFTER_FREEZE`,
+//! `FLEETD_TEST_FROZEN_DELAY_MS`,
 //! `FLEETD_TEST_PANIC_DESCRIBING`, `FLEETD_TEST_PANIC_OPENING_HANDOFF`)
 //! work.
 
@@ -549,6 +550,41 @@ fn exec_failure_thaws() {
     // Serving as usual: a new agent starts.
     let next = c.sh("exit 0");
     assert_eq!(c.wait_exit_code(next), 0);
+}
+
+#[test]
+fn stop_signal_during_freeze_stops_instead_of_exec() {
+    // Issue #23 / ADR 0032: the restart sits frozen for 1.5 s; a SIGTERM
+    // then must stop the daemon, not be lost across the exec.
+    let mut daemon = Daemon::start_with(&[("FLEETD_TEST_FROZEN_DELAY_MS", "1500")]);
+    let (mut c, _) = daemon.connect();
+    let shell = c.sh(SHELL);
+    c.wait_screen(shell, "ready", |l| l == "ready");
+    c.input(shell, b"echo pid=$$\n");
+    let pid = shown_pid(&mut c, shell);
+
+    let id = c.restart_daemon(fleetd());
+    // Past the check (well under 1 s), inside the frozen delay.
+    std::thread::sleep(Duration::from_millis(800));
+    // SAFETY: plain signal to our child, not yet reaped.
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGTERM) },
+        0
+    );
+    let e = error_message(c.response(id));
+    assert!(e.contains("stop signal"), "{e}");
+
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = daemon.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "fleetd did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "fleetd exited with {status}");
+    // Stopped like any SIGTERM: its agents were ended.
+    assert_gone(pid);
 }
 
 #[test]

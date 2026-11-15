@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use fleetd::handoff::{self, Handed};
 use fleetd::logging::{self, DAEMON_LOG, STDIO_LOG};
-use fleetd::{Config, Daemon, StartupError, raise_fd_limit, startup};
+use fleetd::{Config, Daemon, StartupError, raise_fd_limit, startup, stop_signal};
 use tracing::{error, info, warn};
 
 /// Logs a fatal error and prints it to stderr: the log may be unavailable,
@@ -158,6 +158,18 @@ fn main() -> ExitCode {
         Err(e) => warn!(error = %e, "raising the open-file limit failed"),
     }
 
+    // Before the socket is bound (issue #23): a stop signal sent once it
+    // exists is kept until `serve` reads it, never lost, and never the
+    // default action that skips the shutdown. After the handoff above,
+    // whose abandon closes every inherited fd.
+    let stop = match stop_signal::arm() {
+        Ok(stop) => stop,
+        Err(e) => {
+            fatal(&format!("arming the stop signals: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
     let started = match adopted {
         Some(daemon) => Ok(daemon),
         None if fell_back.is_some() => startup(&cfg).map(Daemon::fell_back),
@@ -167,6 +179,8 @@ fn main() -> ExitCode {
         Ok(d) => d,
         Err(StartupError::AlreadyRunning) => {
             info!(state_dir = ?cfg.state_dir, "another fleetd holds the instance lock; exiting");
+            // The prompt and the upgrade it may exec stop on Ctrl-C as before.
+            stop_signal::disarm(stop);
             return offer_upgrade(&cfg, upgrade, force_stop);
         }
         Err(e) => {
@@ -189,7 +203,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let served = rt.block_on(daemon.serve());
+    let served = rt.block_on(daemon.serve(stop));
     // Do not wait on blocking calls stuck on an agent (e.g. a full input queue).
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
     match served {

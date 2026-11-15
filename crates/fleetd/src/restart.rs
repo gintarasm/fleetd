@@ -243,6 +243,12 @@ impl Restart {
             state_dir: &self.state_dir,
         };
         handoff::test_panic("FLEETD_TEST_PANIC_AFTER_FREEZE");
+        handoff::test_delay_frozen();
+        // A stop signal is kept until the serve loop reads it, and that loop
+        // waits for this restart: stop instead of losing it across the exec.
+        if let Some(reason) = stopping() {
+            return reason;
+        }
         let mut keep = vec![self.listener_fd, self.lock_fd];
         keep.extend(agents.iter().filter_map(|a| match a.terminal {
             Some(handoff_agent::Terminal::Fd(fd)) => Some(fd),
@@ -279,12 +285,23 @@ impl Restart {
                         let _ = written.recv_timeout(RESTART_FLUSH);
                     }
                 }
+                // Checked again as late as possible: the window left
+                // before the exec is a few instructions.
+                if let Some(reason) = stopping() {
+                    return reason;
+                }
                 let e = handoff::exec(binary, &self.state_dir, record_fd, &keep, &pids);
                 format!("exec {}: {e}", binary.display())
             }
             Err(e) => format!("writing the handoff record: {e}"),
         }
     }
+}
+
+/// Why a restart gives up, if a stop signal has arrived (see
+/// [`crate::stop_signal`]).
+fn stopping() -> Option<String> {
+    crate::stop_signal::received().map(|sig| format!("fleetd is stopping (stop signal {sig})"))
 }
 
 /// Undoes a prepared handoff when dropped: removes the record, if written,

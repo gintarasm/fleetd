@@ -383,6 +383,19 @@ pub(crate) fn test_delay_after_check() {
     }
 }
 
+/// Test hook: `FLEETD_TEST_FROZEN_DELAY_MS` pauses a restart with its
+/// agents frozen, before the record is written, so a test can signal the
+/// daemon then.
+pub(crate) fn test_delay_frozen() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("FLEETD_TEST_FROZEN_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 /// Test hook: with `FLEETD_TEST_CORRUPT_HANDOFF` set, overwrites the written
 /// record with bytes that do not decode, so the successor falls back.
 pub(crate) fn test_corrupt_record(state_dir: &Path) {

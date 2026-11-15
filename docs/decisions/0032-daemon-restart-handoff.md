@@ -74,7 +74,7 @@ One decision, `restart_outcome` in `fleet-client`, is shared by the CLI and the 
 ## Known limits
 
 - Between clearing close-on-exec on the listener and lock and the `execve` (the login-env capture can spawn then), a forked child could inherit them. The window is short; closing it needs the capture moved out of that interval.
-- A SIGTERM that arrives during a freeze which then execs successfully is lost; the new daemon does not see it.
+- ~~A SIGTERM that arrives during a freeze which then execs successfully is lost; the new daemon does not see it.~~ Narrowed by [0039](0039-stop-signals-armed-before-bind.md): a stop signal during the freeze makes the restart give up and the daemon stop. Only one arriving in the last instructions before `execve` is lost, and in the new image one that arrives before its handlers are armed kills it.
 - A record that lists fewer agents than it was passed pids for leaves each left-out agent's terminal fd open, unclaimed, in the new daemon; the agent itself is ended.
 - A requester that disconnects before its answer does not cancel the restart.
 - portable-pty reports any death by signal as exit code 1, so adopted agents do too.

@@ -6,6 +6,7 @@ pub mod logging;
 mod restart;
 mod server;
 pub mod stdio;
+pub mod stop_signal;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -23,11 +24,11 @@ use fleet_proto::{PROTOCOL_VERSION, RestoreSummary};
 
 use fs4::{FileExt, TryLockError};
 use tokio::net::UnixListener;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::server::Server;
+use crate::stop_signal::StopSignal;
 
 pub use restart::{CHECK_TIMEOUT, FREEZE_DEADLINE};
 
@@ -264,16 +265,16 @@ impl Daemon {
     /// unless `FLEETD_LOGIN_ENV=off` (see [`fleet_node::env`]), open the
     /// node's state (adopting the handed-over agents, see
     /// [`Daemon::adopted`]), then serve protocol connections until
-    /// SIGTERM/SIGINT/SIGHUP, or until a `RestartDaemon` `exec`s a new
+    /// SIGTERM/SIGINT/SIGHUP (armed by [`stop_signal::arm`] before the socket
+    /// was bound; one received before `serve` counts), or until a `RestartDaemon` `exec`s a new
     /// binary in this process (see `Restart::run`; one that fails is
     /// undone and serving goes on). Then stop every agent (decision 0018): SIGTERM
     /// to each agent's process group, up to 2 s grace, then SIGKILL; their
     /// exits are recorded. Finally remove the socket file and return.
-    pub async fn serve(self) -> io::Result<()> {
+    pub async fn serve(self, stop: StopSignal) -> io::Result<()> {
         let listener = UnixListener::from_std(self.listener)?;
-        let mut term = signal(SignalKind::terminate())?;
-        let mut int = signal(SignalKind::interrupt())?;
-        let mut hup = signal(SignalKind::hangup())?;
+        let stop = stop.recv();
+        tokio::pin!(stop);
         // `socket_path` is `<state_dir>/fleetd.sock` (see `Config::socket_path`).
         let state_dir = self
             .socket_path
@@ -333,9 +334,7 @@ impl Daemon {
         let mut check: Option<JoinHandle<restart::Checked>> = None;
         let signal = loop {
             tokio::select! {
-                _ = term.recv() => break "SIGTERM",
-                _ = int.recv() => break "SIGINT",
-                _ = hup.recv() => break "SIGHUP",
+                signal = &mut stop => break signal?,
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => server.accept(stream),
                     // Accept errors never end `serve`; only a signal does.
