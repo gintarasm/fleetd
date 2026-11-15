@@ -19,6 +19,7 @@ use crate::core::config::GuiConfig;
 use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
+use crate::core::shortcuts::ClosedPanes;
 use crate::core::sidebar::{ended, tilde};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
@@ -263,6 +264,8 @@ pub struct AppState {
     pub(super) layout: Layout,
     panes: HashMap<PaneId, Entity<PaneView>>,
     focused: PaneId,
+    /// The agents of panes closed lately, for ⌘⇧T (not saved).
+    closed: ClosedPanes,
     /// The pane filling the pane area, if any (not saved).
     pub(super) maximized: Option<PaneId>,
     /// OSC titles of the agents shown in panes.
@@ -338,6 +341,7 @@ impl AppState {
             layout,
             panes: HashMap::new(),
             focused,
+            closed: ClosedPanes::default(),
             maximized: None,
             titles: HashMap::new(),
             theme,
@@ -415,6 +419,7 @@ impl AppState {
         self.panes.clear();
         self.focused = self.layout.panes()[0];
         self.maximized = None;
+        self.closed.clear();
         self.titles.clear();
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
@@ -791,6 +796,7 @@ impl AppState {
         let reconnect_in = self
             .reconnect_at
             .map(|at| at.saturating_duration_since(Instant::now()));
+        let no_agents = self.live && self.session.listed() && self.agents.is_empty();
         for (i, pane) in self.layout.panes().into_iter().enumerate() {
             let agent = self.layout.agent(pane);
             let row = agent.and_then(|id| self.agents.iter().find(|r| r.info.id == id));
@@ -808,6 +814,7 @@ impl AppState {
                 reconnect_in,
                 focused: pane == self.focused,
                 maximized: self.maximized == Some(pane),
+                no_agents,
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));
@@ -905,9 +912,13 @@ impl AppState {
     /// The last pane stays, empty.
     pub fn close_focused(&mut self, cx: &mut Context<Self>) {
         let pane = self.focused;
+        let agent = self.layout.agent(pane);
         let Some(next) = self.layout.close(pane) else {
             return;
         };
+        if let Some(id) = agent {
+            self.closed.push(id);
+        }
         self.session.close_pane(pane);
         self.panes.remove(&pane);
         self.maximized = None;
@@ -918,6 +929,29 @@ impl AppState {
         }
         self.focused = next;
         self.layout_changed(cx);
+    }
+
+    /// ⌘⇧T: the agent of the pane closed last that is still listed, in
+    /// the focused pane if it is empty, else in a new split. `None` when
+    /// there is none or no pane fits (it then stays to reopen).
+    pub fn reopen_closed(&mut self, cx: &mut Context<Self>) -> Option<PaneId> {
+        if !self.session.listed() {
+            return None;
+        }
+        let agents = &self.agents;
+        let id = self
+            .closed
+            .pop(|id| agents.iter().any(|r| r.info.id == id))?;
+        let pane = self.focused;
+        if self.layout.agent(pane).is_none() && !self.starting.contains(&pane) {
+            self.show_agent(id, cx);
+            return Some(pane);
+        }
+        let new = self.open_in_new_split(id, cx);
+        if new.is_none() {
+            self.closed.push(id);
+        }
+        new
     }
 
     /// The pane `n` (1-based, reading order).

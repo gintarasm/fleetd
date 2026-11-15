@@ -96,6 +96,13 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Select All", keymap::SelectAll),
                 ],
             },
+            Menu {
+                name: "Help".into(),
+                items: vec![MenuItem::action(
+                    "Keyboard Shortcuts",
+                    keymap::ShowShortcuts,
+                )],
+            },
         ]);
         connect::install_backend(backend, cx);
         let theme = Theme::for_appearance(cx.window_appearance());

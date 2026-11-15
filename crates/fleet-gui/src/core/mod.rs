@@ -13,6 +13,7 @@ mod pane_link;
 pub mod scrollback;
 pub mod selection;
 pub mod session;
+pub mod shortcuts;
 pub mod sidebar;
 pub mod spawn;
 pub mod state;

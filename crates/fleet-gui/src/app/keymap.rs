@@ -4,6 +4,7 @@
 use gpui::{Action, App, KeyBinding, Keystroke, actions};
 
 use crate::core::keys::{Key, KeyCode, KeyMods};
+use crate::core::shortcuts::{self, Binding, Section};
 
 actions!(
     fleet,
@@ -32,6 +33,8 @@ actions!(
         Cut,
         Undo,
         Redo,
+        ReopenClosedPane,
+        ShowShortcuts,
     ]
 );
 
@@ -89,7 +92,32 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-z", Undo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-shift-z", Redo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-shift-t", ReopenClosedPane, None),
+        KeyBinding::new("cmd-/", ShowShortcuts, None),
     ]);
+}
+
+/// The ⌘/ cheat sheet: every key binding registered now, whoever bound it.
+pub fn cheat_sheet(cx: &App) -> Vec<Section> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let bindings: Vec<(String, &'static str, Option<String>)> = keymap
+        .bindings()
+        .filter(|b| !gpui::is_no_action(b.action()))
+        .map(|b| {
+            let strokes: Vec<String> = b.keystrokes().iter().map(|k| k.unparse()).collect();
+            (
+                strokes.join(" "),
+                b.action().name(),
+                b.predicate().map(|p| p.to_string()),
+            )
+        })
+        .collect();
+    shortcuts::cheat_sheet(bindings.iter().map(|(keys, action, context)| Binding {
+        keys,
+        action,
+        context: context.as_deref(),
+    }))
 }
 
 /// The key a keystroke encodes; `None` for cmd-keys (app shortcuts) and
