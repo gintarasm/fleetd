@@ -22,6 +22,7 @@ use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restar
 use crate::core::sidebar::{ended, tilde};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::target::Target;
+use crate::core::titlebar::{UpdateButton, update_button};
 
 /// Saved state is written once it has been still this long.
 pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -64,6 +65,11 @@ pub trait SessionApi: InputSink {
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
     /// arrives as a `UiEvent`.
     fn restart_daemon(&self) {}
+    /// A [`SessionApi::restart_daemon`] is in flight (a further ask is
+    /// ignored).
+    fn restart_pending(&self) -> bool {
+        false
+    }
     /// The fleetd binary on disk differs from the running one (stats a
     /// file: not for every frame).
     fn update_available(&self) -> bool {
@@ -132,6 +138,10 @@ impl SessionApi for Session {
 
     fn restart_daemon(&self) {
         Session::restart_daemon(self);
+    }
+
+    fn restart_pending(&self) -> bool {
+        Session::restart_pending(self)
     }
 
     fn update_available(&self) -> bool {
@@ -305,6 +315,8 @@ pub struct AppState {
     reconnect_at: Option<Instant>,
     /// A newer fleetd binary is on disk (see [`AppState::refresh_update_available`]).
     pub(super) update_available: bool,
+    /// The restart [`AppState::restart_daemon`] asked for is in flight.
+    updating: bool,
     pub(super) window: Option<WindowHandle<Workspace>>,
     /// Saved state not yet written.
     dirty: bool,
@@ -358,6 +370,7 @@ impl AppState {
             last_list: 0,
             reconnect_at: None,
             update_available: false,
+            updating: false,
             window: None,
             dirty: false,
             save_task: None,
@@ -431,6 +444,7 @@ impl AppState {
         self.last_list = 0;
         self.reconnect_at = None;
         self.update_available = self.session.update_available();
+        self.updating = false;
         self.agents = self.session.agents();
         for pane in self.layout.panes() {
             let agent = self.layout.agent(pane);
@@ -583,6 +597,7 @@ impl AppState {
                     cx.notify();
                 }
                 UiEvent::DaemonRestarted(outcome) => {
+                    self.updating = self.session.restart_pending();
                     // The new daemon may be older or newer than the disk again.
                     self.refresh_update_available(cx);
                     // Success is good news: a neutral toast. Ended agents
@@ -597,6 +612,7 @@ impl AppState {
                     chrome = true;
                 }
                 UiEvent::DaemonRestartFailed(reason) => {
+                    self.updating = self.session.restart_pending();
                     self.show_error(restart_failure_text(&reason), cx);
                     chrome = true;
                 }
@@ -1025,9 +1041,20 @@ impl AppState {
     }
 
     /// Restarts fleetd into its binary on disk; agents keep running and
-    /// the outcome is shown as a toast.
-    pub fn restart_daemon(&self) {
+    /// the outcome is shown as a toast. Asked again while one is in flight
+    /// (a double click), it does nothing.
+    pub fn restart_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.updating {
+            return;
+        }
         self.session.restart_daemon();
+        self.updating = self.session.restart_pending();
+        cx.notify();
+    }
+
+    /// The bar's Update fleetd button, if it shows.
+    pub fn update_button(&self) -> Option<UpdateButton> {
+        update_button(self.update_available, self.updating)
     }
 
     /// Re-checks whether a newer fleetd is on disk. Stats a file, so it runs

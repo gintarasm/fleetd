@@ -79,7 +79,7 @@ pub fn handle(entry: StatusEntry, cx: &mut App) {
         }
         StatusEntry::RestartFleetd => {
             if let Some(app) = AppState::global(cx) {
-                app.read(cx).restart_daemon();
+                app.update(cx, |a, cx| a.restart_daemon(cx));
             }
         }
         StatusEntry::InstallSkill => install_agent_skill(cx),

@@ -17,7 +17,7 @@ use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
 use crate::core::icons::Icon;
 use crate::core::style::{chrome, radius, space, text};
-use crate::core::titlebar::BarTitle;
+use crate::core::titlebar::{BarTitle, UpdateButton};
 
 /// What the bar draws.
 pub struct BarData {
@@ -26,6 +26,9 @@ pub struct BarData {
     pub ended: usize,
     /// Full screen hides the traffic lights: no room is kept for them.
     pub fullscreen: bool,
+    /// Update fleetd, while a newer build is on disk or the restart onto
+    /// it runs.
+    pub update: Option<UpdateButton>,
 }
 
 /// The Clear exited button's tooltip; `None` while it is disabled.
@@ -123,6 +126,44 @@ pub fn render_bar(
                         .child(SharedString::from(data.title.subtitle.clone())),
                 ),
         );
+    // Agents keep running through the restart, so the button is an
+    // offer, not a warning: accent text, no fill.
+    let update = data.update.map(|b| {
+        div()
+            .id("fleetd-update")
+            .debug_selector(|| "fleetd-update".to_owned())
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(chrome::BAR_HEIGHT - space::LG))
+            .px(px(space::SM))
+            .rounded(px(radius::SM))
+            .border_1()
+            .border_color(theme.border)
+            .type_style(text::CALLOUT)
+            .child(b.label)
+            // Not a drag.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(!b.enabled, |d| d.text_color(theme.secondary))
+            .when(b.enabled, |d| {
+                d.text_color(theme.accent)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .active(|s| s.bg(theme.pressed))
+                    .tooltip(move |_, cx| {
+                        let theme = tooltip_theme;
+                        cx.new(|_| Tooltip {
+                            text: "Restart fleetd onto the build on disk; agents keep running"
+                                .into(),
+                            theme,
+                        })
+                        .into()
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.app().update(cx, |a, cx| a.restart_daemon(cx));
+                    }))
+            })
+    });
     let clear_tip = clear_exited_tooltip(data.ended);
     let clear = icon_button("clear-exited", Icon::Trash, theme, clear_tip.is_some())
         .debug_selector(|| "clear-exited".to_owned())
@@ -159,6 +200,7 @@ pub fn render_bar(
         .child(div().flex_none().w(px(lights)))
         .child(target)
         .child(div().flex_1())
+        .children(update)
         .child(clear)
         .child(new_agent)
 }

@@ -463,6 +463,8 @@ struct FakeFleetd {
     dir: tempfile::TempDir,
     /// `RestartDaemon` requests received, on any connection.
     restarts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Their `binary`, in order.
+    binaries: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeFleetd {
@@ -497,6 +499,8 @@ impl FakeFleetd {
         let listener = UnixListener::bind(dir.path().join("fleetd.sock")).unwrap();
         let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&restarts);
+        let binaries = Arc::new(Mutex::new(Vec::new()));
+        let asked_for = Arc::clone(&binaries);
         std::thread::spawn(move || {
             for (served, stream) in listener.incoming().enumerate() {
                 let Ok(mut stream) = stream else { return };
@@ -509,6 +513,7 @@ impl FakeFleetd {
                 let hello = hellos[served.min(hellos.len() - 1)].clone();
                 let on_restart = on_restart.clone();
                 let counter = Arc::clone(&counter);
+                let asked_for = Arc::clone(&asked_for);
                 std::thread::spawn(move || {
                     let mut buf = BytesMut::new();
                     let mut chunk = [0u8; 4096];
@@ -529,7 +534,8 @@ impl FakeFleetd {
                                 }
                                 Frame::Request(r) => {
                                     let kind = match r.kind {
-                                        Some(request::Kind::RestartDaemon(_)) => {
+                                        Some(request::Kind::RestartDaemon(rd)) => {
+                                            asked_for.lock().unwrap().push(rd.binary);
                                             counter
                                                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                             let kind = on_restart.clone().unwrap_or_else(|| {
@@ -583,7 +589,11 @@ impl FakeFleetd {
                 });
             }
         });
-        FakeFleetd { dir, restarts }
+        FakeFleetd {
+            dir,
+            restarts,
+            binaries,
+        }
     }
 }
 
@@ -779,5 +789,131 @@ fn restart_that_never_settles_times_out_once_and_a_second_ask_is_ignored() {
     assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestarted(_))));
     // The second ask never reached the daemon.
     assert_eq!(fake.restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    s.shutdown();
+}
+
+/// The identity `fleetd` at `path` reports in its handshake.
+fn identity_of(path: &Path) -> fleet_proto::BinaryIdentity {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).unwrap();
+    fleet_proto::BinaryIdentity {
+        path: path.to_string_lossy().into_owned(),
+        dev: m.dev(),
+        ino: m.ino(),
+        size: m.size(),
+        mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+    }
+}
+
+fn hello_running(instance: u64, restore: Option<RestoreSummary>, binary: &Path) -> HelloOk {
+    HelloOk {
+        binary: Some(Box::new(identity_of(binary))),
+        ..hello(instance, restore)
+    }
+}
+
+/// A `fleetd` on disk (a stand-in file) and a copy of it as it was: the
+/// running daemon reports the copy, so the one on disk is a newer build.
+fn builds() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("fleetd-old");
+    std::fs::write(&old, "old build").unwrap();
+    let new = dir.path().join("fleetd");
+    std::fs::write(&new, "a newer build").unwrap();
+    (dir, old, new)
+}
+
+#[test]
+fn update_is_offered_only_when_the_binary_on_disk_is_newer() {
+    let (_bins, old, new) = builds();
+    // The daemon runs the build on disk: no update.
+    let same = FakeFleetd::start(vec![hello_running(5, None, &new)], None, Duration::ZERO);
+    let (s, events) = start_session_in(same.dir.path());
+    s.set_fleetd_for_test(new.clone());
+    connected(&events);
+    assert!(!s.update_available());
+    s.shutdown();
+
+    // It runs an older one: an update is offered.
+    let older = FakeFleetd::start(vec![hello_running(5, None, &old)], None, Duration::ZERO);
+    let (s, events) = start_session_in(older.dir.path());
+    s.set_fleetd_for_test(new.clone());
+    connected(&events);
+    assert!(s.update_available());
+    s.shutdown();
+
+    // An older fleetd that does not report its binary: never.
+    let unknown = FakeFleetd::start(vec![hello(5, None)], None, Duration::ZERO);
+    let (s, events) = start_session_in(unknown.dir.path());
+    s.set_fleetd_for_test(new);
+    connected(&events);
+    assert!(!s.update_available());
+    s.shutdown();
+}
+
+#[test]
+fn update_double_clicked_sends_one_restart_and_clears_once_restarted() {
+    let (_bins, old, new) = builds();
+    let kept = RestoreSummary {
+        previous_instance: 5,
+        kept: vec![1],
+        ..Default::default()
+    };
+    let fake = FakeFleetd::start(
+        vec![
+            hello_running(5, None, &old),
+            hello_running(6, Some(kept), &new),
+        ],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 1,
+        })),
+        Duration::from_millis(300),
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_fleetd_for_test(new.clone());
+    connected(&events);
+    assert!(s.update_available());
+    assert!(!s.restart_pending());
+
+    // A double click: two asks back to back.
+    s.restart_daemon();
+    assert!(s.restart_pending());
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestarted(_)))
+    });
+    assert!(events.has(|e| {
+        *e == UiEvent::DaemonRestarted(fleet_client::RestartOutcome::Restarted { kept: 1 })
+    }));
+    assert!(!s.restart_pending());
+    // The new daemon runs the build on disk: the button goes away.
+    assert!(!s.update_available());
+    // One request, onto the fleetd the update check compared against.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(fake.restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        *fake.binaries.lock().unwrap(),
+        vec![new.to_string_lossy().into_owned()]
+    );
+    s.shutdown();
+}
+
+#[test]
+fn update_of_a_daemon_too_old_to_restart_says_how_to_stop_it() {
+    let (_bins, old, new) = builds();
+    let fake = FakeFleetd::start(vec![hello_running(5, None, &old)], None, Duration::ZERO);
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_fleetd_for_test(new);
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    assert!(!s.restart_pending());
+    let text = fleet_gui::core::session::restart_failure_text(fleet_client::TOO_OLD);
+    assert!(text.contains("--force-stop"), "{text}");
+    assert!(events.has(|e| *e == UiEvent::DaemonRestartFailed(fleet_client::TOO_OLD.into())));
+    // Still out of date: the button stays.
+    assert!(s.update_available());
     s.shutdown();
 }
