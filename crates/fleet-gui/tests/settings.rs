@@ -62,8 +62,14 @@ fn theme_and_motion_choices_resolve_against_the_system() {
         ThemeChoice::System.resolve(Appearance::Light),
         Appearance::Light
     );
-    assert_eq!(ThemeChoice::Dark.resolve(Appearance::Light), Appearance::Dark);
-    assert_eq!(ThemeChoice::Light.resolve(Appearance::Dark), Appearance::Light);
+    assert_eq!(
+        ThemeChoice::Dark.resolve(Appearance::Light),
+        Appearance::Dark
+    );
+    assert_eq!(
+        ThemeChoice::Light.resolve(Appearance::Dark),
+        Appearance::Light
+    );
     assert!(MotionChoice::System.resolve(true));
     assert!(!MotionChoice::System.resolve(false));
     assert!(MotionChoice::On.resolve(false));
@@ -81,12 +87,24 @@ fn theme_and_motion_choices_resolve_against_the_system() {
 #[test]
 fn a_change_reports_its_key_only_when_it_changes_something() {
     let mut c = GuiConfig::default();
-    assert_eq!(Change::Theme(ThemeChoice::Dark).apply(&mut c), Some("theme"));
+    assert_eq!(
+        Change::Theme(ThemeChoice::Dark).apply(&mut c),
+        Some("theme")
+    );
     assert_eq!(c.theme, ThemeChoice::Dark);
     assert_eq!(Change::Theme(ThemeChoice::Dark).apply(&mut c), None);
-    assert_eq!(Change::ConfirmKill(false).apply(&mut c), Some("confirm_kill"));
-    assert_eq!(Change::OptionAsMeta(false).apply(&mut c), Some("option_as_meta"));
-    assert_eq!(Change::Notifications(false).apply(&mut c), Some("notifications"));
+    assert_eq!(
+        Change::ConfirmKill(false).apply(&mut c),
+        Some("confirm_kill")
+    );
+    assert_eq!(
+        Change::OptionAsMeta(false).apply(&mut c),
+        Some("option_as_meta")
+    );
+    assert_eq!(
+        Change::Notifications(false).apply(&mut c),
+        Some("notifications")
+    );
     assert_eq!(
         Change::ReduceMotion(MotionChoice::Off).apply(&mut c),
         Some("reduce_motion")
@@ -101,7 +119,10 @@ fn a_change_reports_its_key_only_when_it_changes_something() {
 #[test]
 fn numbers_step_within_their_ranges() {
     let mut c = GuiConfig::default();
-    assert_eq!(Change::FontSize(13.0 + 1.0).apply(&mut c), Some("font_size"));
+    assert_eq!(
+        Change::FontSize(13.0 + 1.0).apply(&mut c),
+        Some("font_size")
+    );
     assert_eq!(c.font_size, 14.0);
     Change::FontSize(200.0).apply(&mut c);
     assert_eq!(c.font_size, FONT_SIZE_MAX);

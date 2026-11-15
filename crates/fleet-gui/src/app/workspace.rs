@@ -1483,8 +1483,9 @@ mod tests {
         let sheet =
             s.ws.read_with(s.cx, |w, _| w.sheet().cloned())
                 .expect("sheet open");
-        let (dir_text, dirs) =
-            sheet.read_with(s.cx, |sh, cx| (sh.dir.read(cx).text().to_owned(), sh.dirs.clone()));
+        let (dir_text, dirs) = sheet.read_with(s.cx, |sh, cx| {
+            (sh.dir.read(cx).text().to_owned(), sh.dirs.clone())
+        });
         assert_eq!(dir_text, "/projects");
         // The recent ones are still offered.
         assert_eq!(dirs, ["/r1"]);

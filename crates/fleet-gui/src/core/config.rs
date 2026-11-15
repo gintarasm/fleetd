@@ -143,10 +143,7 @@ pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
 /// Sets these keys of `[gui]`, leaving comments and every other key as
 /// they were; creates the file (and the table) when missing. The file's
 /// mode is kept.
-pub fn save_gui_values(
-    state_dir: &Path,
-    values: Vec<(&str, toml_edit::Value)>,
-) -> io::Result<()> {
+pub fn save_gui_values(state_dir: &Path, values: Vec<(&str, toml_edit::Value)>) -> io::Result<()> {
     let path = config_path(state_dir);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,

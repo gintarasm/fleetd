@@ -124,14 +124,15 @@ impl SettingsWindow {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let c = app.read(cx).config().clone();
         let font_family = cx.new(|cx| TextField::new(c.font_family.clone(), "SF Mono", cx));
-        let command = cx.new(|cx| {
-            TextField::new(shell_words::join(&c.default_command), "claude", cx)
-        });
-        let folder = cx.new(|cx| {
-            TextField::new(c.default_dir.clone(), "The most recent folder", cx)
-        });
+        let command =
+            cx.new(|cx| TextField::new(shell_words::join(&c.default_command), "claude", cx));
+        let folder =
+            cx.new(|cx| TextField::new(c.default_dir.clone(), "The most recent folder", cx));
         let mut subs = vec![cx.observe(&app, |_, _, cx| cx.notify())];
-        for (field, which) in [&font_family, &command, &folder].into_iter().zip(TEXT_SETTINGS) {
+        for (field, which) in [&font_family, &command, &folder]
+            .into_iter()
+            .zip(TEXT_SETTINGS)
+        {
             let handle = field.read(cx).focus_handle().clone();
             subs.push(cx.on_blur(&handle, window, move |this, _, cx| {
                 this.commit(which, cx);
@@ -288,11 +289,16 @@ impl SettingsWindow {
         let mut themes = segmented();
         for choice in ThemeChoice::ALL {
             themes = themes.child(
-                pill(("theme", choice as usize), choice.title(), c.theme == choice, theme)
-                    .debug_selector(move || format!("theme-{}", choice.title()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.change(Change::Theme(choice), cx);
-                    })),
+                pill(
+                    ("theme", choice as usize),
+                    choice.title(),
+                    c.theme == choice,
+                    theme,
+                )
+                .debug_selector(move || format!("theme-{}", choice.title()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change(Change::Theme(choice), cx);
+                })),
             );
         }
         let blur = stepper(

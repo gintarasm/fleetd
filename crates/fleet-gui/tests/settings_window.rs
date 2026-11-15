@@ -11,9 +11,7 @@ use fleet_gui::core::config::{GuiConfig, load_config};
 use fleet_gui::core::settings::Section;
 use fleet_gui::core::target::Target;
 use fleet_gui::core::theme::Appearance;
-use gpui::{
-    AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle,
-};
+use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
 
 struct Setup {
     app: Entity<AppState>,
@@ -29,7 +27,9 @@ fn setup(cx: &mut TestAppContext, dir: &Path, config: GuiConfig) -> Setup {
     let ws = cx.add_window(|window, cx| Workspace::new(state, window, cx));
     cx.update(open_settings);
     cx.run_until_parked();
-    let settings = cx.update(|cx| settings_window(cx)).expect("Settings is open");
+    let settings = cx
+        .update(|cx| settings_window(cx))
+        .expect("Settings is open");
     Setup { app, ws, settings }
 }
 
@@ -90,9 +90,11 @@ fn theme_choice_overrides_the_system_appearance(cx: &mut TestAppContext) {
     click(cx, &s, "theme-Light");
     let appearance = s.app.read_with(cx, |a, _| a.theme().appearance);
     assert_eq!(appearance, Appearance::Light);
-    assert!(std::fs::read_to_string(dir.path().join("config.toml"))
-        .unwrap()
-        .contains("theme = \"light\""));
+    assert!(
+        std::fs::read_to_string(dir.path().join("config.toml"))
+            .unwrap()
+            .contains("theme = \"light\"")
+    );
 }
 
 #[gpui::test]
@@ -145,14 +147,18 @@ fn text_fields_apply_on_return_and_when_they_lose_focus(cx: &mut TestAppContext)
     // Return applies the focused field.
     vcx.update(|window, cx| {
         view.update(cx, |w, cx| {
-            w.set_field_text(TextSetting::DefaultCommand, "codex --model 'o 3'".into(), cx);
+            w.set_field_text(
+                TextSetting::DefaultCommand,
+                "codex --model 'o 3'".into(),
+                cx,
+            );
             w.focus_field(TextSetting::DefaultCommand, window, cx);
         });
     });
     vcx.run_until_parked();
     vcx.simulate_keystrokes("enter");
     vcx.run_until_parked();
-    let c = s.app.read_with(&mut vcx, |a, _| a.config().clone());
+    let c = s.app.read_with(&vcx, |a, _| a.config().clone());
     assert_eq!(c.default_command, ["codex", "--model", "o 3"]);
 
     // Moving to another field applies the one left.
@@ -164,10 +170,12 @@ fn text_fields_apply_on_return_and_when_they_lose_focus(cx: &mut TestAppContext)
     });
     vcx.run_until_parked();
     vcx.update(|window, cx| {
-        view.update(cx, |w, cx| w.focus_field(TextSetting::DefaultCommand, window, cx));
+        view.update(cx, |w, cx| {
+            w.focus_field(TextSetting::DefaultCommand, window, cx)
+        });
     });
     vcx.run_until_parked();
-    let c = s.app.read_with(&mut vcx, |a, _| a.config().clone());
+    let c = s.app.read_with(&vcx, |a, _| a.config().clone());
     assert_eq!(c.default_dir, "~/work");
     // The field shows what was kept.
     let shown = view.read_with(&vcx, |w, cx| w.field_text(TextSetting::DefaultDir, cx));
@@ -206,7 +214,10 @@ fn opening_settings_reads_edits_made_to_the_file(cx: &mut TestAppContext) {
     cx.update(open_settings);
     cx.run_until_parked();
     let c = config(cx, &s);
-    assert_eq!((c.font_size, c.theme), (18.0, fleet_gui::core::settings::ThemeChoice::Dark));
+    assert_eq!(
+        (c.font_size, c.theme),
+        (18.0, fleet_gui::core::settings::ThemeChoice::Dark)
+    );
     let reopened = cx.update(|cx| settings_window(cx)).unwrap();
     assert_ne!(reopened, s.settings, "a new window");
 }
