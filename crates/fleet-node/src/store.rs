@@ -506,10 +506,31 @@ impl Store {
 
     /// running -> lost for every agent left running by a previous daemon.
     pub fn mark_running_as_lost(&self) -> rusqlite::Result<usize> {
-        self.conn.execute(
-            "UPDATE agents SET state = ?1 WHERE state = ?2",
-            (AgentState::Lost.as_str(), AgentState::Running.as_str()),
-        )
+        self.mark_running_as_lost_except(&[])
+    }
+
+    /// [`Store::mark_running_as_lost`], sparing `keep`: the agents a previous
+    /// daemon handed over, still running. One transaction.
+    pub fn mark_running_as_lost_except(&self, keep: &[u64]) -> rusqlite::Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let running: Vec<u64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM agents WHERE state = ?1")?;
+            let ids = stmt.query_map((AgentState::Running.as_str(),), |r| {
+                r.get::<_, i64>(0).map(|id| id as u64)
+            })?;
+            ids.collect::<rusqlite::Result<_>>()?
+        };
+        let mut lost = 0;
+        for id in running.into_iter().filter(|id| !keep.contains(id)) {
+            lost += self.conn.execute(
+                "UPDATE agents SET state = ?1 WHERE id = ?2",
+                (AgentState::Lost.as_str(), id as i64),
+            )?;
+        }
+        tx.commit()?;
+        Ok(lost)
     }
 }
 
@@ -593,6 +614,20 @@ mod tests {
         assert_eq!(s.mark_running_as_lost().unwrap(), 0);
         // lost agents cannot transition to exited
         assert!(s.set_exited(a, 0).is_err());
+    }
+
+    #[test]
+    fn handed_over_agents_are_spared_from_lost() {
+        let (_d, _p, s) = open_tmp();
+        let kept = s.insert_agent(&new_agent(1)).unwrap();
+        let other = s.insert_agent(&new_agent(2)).unwrap();
+        let done = s.insert_agent(&new_agent(3)).unwrap();
+        s.set_exited(done, 0).unwrap();
+        assert_eq!(s.mark_running_as_lost_except(&[kept, done, 99]).unwrap(), 1);
+        let state = |id| s.agent(id).unwrap().unwrap().state;
+        assert_eq!(state(kept), AgentState::Running);
+        assert_eq!(state(other), AgentState::Lost);
+        assert_eq!(state(done), AgentState::Exited);
     }
 
     #[test]
