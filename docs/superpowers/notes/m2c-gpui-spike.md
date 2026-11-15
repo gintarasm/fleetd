@@ -1,6 +1,6 @@
 # M2c gpui restyle spike: how to compare it
 
-Branch `spike/gpui-restyle` (from `m2c-followups` at `72428c4`). What was done and what gpui could not do: [ADR 0031](../../decisions/0031-native-look.md). Spec: `docs/superpowers/specs/2026-11-14-m2c-daily-drive-design.md` §1.
+Branch `spike/gpui-restyle` (`m2c-followups` merged in). What was done and what gpui could not do: [ADR 0031](../../decisions/0031-native-look.md). Spec: `docs/superpowers/specs/2026-11-14-m2c-daily-drive-design.md` §1.
 
 The reference screenshot stays at `~/Developer/fleetd-ui-reference.png`; keep every screenshot taken below outside the repo too (next to it).
 
@@ -36,12 +36,12 @@ Light mode: System Settings › Appearance › Light (or `osascript -e 'tell app
 
 ## What to look at
 
-1. **Chrome.** Traffic lights centred in the 40 px bar; "This Mac" + agent counts under them (click: Switch fleetd); + and trash buttons at the right with tooltips. Drag the window from the bar's empty space (top and bottom halves), double-click it (zoom/minimise per your setting); pressing a button must not drag. Full screen: the bar keeps working without the light gap.
+1. **Chrome.** Traffic lights centred in the 40 px bar; "This Mac" + agent counts under them (click: Switch fleetd); + and trash buttons at the right with tooltips. Drag the window from the bar's empty space (top and bottom halves), also with the ⌘N or connect sheet open; double-click it (zoom/minimise per your setting); pressing a button must not drag. Full screen: the bar keeps working without the light gap.
 2. **Material.** The desktop shows through, blurred, behind the bar, the sidebar and the gaps; pane cards and sheets read as raised cards with a soft shadow. Try a bright wallpaper: is text still readable? Reduce transparency: opaque, same look.
 3. **Type and spacing.** SF Pro everywhere outside the terminal; headers semibold, second lines smaller and greyer; consistent 4/8 px rhythm in the sidebar rows, pane headers, sheets.
 4. **Controls.** Right-click a sidebar row (running: Open in New Split, Kill…; exited: Restart, Remove) and a pane header or grid (Copy/Paste, splits, Maximize, Restart Agent, Close Pane with shortcuts): real macOS menus, keyboard navigable, typing a letter jumps. In ⌘N's fields: click to place the caret, drag/double/triple-click to select, ⌥←/⌘←, ⌘A, ⌘Z/⇧⌘Z, ⌃A/⌃E/⌃K, a long path scrolls; Edit menu › Emoji & Symbols; a Japanese or Pinyin input method (candidate window at the text). Compare with a real field (e.g. Finder's ⇧⌘G).
 5. **Motion.** Hover and press fills on rows and buttons; the ⌘N sheet slides in from the bar; the error toast rises in. Trackpad flicks in the sidebar and in terminal history (with output scrolled back) coast with momentum. Note: no bounce at the ends, hover changes are instant.
-6. **Icons and terminal.** Lucide icons in the pane headers (maximize turns into restore), the bar, the Restart button of an exited pane. Terminal text in SF Mono 13 (Menlo if SF Mono is not installed); `[gui] font_family = "Menlo"` in `~/.fleet/config.toml` still wins.
+6. **Icons and terminal.** Lucide icons in the pane headers (maximize turns into restore), the bar, the Restart button of an exited pane. Terminal text in SF Mono 13, loaded from Terminal.app (bold and italic are real faces; Menlo if those files are missing); `[gui] font_family = "Menlo"` in `~/.fleet/config.toml` still wins.
 
 Then use the spike for about an hour of real work before the go/no-go.
 
