@@ -118,10 +118,17 @@ fn identity_of(path: &str) -> std::io::Result<BinaryIdentity> {
     })
 }
 
+/// The same file: `path` is only a spelling of it (`~/.local/bin/fleetd` may
+/// link to the app bundle's), so it is not compared. The GUI uses the same
+/// four fields (`fleet-gui` `launch::update_available`).
+fn same_file(a: &BinaryIdentity, b: &BinaryIdentity) -> bool {
+    (a.dev, a.ino, a.size, a.mtime_ns) == (b.dev, b.ino, b.size, b.mtime_ns)
+}
+
 fn classify(theirs: &BinaryIdentity, mine: &BinaryIdentity) -> Running {
     if theirs.path.is_empty() {
         Running::TooOld
-    } else if theirs == mine {
+    } else if same_file(theirs, mine) {
         Running::Same
     } else {
         Running::Different
@@ -381,7 +388,11 @@ mod tests {
         let mine = id("/a/fleetd", 1);
         assert_eq!(classify(&id("/a/fleetd", 1), &mine), Running::Same);
         assert_eq!(classify(&id("/a/fleetd", 2), &mine), Running::Different);
-        assert_eq!(classify(&id("/b/fleetd", 1), &mine), Running::Different);
+        // The same file under another path (a symlink to it) is the same build.
+        assert_eq!(classify(&id("/b/fleetd", 1), &mine), Running::Same);
+        let mut newer = id("/a/fleetd", 1);
+        newer.mtime_ns = 5;
+        assert_eq!(classify(&newer, &mine), Running::Different);
         assert_eq!(classify(&BinaryIdentity::default(), &mine), Running::TooOld);
     }
 
