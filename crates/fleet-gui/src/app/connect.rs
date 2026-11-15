@@ -15,11 +15,15 @@ use gpui::{
 
 use super::app_state::{AppState, SessionApi};
 use super::bench;
-use super::new_agent::{TextField, button};
-use super::theme::{Theme, current as theme};
+use super::controls::{
+    ButtonKind, button, error_text, field_label, list_row, list_well, sheet_card, sheet_title,
+};
+use super::text_field::TextField;
+use super::theme::{Typography, current as theme};
 use super::workspace::Workspace;
 use crate::core::launch::{find_fleetd, start_local};
 use crate::core::session::{CLIENT_NAME, Session, UiEvent};
+use crate::core::style::{space, text};
 use crate::core::target::{ConnectError, Connected, Startup, Target, connect, startup_action};
 
 /// A startup connect this quick never shows the sheet.
@@ -503,152 +507,120 @@ impl ConnectSheet {
     }
 }
 
-/// A button that does nothing while `enabled` is false.
-fn action_button(
-    id: &'static str,
-    label: &'static str,
-    theme: &Theme,
-    primary: bool,
-    enabled: bool,
-) -> gpui::Stateful<gpui::Div> {
-    let b = button(id, label, theme, primary);
-    if enabled {
-        b
-    } else {
-        b.text_color(theme.dim_text)
-            .border_color(theme.border)
-            .cursor_default()
-    }
-}
-
 impl Render for ConnectSheet {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let idle = self.busy.is_none();
-        let label = |text: &'static str| {
-            div()
-                .text_size(px(12.))
-                .text_color(theme.dim_text)
-                .child(text)
-        };
         let start_enabled = idle && self.fleetd.is_some();
-        let mut start = action_button(
+        let mut start = button(
             "start-local",
             "Start fleetd on this Mac",
             &theme,
-            true,
+            ButtonKind::Primary,
             start_enabled,
         )
         .debug_selector(|| "connect-start-local".to_owned());
         if start_enabled {
             start = start.on_click(cx.listener(|this, _, _, cx| this.start_local(cx)));
         }
-        let mut local = div().flex().flex_col().gap(px(4.)).child(start);
+        let mut local = div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(space::XS))
+            .child(start);
         if self.fleetd.is_none() {
             local = local.child(
                 div()
-                    .text_size(px(12.))
-                    .text_color(theme.dim_text)
+                    .type_style(text::SUBHEADLINE)
+                    .text_color(theme.tertiary)
                     .child("fleetd not found next to the app or on PATH"),
             );
         }
         let connect_enabled = idle && self.remote_target(cx).is_some();
-        let mut connect = action_button("connect-remote", "Connect", &theme, true, connect_enabled)
-            .debug_selector(|| "connect-remote".to_owned());
+        let mut connect = button(
+            "connect-remote",
+            "Connect",
+            &theme,
+            ButtonKind::Secondary,
+            connect_enabled,
+        )
+        .debug_selector(|| "connect-remote".to_owned());
         if connect_enabled {
             connect = connect.on_click(cx.listener(|this, _, _, cx| this.connect_remote(cx)));
         }
         let remote_row = div()
             .flex()
             .flex_row()
-            .gap(px(8.))
+            .gap(px(space::SM))
             .child(div().flex_1().child(self.remote.clone()))
             .child(connect);
         let recents = (!self.recents.is_empty()).then(|| {
-            div()
-                .id("recent-targets")
-                .flex()
-                .flex_col()
-                .max_h(px(160.))
-                .overflow_y_scroll()
-                .children(self.recents.iter().enumerate().map(|(i, t)| {
+            list_well("recent-targets", 160.0, &theme).children(
+                self.recents.iter().enumerate().map(|(i, t)| {
                     let target = t.clone();
-                    let row = div()
-                        .id(("recent-target", i))
-                        .px(px(6.))
-                        .py(px(3.))
-                        .rounded(px(4.))
-                        .text_size(px(12.))
-                        .truncate()
-                        .child(SharedString::from(target_label(t)));
+                    let row = list_row(("recent-target", i), target_label(t), &theme, idle);
                     if idle {
-                        row.cursor_pointer()
-                            .hover(|s| s.bg(theme.bg()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.connect_to(target.clone(), cx);
-                            }))
+                        row.on_click(cx.listener(move |this, _, _, cx| {
+                            this.connect_to(target.clone(), cx);
+                        }))
                     } else {
-                        row.text_color(theme.dim_text)
+                        row
                     }
-                }))
+                }),
+            )
         });
         let status = self.busy.as_ref().map(|b| {
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(space::SM))
                 .child(div().text_color(theme.accent).child(SPINNER[b.frame]))
                 .child(
                     div()
                         .flex_1()
-                        .text_color(theme.dim_text)
+                        .type_style(text::CALLOUT)
+                        .text_color(theme.secondary)
                         .child(SharedString::from(b.label.clone())),
                 )
         });
-        let reason = self.reason.clone().filter(|_| idle).map(|r| {
-            div()
-                .debug_selector(|| "connect-reason".to_owned())
-                .text_color(theme.resolve(fleet_term::Color::Named(1), true))
-                .child(r)
-        });
+        let reason = self
+            .reason
+            .clone()
+            .filter(|_| idle)
+            .map(|r| error_text(r, &theme).debug_selector(|| "connect-reason".to_owned()));
         let cancel = (!idle || self.dismissable).then(|| {
             div().flex().flex_row().justify_end().child(
-                button("connect-cancel", "Cancel", &theme, false)
-                    .debug_selector(|| "connect-cancel".to_owned())
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                button(
+                    "connect-cancel",
+                    "Cancel",
+                    &theme,
+                    ButtonKind::Secondary,
+                    true,
+                )
+                .debug_selector(|| "connect-cancel".to_owned())
+                .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
         });
-        div()
-            .id("connect-sheet")
+        let section = |label, body: gpui::Div| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::SM - space::XXS))
+                .child(field_label(label, &theme))
+                .child(body)
+        };
+        sheet_card("connect-sheet", 440.0, &theme)
             .debug_selector(|| "connect-sheet".to_owned())
             .on_key_down(cx.listener(Self::key_down))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .w(px(440.))
-            .flex()
-            .flex_col()
-            .gap(px(10.))
-            .p(px(18.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.header_bg)
-            .text_color(theme.fg())
-            .text_size(px(13.))
-            .child(div().text_size(px(15.)).child("Connect to fleetd"))
+            .child(sheet_title("Connect to fleetd"))
             .children(reason)
             .child(local)
-            .child(label("Connect to a remote fleetd"))
-            .child(remote_row)
-            .children(recents.map(|r| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(label("Recent"))
-                    .child(r)
-            }))
+            .child(section("Connect to a remote fleetd", remote_row))
+            .children(recents.map(|r| section("Recent", div().child(r))))
             .children(status)
             .children(cancel)
     }

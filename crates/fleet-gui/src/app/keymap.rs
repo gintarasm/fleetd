@@ -27,6 +27,10 @@ actions!(
         SwitchFleetd,
         InstallSkill,
         RestartPane,
+        SelectAll,
+        Cut,
+        Undo,
+        Redo,
     ]
 );
 
@@ -77,6 +81,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
+        KeyBinding::new("cmd-c", Copy, Some(TEXT_FIELD_CONTEXT)),
+        KeyBinding::new("cmd-x", Cut, Some(TEXT_FIELD_CONTEXT)),
+        KeyBinding::new("cmd-a", SelectAll, Some(TEXT_FIELD_CONTEXT)),
+        KeyBinding::new("cmd-z", Undo, Some(TEXT_FIELD_CONTEXT)),
+        KeyBinding::new("cmd-shift-z", Redo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
     ]);
 }

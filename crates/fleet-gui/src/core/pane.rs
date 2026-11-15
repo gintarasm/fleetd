@@ -325,6 +325,11 @@ impl PaneModel {
         self.selection = None;
     }
 
+    /// Some text is selected.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
     /// The selected text: one row per line, trailing spaces trimmed, joined
     /// by `\n`.
     pub fn selection_text(&self) -> Option<String> {

@@ -302,7 +302,7 @@ A status item is always present: Show fleetd, the running agents, New agent…, 
 |---|---|---|
 | `connection` | absent | `"local"` or `"ssh://[user@]host"`; the GUI writes this one |
 | `default_command` | `["claude"]` | what New agent runs |
-| `font_family` | `"Menlo"` | |
+| `font_family` | `"SF Mono"` | terminal font; SF Mono is loaded from Terminal.app, any other family must be installed; Menlo when it is not |
 | `font_size` | `13` | |
 | `option_as_meta` | `true` | Option sends Esc-prefixed keys |
 

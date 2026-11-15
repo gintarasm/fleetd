@@ -1,7 +1,7 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
-//! directory, "Clear exited" above them and "+ New agent" at the bottom.
-//! A click shows the agent in the focused pane; a right-click offers Open
-//! in new split, and Kill (running) or Restart and Remove (ended).
+//! directory. (New agent and Clear exited live in the unified bar.)
+//! A click shows the agent in the focused pane; a right-click opens the
+//! row's native menu (`core::menus::row_menu`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,19 +9,17 @@ use std::path::Path;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::tail_text::tail_text;
-use super::theme::Theme;
+use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
 use crate::core::session::AgentRow;
 pub use crate::core::sidebar::program_name;
 use crate::core::sidebar::{group_agents, since};
-
-/// Width of the sidebar.
-pub const SIDEBAR_WIDTH: f32 = 240.0;
+use crate::core::style::{chrome, radius, space, text};
 
 /// The state mark of a row: ● running, ○ exited `✕code`, `?` lost.
 pub fn state_mark(row: &AgentRow) -> String {
@@ -53,44 +51,12 @@ pub struct SidebarData<'a> {
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
     pub mark: &'a dyn Fn(u64) -> TabMark,
-    /// Exited or lost agents (what Clear exited removes).
-    pub ended: usize,
     /// A newer fleetd is on disk: the footer offers to restart into it.
     pub update_available: bool,
 }
 
-/// The Clear exited button's tooltip; `None` while it is disabled.
-pub fn clear_exited_tooltip(ended: usize) -> Option<String> {
-    match ended {
-        0 => None,
-        1 => Some("Remove 1 exited agent".to_owned()),
-        n => Some(format!("Remove {n} exited agents")),
-    }
-}
-
 /// The footer notice while a newer fleetd is on disk.
 pub const UPDATE_NOTICE: &str = "fleetd update available";
-
-/// A plain text tooltip.
-struct Tooltip {
-    text: SharedString,
-    theme: Theme,
-}
-
-impl Render for Tooltip {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(8.))
-            .py(px(4.))
-            .rounded(px(4.))
-            .border_1()
-            .border_color(self.theme.dim_text)
-            .bg(self.theme.header_bg)
-            .text_color(self.theme.fg())
-            .text_size(px(12.))
-            .child(self.text.clone())
-    }
-}
 
 /// A tab's title: the agent's OSC title if a pane knows it, else the
 /// program.
@@ -118,32 +84,28 @@ pub fn render_sidebar(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(2.))
-                .pt(px(10.))
+                .gap(px(space::XXS))
                 .child(
                     div()
-                        .px(px(10.))
-                        .pb(px(2.))
-                        .text_size(px(11.))
                         .flex()
-                        .text_color(theme.dim_text)
+                        .px(px(space::SM))
+                        .pt(px(space::MD))
+                        .pb(px(space::XS))
+                        .type_style(text::SECTION)
+                        .text_color(theme.secondary)
                         .child(tail_text(group.title)),
                 )
                 .children(tabs)
         })
         .collect();
-    let new_agent = div()
-        .id("new-agent")
-        .flex_none()
-        .mx(px(4.))
-        .px(px(10.))
-        .py(px(6.))
-        .rounded(px(6.))
-        .text_color(theme.dim_text)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.header_bg).text_color(theme.fg()))
-        .child("+ New agent")
-        .on_click(cx.listener(|this, _, window, cx| this.open_new_agent(window, cx)));
+    let empty = data.rows.is_empty().then(|| {
+        div()
+            .px(px(space::SM))
+            .pt(px(space::MD))
+            .type_style(text::CALLOUT)
+            .text_color(theme.tertiary)
+            .child("No agents yet. Press ⌘N to start one.")
+    });
     // Agents keep running through the restart, so the notice is a
     // suggestion, not a warning.
     let update = data.update_available.then(|| {
@@ -155,68 +117,41 @@ pub fn render_sidebar(
             .flex_none()
             .items_center()
             .justify_between()
-            .mx(px(4.))
-            .px(px(10.))
-            .py(px(4.))
-            .text_size(px(11.))
-            .text_color(theme.dim_text)
+            .mx(px(space::SM))
+            .mb(px(space::SM))
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .rounded(px(radius::MD))
+            .bg(theme.raised)
+            .border_1()
+            .border_color(theme.border)
+            .type_style(text::CALLOUT)
+            .text_color(theme.secondary)
             .child(UPDATE_NOTICE)
             .child(
                 div()
                     .id("fleetd-update-restart")
                     .debug_selector(|| "fleetd-update-restart".to_owned())
-                    .px(px(6.))
-                    .py(px(2.))
-                    .rounded(px(4.))
-                    .text_color(theme.fg())
+                    .px(px(space::SM))
+                    .py(px(space::XXS))
+                    .rounded(px(radius::SM))
+                    .text_color(theme.accent)
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.header_bg))
+                    .hover(|s| s.bg(theme.hover))
                     .child("Restart")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.app().read(cx).restart_daemon();
                     })),
             )
     });
-    let tooltip = clear_exited_tooltip(data.ended);
-    let enabled = tooltip.is_some();
-    let tooltip_theme = *theme;
-    let clear = div()
-        .id("clear-exited")
-        .debug_selector(|| "clear-exited".to_owned())
-        .px(px(6.))
-        .py(px(2.))
-        .rounded(px(4.))
-        .text_size(px(11.))
-        .text_color(theme.dim_text)
-        .child("Clear exited")
-        .when(!enabled, |s| s.opacity(0.4))
-        .when_some(tooltip, |s, text| {
-            let text = SharedString::from(text);
-            s.cursor_pointer()
-                .hover(|s| s.bg(theme.header_bg).text_color(theme.fg()))
-                .tooltip(move |_, cx| {
-                    let (text, theme) = (text.clone(), tooltip_theme);
-                    cx.new(|_| Tooltip { text, theme }).into()
-                })
-                .on_click(cx.listener(|this, _, _, cx| this.clear_exited(cx)))
-        });
-    let header = div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .justify_end()
-        .px(px(8.))
-        .child(clear);
     div()
         .flex()
         .flex_col()
         .flex_none()
-        .w(px(SIDEBAR_WIDTH))
+        .w(px(chrome::SIDEBAR_WIDTH))
         .h_full()
-        .py(px(8.))
-        .text_color(theme.fg())
-        .text_size(px(13.))
-        .child(header)
+        .text_color(theme.text)
+        .type_style(text::BODY)
         .child(
             div()
                 .id("tabs")
@@ -224,12 +159,13 @@ pub fn render_sidebar(
                 .flex_col()
                 .flex_1()
                 .min_h_0()
-                .px(px(4.))
+                .px(px(space::SM))
+                .pb(px(space::SM))
                 .overflow_y_scroll()
+                .children(empty)
                 .children(groups),
         )
         .children(update)
-        .child(new_agent)
 }
 
 fn render_tab(
@@ -241,19 +177,22 @@ fn render_tab(
     let id = row.info.id;
     let state = row.info.state();
     let mark = (data.mark)(id);
-    let dot_color = match state {
-        AgentState::Running => theme.resolve(fleet_term::Color::Named(2), true),
-        _ => theme.dim_text,
+    let running = state == AgentState::Running;
+    let dot_color = if running {
+        theme.success
+    } else {
+        theme.tertiary
     };
+    let title_color = if running { theme.text } else { theme.secondary };
     let line1 = div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(6.))
+        .gap(px(space::SM - space::XXS))
         .child(
             div()
                 .flex_none()
-                .text_size(px(10.))
+                .type_style(text::CAPTION)
                 .text_color(dot_color)
                 .child(SharedString::from(state_mark(row))),
         )
@@ -262,56 +201,65 @@ fn render_tab(
                 .flex_1()
                 .min_w_0()
                 .truncate()
+                .text_color(title_color)
+                .when(mark == TabMark::Focused, |s| {
+                    s.font_weight(gpui::FontWeight::MEDIUM)
+                })
                 .child(SharedString::from(tab_title(row, data.titles))),
         )
         .child(
             div()
                 .flex_none()
-                .text_size(px(11.))
-                .text_color(theme.dim_text)
+                .type_style(text::CAPTION)
+                .text_color(theme.tertiary)
                 .child(SharedString::from(since(
                     row.last_output_unix_ms,
                     data.now_ms,
                 ))),
         );
     let line2 = div()
-        .pl(px(16.))
-        .text_size(px(11.))
-        .text_color(theme.dim_text)
+        .pl(px(space::LG))
+        .type_style(text::SUBHEADLINE)
+        .text_color(if running {
+            theme.secondary
+        } else {
+            theme.tertiary
+        })
         .truncate()
         .child(SharedString::from(one_line(&row.last_line)));
     let bar = div()
         .absolute()
         .left_0()
-        .top(px(6.))
-        .bottom(px(6.))
+        .top(px(space::SM))
+        .bottom(px(space::SM))
         .w(px(3.))
         .rounded(px(2.))
         .bg(match mark {
             TabMark::Focused => theme.accent,
-            TabMark::Shown => theme.dim_text.opacity(0.5),
-            TabMark::None => theme.dim_text.opacity(0.),
+            TabMark::Shown => theme.tertiary.opacity(0.6),
+            TabMark::None => theme.tertiary.opacity(0.),
         });
     div()
         .id(("agent", id))
         .debug_selector(move || format!("tab-{id}"))
         .relative()
-        .px(px(10.))
-        .py(px(5.))
-        .rounded(px(6.))
+        .flex()
+        .flex_col()
+        .gap(px(space::XXS))
+        .px(px(space::SM))
+        .py(px(space::XS + space::XXS))
+        .rounded(px(radius::MD))
         .cursor_pointer()
-        .when(mark == TabMark::Focused, |s| s.bg(theme.header_bg))
-        .hover(|s| s.bg(theme.header_bg))
-        .when(state != AgentState::Running, |s| s.opacity(0.5))
+        .when(mark == TabMark::Focused, |s| s.bg(theme.selected))
+        .hover(|s| s.bg(theme.hover))
+        .active(|s| s.bg(theme.pressed))
         .child(bar)
         .child(line1)
         .child(line2)
         .on_click(cx.listener(move |this, _, window, cx| this.show_agent(id, window, cx)))
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                this.open_row_menu(id, ev.position, cx);
-            }),
+            cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
 }
 
@@ -322,7 +270,7 @@ fn one_line(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_exited_tooltip, program_name, state_mark};
+    use super::{program_name, state_mark};
     use crate::core::session::AgentRow;
     use fleet_proto::{AgentInfo, AgentState};
 
@@ -337,19 +285,6 @@ mod tests {
             last_line: String::new(),
             last_output_unix_ms: None,
         }
-    }
-
-    #[test]
-    fn clear_exited_tooltip_counts_ended_agents() {
-        assert_eq!(clear_exited_tooltip(0), None);
-        assert_eq!(
-            clear_exited_tooltip(1).as_deref(),
-            Some("Remove 1 exited agent")
-        );
-        assert_eq!(
-            clear_exited_tooltip(3).as_deref(),
-            Some("Remove 3 exited agents")
-        );
     }
 
     #[test]

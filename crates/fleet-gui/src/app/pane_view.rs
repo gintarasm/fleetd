@@ -7,23 +7,28 @@ use std::time::Duration;
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Font, FontWeight,
+    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
     InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, Subscription, UTF16Selection, Window, div,
-    font, point, px, size,
+    point, px, size,
 };
 
+use super::controls;
+use super::fonts::terminal_font;
+use super::icons;
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
-use super::theme::current as theme;
+use super::theme::{Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
 use crate::core::pane::{PaneModel, PaneState, ViewRow};
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
+use crate::core::style::{self, radius, space, text};
 
 /// At most this many lines are scrolled (or reported) per wheel event.
 const MAX_WHEEL_LINES: f32 = 100.0;
@@ -137,6 +142,8 @@ pub struct PaneChrome {
     pub reconnect_in: Option<Duration>,
     /// The pane has keyboard focus (drawn in the header).
     pub focused: bool,
+    /// The pane fills the window (its button offers Restore).
+    pub maximized: bool,
 }
 
 /// The line drawn over the grid, if any.
@@ -201,6 +208,11 @@ pub enum PaneEvent {
     Close,
     /// The exit banner's Restart: the ended agent again, in this pane.
     Restart,
+    /// A right-click asks for the pane's context menu: on the header, or
+    /// on the grid (`on_grid`) while the agent does not take the mouse.
+    ContextMenu {
+        on_grid: bool,
+    },
 }
 
 impl EventEmitter<PaneEvent> for PaneView {}
@@ -243,7 +255,7 @@ impl PaneView {
             sink,
             focus: cx.focus_handle(),
             option_as_meta: config.option_as_meta,
-            font: font(config.font_family.clone()),
+            font: terminal_font(&config.font_family, cx),
             font_size: px(config.font_size),
             marked: None,
             marked_selection: None,
@@ -290,6 +302,16 @@ impl PaneView {
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    /// Some text is selected (the context menu's Copy).
+    pub fn has_selection(&self) -> bool {
+        self.model().has_selection()
+    }
+
+    /// The pane's agent exited or is gone (the context menu's Restart).
+    pub fn restartable(&self) -> bool {
+        restartable(&self.chrome, self.model().state())
     }
 
     fn model(&self) -> MutexGuard<'_, PaneModel> {
@@ -388,6 +410,11 @@ impl PaneView {
             if let Some(bytes) = bytes {
                 self.send(bytes, cx);
             }
+            return;
+        }
+        if button == MouseButton::Right {
+            drop(model);
+            cx.emit(PaneEvent::ContextMenu { on_grid: true });
             return;
         }
         if button != MouseButton::Left {
@@ -609,50 +636,48 @@ impl Render for PaneView {
         };
         let chrome = &self.chrome;
         let (title_text, path) = header_parts(chrome, title.as_deref());
-        let icon_button = |id: &'static str, glyph: &'static str, event: PaneEvent| {
-            div()
-                .id(id)
+        let icon_button = |id: &'static str, icon: Icon, event: PaneEvent| {
+            controls::icon_button(id, icon, &theme, true)
                 .debug_selector(move || format!("pane-{}-{id}", chrome.number))
-                .flex_none()
-                .w(px(20.))
-                .h(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.))
-                .text_color(theme.dim_text)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.header_bg).text_color(theme.fg()))
-                .child(glyph)
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
         };
         let header = div()
+            .id("pane-header")
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ContextMenu { on_grid: false })),
+            )
             .flex()
             .flex_row()
             .flex_none()
-            .h(px(28.))
-            .px(px(10.))
+            .h(px(style::chrome::PANE_HEADER_HEIGHT))
+            .pl(px(space::MD))
+            .pr(px(space::XS))
             .items_center()
-            .gap(px(6.))
-            .text_size(px(12.))
-            .child(div().flex_none().text_color(theme.dim_text).child("❯"))
+            .gap(px(space::SM - space::XXS))
+            .type_style(text::CALLOUT)
+            .child(icons::icon(Icon::Terminal).text_color(if chrome.focused {
+                theme.accent
+            } else {
+                theme.tertiary
+            }))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .min_w_0()
-                    .gap(px(6.))
+                    .gap(px(space::SM - space::XXS))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .child(
                         div()
                             .flex_none()
-                            .font_weight(FontWeight::BOLD)
+                            .type_style(text::HEADLINE)
                             .text_color(if chrome.focused {
-                                theme.fg()
+                                theme.text
                             } else {
-                                theme.dim_text
+                                theme.secondary
                             })
                             .child(SharedString::from(title_text)),
                     )
@@ -662,36 +687,58 @@ impl Render for PaneView {
                             .flex_row()
                             .flex_1()
                             .min_w_0()
-                            .gap(px(4.))
-                            .text_color(theme.dim_text)
-                            .child(div().flex_none().child("·"))
+                            .gap(px(space::XS))
+                            .text_color(theme.secondary)
+                            .child(div().flex_none().text_color(theme.tertiary).child("·"))
                             .child(tail_text(path))
                     })),
             )
             .children(observing.then(|| {
                 div()
                     .flex_none()
-                    .text_color(theme.dim_text)
+                    .px(px(space::SM - space::XXS))
+                    .rounded(px(radius::SM))
+                    .bg(theme.hover)
+                    .type_style(text::SUBHEADLINE)
+                    .text_color(theme.secondary)
                     .child("observing")
             }))
             .children((chrome.number > 0).then(|| {
                 div()
                     .flex_none()
                     // Apart from a long path that ends next to it.
-                    .ml(px(6.))
-                    .text_color(theme.dim_text)
-                    .child(SharedString::from(chrome.number.to_string()))
+                    .ml(px(space::SM - space::XXS))
+                    .mr(px(space::XS))
+                    .type_style(text::SUBHEADLINE)
+                    .text_color(theme.tertiary)
+                    .child(SharedString::from(format!("⌘{}", chrome.number)))
             }))
-            .child(icon_button("split-right", "◫", PaneEvent::SplitRight))
-            .child(icon_button("split-down", "⊟", PaneEvent::SplitDown))
-            .child(icon_button("maximize", "⤢", PaneEvent::ToggleMaximize))
-            .child(icon_button("close", "✕", PaneEvent::Close));
+            .child(icon_button(
+                "split-right",
+                Icon::SplitRight,
+                PaneEvent::SplitRight,
+            ))
+            .child(icon_button(
+                "split-down",
+                Icon::SplitDown,
+                PaneEvent::SplitDown,
+            ))
+            .child(icon_button(
+                "maximize",
+                if chrome.maximized {
+                    Icon::Restore
+                } else {
+                    Icon::Maximize
+                },
+                PaneEvent::ToggleMaximize,
+            ))
+            .child(icon_button("close", Icon::Close, PaneEvent::Close));
         let mut grid = div()
             .relative()
             .flex_1()
             .min_h_0()
-            .mx(px(8.))
-            .mb(px(6.))
+            .mx(px(space::SM))
+            .mb(px(space::SM - space::XXS))
             .overflow_hidden()
             .child(element);
         if let Some(text) = banner(chrome, state) {
@@ -700,30 +747,46 @@ impl Render for PaneView {
                 div()
                     .id("restart")
                     .debug_selector(move || format!("pane-{number}-restart"))
-                    .px(px(6.))
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(theme.dim_text)
+                    .px(px(space::SM))
+                    .py(px(space::XXS))
+                    .rounded(px(radius::SM))
+                    .bg(theme.accent)
+                    .text_color(gpui::white())
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.window_bg))
+                    .hover(|s| s.opacity(0.9))
+                    .active(|s| s.opacity(0.8))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(space::XS))
+                    .child(icons::sized(Icon::Restart, 12.0).text_color(gpui::white()))
                     .child("Restart")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Restart)))
             });
             grid = grid.child(
                 div()
                     .absolute()
-                    .top(px(4.))
-                    .right(px(4.))
+                    .top(px(space::XS))
+                    .right(px(space::XS))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(8.))
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded(px(4.))
-                    .bg(theme.header_bg)
-                    .text_color(theme.fg())
-                    .text_size(px(12.))
+                    .gap(px(space::SM))
+                    .pl(px(space::MD))
+                    .pr(px(if restart.is_some() {
+                        space::XS
+                    } else {
+                        space::MD
+                    }))
+                    .py(px(space::XS))
+                    .rounded(px(radius::MD))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.raised)
+                    .shadow_md()
+                    .text_color(theme.text)
+                    .type_style(text::CALLOUT)
                     .child(SharedString::from(text))
                     .children(restart),
             );
@@ -736,7 +799,8 @@ impl Render for PaneView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(theme.dim_text)
+                    .type_style(text::BODY)
+                    .text_color(theme.tertiary)
                     .child(text),
             );
         }
@@ -749,15 +813,22 @@ impl Render for PaneView {
             .size_full()
             .flex()
             .flex_col()
-            .rounded(px(10.))
+            .rounded(px(radius::LG))
             .overflow_hidden()
+            // A card lifted off the window's material.
+            .shadow(vec![BoxShadow {
+                color: theme.shadow,
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(space::XS),
+                spread_radius: px(0.),
+            }])
             .border_1()
             .border_color(if chrome.focused {
-                theme.accent.opacity(0.45)
+                theme.accent.opacity(0.55)
             } else {
                 theme.border
             })
-            .bg(theme.bg())
+            .bg(theme.card)
             .child(header)
             .child(grid)
     }

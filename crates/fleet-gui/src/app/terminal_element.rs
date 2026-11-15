@@ -558,7 +558,7 @@ impl TerminalElement {
         );
         window.paint_quad(fill(
             Bounds::new(at, size(line.width.max(m.cell_w), m.line_h)),
-            self.theme.marked_bg,
+            self.theme.marked,
         ));
         let _ = line.paint(at, m.line_h, window, cx);
     }
@@ -594,7 +594,7 @@ impl TerminalElement {
             ),
             pill_size,
         );
-        window.paint_quad(fill(pill, self.theme.header_bg).corner_radii(pill_size.height / 2.0));
+        window.paint_quad(fill(pill, self.theme.raised).corner_radii(pill_size.height / 2.0));
         let text_at = point(pill.origin.x + pad, pill.origin.y + m.line_h * 0.25);
         let _ = line.paint(text_at, m.line_h, window, cx);
         pill

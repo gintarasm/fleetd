@@ -3,7 +3,12 @@
 mod app_state;
 mod bench;
 mod connect;
+mod context_menu;
+mod controls;
+mod fonts;
+mod icons;
 mod keymap;
+mod native;
 mod new_agent;
 mod pane_view;
 mod resident;
@@ -11,7 +16,9 @@ mod sidebar_view;
 mod status_item;
 mod tail_text;
 mod terminal_element;
+mod text_field;
 mod theme;
+mod titlebar_view;
 mod workspace;
 
 use std::path::PathBuf;
@@ -50,13 +57,15 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
             (GuiConfig::default(), Some(message))
         }
     };
+    // Off the main thread while the app launches.
+    fonts::preload(&config.font_family);
     // `--target` beats `[gui] connection`.
     let saved = target.or_else(|| config.connection.clone());
     let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(state_dir.clone()));
     // The connect runs while the app launches and the window opens.
     let attempt = StartupAttempt::start(backend.clone(), saved.clone());
 
-    let app = Application::new();
+    let app = Application::new().with_assets(icons::Assets);
     // Unconnected, the reopened window asks again.
     app.on_reopen(resident::show);
     app.run(move |cx| {
@@ -64,15 +73,30 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
         cx.on_action(|_: &keymap::Quit, cx| cx.quit());
         cx.on_action(|_: &keymap::SwitchFleetd, cx| switch_fleetd(cx));
         cx.on_action(|_: &keymap::InstallSkill, cx| resident::install_agent_skill(cx));
-        cx.set_menus(vec![Menu {
-            name: "fleet".into(),
-            items: vec![
-                MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),
-                MenuItem::action("Install agent skill", keymap::InstallSkill),
-                MenuItem::separator(),
-                MenuItem::action("Quit fleet", keymap::Quit),
-            ],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "fleet".into(),
+                items: vec![
+                    MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),
+                    MenuItem::action("Install agent skill", keymap::InstallSkill),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit fleet", keymap::Quit),
+                ],
+            },
+            Menu {
+                // AppKit adds AutoFill, Dictation and Emoji & Symbols to it.
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Undo", keymap::Undo),
+                    MenuItem::action("Redo", keymap::Redo),
+                    MenuItem::separator(),
+                    MenuItem::action("Cut", keymap::Cut),
+                    MenuItem::action("Copy", keymap::Copy),
+                    MenuItem::action("Paste", keymap::Paste),
+                    MenuItem::action("Select All", keymap::SelectAll),
+                ],
+            },
+        ]);
         connect::install_backend(backend, cx);
         let theme = Theme::for_appearance(cx.window_appearance());
         let shown = saved.clone().unwrap_or(Target::Local);
@@ -100,6 +124,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
             }
         }
         resident::install(cx);
+        context_menu::install(cx);
 
         // Detach only, well inside gpui's 100 ms quit budget; agents run on.
         cx.on_app_quit(move |cx| {

@@ -2,18 +2,19 @@
 //! or chosen with the native folder picker for a local daemon) and a
 //! command, prefilled from `[gui] default_command`.
 
-use std::ops::Range;
-
 use gpui::{
-    App, AppContext, Bounds, Context, ElementInputHandler, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, PathPromptOptions, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement, Styled, UTF16Selection, Window, canvas, div, px,
+    App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement, PathPromptOptions, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, px,
 };
 
-use super::keymap::{Paste, TEXT_FIELD_CONTEXT};
-use super::theme::{Theme, current as theme};
+use super::controls::{
+    ButtonKind, button, error_text, field_label, list_row, list_well, sheet_card, sheet_title,
+};
+use super::text_field::TextField;
+use super::theme::{Typography, current as theme};
 use crate::core::session::AgentRow;
+use crate::core::style::{space, text};
 use crate::core::target::Target;
 
 /// What a spawn needs from the sheet.
@@ -66,220 +67,6 @@ pub fn dir_hint(target: &Target) -> Option<String> {
             let host = dest.rsplit_once('@').map_or(dest.as_str(), |(_, h)| h);
             Some(format!("paths on {host}; ~ is not expanded"))
         }
-    }
-}
-
-/// A one-line text field. Text goes in through the input handler (typing,
-/// IME), the clipboard or [`TextField::set_text`]; Backspace deletes the
-/// last character. There is no caret movement: edits happen at the end.
-pub struct TextField {
-    text: String,
-    /// The IME's uncommitted text, a UTF-16 range of `text`.
-    marked: Option<Range<usize>>,
-    focus: FocusHandle,
-    placeholder: SharedString,
-}
-
-impl TextField {
-    pub fn new(text: String, placeholder: &str, cx: &mut Context<Self>) -> Self {
-        TextField {
-            text,
-            marked: None,
-            focus: cx.focus_handle(),
-            placeholder: SharedString::from(placeholder.to_owned()),
-        }
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
-        self.text = text;
-        self.marked = None;
-        cx.notify();
-    }
-
-    pub fn focus_handle(&self) -> &FocusHandle {
-        &self.focus
-    }
-
-    fn utf16_len(&self) -> usize {
-        self.text.encode_utf16().count()
-    }
-
-    /// The byte offset of UTF-16 offset `u16_at`, clamped to the text.
-    fn byte_at(&self, u16_at: usize) -> usize {
-        let mut seen = 0;
-        for (i, c) in self.text.char_indices() {
-            if seen >= u16_at {
-                return i;
-            }
-            seen += c.len_utf16();
-        }
-        self.text.len()
-    }
-
-    /// Replaces `range` (UTF-16; default: the marked text, else the end)
-    /// and returns the UTF-16 range of what was inserted.
-    fn replace(&mut self, range: Option<Range<usize>>, new: &str) -> Range<usize> {
-        let end = self.utf16_len();
-        let range = range.or_else(|| self.marked.clone()).unwrap_or(end..end);
-        let start = range.start.min(end);
-        let stop = range.end.clamp(start, end);
-        let (from, to) = (self.byte_at(start), self.byte_at(stop));
-        self.text.replace_range(from..to, new);
-        start..start + new.encode_utf16().count()
-    }
-
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let m = &ev.keystroke.modifiers;
-        if ev.keystroke.key == "backspace" && self.marked.is_none() && !m.platform {
-            self.text.pop();
-            cx.notify();
-            cx.stop_propagation();
-        }
-    }
-
-    fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-            let line = text.lines().next().unwrap_or("").to_owned();
-            self.replace(None, &line);
-            self.marked = None;
-            cx.notify();
-        }
-    }
-}
-
-impl Render for TextField {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme(cx);
-        let focused = self.focus.is_focused(window);
-        let (shown, color) = if self.text.is_empty() {
-            (self.placeholder.clone(), theme.dim_text)
-        } else {
-            (SharedString::from(self.text.clone()), theme.fg())
-        };
-        let entity = cx.entity();
-        let focus = self.focus.clone();
-        div()
-            .key_context(TEXT_FIELD_CONTEXT)
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(Self::key_down))
-            .on_action(cx.listener(Self::paste))
-            .relative()
-            .flex()
-            .flex_row()
-            .items_center()
-            .h(px(26.))
-            .px(px(6.))
-            .rounded(px(4.))
-            .border_1()
-            .border_color(if focused { theme.fg() } else { theme.dim_text })
-            .bg(theme.bg())
-            .overflow_hidden()
-            .child(div().text_color(color).whitespace_nowrap().child(shown))
-            // The caret, after the text.
-            .children(focused.then(|| div().w(px(1.)).h(px(14.)).bg(theme.fg())))
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        window.handle_input(
-                            &focus,
-                            ElementInputHandler::new(bounds, entity.clone()),
-                            cx,
-                        );
-                    },
-                )
-                .absolute()
-                .size_full(),
-            )
-    }
-}
-
-impl EntityInputHandler for TextField {
-    fn text_for_range(
-        &mut self,
-        range: Range<usize>,
-        adjusted_range: &mut Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let len = self.utf16_len();
-        let start = range.start.min(len);
-        let end = range.end.clamp(start, len);
-        *adjusted_range = Some(start..end);
-        Some(self.text[self.byte_at(start)..self.byte_at(end)].to_owned())
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let end = self.utf16_len();
-        Some(UTF16Selection {
-            range: end..end,
-            reversed: false,
-        })
-    }
-
-    fn marked_text_range(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        self.marked.clone()
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked = None;
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.replace(range, text);
-        self.marked = None;
-        cx.notify();
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let inserted = self.replace(range, new_text);
-        self.marked = (!inserted.is_empty()).then_some(inserted);
-        cx.notify();
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _range_utf16: Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        Some(element_bounds)
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _point: Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        None
     }
 }
 
@@ -385,116 +172,78 @@ impl NewAgentSheet {
     }
 }
 
-pub(super) fn button(
-    id: &'static str,
-    label: &'static str,
-    theme: &Theme,
-    primary: bool,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .px(px(12.))
-        .py(px(4.))
-        .rounded(px(4.))
-        .border_1()
-        .border_color(theme.dim_text)
-        .bg(if primary { theme.header_bg } else { theme.bg() })
-        .text_color(theme.fg())
-        .cursor_pointer()
-        .child(label)
-}
-
 impl Render for NewAgentSheet {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        let label = |text: &'static str| {
-            div()
-                .text_size(px(12.))
-                .text_color(theme.dim_text)
-                .child(text)
-        };
         let mut dir_row = div()
             .flex()
             .flex_row()
-            .gap(px(8.))
+            .gap(px(space::SM))
             .child(div().flex_1().child(self.dir.clone()));
         if self.can_choose {
             dir_row = dir_row.child(
-                button("choose", "Choose…", &theme, false)
+                button("choose", "Choose…", &theme, ButtonKind::Secondary, true)
                     .on_click(cx.listener(|this, _, _, cx| this.choose(cx))),
             );
         }
-        let recent = div()
-            .id("recent-dirs")
-            .flex()
-            .flex_col()
-            .max_h(px(140.))
-            .overflow_y_scroll()
-            .children(self.dirs.iter().enumerate().map(|(i, d)| {
-                let path = d.clone();
-                div()
-                    .id(("dir", i))
-                    .px(px(6.))
-                    .py(px(2.))
-                    .rounded(px(3.))
-                    .text_size(px(12.))
-                    .truncate()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.header_bg))
-                    .child(SharedString::from(d.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let path = path.clone();
-                        this.dir.update(cx, |f, cx| f.set_text(path, cx));
-                    }))
-            }));
-        div()
-            .id("new-agent-sheet")
+        let recent = (!self.dirs.is_empty()).then(|| {
+            list_well("recent-dirs", 140.0, &theme).children(self.dirs.iter().enumerate().map(
+                |(i, d)| {
+                    let path = d.clone();
+                    list_row(("dir", i), d.clone(), &theme, true).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let path = path.clone();
+                            this.dir.update(cx, |f, cx| f.set_text(path, cx));
+                        },
+                    ))
+                },
+            ))
+        });
+        sheet_card("new-agent-sheet", 520.0, &theme)
             .debug_selector(|| "new-agent-sheet".to_owned())
             .on_key_down(cx.listener(Self::key_down))
             // Clicks and the wheel stop here, never reaching the panes.
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .w(px(520.))
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .p(px(16.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(theme.dim_text)
-            .bg(theme.header_bg)
-            .text_color(theme.fg())
-            .text_size(px(13.))
-            .child(div().text_size(px(15.)).child("New agent"))
-            .child(label("Directory"))
-            .child(dir_row)
-            .children(self.hint.clone().map(|h| {
+            .child(sheet_title("New agent"))
+            .child(
                 div()
-                    .debug_selector(|| "dir-hint".to_owned())
-                    .text_size(px(11.))
-                    .text_color(theme.dim_text)
-                    .child(SharedString::from(h))
-            }))
-            .child(recent)
-            .child(label("Command"))
-            .child(self.command.clone())
-            .children(self.error.clone().map(|e| {
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SM - space::XXS))
+                    .child(field_label("Directory", &theme))
+                    .child(dir_row)
+                    .children(self.hint.clone().map(|h| {
+                        div()
+                            .debug_selector(|| "dir-hint".to_owned())
+                            .type_style(text::SUBHEADLINE)
+                            .text_color(theme.tertiary)
+                            .child(SharedString::from(h))
+                    }))
+                    .children(recent),
+            )
+            .child(
                 div()
-                    .text_color(theme.resolve(fleet_term::Color::Named(1), true))
-                    .child(e)
-            }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SM - space::XXS))
+                    .child(field_label("Command", &theme))
+                    .child(self.command.clone()),
+            )
+            .children(self.error.clone().map(|e| error_text(e, &theme)))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .justify_end()
-                    .gap(px(8.))
+                    .gap(px(space::SM))
+                    .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, false)
+                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        button("spawn", "Spawn", &theme, true)
+                        button("spawn", "Spawn", &theme, ButtonKind::Primary, true)
                             .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     ),
             )

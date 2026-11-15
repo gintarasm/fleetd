@@ -2,9 +2,11 @@
 
 pub mod backoff;
 pub mod config;
+pub mod icons;
 pub mod keys;
 pub mod launch;
 pub mod layout;
+pub mod menus;
 pub mod mouse;
 pub mod pane;
 mod pane_link;
@@ -14,5 +16,9 @@ pub mod session;
 pub mod sidebar;
 pub mod state;
 pub mod status_menu;
+pub mod style;
 pub mod target;
+pub mod text_edit;
+pub mod theme;
+pub mod titlebar;
 pub mod truncate;

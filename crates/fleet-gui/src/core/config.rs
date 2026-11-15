@@ -6,6 +6,52 @@ use serde::Deserialize;
 use super::state::write_atomic;
 use super::target::Target;
 
+/// The terminal font when the config names none: SF Mono, the macOS
+/// terminal face. It is rarely installed for apps (only with Apple's
+/// developer download), but every Mac carries its static faces inside
+/// Terminal.app ([`SF_MONO_DIR`]); the GUI registers those with its own
+/// text system (see [`sf_mono_files`]).
+pub const DEFAULT_FONT_FAMILY: &str = "SF Mono";
+
+/// Where Terminal.app keeps SF Mono (macOS 10.15 and later).
+pub const SF_MONO_DIR: &str =
+    "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts";
+
+/// The SF Mono faces a terminal draws with: regular, bold, italic, bold
+/// italic.
+pub const SF_MONO_FACES: [&str; 4] = [
+    "SF-Mono-Regular.otf",
+    "SF-Mono-Bold.otf",
+    "SF-Mono-RegularItalic.otf",
+    "SF-Mono-BoldItalic.otf",
+];
+
+/// The font files to register for the configured terminal family: SF
+/// Mono's faces from `dir` when the family is SF Mono, else none (other
+/// families come from the system as installed).
+pub fn sf_mono_files(configured: &str, dir: &Path) -> Vec<PathBuf> {
+    if configured.trim() != DEFAULT_FONT_FAMILY {
+        return Vec::new();
+    }
+    SF_MONO_FACES.iter().map(|f| dir.join(f)).collect()
+}
+/// Used when the configured family (or SF Mono) is not installed.
+pub const FALLBACK_FONT_FAMILY: &str = "Menlo";
+
+/// The terminal font families to try, in order: the configured one, then
+/// Menlo (always on macOS).
+pub fn font_families(configured: &str) -> Vec<&str> {
+    let configured = configured.trim();
+    let mut out = Vec::with_capacity(2);
+    if !configured.is_empty() {
+        out.push(configured);
+    }
+    if configured != FALLBACK_FONT_FAMILY {
+        out.push(FALLBACK_FONT_FAMILY);
+    }
+    out
+}
+
 /// `[gui]` table of `<state-dir>/config.toml`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
@@ -22,7 +68,7 @@ impl Default for GuiConfig {
         GuiConfig {
             connection: None,
             default_command: vec!["claude".to_owned()],
-            font_family: "Menlo".to_owned(),
+            font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
             option_as_meta: true,
         }
@@ -97,11 +143,34 @@ mod tests {
     }
 
     #[test]
+    fn sf_mono_is_registered_from_terminal_only_when_configured() {
+        let dir = Path::new("/T");
+        let files = sf_mono_files("SF Mono", dir);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0], Path::new("/T/SF-Mono-Regular.otf"));
+        assert!(
+            files
+                .iter()
+                .all(|f| f.extension().is_some_and(|e| e == "otf"))
+        );
+        assert!(sf_mono_files("Menlo", dir).is_empty());
+        assert!(sf_mono_files("Iosevka", dir).is_empty());
+    }
+
+    #[test]
+    fn font_falls_back_to_menlo() {
+        assert_eq!(font_families("SF Mono"), ["SF Mono", "Menlo"]);
+        assert_eq!(font_families("Iosevka"), ["Iosevka", "Menlo"]);
+        assert_eq!(font_families("Menlo"), ["Menlo"]);
+        assert_eq!(font_families("  "), ["Menlo"]);
+    }
+
+    #[test]
     fn missing_config_gives_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let c = load_config(dir.path()).unwrap();
         assert_eq!(c.default_command, ["claude"]);
-        assert_eq!(c.font_family, "Menlo");
+        assert_eq!(c.font_family, "SF Mono");
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
         assert_eq!(c.connection, None);
