@@ -3,37 +3,33 @@
 
 pub mod handoff;
 pub mod logging;
+mod restart;
 mod server;
 pub mod stdio;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fleet_node::env::{LOGIN_ENV_SWITCH, LOGIN_ENV_TIMEOUT, LoginEnv, login_shell};
 use fleet_node::node::Node;
-use fleet_proto::handoff::{HandoffRecord, handoff_agent};
-use fleet_proto::{HANDOFF_VERSION, PROTOCOL_VERSION, RestoreSummary};
+use fleet_proto::handoff::HandoffRecord;
+use fleet_proto::{PROTOCOL_VERSION, RestoreSummary};
 
 use fs4::{FileExt, TryLockError};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::server::{RESTART_FLUSH, RestartReply, RestartRequest, Server};
+use crate::server::Server;
 
-/// Bound on the new binary's `--handoff-check`.
-pub const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
-/// Bound on stopping requests and freezing the node for a restart.
-pub const FREEZE_DEADLINE: Duration = Duration::from_secs(3);
+pub use restart::{CHECK_TIMEOUT, FREEZE_DEADLINE};
 
 /// Longest socket path macOS accepts: `sun_path` is 104 bytes including the NUL.
 const MAX_SOCKET_PATH_BYTES: usize = 103;
@@ -231,12 +227,6 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
     })
 }
 
-fn unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
-}
-
 impl Daemon {
     /// A daemon started by a predecessor's `exec` from its handoff record
     /// `rec`: the instance lock and the listener are the predecessor's,
@@ -300,30 +290,12 @@ impl Daemon {
             );
         }
         let (node, restore) = match self.origin {
-            Origin::Handoff(rec) => {
-                // The handed-over terminals are claimed before the capture
-                // opens a terminal of its own.
-                let dir = state_dir.clone();
-                let agents = rec.agents;
-                let (node, kept, failed) =
-                    tokio::task::spawn_blocking(move || Node::open_with_handoff(&dir, agents))
-                        .await
-                        .map_err(io::Error::other)??;
-                let login_env = LoginEnv::capture_in_background(shell, LOGIN_ENV_TIMEOUT);
-                info!(
-                    kept = kept.len(),
-                    failed = failed.len(),
-                    frozen_ms = unix_ms().saturating_sub(rec.frozen_unix_ms),
-                    "restarted from a handoff; serving"
-                );
-                let restore = RestoreSummary {
-                    previous_instance: rec.previous_instance,
-                    kept,
-                    failed,
-                    ..Default::default()
-                };
-                (node.with_base_env(login_env), restore)
-            }
+            // Restart-only code runs on blocking threads (see `restart`):
+            // kept out of `serve`'s own code, which is paged in on every
+            // start (idle RSS is gated).
+            Origin::Handoff(rec) => restart::open_from_handoff(state_dir.clone(), rec, shell)
+                .await
+                .map_err(io::Error::other)??,
             origin => {
                 // In the background, overlapping opening the store; the
                 // first spawn waits for it (bounded), nothing else does.
@@ -344,13 +316,10 @@ impl Daemon {
         let node = Arc::new(node);
         let identity = handoff::Identity::current();
         let instance = identity.instance;
-        // One restart at a time: the server refuses a second while one is
-        // pending, so the channel never holds more than one.
-        let (restarts_tx, mut restarts) = mpsc::channel(1);
-        let server = Server::new(Arc::clone(&node), identity, restore, restarts_tx);
-        // The restart whose binary is being checked, and the check.
-        let mut checking: Option<(RestartRequest, PathBuf)> = None;
-        let mut check: Option<JoinHandle<Result<(), String>>> = None;
+        let server = Server::new(Arc::clone(&node), identity, restore);
+        let restarts = server.restarts();
+        // The restart whose binary is being checked.
+        let mut check: Option<JoinHandle<restart::Checked>> = None;
         let signal = loop {
             tokio::select! {
                 _ = term.recv() => break "SIGTERM",
@@ -366,49 +335,28 @@ impl Daemon {
                         }
                     }
                 },
-                Some(req) = restarts.recv(), if check.is_none() => {
-                    match handoff::resolve_binary(&req.binary) {
-                        Ok(binary) => {
-                            info!(binary = ?binary, "restart: checking the new binary");
-                            let b = binary.clone();
-                            check = Some(tokio::task::spawn_blocking(move || {
-                                let checked = handoff::run_check(&b, CHECK_TIMEOUT);
-                                if checked.is_ok() {
-                                    handoff::test_delay_after_check();
-                                }
-                                checked
-                            }));
-                            checking = Some((req, binary));
-                        }
-                        Err(reason) => refuse(&server, req.reply, &reason),
-                    }
+                // One restart at a time: the server refuses a second while
+                // one is pending.
+                req = restarts.next(), if check.is_none() => {
+                    check = restart::check(&restarts, req);
                 }
                 checked = async { check.as_mut().expect("guarded").await }, if check.is_some() => {
                     check = None;
-                    let (req, binary) = checking.take().expect("set with the check");
-                    let checked = checked.map_err(|e| e.to_string()).and_then(|c| c);
-                    let mut reply = Some(req.reply);
-                    let reason = match checked {
-                        Ok(()) => {
-                            info!("restart: check passed");
-                            let restart = Restart {
-                                server: &server,
-                                node: &node,
-                                state_dir: &state_dir,
-                                instance,
-                                listener_fd: listener.as_raw_fd(),
-                                lock_fd: self.lock.as_raw_fd(),
-                            };
-                            restart.run(&binary, &mut reply).await
+                    let finished = match checked {
+                        Ok(checked) => restart::Restart {
+                            restarts: restarts.clone(),
+                            node: Arc::clone(&node),
+                            state_dir: state_dir.clone(),
+                            instance,
+                            listener_fd: listener.as_raw_fd(),
+                            lock_fd: self.lock.as_raw_fd(),
                         }
-                        Err(reason) => reason,
+                        .finish(checked)
+                        .await,
+                        Err(e) => Err(e),
                     };
-                    match reply {
-                        Some(reply) => refuse(&server, reply, &reason),
-                        None => {
-                            warn!(reason, "restart failed after its answer; serving on");
-                            server.restart_failed(&reason);
-                        }
+                    if let Err(e) = finished {
+                        restarts.failed(&format!("restart: {e}"));
                     }
                 }
             }
@@ -421,104 +369,6 @@ impl Daemon {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
-    }
-}
-
-/// Answers a restart with an `Error`: it failed, and the daemon serves on.
-fn refuse(server: &Server, reply: oneshot::Sender<RestartReply>, reason: &str) {
-    warn!(reason, "restart refused; serving on");
-    let _ = reply.send(RestartReply::Refused(reason.to_owned()));
-    server.restart_failed(reason);
-}
-
-/// A restart whose binary passed the check: what [`Restart::run`] needs.
-/// Only the serve loop runs one (it is the single restart coordinator, the
-/// only caller of [`Node::prepare_handoff`] and [`Node::thaw`]).
-struct Restart<'a> {
-    server: &'a Server,
-    node: &'a Arc<Node>,
-    state_dir: &'a Path,
-    instance: u64,
-    listener_fd: RawFd,
-    lock_fd: RawFd,
-}
-
-impl Restart<'_> {
-    /// Stops requests, freezes the node, writes the handoff record, answers
-    /// the requester `RestartingDaemon` (taking `reply`), waits for that to
-    /// be written (at most [`RESTART_FLUSH`]) and `exec`s `binary`. Accepting
-    /// stops meanwhile: the serve loop is here, and connections wait in the
-    /// listener's backlog for whichever daemon serves next.
-    ///
-    /// Returns only if something failed before or at the `exec`, with the
-    /// reason, everything undone: the node thawed, requests admitted again,
-    /// no record left. `reply` is still there if the requester was not
-    /// answered yet.
-    async fn run(
-        &self,
-        binary: &Path,
-        reply: &mut Option<oneshot::Sender<RestartReply>>,
-    ) -> String {
-        let started = Instant::now();
-        let frozen_unix_ms = unix_ms();
-        let deadline = started + FREEZE_DEADLINE;
-        let Some(stopped) = self.server.stop_requests(deadline.into()).await else {
-            return "agents are starting; try again".into();
-        };
-        let node = Arc::clone(self.node);
-        let prepared = tokio::task::spawn_blocking(move || node.prepare_handoff(deadline))
-            .await
-            .map_err(io::Error::other)
-            .and_then(|r| r);
-        let agents = match prepared {
-            Ok(agents) => agents,
-            // Nothing stays frozen (see `prepare_handoff`).
-            Err(e) => return e.to_string(),
-        };
-        let mut keep = vec![self.listener_fd, self.lock_fd];
-        keep.extend(agents.iter().filter_map(|a| match a.terminal {
-            Some(handoff_agent::Terminal::Fd(fd)) => Some(fd),
-            _ => None,
-        }));
-        let pids: Vec<i32> = agents.iter().map(|a| a.pid).collect();
-        let count = agents.len() as u32;
-        let rec = HandoffRecord {
-            version: HANDOFF_VERSION,
-            listener_fd: self.listener_fd,
-            lock_fd: self.lock_fd,
-            previous_instance: self.instance,
-            agents,
-            frozen_unix_ms,
-        };
-        let reason = match handoff::write_record(self.state_dir, &rec) {
-            Ok(record_fd) => {
-                drop(rec);
-                handoff::test_corrupt_record(self.state_dir);
-                info!(
-                    agents = count,
-                    froze_in_ms = started.elapsed().as_millis() as u64,
-                    "restart: agents frozen and recorded; exec"
-                );
-                let (flushed, written) = oneshot::channel();
-                if let Some(r) = reply.take() {
-                    let restarting = RestartReply::Restarting {
-                        agents: count,
-                        flushed,
-                    };
-                    // A requester that has gone does not stop the restart.
-                    if r.send(restarting).is_ok() {
-                        let _ = tokio::time::timeout(RESTART_FLUSH, written).await;
-                    }
-                }
-                let e = handoff::exec(binary, self.state_dir, record_fd, &keep, &pids);
-                format!("exec {}: {e}", binary.display())
-            }
-            Err(e) => format!("writing the handoff record: {e}"),
-        };
-        handoff::remove_stale(self.state_dir);
-        self.node.thaw();
-        drop(stopped);
-        reason
     }
 }
 
