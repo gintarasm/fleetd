@@ -461,6 +461,8 @@ fn close_pane_detaches_without_killing() {
 /// would.
 struct FakeFleetd {
     dir: tempfile::TempDir,
+    /// `RestartDaemon` requests received, on any connection.
+    restarts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FakeFleetd {
@@ -477,6 +479,8 @@ impl FakeFleetd {
 
         let dir = tempfile::tempdir().unwrap();
         let listener = UnixListener::bind(dir.path().join("fleetd.sock")).unwrap();
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&restarts);
         std::thread::spawn(move || {
             for (served, stream) in listener.incoming().enumerate() {
                 let Ok(mut stream) = stream else { return };
@@ -488,6 +492,7 @@ impl FakeFleetd {
                 }
                 let hello = hellos[served.min(hellos.len() - 1)].clone();
                 let on_restart = on_restart.clone();
+                let counter = Arc::clone(&counter);
                 std::thread::spawn(move || {
                     let mut buf = BytesMut::new();
                     let mut chunk = [0u8; 4096];
@@ -509,6 +514,8 @@ impl FakeFleetd {
                                 Frame::Request(r) => {
                                     let kind = match r.kind {
                                         Some(request::Kind::RestartDaemon(_)) => {
+                                            counter
+                                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                             let kind = on_restart.clone().unwrap_or_else(|| {
                                                 response::Kind::Error(fleet_proto::Error {
                                                     message: "empty request".into(),
@@ -524,7 +531,14 @@ impl FakeFleetd {
                                                 }),
                                             );
                                             if restarting {
-                                                return; // exec: the connection ends
+                                                // exec: the connection ends, after
+                                                // a moment in which a pipelined
+                                                // second request is still counted.
+                                                stream
+                                                    .set_read_timeout(Some(Duration::from_millis(
+                                                        150,
+                                                    )))
+                                                    .unwrap();
                                             }
                                             continue;
                                         }
@@ -552,7 +566,7 @@ impl FakeFleetd {
                 });
             }
         });
-        FakeFleetd { dir }
+        FakeFleetd { dir, restarts }
     }
 }
 
@@ -688,5 +702,7 @@ fn restart_that_never_settles_times_out_once_and_a_second_ask_is_ignored() {
         )]
     );
     assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestarted(_))));
+    // The second ask never reached the daemon.
+    assert_eq!(fake.restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
     s.shutdown();
 }
