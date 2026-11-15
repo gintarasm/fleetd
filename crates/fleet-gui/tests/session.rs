@@ -10,6 +10,7 @@ use fleet_gui::core::backoff::Backoff;
 use fleet_gui::core::launch::start_local;
 use fleet_gui::core::pane::{PaneModel, PaneState};
 use fleet_gui::core::session::{ConnState, PaneId, Session, UiEvent};
+use fleet_gui::core::spawn::{KIND_LABEL, SHELL_KIND, SpawnRequest, new_terminal};
 use fleet_gui::core::target::{Target, connect};
 use fleet_proto::{
     AgentList, AgentState, Attach, Frame, HelloOk, ListAgents, Response, RestartingDaemon,
@@ -319,9 +320,12 @@ fn spawn_attached_pane_answers_startup_queries() {
     // `dd` stops 2 s after the last byte.
     let script = r"stty raw -echo min 0 time 20; printf '\033[?u\033]11;?\033\\\033[6n'; r=$(dd bs=1 count=200 2>/dev/null | od -An -tx1 -v); stty sane; echo; echo HEX:$r; echo END; sleep 30";
     s.spawn(
-        "/bin/sh".into(),
-        vec!["-c".into(), script.into()],
-        "/".into(),
+        SpawnRequest {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: "/".into(),
+            labels: Default::default(),
+        },
         120,
         30,
         pane,
@@ -437,6 +441,47 @@ fn daemon_restart_reconnects_and_reattaches() {
     if state(&model) == PaneState::Live {
         assert_eq!(d.agent_state(id), AgentState::Running);
     }
+    s.shutdown();
+}
+
+/// New terminal: a login shell in the chosen folder, labelled
+/// `kind=shell`, shown in the pane it was spawned for.
+#[test]
+fn new_terminal_spawns_a_labelled_login_shell() {
+    let d = Daemon::start();
+    let (s, _events) = start_session(&d);
+    let pane = PaneId(1);
+    let model = s.open_pane(pane, None);
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let cwd = cwd.to_string_lossy().into_owned();
+    s.spawn(
+        new_terminal(&Target::Local, Some("/bin/sh"), cwd.clone()),
+        80,
+        24,
+        pane,
+    )
+    .expect("spawn");
+    let mut row = None;
+    wait_until("the shell in the sidebar", || {
+        row = s.agents().into_iter().next();
+        row.is_some()
+    });
+    let info = row.unwrap().info;
+    assert_eq!(info.program, "/bin/sh");
+    assert_eq!(info.args, ["-l"]);
+    assert_eq!(info.cwd, cwd);
+    assert_eq!(
+        info.labels.get(KIND_LABEL).map(String::as_str),
+        Some(SHELL_KIND)
+    );
+    wait_until("the pane to show the shell", || {
+        model.lock().unwrap().agent_id() == Some(info.id)
+    });
+    s.input(pane, b"pwd\n".to_vec());
+    wait_until("the shell's pwd", || {
+        grid(&model).iter().any(|l| l.trim() == cwd)
+    });
     s.shutdown();
 }
 

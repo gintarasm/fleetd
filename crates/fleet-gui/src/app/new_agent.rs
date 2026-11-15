@@ -17,13 +17,7 @@ use crate::core::session::AgentRow;
 use crate::core::style::{space, text};
 use crate::core::target::Target;
 
-/// What a spawn needs from the sheet.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpawnRequest {
-    pub program: String,
-    pub args: Vec<String>,
-    pub cwd: String,
-}
+pub use crate::core::spawn::SpawnRequest;
 
 pub enum SheetEvent {
     Spawn(SpawnRequest),
@@ -118,7 +112,12 @@ impl NewAgentSheet {
         match parse_command(self.command.read(cx).text()) {
             Ok((program, args)) => {
                 self.error = None;
-                cx.emit(SheetEvent::Spawn(SpawnRequest { program, args, cwd }));
+                cx.emit(SheetEvent::Spawn(SpawnRequest {
+                    program,
+                    args,
+                    cwd,
+                    labels: Default::default(),
+                }));
             }
             Err(e) => {
                 self.error = Some(e);

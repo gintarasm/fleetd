@@ -37,6 +37,8 @@ pub enum StatusEntry {
         label: String,
     },
     NewAgent,
+    /// A plain login shell (`kind=shell`), ⌘T in the window.
+    NewTerminal,
     /// Forgets every exited or lost agent; listed only when one exists.
     ClearExited,
     SwitchFleetd,
@@ -55,6 +57,7 @@ impl StatusEntry {
             StatusEntry::Header(text) | StatusEntry::Agent { label: text, .. } => text,
             StatusEntry::Show => "Show fleetd",
             StatusEntry::NewAgent => "New agent…",
+            StatusEntry::NewTerminal => "New terminal",
             StatusEntry::ClearExited => "Clear exited agents",
             StatusEntry::SwitchFleetd => "Switch fleetd…",
             StatusEntry::RestartFleetd => "Restart fleetd",
@@ -107,7 +110,7 @@ pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
         }
         menu.push(StatusEntry::Separator);
     }
-    menu.push(StatusEntry::NewAgent);
+    menu.extend([StatusEntry::NewAgent, StatusEntry::NewTerminal]);
     if state.agents.iter().any(ended) {
         menu.push(StatusEntry::ClearExited);
     }
@@ -197,6 +200,7 @@ mod tests {
                 },
                 StatusEntry::Separator,
                 StatusEntry::NewAgent,
+                StatusEntry::NewTerminal,
                 StatusEntry::ClearExited,
                 StatusEntry::SwitchFleetd,
                 StatusEntry::RestartFleetd,
