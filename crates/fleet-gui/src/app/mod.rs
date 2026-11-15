@@ -4,6 +4,7 @@ mod app_state;
 mod bench;
 mod connect;
 mod controls;
+mod icons;
 mod keymap;
 mod native;
 mod new_agent;
@@ -59,7 +60,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
     // The connect runs while the app launches and the window opens.
     let attempt = StartupAttempt::start(backend.clone(), saved.clone());
 
-    let app = Application::new();
+    let app = Application::new().with_assets(icons::Assets);
     // Unconnected, the reopened window asks again.
     app.on_reopen(resident::show);
     app.run(move |cx| {

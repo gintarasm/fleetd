@@ -10,10 +10,12 @@ use gpui::{
 };
 
 use super::controls::icon_button;
+use super::icons;
 use super::native;
 use super::sidebar_view::{Tooltip, clear_exited_tooltip};
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
+use crate::core::icons::Icon;
 use crate::core::style::{chrome, radius, space, text};
 use crate::core::titlebar::BarTitle;
 
@@ -42,9 +44,10 @@ pub fn render_bar(
         .id("bar-target")
         .debug_selector(|| "bar-target".to_owned())
         .flex()
-        .flex_col()
+        .flex_row()
         .flex_none()
-        .justify_center()
+        .items_center()
+        .gap(px(space::SM))
         .w(px(chrome::SIDEBAR_WIDTH - lights - space::SM))
         .h(px(chrome::BAR_HEIGHT - space::SM))
         .px(px(space::SM))
@@ -66,22 +69,29 @@ pub fn render_bar(
             })
             .into()
         })
+        .child(icons::sized(Icon::Server, space::LG).text_color(theme.secondary))
         .child(
             div()
-                .type_style(text::HEADLINE)
-                .text_color(theme.text)
-                .truncate()
-                .child(SharedString::from(data.title.title.clone())),
-        )
-        .child(
-            div()
-                .type_style(text::CAPTION)
-                .text_color(theme.secondary)
-                .truncate()
-                .child(SharedString::from(data.title.subtitle.clone())),
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .child(
+                    div()
+                        .type_style(text::HEADLINE)
+                        .text_color(theme.text)
+                        .truncate()
+                        .child(SharedString::from(data.title.title.clone())),
+                )
+                .child(
+                    div()
+                        .type_style(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .truncate()
+                        .child(SharedString::from(data.title.subtitle.clone())),
+                ),
         );
     let clear_tip = clear_exited_tooltip(data.ended);
-    let clear = icon_button("clear-exited", "⌫", theme, clear_tip.is_some())
+    let clear = icon_button("clear-exited", Icon::Trash, theme, clear_tip.is_some())
         .debug_selector(|| "clear-exited".to_owned())
         .when_some(clear_tip, |b, tip| {
             let tip = SharedString::from(tip);
@@ -91,7 +101,7 @@ pub fn render_bar(
             })
             .on_click(cx.listener(|this, _, _, cx| this.clear_exited(cx)))
         });
-    let new_agent = icon_button("new-agent", "+", theme, true)
+    let new_agent = icon_button("new-agent", Icon::Plus, theme, true)
         .debug_selector(|| "new-agent".to_owned())
         .tooltip(move |_, cx| {
             let theme = tooltip_theme;

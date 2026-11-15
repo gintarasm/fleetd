@@ -7,7 +7,9 @@ use gpui::{
     Stateful, StatefulInteractiveElement, Styled, div, px,
 };
 
+use super::icons;
 use super::theme::{Theme, Typography};
+use crate::core::icons::Icon;
 use crate::core::style::{chrome, radius, space, text};
 
 /// The default (accent-filled) button or a plain one.
@@ -140,31 +142,37 @@ pub fn error_text(message: impl IntoElement, theme: &Theme) -> Div {
         .child(message)
 }
 
-/// A square toolbar button holding a glyph; `enabled: false` draws it
+/// A square toolbar button holding an icon; `enabled: false` draws it
 /// dimmed (the caller adds no click handler then). A press on it never
 /// reaches what is behind it (the bar's window drag).
-pub fn icon_button(
-    id: &'static str,
-    glyph: &'static str,
-    theme: &Theme,
-    enabled: bool,
-) -> Stateful<Div> {
+pub fn icon_button(id: &'static str, icon: Icon, theme: &Theme, enabled: bool) -> Stateful<Div> {
     let theme = *theme;
+    let glyph = icons::icon(icon)
+        .text_color(if enabled {
+            theme.secondary
+        } else {
+            theme.tertiary
+        })
+        .when(enabled, |g| {
+            g.group_hover(ICON_BUTTON_GROUP, move |s| s.text_color(theme.text))
+        });
     div()
         .id(id)
+        .group(ICON_BUTTON_GROUP)
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
         .size(px(chrome::ICON_BUTTON))
         .rounded(px(radius::MD))
-        .text_color(theme.secondary)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(glyph)
         .when(enabled, |b| {
             b.cursor_pointer()
-                .hover(move |s| s.bg(theme.hover).text_color(theme.text))
+                .hover(move |s| s.bg(theme.hover))
                 .active(move |s| s.bg(theme.pressed))
         })
-        .when(!enabled, |b| b.text_color(theme.tertiary))
 }
+
+/// The hover group of an icon button (the icon brightens with its button).
+const ICON_BUTTON_GROUP: &str = "icon-button";

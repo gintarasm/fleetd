@@ -759,6 +759,7 @@ impl AppState {
                 starting: self.starting.contains(&pane),
                 reconnect_in,
                 focused: pane == self.focused,
+                maximized: self.maximized == Some(pane),
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));

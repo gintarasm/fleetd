@@ -6,6 +6,27 @@ use serde::Deserialize;
 use super::state::write_atomic;
 use super::target::Target;
 
+/// The terminal font when the config names none: SF Mono, the macOS
+/// terminal face (installed with Xcode and Terminal's fonts; not on
+/// every Mac).
+pub const DEFAULT_FONT_FAMILY: &str = "SF Mono";
+/// Used when the configured family (or SF Mono) is not installed.
+pub const FALLBACK_FONT_FAMILY: &str = "Menlo";
+
+/// The terminal font families to try, in order: the configured one, then
+/// Menlo (always on macOS).
+pub fn font_families(configured: &str) -> Vec<&str> {
+    let configured = configured.trim();
+    let mut out = Vec::with_capacity(2);
+    if !configured.is_empty() {
+        out.push(configured);
+    }
+    if configured != FALLBACK_FONT_FAMILY {
+        out.push(FALLBACK_FONT_FAMILY);
+    }
+    out
+}
+
 /// `[gui]` table of `<state-dir>/config.toml`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default)]
@@ -22,7 +43,7 @@ impl Default for GuiConfig {
         GuiConfig {
             connection: None,
             default_command: vec!["claude".to_owned()],
-            font_family: "Menlo".to_owned(),
+            font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
             option_as_meta: true,
         }
@@ -97,11 +118,19 @@ mod tests {
     }
 
     #[test]
+    fn font_falls_back_to_menlo() {
+        assert_eq!(font_families("SF Mono"), ["SF Mono", "Menlo"]);
+        assert_eq!(font_families("Iosevka"), ["Iosevka", "Menlo"]);
+        assert_eq!(font_families("Menlo"), ["Menlo"]);
+        assert_eq!(font_families("  "), ["Menlo"]);
+    }
+
+    #[test]
     fn missing_config_gives_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let c = load_config(dir.path()).unwrap();
         assert_eq!(c.default_command, ["claude"]);
-        assert_eq!(c.font_family, "Menlo");
+        assert_eq!(c.font_family, "SF Mono");
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
         assert_eq!(c.connection, None);

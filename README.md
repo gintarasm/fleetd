@@ -276,7 +276,7 @@ A status item is always present: Show fleetd, the running agents, New agent…, 
 |---|---|---|
 | `connection` | absent | `"local"` or `"ssh://[user@]host"`; the GUI writes this one |
 | `default_command` | `["claude"]` | what New agent runs |
-| `font_family` | `"Menlo"` | |
+| `font_family` | `"SF Mono"` | terminal font; Menlo when the family is not installed |
 | `font_size` | `13` | |
 | `option_as_meta` | `true` | Option sends Esc-prefixed keys |
 

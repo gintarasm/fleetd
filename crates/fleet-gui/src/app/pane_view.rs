@@ -7,18 +7,21 @@ use std::time::Duration;
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
+    AnyWindowHandle, App, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle,
+    Font, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, Subscription, UTF16Selection, Window, div,
     font, point, px, size,
 };
 
+use super::controls;
+use super::icons;
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
 use super::theme::{Typography, current as theme};
-use crate::core::config::GuiConfig;
+use crate::core::config::{FALLBACK_FONT_FAMILY, GuiConfig, font_families};
+use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
 use crate::core::pane::{PaneModel, PaneState, ViewRow};
@@ -50,6 +53,24 @@ impl InputSink for Session {
     fn check_paging(&self, pane: PaneId) {
         Session::check_paging(self, pane);
     }
+}
+
+/// The terminal font: the first of [`font_families`] (the configured
+/// family, then Menlo) that is installed. gpui would otherwise fall back
+/// to a proportional face for a missing family.
+pub fn terminal_font(configured: &str, cx: &App) -> Font {
+    let ts = cx.text_system();
+    for family in font_families(configured) {
+        let f = font(family.to_owned());
+        let id = ts.resolve_font(&f);
+        if ts
+            .get_font_for_id(id)
+            .is_some_and(|got| got.family == f.family)
+        {
+            return f;
+        }
+    }
+    font(FALLBACK_FONT_FAMILY)
 }
 
 /// The `(col, row)` of the cell under `pos` in a grid of `cols`×`rows`
@@ -138,6 +159,8 @@ pub struct PaneChrome {
     pub reconnect_in: Option<Duration>,
     /// The pane has keyboard focus (drawn in the header).
     pub focused: bool,
+    /// The pane fills the window (its button offers Restore).
+    pub maximized: bool,
 }
 
 /// The line drawn over the grid, if any.
@@ -244,7 +267,7 @@ impl PaneView {
             sink,
             focus: cx.focus_handle(),
             option_as_meta: config.option_as_meta,
-            font: font(config.font_family.clone()),
+            font: terminal_font(&config.font_family, cx),
             font_size: px(config.font_size),
             marked: None,
             marked_selection: None,
@@ -610,21 +633,9 @@ impl Render for PaneView {
         };
         let chrome = &self.chrome;
         let (title_text, path) = header_parts(chrome, title.as_deref());
-        let icon_button = |id: &'static str, glyph: &'static str, event: PaneEvent| {
-            div()
-                .id(id)
+        let icon_button = |id: &'static str, icon: Icon, event: PaneEvent| {
+            controls::icon_button(id, icon, &theme, true)
                 .debug_selector(move || format!("pane-{}-{id}", chrome.number))
-                .flex_none()
-                .size(px(style::chrome::ICON_BUTTON))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(radius::MD))
-                .text_color(theme.secondary)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.hover).text_color(theme.text))
-                .active(|s| s.bg(theme.pressed))
-                .child(glyph)
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
         };
         let header = div()
@@ -638,7 +649,11 @@ impl Render for PaneView {
             .items_center()
             .gap(px(space::SM - space::XXS))
             .type_style(text::CALLOUT)
-            .child(div().flex_none().text_color(theme.tertiary).child("❯"))
+            .child(icons::icon(Icon::Terminal).text_color(if chrome.focused {
+                theme.accent
+            } else {
+                theme.tertiary
+            }))
             .child(
                 div()
                     .flex()
@@ -691,10 +706,26 @@ impl Render for PaneView {
                     .text_color(theme.tertiary)
                     .child(SharedString::from(format!("⌘{}", chrome.number)))
             }))
-            .child(icon_button("split-right", "◫", PaneEvent::SplitRight))
-            .child(icon_button("split-down", "⊟", PaneEvent::SplitDown))
-            .child(icon_button("maximize", "⤢", PaneEvent::ToggleMaximize))
-            .child(icon_button("close", "✕", PaneEvent::Close));
+            .child(icon_button(
+                "split-right",
+                Icon::SplitRight,
+                PaneEvent::SplitRight,
+            ))
+            .child(icon_button(
+                "split-down",
+                Icon::SplitDown,
+                PaneEvent::SplitDown,
+            ))
+            .child(icon_button(
+                "maximize",
+                if chrome.maximized {
+                    Icon::Restore
+                } else {
+                    Icon::Maximize
+                },
+                PaneEvent::ToggleMaximize,
+            ))
+            .child(icon_button("close", Icon::Close, PaneEvent::Close));
         let mut grid = div()
             .relative()
             .flex_1()
@@ -718,6 +749,11 @@ impl Render for PaneView {
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.9))
                     .active(|s| s.opacity(0.8))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(space::XS))
+                    .child(icons::sized(Icon::Restart, 12.0).text_color(gpui::white()))
                     .child("Restart")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Restart)))
             });
