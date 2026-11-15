@@ -1,16 +1,19 @@
 use bytes::{Bytes, BytesMut};
 use fleet_proto::{
-    Ack, AgentActivity, AgentExited, AgentInfo, AgentList, AgentResized, AgentState, Attach,
-    AttachOk, AttachRole, Detach, Error, Event, Frame, FrameCodec, HandshakeReject, Hello, HelloOk,
-    HistoryPage, KillAgent, Lagged, ListAgents, PROTOCOL_VERSION, ReadHistory, Request, Resize,
-    Response, SendInput, SetLabels, SpawnAgent, SpawnedAttached, event, request, response,
+    Ack, AgentActivity, AgentExited, AgentInfo, AgentList, AgentRemoved, AgentResized, AgentState,
+    Attach, AttachOk, AttachRole, Detach, Error, Event, ForgetAgents, Forgotten, Frame, FrameCodec,
+    HandshakeReject, Hello, HelloOk, HistoryPage, KillAgent, Lagged, ListAgents, PROTOCOL_VERSION,
+    ReadHistory, Request, Resize, Response, RestartAgent, Restarted, SendInput, SetLabels,
+    SpawnAgent, SpawnedAttached, event, request, response,
 };
 use tokio_util::codec::{Decoder, Encoder};
 
 fn roundtrip(frame: Frame) -> Frame {
     let mut buf = BytesMut::new();
     FrameCodec::new().encode(frame, &mut buf).unwrap();
-    FrameCodec::new().decode(&mut buf).unwrap().unwrap()
+    let got = FrameCodec::new().decode(&mut buf).unwrap().unwrap();
+    assert!(buf.is_empty(), "decode left {} bytes", buf.len());
+    got
 }
 
 #[test]
@@ -127,6 +130,17 @@ fn roundtrip_every_kind() {
             set: labels(),
             remove: vec!["old".into()],
         }),
+        request::Kind::Restart(RestartAgent {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            attach: true,
+        }),
+        request::Kind::Forget(ForgetAgents {
+            ids: vec![1, 2],
+            exited_only: false,
+            selector: labels(),
+        }),
     ];
     let responses = [
         response::Kind::Spawned(Box::new(info())),
@@ -148,6 +162,15 @@ fn roundtrip_every_kind() {
             agent: Some(info()),
             attached: Some(attach_ok()),
         })),
+        response::Kind::Restarted(Box::new(Restarted {
+            old_id: 1,
+            agent: Some(info()),
+            attached: Some(attach_ok()),
+        })),
+        response::Kind::Forgotten(Forgotten {
+            ids: vec![1],
+            refused: vec![2, 3],
+        }),
     ];
     let events = [
         event::Kind::Exited(AgentExited {
@@ -168,6 +191,10 @@ fn roundtrip_every_kind() {
             agent_id: 1,
             cols: 100,
             rows: 30,
+        }),
+        event::Kind::AgentRemoved(AgentRemoved {
+            agent_id: 1,
+            replaced_by: Some(2),
         }),
     ];
     let mut frames = vec![
