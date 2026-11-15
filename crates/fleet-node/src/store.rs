@@ -201,6 +201,8 @@ impl Store {
         restore
     }
 
+    /// The `agents_v3` and `agent_replacements` DDL here must stay in sync
+    /// with `create_v3` (the schema-equality test compares the two).
     fn rebuild_agents_v3(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch("BEGIN")?;
         let run = || -> rusqlite::Result<()> {
@@ -236,8 +238,10 @@ impl Store {
             }
             self.conn.execute_batch("PRAGMA user_version = 3")
         };
-        match run() {
-            Ok(()) => self.conn.execute_batch("COMMIT"),
+        // A failed COMMIT (e.g. SQLITE_BUSY) can leave the transaction open;
+        // roll it back like any other error so the connection is usable.
+        match run().and_then(|()| self.conn.execute_batch("COMMIT")) {
+            Ok(()) => Ok(()),
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(e)
@@ -786,6 +790,20 @@ mod tests {
             )
             .unwrap();
         out.push(format!("agents autoincrement {autoinc}"));
+        // The full DDL (covers the CHECK constraint), normalised: SQLite
+        // quotes the name of a renamed table and keeps the original spacing.
+        for table in ["agents", "agent_labels", "agent_replacements"] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let sql = sql.replace(['"', '\''], "").replace("agents_v3", "agents");
+            let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push(format!("{table} sql {sql}"));
+        }
         out
     }
 
