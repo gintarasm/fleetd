@@ -1,4 +1,4 @@
-# 0034 — Agent skill install for omp
+# 0037 — Agent skill install for omp
 
 **Status:** accepted · 2026-11-15 (issue #20)
 
