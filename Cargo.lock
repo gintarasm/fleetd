@@ -2039,6 +2039,7 @@ dependencies = [
  "fs4",
  "futures-util",
  "libc",
+ "prost",
  "rusqlite",
  "tempfile",
  "tokio",
