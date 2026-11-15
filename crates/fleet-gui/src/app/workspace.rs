@@ -1749,13 +1749,12 @@ mod tests {
                 ended(6, "/w", 3, AgentState::Lost),
             ],
         );
-        // Drawn bounds outlive a frame in gpui's test window: the items
-        // are checked as the menu lists them, then clicked.
+        // Drawn bounds outlive a frame in gpui's test window, so absence is
+        // checked as the menu lists its items, presence also as drawn.
         let items = |s: &mut Setup<'_>, id: u64| s.ws.read_with(s.cx, |w, cx| w.menu_items(id, cx));
         assert_eq!(items(&mut s, 7), [MenuItem::OpenSplit, MenuItem::Kill]);
         open_menu(&mut s, 7);
         assert!(drawn(&mut s, "menu-open-split") && drawn(&mut s, "menu-kill"));
-        assert!(!drawn(&mut s, "menu-restart") && !drawn(&mut s, "menu-remove"));
         for id in [8, 6] {
             assert_eq!(
                 items(&mut s, id),
