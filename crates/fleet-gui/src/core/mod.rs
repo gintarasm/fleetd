@@ -18,6 +18,7 @@ pub mod selection;
 pub mod session;
 pub mod sidebar;
 pub mod spawn;
+pub mod split_chooser;
 pub mod state;
 pub mod status_menu;
 pub mod style;
