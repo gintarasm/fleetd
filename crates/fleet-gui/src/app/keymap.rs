@@ -32,6 +32,9 @@ actions!(
         Cut,
         Undo,
         Redo,
+        Find,
+        FindNext,
+        FindPrevious,
     ]
 );
 
@@ -82,6 +85,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
+        // Also from the pane's find field, inside the terminal's context.
+        KeyBinding::new("cmd-f", Find, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-g", FindNext, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-shift-g", FindPrevious, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(TEXT_FIELD_CONTEXT)),

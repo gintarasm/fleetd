@@ -2,6 +2,7 @@
 
 pub mod backoff;
 pub mod config;
+pub mod find;
 pub mod icons;
 pub mod keys;
 pub mod launch;
