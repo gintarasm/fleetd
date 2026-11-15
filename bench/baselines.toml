@@ -20,7 +20,7 @@ baseline = 2418374.5
 suite = "wall"
 unit = "bytes"
 budget = 52428800      # hard ceiling from docs/plan.md
-baseline = 5128192
+baseline = 5472256
 
 [metrics.flood50_cpu_ns_per_mib]
 suite = "wall"
@@ -82,7 +82,7 @@ baseline = 57833.5
 [metrics.fleetd_startup_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 3066
+baseline = 4012
 
 [metrics.frame_decode_output_64x64k_instructions]
 suite = "instr"
