@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Action, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, PromptButton, PromptLevel, Render, SharedString,
+    IntoElement, KeyDownEvent, ParentElement, PromptButton, PromptLevel, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px, relative,
     size,
@@ -18,14 +18,15 @@ use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, swit
 use super::context_menu::{self, MenuLine};
 use super::controls::appear;
 use super::keymap::{
-    ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
-    FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart, RestartPane,
-    SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    ClosePane, Copy, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
+    FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart,
+    RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
-use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
+use super::sidebar_view::{SidebarData, TabMark, render_sidebar, tab_title};
+use super::text_field::TextField;
 use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use crate::core::config::save_connection;
@@ -34,7 +35,7 @@ use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
 };
 use crate::core::session::PaneId;
-use crate::core::sidebar::ended;
+use crate::core::sidebar::{Filter, SidebarGroup, StatusFilter, ended, sidebar_groups};
 use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::target::Target;
 use crate::core::titlebar::{Link, bar_title, window_title};
@@ -123,6 +124,15 @@ pub struct Workspace {
     window_title: String,
     /// Reduce Motion is on (read at launch and on appearance changes).
     reduce_motion: bool,
+    /// The sidebar's filter field (⌘⇧F), its status filter, and the
+    /// tabs' focus (issue #40).
+    pub(crate) filter_field: Entity<TextField>,
+    status_filter: StatusFilter,
+    sidebar_focus: FocusHandle,
+    /// The sidebar groups and tabs the last frame drew (gpui's test
+    /// selectors outlive the frame that drew them).
+    #[cfg(test)]
+    drawn_sidebar: Vec<(String, Vec<u64>)>,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -184,6 +194,8 @@ impl Workspace {
             }
         });
         let epoch = app.read(cx).session_epoch();
+        let filter_field = cx.new(|cx| TextField::new(String::new(), "Filter", cx));
+        let filtered = cx.observe(&filter_field, |_, _, cx| cx.notify());
         let ws = Workspace {
             app,
             _ticker: ticker,
@@ -194,7 +206,12 @@ impl Workspace {
             drawn: Vec::new(),
             window_title: String::new(),
             reduce_motion: native::reduce_motion(),
-            _subscriptions: vec![observe, appearance, activation],
+            filter_field,
+            status_filter: StatusFilter::All,
+            sidebar_focus: cx.focus_handle(),
+            #[cfg(test)]
+            drawn_sidebar: Vec::new(),
+            _subscriptions: vec![observe, appearance, activation, filtered],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
         ws
@@ -380,6 +397,114 @@ impl Workspace {
     pub fn show_agent(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.app.update(cx, |a, cx| a.show_agent(agent_id, cx));
         self.focus_current(window, cx);
+    }
+
+    /// The sidebar's groups under its filter and the target's collapsed
+    /// groups.
+    fn sidebar_groups(&self, cx: &App) -> Vec<SidebarGroup> {
+        let app = self.app.read(cx);
+        let filter = Filter {
+            query: self.filter_field.read(cx).text().to_owned(),
+            status: self.status_filter,
+        };
+        let titles = &app.titles;
+        sidebar_groups(
+            &app.agents,
+            &app.home,
+            &filter,
+            &|r| tab_title(r, titles),
+            &app.statuses,
+            &app.collapsed_groups(),
+        )
+    }
+
+    /// ⌘⇧F: the keyboard goes to the sidebar's filter field.
+    fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        window.focus(self.filter_field.read(cx).focus_handle());
+    }
+
+    /// A click on the sidebar's tabs gives them the keyboard, so typing
+    /// filters (a click on a tab then focuses its pane).
+    pub(super) fn focus_sidebar(&mut self, window: &mut Window, _: &mut Context<Self>) {
+        window.focus(&self.sidebar_focus);
+    }
+
+    /// A key typed while the sidebar's tabs have the keyboard starts the
+    /// filter with it.
+    pub(super) fn sidebar_key_down(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sidebar_focus.is_focused(window) {
+            return;
+        }
+        let m = &ev.keystroke.modifiers;
+        if m.platform || m.control {
+            return;
+        }
+        if ev.keystroke.key == "escape" {
+            self.focus_current(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let Some(text) = ev
+            .keystroke
+            .key_char
+            .clone()
+            .filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
+        else {
+            return;
+        };
+        let field = self.filter_field.clone();
+        window.focus(field.read(cx).focus_handle());
+        field.update(cx, |f, cx| f.insert(&text, cx));
+        cx.stop_propagation();
+    }
+
+    /// In the filter field: Escape clears it, then gives the keyboard
+    /// back to the focused pane; Enter shows the first agent listed.
+    pub(super) fn filter_key_down(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                if self.filter_field.read(cx).text().is_empty() {
+                    self.focus_current(window, cx);
+                } else {
+                    self.filter_field
+                        .update(cx, |f, cx| f.set_text(String::new(), cx));
+                }
+                cx.stop_propagation();
+            }
+            "enter" => {
+                let first = self
+                    .sidebar_groups(cx)
+                    .iter()
+                    .find_map(|g| g.agents.first().map(|r| r.info.id));
+                if let Some(id) = first {
+                    self.show_agent(id, window, cx);
+                }
+                cx.stop_propagation();
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn set_status_filter(&mut self, filter: StatusFilter, cx: &mut Context<Self>) {
+        self.status_filter = filter;
+        cx.notify();
+    }
+
+    pub(super) fn toggle_group(&mut self, title: &str, cx: &mut Context<Self>) {
+        self.app.update(cx, |a, cx| a.toggle_group(title, cx));
     }
 
     /// The `input` bench's panes: `agent` in the focused pane (returned)
@@ -754,11 +879,10 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
         let theme = self.app.read(cx).theme;
-        let (rows, home, error, notice, titles, marks, update, statuses, bells) = {
+        let (rows, error, notice, titles, marks, update, statuses, bells) = {
             let app = self.app.read(cx);
             (
                 app.agents.clone(),
-                app.home.clone(),
                 app.error.clone(),
                 app.notice.clone(),
                 app.titles.clone(),
@@ -769,17 +893,33 @@ impl Render for Workspace {
             )
         };
         let mark = move |id: u64| marks.get(&id).copied().unwrap_or(TabMark::None);
+        let groups = self.sidebar_groups(cx);
+        #[cfg(test)]
+        {
+            self.drawn_sidebar = groups
+                .iter()
+                .map(|g| {
+                    (
+                        g.title.clone(),
+                        g.agents.iter().map(|r| r.info.id).collect(),
+                    )
+                })
+                .collect();
+        }
         let data = SidebarData {
             rows: &rows,
-            home: &home,
             now_ms: now_ms(),
             titles: &titles,
             mark: &mark,
             statuses: &statuses,
             bells: &bells,
             reduce_motion: self.reduce_motion,
+            groups,
+            filter_field: self.filter_field.clone(),
+            status_filter: self.status_filter,
+            focus: self.sidebar_focus.clone(),
         };
-        let sidebar = render_sidebar(&data, &theme, cx);
+        let sidebar = render_sidebar(data, &theme, cx);
         let ended_rows = rows.iter().filter(|r| ended(r)).count();
         let bar = {
             let app = self.app.read(cx);
@@ -922,6 +1062,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FocusPane4, w, cx| this.focus_number(4, w, cx)))
             .on_action(cx.listener(Self::new_agent))
             .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::focus_filter))
             .on_action(cx.listener(Self::kill))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
@@ -2582,5 +2723,196 @@ mod tests {
         click(&mut s, "clear-exited");
         assert!(!s.cx.has_pending_prompt());
         assert_eq!(fake.calls().last(), Some(&Call::ClearExited));
+    }
+
+    /// The tabs the last frame drew.
+    fn tabs_drawn(s: &mut Setup<'_>) -> Vec<u64> {
+        s.cx.run_until_parked();
+        s.ws.read_with(s.cx, |w, _| {
+            w.drawn_sidebar
+                .iter()
+                .flat_map(|(_, ids)| ids.clone())
+                .collect()
+        })
+    }
+
+    fn groups_drawn(s: &mut Setup<'_>) -> Vec<String> {
+        s.cx.run_until_parked();
+        s.ws.read_with(s.cx, |w, _| {
+            w.drawn_sidebar.iter().map(|(t, _)| t.clone()).collect()
+        })
+    }
+
+    fn project(mut r: AgentRow, p: &str) -> AgentRow {
+        r.info.labels.insert("project".into(), p.into());
+        r
+    }
+
+    fn filter_text(s: &mut Setup<'_>) -> String {
+        s.ws.read_with(s.cx, |w, cx| w.filter_field.read(cx).text().to_owned())
+    }
+
+    fn filter_focused(s: &mut Setup<'_>) -> bool {
+        s.ws.update_in(s.cx, |w, window, cx| {
+            w.filter_field.read(cx).focus_handle().is_focused(window)
+        })
+    }
+
+    fn pane_focused(s: &mut Setup<'_>) -> bool {
+        let pane = focused(s);
+        s.ws.update_in(s.cx, |w, window, cx| {
+            w.pane_focus_handle(pane, cx)
+                .is_some_and(|h| h.is_focused(window))
+        })
+    }
+
+    #[gpui::test]
+    fn cmd_shift_f_filters_by_name_cwd_and_labels_and_escape_clears(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let mut coder = project(row(2, "/srv/beta", 2), "beta");
+        coder.info.labels.insert("role".into(), "coder".into());
+        agents(
+            &mut s,
+            &fake,
+            vec![project(row(1, "/srv/alpha", 1), "alpha"), coder],
+        );
+        assert_eq!(tabs_drawn(&mut s), [1, 2]);
+
+        s.cx.simulate_keystrokes("cmd-shift-f");
+        assert!(filter_focused(&mut s));
+        s.cx.simulate_input("coder");
+        assert_eq!(tabs_drawn(&mut s), [2]);
+        assert!(drawn(&mut s, "tab-2"));
+        assert_eq!(groups_drawn(&mut s), ["beta"]);
+
+        s.ws.update(s.cx, |w, cx| {
+            w.filter_field
+                .update(cx, |f, cx| f.set_text("srv/alpha".into(), cx))
+        });
+        assert_eq!(tabs_drawn(&mut s), [1]);
+
+        s.ws.update(s.cx, |w, cx| {
+            w.filter_field
+                .update(cx, |f, cx| f.set_text("nothing".into(), cx))
+        });
+        assert!(tabs_drawn(&mut s).is_empty());
+        assert!(drawn(&mut s, "sidebar-no-match"));
+
+        // Escape clears the text, then a second one gives the pane the keys.
+        s.cx.simulate_keystrokes("escape");
+        assert_eq!(filter_text(&mut s), "");
+        assert_eq!(tabs_drawn(&mut s), [1, 2]);
+        assert!(filter_focused(&mut s));
+        s.cx.simulate_keystrokes("escape");
+        assert!(pane_focused(&mut s));
+    }
+
+    #[gpui::test]
+    fn enter_in_the_filter_shows_the_first_match(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        s.cx.simulate_keystrokes("cmd-shift-f");
+        s.cx.simulate_input("/b");
+        s.cx.simulate_keystrokes("enter");
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::Attach(PaneId(1), 2)));
+        assert!(pane_focused(&mut s));
+    }
+
+    #[gpui::test]
+    fn typing_in_the_sidebar_goes_to_the_filter(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        // A click on the sidebar's empty space below the tabs.
+        let tabs = s.cx.debug_bounds("sidebar").expect("sidebar drawn");
+        let at = point(tabs.left() + gpui::px(20.), tabs.bottom() - gpui::px(10.));
+        s.cx.simulate_click(at, Modifiers::none());
+        s.cx.run_until_parked();
+        assert!(!pane_focused(&mut s));
+        s.cx.simulate_keystrokes("b");
+        assert!(filter_focused(&mut s));
+        assert_eq!(filter_text(&mut s), "b");
+        assert_eq!(tabs_drawn(&mut s), [2]);
+    }
+
+    #[gpui::test]
+    fn status_filters_narrow_the_sidebar(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let mut quiet = row(3, "/c", 3);
+        quiet.last_line = "Continue? (y/n)".into();
+        quiet.last_output_unix_ms = Some(1);
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                row(1, "/a", 1),
+                ended(2, "/b", 2, AgentState::Exited),
+                quiet,
+            ],
+        );
+        let tabs = |s: &mut Setup<'_>| {
+            let mut t = tabs_drawn(s);
+            t.sort_unstable();
+            t
+        };
+        assert_eq!(tabs(&mut s), [1, 2, 3]);
+        click(&mut s, "status-filter-Exited");
+        assert_eq!(tabs(&mut s), [2]);
+        click(&mut s, "status-filter-Running");
+        assert_eq!(tabs(&mut s), [1, 3]);
+        click(&mut s, "status-filter-Needs you");
+        assert_eq!(tabs(&mut s), [3]);
+        click(&mut s, "status-filter-All");
+        assert_eq!(tabs(&mut s), [1, 2, 3]);
+    }
+
+    #[gpui::test]
+    fn a_group_collapses_with_a_count_and_is_remembered(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                project(row(1, "/a", 1), "alpha"),
+                project(row(2, "/a", 2), "alpha"),
+                project(row(3, "/b", 3), "beta"),
+            ],
+        );
+        assert!(!drawn(&mut s, "group-count-alpha"));
+        click(&mut s, "group-alpha");
+        assert_eq!(tabs_drawn(&mut s), [3]);
+        assert_eq!(groups_drawn(&mut s), ["alpha", "beta"]);
+        assert!(drawn(&mut s, "group-count-alpha"));
+        let count = s.cx.debug_bounds("group-count-alpha-2");
+        assert!(count.is_some(), "the count says 2");
+
+        s.cx.executor().advance_clock(SAVE_DEBOUNCE);
+        s.cx.run_until_parked();
+        let saved = GuiState::load(dir.path()).collapsed_groups;
+        assert_eq!(saved["local"].iter().collect::<Vec<_>>(), ["alpha"]);
+
+        // Typing shows what matched inside it, without forgetting it.
+        s.cx.simulate_keystrokes("cmd-shift-f");
+        s.cx.simulate_input("/a");
+        assert_eq!(tabs_drawn(&mut s), [2, 1]);
+        s.cx.simulate_keystrokes("escape");
+        assert_eq!(tabs_drawn(&mut s), [3]);
+
+        click(&mut s, "group-alpha");
+        assert_eq!(tabs_drawn(&mut s), [2, 1, 3]);
+        assert!(
+            s.app
+                .read_with(s.cx, |a, _| a.collapsed_groups().is_empty())
+        );
     }
 }

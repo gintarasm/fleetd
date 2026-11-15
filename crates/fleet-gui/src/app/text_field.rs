@@ -105,6 +105,13 @@ impl TextField {
         &self.focus
     }
 
+    /// Types `text` at the caret (a key typed elsewhere, handed over).
+    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.edit.unmark();
+        self.edit.insert(text);
+        self.changed(cx);
+    }
+
     /// After any edit or caret move: the caret shows at once.
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.caret_on = true;
