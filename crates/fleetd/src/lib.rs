@@ -1,13 +1,16 @@
 //! fleetd: the single-instance node daemon, serving the fleet protocol on a
 //! unix socket in the state dir.
 
+pub mod handoff;
 pub mod logging;
+mod restart;
 mod server;
 pub mod stdio;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
@@ -15,12 +18,18 @@ use std::sync::Arc;
 
 use fleet_node::env::{LOGIN_ENV_SWITCH, LOGIN_ENV_TIMEOUT, LoginEnv, login_shell};
 use fleet_node::node::Node;
-use fleet_proto::PROTOCOL_VERSION;
+use fleet_proto::handoff::HandoffRecord;
+use fleet_proto::{PROTOCOL_VERSION, RestoreSummary};
 
 use fs4::{FileExt, TryLockError};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+use crate::server::Server;
+
+pub use restart::{CHECK_TIMEOUT, FREEZE_DEADLINE};
 
 /// Longest socket path macOS accepts: `sun_path` is 104 bytes including the NUL.
 const MAX_SOCKET_PATH_BYTES: usize = 103;
@@ -131,9 +140,24 @@ impl From<io::Error> for StartupError {
 
 /// A started daemon: holds the instance lock and the bound (non-blocking) listener.
 pub struct Daemon {
-    _lock: File,
+    lock: File,
     listener: StdUnixListener,
     socket_path: PathBuf,
+    origin: Origin,
+}
+
+/// How this daemon process came to be, which decides how the node opens.
+enum Origin {
+    /// A normal start.
+    Fresh,
+    /// Started by a predecessor's `exec` whose handoff it could not use: the
+    /// agents were ended (see [`handoff::abandon`]), and it starts normally
+    /// (see [`Daemon::fell_back`]).
+    FellBack,
+    /// Started by a predecessor's `exec` from this record (see
+    /// [`Daemon::adopted`]), with the pids it passed: ended if this start
+    /// fails before the node has adopted them (see `restart::HandedAgents`).
+    Handoff(HandoffRecord, restart::HandedAgents),
 }
 
 /// Makes `dir` (and missing parents) exist with mode 0700. The common case,
@@ -185,6 +209,9 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
         return Err(StartupError::SocketPathTooLong(socket_path));
     }
 
+    // The lock is ours, so no other fleetd is mid-restart on this dir.
+    handoff::remove_stale(&cfg.state_dir);
+
     match fs::remove_file(&socket_path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -194,19 +221,54 @@ pub fn startup(cfg: &Config) -> Result<Daemon, StartupError> {
     listener.set_nonblocking(true)?;
 
     Ok(Daemon {
-        _lock: lock,
+        lock,
         listener,
         socket_path,
+        origin: Origin::Fresh,
     })
 }
 
 impl Daemon {
+    /// A daemon started by a predecessor's `exec` from its handoff record
+    /// `rec`: the instance lock and the listener are the predecessor's,
+    /// inherited (see [`handoff::adopt_listener_and_lock`]), so nothing is
+    /// bound or locked; [`Daemon::serve`] adopts the record's agents.
+    ///
+    /// `pids` are the agents' pids the predecessor passed (see
+    /// [`handoff::Handed`]). Every one the node has not adopted is ended:
+    /// once it opens, those the record left out; if the daemon is dropped or
+    /// `serve` fails before then, all of them.
+    pub fn adopted(
+        cfg: &Config,
+        listener: StdUnixListener,
+        lock: File,
+        rec: HandoffRecord,
+        pids: Vec<i32>,
+    ) -> Daemon {
+        Daemon {
+            lock,
+            listener,
+            socket_path: cfg.socket_path(),
+            origin: Origin::Handoff(rec, restart::HandedAgents::new(pids, cfg.state_dir.clone())),
+        }
+    }
+
+    /// Marks a normally started daemon as one whose handoff could not be
+    /// used (its handshakes report `fell_back`).
+    pub fn fell_back(mut self) -> Daemon {
+        self.origin = Origin::FellBack;
+        self
+    }
+
     /// Start capturing the login shell's environment in the background
-    /// unless `FLEETD_LOGIN_ENV=off` (see [`fleet_node::env`]), open the node's state, then serve protocol
-    /// connections until SIGTERM/SIGINT/SIGHUP. Then stop every agent (v1 has no PTY handoff, decision
-    /// 0018): SIGTERM to each agent's process group, up to 2 s grace, then
-    /// SIGKILL; their exits are recorded. Finally remove the socket file and
-    /// return.
+    /// unless `FLEETD_LOGIN_ENV=off` (see [`fleet_node::env`]), open the
+    /// node's state (adopting the handed-over agents, see
+    /// [`Daemon::adopted`]), then serve protocol connections until
+    /// SIGTERM/SIGINT/SIGHUP, or until a `RestartDaemon` `exec`s a new
+    /// binary in this process (see `Restart::run`; one that fails is
+    /// undone and serving goes on). Then stop every agent (decision 0018): SIGTERM
+    /// to each agent's process group, up to 2 s grace, then SIGKILL; their
+    /// exits are recorded. Finally remove the socket file and return.
     pub async fn serve(self) -> io::Result<()> {
         let listener = UnixListener::from_std(self.listener)?;
         let mut term = signal(SignalKind::terminate())?;
@@ -218,9 +280,6 @@ impl Daemon {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_default();
-        // In the background, overlapping opening the store; the first spawn
-        // waits for it (bounded), nothing else does. `FLEETD_LOGIN_ENV=off`
-        // skips it.
         info!(
             version = env!("CARGO_PKG_VERSION"),
             pid = std::process::id(),
@@ -237,14 +296,41 @@ impl Daemon {
                 "login env capture skipped ({LOGIN_ENV_SWITCH}=off or no SHELL); agents start from the daemon's env"
             );
         }
-        let login_env = LoginEnv::capture_in_background(shell, LOGIN_ENV_TIMEOUT);
-        let node = tokio::task::spawn_blocking(move || {
-            Node::open(&state_dir).map(|n| n.with_base_env(login_env))
-        })
-        .await
-        .map_err(io::Error::other)??;
+        let (node, restore) = match self.origin {
+            // Restart-only code runs on blocking threads (see `restart`):
+            // kept out of `serve`'s own code, which is paged in on every
+            // start (idle RSS is gated).
+            Origin::Handoff(rec, handed) => {
+                restart::open_from_handoff(state_dir.clone(), rec, handed, shell)
+                    .await
+                    .map_err(io::Error::other)??
+            }
+            origin => {
+                // In the background, overlapping opening the store; the
+                // first spawn waits for it (bounded), nothing else does.
+                let login_env = LoginEnv::capture_in_background(shell, LOGIN_ENV_TIMEOUT);
+                let dir = state_dir.clone();
+                let node = tokio::task::spawn_blocking(move || {
+                    Node::open(&dir).map(|n| n.with_base_env(login_env))
+                })
+                .await
+                .map_err(io::Error::other)??;
+                let restore = RestoreSummary {
+                    fell_back: matches!(origin, Origin::FellBack),
+                    ..Default::default()
+                };
+                (node, restore)
+            }
+        };
         let node = Arc::new(node);
-        let server = server::Server::new(Arc::clone(&node));
+        let identity = handoff::Identity::current();
+        let instance = identity.instance;
+        // What a restart with no binary named restarts onto.
+        let own_binary = identity.binary.path.clone();
+        let server = Server::new(Arc::clone(&node), identity, restore);
+        let restarts = server.restarts();
+        // The restart whose binary is being checked.
+        let mut check: Option<JoinHandle<restart::Checked>> = None;
         let signal = loop {
             tokio::select! {
                 _ = term.recv() => break "SIGTERM",
@@ -260,6 +346,30 @@ impl Daemon {
                         }
                     }
                 },
+                // One restart at a time: the server refuses a second while
+                // one is pending.
+                req = restarts.next(), if check.is_none() => {
+                    check = restart::check(&restarts, req, &own_binary);
+                }
+                checked = async { check.as_mut().expect("guarded").await }, if check.is_some() => {
+                    check = None;
+                    let finished = match checked {
+                        Ok(checked) => restart::Restart {
+                            restarts: restarts.clone(),
+                            node: Arc::clone(&node),
+                            state_dir: state_dir.clone(),
+                            instance,
+                            listener_fd: listener.as_raw_fd(),
+                            lock_fd: self.lock.as_raw_fd(),
+                        }
+                        .finish(checked)
+                        .await,
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = finished {
+                        restarts.failed(&format!("restart: {e}"));
+                    }
+                }
             }
         };
         info!(signal, "fleetd stopping: stopping agents");

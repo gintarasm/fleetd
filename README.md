@@ -15,16 +15,29 @@ A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Co
 | M2a | Daemon side of the GUI: agent history, protocol v2, labels, flood fix, `fleetd --stdio`, login-shell env, agent skill | done |
 | M2b | GUI (gpui): sidebar, terminal panes, splits, menu-bar app, connect sheet | done |
 | M2c | Daily-drive polish: native-feeling GUI, restart and remove exited agents | TBD |
-| M3 | Projects, workspaces, worktrees, tasks; diff view | TBD |
-| M4 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent MCP channel | TBD |
-| M5 | Remote nodes over SSH | TBD |
-| M6 | Credentials | TBD |
+| M3 | Satellite: agents spawning agents (MCP), spawn quotas, a graph view of what's running | TBD |
+| M4 | Projects, workspaces, worktrees, tasks; diff view | TBD |
+| M5 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent messaging | TBD |
+| M6 | Remote nodes over SSH | TBD |
+| M7 | Credentials | TBD |
 
 ## Install
 
 Requires the Rust toolchain pinned in `rust-toolchain.toml`; `rustup` installs it automatically. Runs on macOS and Linux.
 
-Install both binaries into `~/.cargo/bin`, which rustup normally puts on your `PATH`:
+```sh
+scripts/install.sh
+```
+
+It builds, installs, and moves a running `fleetd` onto the new build with its agents kept (`fleet daemon restart`). Updating is `git pull && scripts/install.sh`. Each step prints one line.
+
+- **macOS:** builds the app bundle (needs the Metal toolchain, see below), copies it to `/Applications/fleetd.app`, and links `fleetd` and `fleet` in `~/.local/bin` to the binaries inside it. It stops rather than replace an existing `fleetd` or `fleet` file there that is not ours.
+- **Linux:** builds and copies `fleetd` and `fleet` into `~/.local/bin`. There is no app.
+- **Flags:** `--app-dir <dir>` (default `/Applications`), `--bin-dir <dir>` (default `~/.local/bin`), `--state-dir <dir>` (default `~/.fleet`, the daemon to restart), `--force-stop`. Relative directories are taken from where you run the script. A `CARGO_TARGET_DIR` you have set is where it builds and installs from.
+- **A daemon too old to restart itself** (built before ADR 0032) is not touched: the script says so and exits 1. Run again with `--force-stop` to stop it (its running agents end). Needed once; see **Updating fleetd**.
+- **No daemon running:** nothing to restart; the next client starts the new one. If the daemon's socket exists but does not answer, the script says so, leaves it and exits 1.
+
+Or, with cargo, install both binaries into `~/.cargo/bin`, which rustup normally puts on your `PATH` (this does not restart a running daemon; run `fleet daemon restart --binary ~/.cargo/bin/fleetd` afterwards):
 
 ```sh
 cargo install --locked --path crates/fleetd      # installs fleetd
@@ -44,14 +57,16 @@ Or build without installing: `cargo build --release -p fleetd -p fleet-cli` puts
 ```sh
 fleetd                      # state in ~/.fleet
 fleetd --state-dir /path    # alternative state directory
+fleetd --upgrade            # restart a running daemon of another build onto this binary
+fleetd --force-stop         # stop a running daemon too old to restart itself, then start
 fleetd --stdio              # bridge stdin/stdout to the daemon, starting one if needed
 ```
 
 - **Foreground process.** `fleetd` runs in the foreground and serves clients on `<state-dir>/fleetd.sock`. To keep it running, start it from a terminal multiplexer or a service manager (a launchd/systemd setup is TBD).
-- **One instance per state directory.** A second `fleetd` on the same directory exits with `fleetd already running` (exit code 2).
+- **One instance per state directory.** A second `fleetd` on the same directory exits with `fleetd already running` (exit code 2). If the running daemon is a different build, `fleetd` offers to restart it onto this binary (agents keep running); see **Updating fleetd**.
 - **Stopping.** SIGTERM, SIGINT (Ctrl-C) or SIGHUP stops every agent: each gets SIGTERM, then 2 s later SIGKILL. Their exits are recorded, then the socket is removed.
 - **Crashes.** If `fleetd` is killed hard, the agents it was running are shown as `lost` on the next start.
-- **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M5).
+- **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M6).
 - **Agent environment.** At startup the daemon asks your login shell (`$SHELL -lic`) for its environment, so agents see the same `PATH` and exports as a terminal would, even when `fleetd` was started by `ssh`, launchd or systemd. The capture runs in the background and gives up after 5 s; if it fails, agents get the daemon's own environment. Set `FLEETD_LOGIN_ENV=off` in the daemon's environment to skip it. Every agent also gets `TERM=xterm-256color` and `FLEET_AGENT_ID=<its id>`.
 
 The state directory (mode 0700) holds:
@@ -64,6 +79,17 @@ The state directory (mode 0700) holds:
 | `scrollback/` | per-agent raw output (8 MiB ring file each) |
 | `history/` | per-agent history: the lines that scrolled off the screen (up to 64 MiB each) |
 | `logs/` | the daemon's log `fleetd.log` (rotated at 10 MiB into `fleetd.log.1` and `.2`, 30 MiB at most) and the `--stdio` bridges' `fleetd-stdio.log` |
+
+### Updating fleetd
+
+A running daemon keeps the binary it started from. Restarting it onto a new build keeps every agent running (same process, id, terminal, screen and history; no output lost; clients reconnect on their own within about a second). Design: [0032](docs/decisions/0032-daemon-restart-handoff.md).
+
+- **`git pull && scripts/install.sh`** builds, installs and restarts the daemon in one step.
+- **`fleet daemon restart [--binary <path>]`** restarts the running daemon onto `<path>` (a relative path is taken from where you run `fleet`). Without `--binary` it restarts onto the binary it runs from, as that file is now: after a rebuild or reinstall at the same path, the new build. It prints `fleetd restarted: N agents kept` and exits 0. If some agents could not be restored it prints `fleetd restarted: K kept, M could not be restored and were ended (ids …)` and exits 1. If the restart was refused it prints `fleetd restart failed: <reason>; the old fleetd is still running` and exits 1. A refusal costs nothing: the new binary is checked first (`fleetd --handoff-check`), and a daemon that cannot freeze its agents in 3 s, or whose `exec` fails, resumes as before.
+- **GUI:** the status-menu item **Restart fleetd** (also for an SSH target, which restarts the remote daemon onto its own binary, as now on disk). When the local daemon runs a different binary from the one the GUI would start, the sidebar shows "fleetd update available" with a Restart action.
+- **`fleetd --upgrade`** does the same from the new binary when another fleetd holds the lock and runs a different build; in a terminal without the flag, `fleetd` asks first. Without a terminal or flag it only says so and exits 2. It needs `fleet` next to `fleetd` or on `PATH` (true for the app bundle, `install.sh` and cargo's `target/` directories).
+- **One-time stop of an old daemon.** A daemon built before ADR 0032 cannot restart itself (`fleet daemon restart` says so). Stopping it ends its agents, once: `scripts/install.sh --force-stop` or `fleetd --force-stop` (SIGTERM to the pid holding the lock, found with `lsof` or `fuser`; never SIGKILL: if it does not exit within 5 s `fleetd` names the pid and exits 1), after which the next client starts the new daemon. Do not use `pkill` from a sandboxed shell: it silently drops signals to processes outside the sandbox.
+- **What a restart loses:** the screen is restored as a reattach restores it (not scroll regions, character sets, tab stops, hyperlinks), and the final screens of agents that already exited are not carried over. A crash or `kill -9` still ends agents.
 
 ### Logs
 
@@ -215,10 +241,10 @@ fleet logs -f              # then follow new lines until Ctrl-C
 
 ### Not yet in the CLI (TBD)
 
-- Workflows (git worktree per agent, diff view; `RunAction`): **TBD** (M3, [0025](docs/decisions/0025-core-knows-agents-workflows-own-hierarchy.md))
-- Remote nodes (`fleet node add user@host`): **TBD** (M5)
-- Plugins and agent adapters: **TBD** (M4)
-- Credentials and secret grants: **TBD** (M6)
+- Workflows (git worktree per agent, diff view; `RunAction`): **TBD** (M4, [0025](docs/decisions/0025-core-knows-agents-workflows-own-hierarchy.md))
+- Remote nodes (`fleet node add user@host`): **TBD** (M6)
+- Plugins and agent adapters: **TBD** (M5)
+- Credentials and secret grants: **TBD** (M7)
 - Agent-to-agent messages (`fleet msg`) and status reporting (`fleet status`): **TBD** (M4, [0019](docs/decisions/0019-control-plane-direction.md))
 - Setting environment variables for an agent from the CLI: **TBD** (the protocol supports it)
 
@@ -266,7 +292,7 @@ Not yet verified by hand: connecting to a remote host over ssh, the "Start fleet
 
 ### Menu bar
 
-A status item is always present: Show fleetd, the running agents, New agent…, Switch fleetd…, Install agent skill and Quit. The app menu has Switch fleetd…, Install agent skill and Quit too. Closing the window keeps the app resident (the Dock icon hides); Show fleetd brings it back (not yet verified by hand, see above). **Quit only quits the GUI; agents keep running.**
+A status item is always present: Show fleetd, the running agents, New agent…, Switch fleetd…, Restart fleetd, Install agent skill and Quit. The app menu has Switch fleetd…, Install agent skill and Quit too. Closing the window keeps the app resident (the Dock icon hides); Show fleetd brings it back (not yet verified by hand, see above). **Quit only quits the GUI; agents keep running.**
 
 ### Configuration
 
@@ -288,7 +314,7 @@ Advisory figures from one local wall run on a dev Mac (local wall numbers are ad
 
 ## Remote agents
 
-**TBD** (M5). Today you can already reach a daemon on another host with `ssh host fleetd --stdio`. Planned: `fleet node add user@host` installs `fleetd` on a Linux or macOS host over SSH and runs it as a user service. Agents run there and you attach from your machine. See [0011](docs/decisions/0011-remote-nodes.md).
+**TBD** (M6). Today you can already reach a daemon on another host with `ssh host fleetd --stdio`. Planned: `fleet node add user@host` installs `fleetd` on a Linux or macOS host over SSH and runs it as a user service. Agents run there and you attach from your machine. See [0011](docs/decisions/0011-remote-nodes.md).
 
 ## Development
 

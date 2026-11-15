@@ -2,7 +2,39 @@ syntax = "proto3";
 package fleet.v1;
 
 message Hello { uint32 protocol_version = 1; string client = 2; }
-message HelloOk { uint32 protocol_version = 1; string server = 2; }
+message HelloOk {
+  uint32 protocol_version = 1;
+  string server = 2;
+  // A random token drawn on every daemon process start (a restart too), so
+  // a client can tell the daemon was replaced. Not a counter: values are
+  // only compared for equality.
+  uint64 instance = 3;
+  // The binary the daemon is running from.
+  BinaryIdentity binary = 4;
+  // What the daemon recovered at startup (unset when nothing was restored).
+  RestoreSummary restore = 5;
+}
+
+message BinaryIdentity {
+  string path = 1;
+  uint64 dev = 2;
+  uint64 ino = 3;
+  uint64 size = 4;
+  int64 mtime_ns = 5;
+}
+
+// `restart_error` is set (and `previous_instance` is 0) when a restart was
+// attempted and the daemon thawed instead.
+message RestoreSummary {
+  uint64 previous_instance = 1;
+  repeated uint64 kept = 2;
+  repeated uint64 failed = 3;
+  bool fell_back = 4;
+  string restart_error = 5;
+}
+
+message RestartDaemon { string binary = 1; }
+message RestartingDaemon { uint32 agents = 1; }
 message HandshakeReject { string reason = 1; }
 
 message Request {
@@ -21,6 +53,7 @@ message Request {
     StopLogs stop_logs = 12;
     RestartAgent restart = 13;
     ForgetAgents forget = 14;
+    RestartDaemon restart_daemon = 15;
   }
 }
 
@@ -37,6 +70,7 @@ message Response {
     LogLines log_lines = 9;
     Restarted restarted = 10;
     Forgotten forgotten = 11;
+    RestartingDaemon restarting_daemon = 12;
   }
 }
 

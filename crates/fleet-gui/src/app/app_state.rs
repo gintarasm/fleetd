@@ -18,7 +18,7 @@ use super::workspace::Workspace;
 use crate::core::config::GuiConfig;
 use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::{PaneModel, PaneState};
-use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent};
+use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::sidebar::{ended, tilde};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::target::Target;
@@ -61,6 +61,14 @@ pub trait SessionApi: InputSink {
     fn forget(&self, ids: Vec<u64>);
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
+    /// Restarts fleetd into its binary on disk, agents kept; the outcome
+    /// arrives as a `UiEvent`.
+    fn restart_daemon(&self) {}
+    /// The fleetd binary on disk differs from the running one (stats a
+    /// file: not for every frame).
+    fn update_available(&self) -> bool {
+        false
+    }
     /// The latest list's old id to newest successor.
     fn replaced(&self) -> HashMap<u64, u64>;
     fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>>;
@@ -120,6 +128,14 @@ impl SessionApi for Session {
 
     fn clear_exited(&self) {
         Session::clear_exited(self);
+    }
+
+    fn restart_daemon(&self) {
+        Session::restart_daemon(self);
+    }
+
+    fn update_available(&self) -> bool {
+        Session::update_available(self)
     }
 
     fn replaced(&self) -> HashMap<u64, u64> {
@@ -262,6 +278,9 @@ pub struct AppState {
     pub(super) agents: Vec<AgentRow>,
     /// The last error, shown until dismissed or replaced.
     pub(super) error: Option<String>,
+    /// A neutral message (a successful restart), shown when there is no
+    /// error; dismissed the same way.
+    pub(super) notice: Option<String>,
     /// `error` is a failure to connect, cleared once connected.
     error_is_connection: bool,
     /// A config error from launch, still shown after the first connect.
@@ -284,6 +303,8 @@ pub struct AppState {
     last_list: u64,
     /// When the control connection retries, while it is down.
     reconnect_at: Option<Instant>,
+    /// A newer fleetd binary is on disk (see [`AppState::refresh_update_available`]).
+    pub(super) update_available: bool,
     pub(super) window: Option<WindowHandle<Workspace>>,
     /// Saved state not yet written.
     dirty: bool,
@@ -328,6 +349,7 @@ impl AppState {
             error: None,
             error_is_connection: false,
             config_error: None,
+            notice: None,
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
             requested: HashMap::new(),
@@ -335,6 +357,7 @@ impl AppState {
             unlisted: HashMap::new(),
             last_list: 0,
             reconnect_at: None,
+            update_available: false,
             window: None,
             dirty: false,
             save_task: None,
@@ -407,6 +430,7 @@ impl AppState {
         self.unlisted.clear();
         self.last_list = 0;
         self.reconnect_at = None;
+        self.update_available = self.session.update_available();
         self.agents = self.session.agents();
         for pane in self.layout.panes() {
             let agent = self.layout.agent(pane);
@@ -480,6 +504,10 @@ impl AppState {
         self.error.as_deref()
     }
 
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
     fn target_key(&self) -> String {
         self.target.to_string()
     }
@@ -538,6 +566,9 @@ impl AppState {
                         ConnState::Disconnected { retry_in } => Some(Instant::now() + retry_in),
                         _ => None,
                     };
+                    if state == ConnState::Connected {
+                        self.refresh_update_available(cx);
+                    }
                     if state == ConnState::Connected && self.error_is_connection {
                         self.error = None;
                         self.error_is_connection = false;
@@ -550,6 +581,24 @@ impl AppState {
                     self.error = Some(e);
                     self.error_is_connection = true;
                     cx.notify();
+                }
+                UiEvent::DaemonRestarted(outcome) => {
+                    // The new daemon may be older or newer than the disk again.
+                    self.refresh_update_available(cx);
+                    // Success is good news: a neutral toast. Ended agents
+                    // make it a problem: the error toast.
+                    if outcome.is_success() {
+                        eprintln!("fleet-gui: {outcome}");
+                        self.notice = Some(outcome.to_string());
+                        cx.notify();
+                    } else {
+                        self.show_error(outcome.to_string(), cx);
+                    }
+                    chrome = true;
+                }
+                UiEvent::DaemonRestartFailed(reason) => {
+                    self.show_error(restart_failure_text(&reason), cx);
+                    chrome = true;
                 }
                 UiEvent::Error(e) => {
                     eprintln!("fleet-gui: {e}");
@@ -975,6 +1024,30 @@ impl AppState {
         self.session.clear_exited();
     }
 
+    /// Restarts fleetd into its binary on disk; agents keep running and
+    /// the outcome is shown as a toast.
+    pub fn restart_daemon(&self) {
+        self.session.restart_daemon();
+    }
+
+    /// Re-checks whether a newer fleetd is on disk. Stats a file, so it runs
+    /// on connect and when the window gains focus, never per frame.
+    pub fn refresh_update_available(&mut self, cx: &mut Context<Self>) {
+        let available = self.session.update_available();
+        if available != self.update_available {
+            self.update_available = available;
+            cx.notify();
+        }
+    }
+
+    /// Shows `text` in the error toast, until dismissed.
+    fn show_error(&mut self, text: String, cx: &mut Context<Self>) {
+        eprintln!("fleet-gui: {text}");
+        self.error = Some(text);
+        self.error_is_connection = false;
+        cx.notify();
+    }
+
     /// Exited or lost agents in the list.
     pub fn ended_count(&self) -> usize {
         self.agents.iter().filter(|r| ended(r)).count()
@@ -1045,6 +1118,7 @@ impl AppState {
 
     pub(super) fn dismiss_error(&mut self, cx: &mut Context<Self>) {
         self.error = None;
+        self.notice = None;
         self.error_is_connection = false;
         cx.notify();
     }

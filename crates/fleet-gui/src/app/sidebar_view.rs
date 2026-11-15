@@ -51,7 +51,12 @@ pub struct SidebarData<'a> {
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
     pub mark: &'a dyn Fn(u64) -> TabMark,
+    /// A newer fleetd is on disk: the footer offers to restart into it.
+    pub update_available: bool,
 }
+
+/// The footer notice while a newer fleetd is on disk.
+pub const UPDATE_NOTICE: &str = "fleetd update available";
 
 /// A tab's title: the agent's OSC title if a pane knows it, else the
 /// program.
@@ -101,6 +106,44 @@ pub fn render_sidebar(
             .text_color(theme.tertiary)
             .child("No agents yet. Press ⌘N to start one.")
     });
+    // Agents keep running through the restart, so the notice is a
+    // suggestion, not a warning.
+    let update = data.update_available.then(|| {
+        div()
+            .id("fleetd-update")
+            .debug_selector(|| "fleetd-update".to_owned())
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .mx(px(space::SM))
+            .mb(px(space::SM))
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .rounded(px(radius::MD))
+            .bg(theme.raised)
+            .border_1()
+            .border_color(theme.border)
+            .type_style(text::CALLOUT)
+            .text_color(theme.secondary)
+            .child(UPDATE_NOTICE)
+            .child(
+                div()
+                    .id("fleetd-update-restart")
+                    .debug_selector(|| "fleetd-update-restart".to_owned())
+                    .px(px(space::SM))
+                    .py(px(space::XXS))
+                    .rounded(px(radius::SM))
+                    .text_color(theme.accent)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .child("Restart")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.app().read(cx).restart_daemon();
+                    })),
+            )
+    });
     div()
         .flex()
         .flex_col()
@@ -122,6 +165,7 @@ pub fn render_sidebar(
                 .children(empty)
                 .children(groups),
         )
+        .children(update)
 }
 
 fn render_tab(

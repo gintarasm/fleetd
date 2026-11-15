@@ -40,6 +40,9 @@ pub enum StatusEntry {
     /// Forgets every exited or lost agent; listed only when one exists.
     ClearExited,
     SwitchFleetd,
+    /// Restarts the connected fleetd into the binary on disk; agents keep
+    /// running. Listed for local and ssh targets alike.
+    RestartFleetd,
     InstallSkill,
     Separator,
     Quit,
@@ -54,6 +57,7 @@ impl StatusEntry {
             StatusEntry::NewAgent => "New agent…",
             StatusEntry::ClearExited => "Clear exited agents",
             StatusEntry::SwitchFleetd => "Switch fleetd…",
+            StatusEntry::RestartFleetd => "Restart fleetd",
             StatusEntry::InstallSkill => "Install agent skill",
             StatusEntry::Separator => "",
             StatusEntry::Quit => "Quit fleet",
@@ -109,6 +113,7 @@ pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
     }
     menu.extend([
         StatusEntry::SwitchFleetd,
+        StatusEntry::RestartFleetd,
         StatusEntry::InstallSkill,
         StatusEntry::Separator,
         StatusEntry::Quit,
@@ -194,6 +199,7 @@ mod tests {
                 StatusEntry::NewAgent,
                 StatusEntry::ClearExited,
                 StatusEntry::SwitchFleetd,
+                StatusEntry::RestartFleetd,
                 StatusEntry::InstallSkill,
                 StatusEntry::Separator,
                 StatusEntry::Quit,
@@ -251,6 +257,24 @@ mod tests {
             assert!(status_menu(&state(Target::Local, rows)).contains(&StatusEntry::ClearExited));
         }
         assert_eq!(StatusEntry::ClearExited.title(), "Clear exited agents");
+    }
+
+    #[test]
+    fn status_menu_offers_restart_for_local_and_ssh() {
+        for target in [
+            Target::Local,
+            Target::Ssh {
+                dest: "me@box".into(),
+            },
+        ] {
+            let menu = status_menu(&state(target, Vec::new()));
+            let switch = menu
+                .iter()
+                .position(|e| *e == StatusEntry::SwitchFleetd)
+                .unwrap();
+            assert_eq!(menu[switch + 1], StatusEntry::RestartFleetd);
+        }
+        assert_eq!(StatusEntry::RestartFleetd.title(), "Restart fleetd");
     }
 
     #[test]

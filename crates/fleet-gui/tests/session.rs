@@ -11,7 +11,10 @@ use fleet_gui::core::launch::start_local;
 use fleet_gui::core::pane::{PaneModel, PaneState};
 use fleet_gui::core::session::{ConnState, PaneId, Session, UiEvent};
 use fleet_gui::core::target::{Target, connect};
-use fleet_proto::{AgentState, Attach, ListAgents, SpawnAgent, request, response};
+use fleet_proto::{
+    AgentList, AgentState, Attach, Frame, HelloOk, ListAgents, Response, RestartingDaemon,
+    RestoreSummary, SpawnAgent, request, response,
+};
 use fleet_term::{Palette, Terminal};
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -448,5 +451,333 @@ fn close_pane_detaches_without_killing() {
     s.close_pane(pane);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(d.agent_state(id), AgentState::Running);
+    s.shutdown();
+}
+
+/// A scripted fleetd on a unix socket: one handshake per connection, from
+/// `hellos` in order (the last repeats), `List` answered with no agents,
+/// and `RestartDaemon` answered by `on_restart` (`None`: an old daemon's
+/// "empty request"), after which the connection is dropped, as an exec
+/// would.
+struct FakeFleetd {
+    dir: tempfile::TempDir,
+    /// `RestartDaemon` requests received, on any connection.
+    restarts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FakeFleetd {
+    fn start(
+        hellos: Vec<HelloOk>,
+        on_restart: Option<response::Kind>,
+        wait_before_serving_again: Duration,
+    ) -> FakeFleetd {
+        Self::start_answering_after(
+            hellos,
+            on_restart,
+            wait_before_serving_again,
+            Duration::ZERO,
+        )
+    }
+
+    /// [`FakeFleetd::start`], answering `RestartDaemon` only after
+    /// `answer_delay` (as a daemon checking and freezing does).
+    fn start_answering_after(
+        hellos: Vec<HelloOk>,
+        on_restart: Option<response::Kind>,
+        wait_before_serving_again: Duration,
+        answer_delay: Duration,
+    ) -> FakeFleetd {
+        use bytes::BytesMut;
+        use fleet_proto::FrameCodec;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use tokio_util::codec::{Decoder, Encoder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join("fleetd.sock")).unwrap();
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&restarts);
+        std::thread::spawn(move || {
+            for (served, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { return };
+                if served > 0 && wait_before_serving_again > Duration::ZERO {
+                    // Only the first reconnect after the restart waits.
+                    if served == 1 {
+                        std::thread::sleep(wait_before_serving_again);
+                    }
+                }
+                let hello = hellos[served.min(hellos.len() - 1)].clone();
+                let on_restart = on_restart.clone();
+                let counter = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    let mut buf = BytesMut::new();
+                    let mut chunk = [0u8; 4096];
+                    let mut greeted = false;
+                    let send = |stream: &mut std::os::unix::net::UnixStream, f: Frame| {
+                        let mut out = BytesMut::new();
+                        FrameCodec::new().encode(f, &mut out).unwrap();
+                        stream.write_all(&out).is_ok()
+                    };
+                    loop {
+                        while let Some(frame) = FrameCodec::new().decode(&mut buf).unwrap() {
+                            match frame {
+                                Frame::Hello(_) if !greeted => {
+                                    greeted = true;
+                                    if !send(&mut stream, Frame::HelloOk(hello.clone())) {
+                                        return;
+                                    }
+                                }
+                                Frame::Request(r) => {
+                                    let kind = match r.kind {
+                                        Some(request::Kind::RestartDaemon(_)) => {
+                                            counter
+                                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                            let kind = on_restart.clone().unwrap_or_else(|| {
+                                                response::Kind::Error(fleet_proto::Error {
+                                                    message: "empty request".into(),
+                                                })
+                                            });
+                                            let restarting =
+                                                matches!(kind, response::Kind::RestartingDaemon(_));
+                                            std::thread::sleep(answer_delay);
+                                            send(
+                                                &mut stream,
+                                                Frame::Response(Response {
+                                                    id: r.id,
+                                                    kind: Some(kind),
+                                                }),
+                                            );
+                                            if restarting {
+                                                // exec: the connection ends, after
+                                                // a moment in which a pipelined
+                                                // second request is still counted.
+                                                stream
+                                                    .set_read_timeout(Some(Duration::from_millis(
+                                                        150,
+                                                    )))
+                                                    .unwrap();
+                                            }
+                                            continue;
+                                        }
+                                        Some(request::Kind::List(_)) => {
+                                            response::Kind::Agents(AgentList::default())
+                                        }
+                                        _ => continue,
+                                    };
+                                    send(
+                                        &mut stream,
+                                        Frame::Response(Response {
+                                            id: r.id,
+                                            kind: Some(kind),
+                                        }),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                });
+            }
+        });
+        FakeFleetd { dir, restarts }
+    }
+}
+
+fn hello(instance: u64, restore: Option<RestoreSummary>) -> HelloOk {
+    HelloOk {
+        instance,
+        restore: restore.map(Box::new),
+        ..Default::default()
+    }
+}
+
+fn start_session_in(dir: &Path) -> (Session, Events) {
+    let (tx, rx) = async_channel::unbounded();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    std::thread::spawn(move || {
+        while let Ok(e) = rx.recv_blocking() {
+            if !matches!(e, UiEvent::PaneChanged(_)) {
+                sink.lock().unwrap().push(e);
+            }
+        }
+    });
+    (
+        Session::start(Target::Local, dir.to_owned(), tx),
+        Events(events),
+    )
+}
+
+fn connected(events: &Events) {
+    wait_until("the control connection", || {
+        events.has(|e| *e == UiEvent::Connection(ConnState::Connected))
+    });
+}
+
+#[test]
+fn restart_reports_kept_agents_after_reconnect() {
+    let kept = RestoreSummary {
+        previous_instance: 5,
+        kept: vec![1, 2],
+        ..Default::default()
+    };
+    let fake = FakeFleetd::start(
+        vec![hello(5, None), hello(6, Some(kept))],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        // The daemon is away for a moment, as during an exec.
+        Duration::from_millis(500),
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestarted(_)))
+    });
+    assert!(events.has(|e| {
+        *e == UiEvent::DaemonRestarted(fleet_client::RestartOutcome::Restarted { kept: 2 })
+    }));
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_))));
+    s.shutdown();
+}
+
+#[test]
+fn restart_with_same_instance_reports_failure() {
+    let thawed = RestoreSummary {
+        restart_error: "exec failed".into(),
+        ..Default::default()
+    };
+    let fake = FakeFleetd::start(
+        vec![hello(5, None), hello(5, Some(thawed))],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    assert!(events.has(|e| *e == UiEvent::DaemonRestartFailed("exec failed".into())));
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestarted(_))));
+    s.shutdown();
+}
+
+#[test]
+fn restart_of_an_old_daemon_reports_it_is_too_old() {
+    let fake = FakeFleetd::start(vec![hello(5, None)], None, Duration::ZERO);
+    let (s, events) = start_session_in(fake.dir.path());
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    assert!(events.has(|e| *e == UiEvent::DaemonRestartFailed(fleet_client::TOO_OLD.into())));
+    s.shutdown();
+}
+
+#[test]
+fn restart_wait_runs_from_the_answer_not_the_click() {
+    let kept = RestoreSummary {
+        previous_instance: 5,
+        kept: vec![1, 2],
+        ..Default::default()
+    };
+    // The answer takes longer than the wait for the new daemon: that wait
+    // has not started yet.
+    let fake = FakeFleetd::start_answering_after(
+        vec![hello(5, None), hello(6, Some(kept))],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+        Duration::from_millis(900),
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_restart_wait_for_test(Duration::from_millis(400));
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestarted(_)))
+    });
+    assert!(events.has(|e| {
+        *e == UiEvent::DaemonRestarted(fleet_client::RestartOutcome::Restarted { kept: 2 })
+    }));
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_))));
+    s.shutdown();
+}
+
+#[test]
+fn restart_never_answered_times_out_after_the_answer_wait() {
+    let fake = FakeFleetd::start_answering_after(
+        vec![hello(5, None)],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+        Duration::from_secs(5),
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_restart_answer_wait_for_test(Duration::from_millis(300));
+    connected(&events);
+    let asked = Instant::now();
+    s.restart_daemon();
+    wait_until("the timeout", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    // Well before the answer (5 s) or the wait for the new daemon (10 s).
+    assert!(asked.elapsed() < Duration::from_secs(3));
+    assert!(events.has(|e| {
+        *e == UiEvent::DaemonRestartFailed("fleetd did not come back within 10 s".into())
+    }));
+    s.shutdown();
+}
+
+#[test]
+fn restart_that_never_settles_times_out_once_and_a_second_ask_is_ignored() {
+    // The daemon acknowledges the restart but the "new" one is still the
+    // old instance with no `restart_error`: never decided. The wait runs
+    // from that acknowledgement.
+    let fake = FakeFleetd::start(
+        vec![hello(5, None)],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_restart_wait_for_test(Duration::from_millis(600));
+    connected(&events);
+    s.restart_daemon();
+    // Asked again while pending: ignored (no second timer, no second event).
+    s.restart_daemon();
+    wait_until("the timeout", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    std::thread::sleep(Duration::from_millis(900));
+    let failures: Vec<_> = events
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        failures,
+        vec![UiEvent::DaemonRestartFailed(
+            "fleetd did not come back within 10 s".into()
+        )]
+    );
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestarted(_))));
+    // The second ask never reached the daemon.
+    assert_eq!(fake.restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
     s.shutdown();
 }

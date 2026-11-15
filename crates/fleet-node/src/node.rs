@@ -1,4 +1,4 @@
-//! The node: [`Node`] ties the [`PtyHost`](crate::PtyHost), the agent
+//! The node: [`Node`] ties the [`AgentHost`](crate::AgentHost), the agent
 //! [`Store`] and one [`AgentPipeline`] per agent together.
 //!
 //! Per-agent output pipeline: PTY output feeds the agent's [`Terminal`] grid,
@@ -53,15 +53,19 @@
 //! so no activity follows an agent's exit.
 
 use crate::env::LoginEnv;
+use crate::handoff::{self, HandoffGate};
 use crate::history::{History, HistoryInfo, Page};
+use crate::host::{AdoptSpec, AgentHost, TerminalHandle};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
 use bytes::{Bytes, BytesMut};
+use fleet_proto::handoff::{HandoffAgent, handoff_agent};
 use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AgentRemoved, AttachOk, SpawnAgent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -893,6 +897,38 @@ impl AgentPipeline {
         (Self::snapshot_of(&mut state), state.term.size())
     }
 
+    /// The current screen and grid size for a successor daemon, with the
+    /// scrollback and history flushed to disk, where the successor reopens
+    /// them. Call with the host frozen: no output may follow.
+    fn hand_off(&self) -> io::Result<(Vec<u8>, (u16, u16))> {
+        let mut state = self.lock();
+        let snapshot = Self::snapshot_of(&mut state);
+        if let Some(scrollback) = &mut state.scrollback {
+            scrollback.flush()?;
+        }
+        if let Some(history) = &mut state.history {
+            history.flush()?;
+        }
+        Ok((snapshot, state.term.size()))
+    }
+
+    /// Replays a predecessor daemon's snapshot of the agent's screen into
+    /// the grid, before any output. The bytes are already in the scrollback
+    /// ring and the history, and were seen by every client, so they reach
+    /// neither, nor subscribers or activity; rows the replay scrolls off are
+    /// dropped. Query replies the replay generates are discarded: the agent
+    /// asked its question of the old daemon, which answered it then (or left
+    /// it to a client).
+    pub fn restore_screen(&self, bytes: &[u8]) {
+        let mut state = self.lock();
+        state.term.feed(bytes);
+        drop(state.term.drain_history());
+        drop(state.term.take_replies());
+        // A snapshot may end inside a sequence (its unterminated tail): the
+        // next attach's snapshot must carry it on.
+        state.partial.feed(bytes);
+    }
+
     fn snapshot_of(state: &mut State) -> Vec<u8> {
         state.term.flush_pending_sync();
         state.drain_history();
@@ -1314,6 +1350,36 @@ fn labels_match(labels: &Labels, selector: &Labels) -> bool {
     selector.iter().all(|(k, v)| labels.get(k) == Some(v))
 }
 
+/// Runs `f` when dropped, on a return or an unwind, unless disarmed.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+/// Test hook (debug builds): with `FLEETD_TEST_PANIC_DESCRIBING` set,
+/// describing the frozen agents for a handoff panics.
+fn test_panic_describing() {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("FLEETD_TEST_PANIC_DESCRIBING").is_some() {
+        panic!("test hook FLEETD_TEST_PANIC_DESCRIBING");
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1482,7 +1548,7 @@ struct NodeSink {
     id: u64,
     pipeline: AgentPipeline,
     store: Arc<Mutex<Store>>,
-    host: Arc<PtyHost>,
+    host: Arc<dyn AgentHost>,
     agents: Arc<Mutex<Agents>>,
     histories: Arc<Mutex<Histories>>,
     exits: broadcast::Sender<AgentExited>,
@@ -1513,7 +1579,7 @@ impl OutputSink for NodeSink {
         // If the spawn has not registered the agent yet, it retires it.
         let mut agents = lock(&self.agents);
         let evicted = match agents.live.remove(&self.id) {
-            Some(live) => agents.retire(&self.host, self.id, &live, code),
+            Some(live) => agents.retire(&*self.host, self.id, &live, code),
             None => None,
         };
         drop(agents);
@@ -1533,7 +1599,7 @@ impl OutputSink for NodeSink {
 /// Every method may block (SQLite, PTY writes, process spawn); call them off
 /// the async executor.
 pub struct Node {
-    host: Arc<PtyHost>,
+    host: Arc<dyn AgentHost>,
     store: Arc<Mutex<Store>>,
     agents: Arc<Mutex<Agents>>,
     exits: broadcast::Sender<AgentExited>,
@@ -1543,6 +1609,8 @@ pub struct Node {
     activity: Arc<ActivityHub>,
     /// The base of every agent's environment.
     base_env: LoginEnv,
+    /// Holds spawns, restarts and forgets out of a handoff.
+    handoff: HandoffGate,
 }
 
 impl Drop for Node {
@@ -1644,7 +1712,13 @@ impl Agents {
     /// [`RETAINED_EXITED`]) and drops everything else it held. Returns the
     /// evicted agent, whose history the caller deletes.
     #[must_use]
-    fn retire(&mut self, host: &PtyHost, id: u64, live: &LiveAgent, exit_code: i32) -> Option<u64> {
+    fn retire(
+        &mut self,
+        host: &dyn AgentHost,
+        id: u64,
+        live: &LiveAgent,
+        exit_code: i32,
+    ) -> Option<u64> {
         let (snapshot, (cols, rows)) = live.pipeline.snapshot_sized();
         let evicted = if self.exited.len() >= RETAINED_EXITED {
             self.exited.pop_front().map(|a| a.id)
@@ -1666,6 +1740,20 @@ impl Agents {
 
     fn exited(&self, id: u64) -> Option<&ExitedAgent> {
         self.exited.iter().find(|a| a.id == id)
+    }
+
+    /// Lists an agent the host now runs as live, or retires it if it has
+    /// already exited (its sink found it unregistered). Returns the agent
+    /// evicted from retention, whose history the caller deletes.
+    #[must_use]
+    fn register(&mut self, host: &dyn AgentHost, id: u64, live: LiveAgent) -> Option<u64> {
+        match live.pipeline.exit_code() {
+            Some(code) => self.retire(host, id, &live, code),
+            None => {
+                self.live.insert(id, live);
+                None
+            }
+        }
     }
 }
 
@@ -1690,6 +1778,11 @@ impl Node {
     /// recently created of them, and the scrollback rings of agents with no
     /// store row.
     pub fn open(state_dir: &Path) -> io::Result<Node> {
+        Self::open_sparing(state_dir, &[])
+    }
+
+    /// [`Node::open`], sparing the agents `keep` from being marked lost.
+    fn open_sparing(state_dir: &Path, keep: &[u64]) -> io::Result<Node> {
         let scrollback_dir = state_dir.join("scrollback");
         let history_dir = state_dir.join("history");
         for dir in [&scrollback_dir, &history_dir] {
@@ -1699,7 +1792,7 @@ impl Node {
                 .create(dir)?;
         }
         let store = Store::open(&state_dir.join("state.db")).map_err(store_err)?;
-        store.mark_running_as_lost().map_err(store_err)?;
+        store.mark_running_as_lost_except(keep).map_err(store_err)?;
         // A corrupt row's history is not kept (its id is unknown).
         let (records, _) = store.list_agents_lossy_unlabeled().map_err(store_err)?;
         prune_history_dirs(&history_dir, &retained_history(&records))?;
@@ -1721,7 +1814,17 @@ impl Node {
             })),
             activity,
             base_env: LoginEnv::daemon(),
+            handoff: HandoffGate::default(),
         })
+    }
+
+    /// Marks every agent the store under `state_dir` has running as lost,
+    /// without opening the node; how many. For a daemon that took over a
+    /// predecessor's agents and ended them before it could open its node (a
+    /// failed handoff-origin start), so the store does not say they run.
+    pub fn mark_left_running_lost(state_dir: &Path) -> io::Result<usize> {
+        let store = Store::open(&state_dir.join("state.db")).map_err(store_err)?;
+        store.mark_running_as_lost().map_err(store_err)
     }
 
     /// Uses `env` as the base of agents' environments instead of the
@@ -1825,6 +1928,7 @@ impl Node {
         attach: Option<(ConnId, BeforeStart<'_>)>,
         origin: Option<ConnId>,
     ) -> io::Result<(RestartOutcome, Option<(AttachOk, Subscription)>)> {
+        let _in_flight = self.handoff.enter()?;
         let (old, _restarting) = {
             let mut agents = lock(&self.agents);
             if agents.restarting.contains(&id) {
@@ -1915,6 +2019,7 @@ impl Node {
         req: SpawnAgent,
         attach: Option<(ConnId, BeforeStart<'_>)>,
     ) -> io::Result<(AgentInfo, Option<(AttachOk, Subscription)>)> {
+        let _in_flight = self.handoff.enter()?;
         if lock(&self.agents).closing {
             return Err(shutting_down());
         }
@@ -1971,16 +2076,7 @@ impl Node {
                     ok.primary = a.primary;
                     (ok, a.subscription)
                 });
-                let sink = NodeSink {
-                    id,
-                    pipeline: pipeline.clone(),
-                    store: Arc::clone(&self.store),
-                    host: Arc::clone(&self.host),
-                    agents: Arc::clone(&self.agents),
-                    histories: Arc::clone(&self.histories),
-                    exits: self.exits.clone(),
-                    activity: Arc::clone(&self.activity),
-                };
+                let sink = self.sink(id, &pipeline);
                 let spec = CommandSpec {
                     program: PathBuf::from(&req.program),
                     args: req.args.clone(),
@@ -2022,14 +2118,7 @@ impl Node {
                 let _ = self.host.force_kill(live.host_id);
                 return Err(shutting_down());
             }
-            // An agent that already exited was not found by its sink.
-            match live.pipeline.exit_code() {
-                Some(code) => agents.retire(&self.host, id, &live, code),
-                None => {
-                    agents.live.insert(id, live);
-                    None
-                }
-            }
+            agents.register(&*self.host, id, live)
         };
         let mut histories = lock(&self.histories);
         histories.spawning.remove(&id);
@@ -2098,6 +2187,7 @@ impl Node {
         selector: &Labels,
         origin: Option<ConnId>,
     ) -> Result<ForgetOutcome, ForgetError> {
+        let _in_flight = self.handoff.enter()?;
         let targets: Vec<u64> = if exited_only {
             if !ids.is_empty() {
                 return Err(io::Error::new(
@@ -2330,8 +2420,8 @@ impl Node {
         lock(&self.store).exit_code(id).ok().flatten()
     }
 
-    /// Stops every agent (there is no handoff to a successor daemon, see
-    /// decision 0018): SIGTERM to each process group, [`SHUTDOWN_GRACE`] to
+    /// Stops every agent (to hand them to a successor daemon instead, see
+    /// [`Node::prepare_handoff`]): SIGTERM to each process group, [`SHUTDOWN_GRACE`] to
     /// exit, then SIGKILL. Exits are recorded as usual; an agent that still
     /// has not reported is left `running` in the store, to be marked lost by
     /// the next [`Node::open`]. Refuses new spawns from now on, and kills a
@@ -2361,6 +2451,265 @@ impl Node {
         if self.host.wait_all(KILL_WAIT).is_err() {
             warn!("some agents did not exit; they will be marked lost");
         }
+    }
+
+    /// The sink that feeds `pipeline` with agent `id`'s output and records
+    /// its exit.
+    fn sink(&self, id: u64, pipeline: &AgentPipeline) -> NodeSink {
+        NodeSink {
+            id,
+            pipeline: pipeline.clone(),
+            store: Arc::clone(&self.store),
+            host: Arc::clone(&self.host),
+            agents: Arc::clone(&self.agents),
+            histories: Arc::clone(&self.histories),
+            exits: self.exits.clone(),
+            activity: Arc::clone(&self.activity),
+        }
+    }
+
+    /// Readies the running agents to be handed to a successor daemon, just
+    /// before `exec`: from now on spawns, restarts and forgets fail with
+    /// "fleetd is restarting"; the host is frozen (no output is read, input
+    /// fails); each agent's scrollback and history are flushed. Returns one
+    /// record entry per running agent, its screen as the attach snapshot and
+    /// its PTY master as an fd of this process.
+    ///
+    /// Refuses with "a restart is already in progress", or with "agents are
+    /// starting; try again" if a spawn, restart or forget is still in flight
+    /// at `deadline`; the freeze also has to finish by then, and so must the
+    /// exit of any agent whose output has ended (else "an agent is exiting;
+    /// try again", see `wait_for_exiting`). On any error
+    /// nothing stays frozen and the node keeps serving. Undo a success with
+    /// [`Node::thaw`] (for example when the `exec` fails).
+    ///
+    /// The final screens of exited agents ([`RETAINED_EXITED`]) are not
+    /// handed over: after a restart, attaching to an agent that exited
+    /// before it yields the empty snapshot, as for an agent of an earlier
+    /// daemon run.
+    pub fn prepare_handoff(&self, deadline: Instant) -> io::Result<Vec<HandoffAgent>> {
+        self.handoff.begin(deadline)?;
+        // Reopens the gate on an error or a panic; disarmed on success.
+        let gate = OnDrop::new(|| self.handoff.end());
+        let agents = self.freeze_for_handoff(deadline);
+        match &agents {
+            Ok(agents) => {
+                info!(agents = agents.len(), "handoff prepared");
+                gate.disarm();
+            }
+            Err(e) => warn!(error = %e, "preparing the handoff failed; serving on"),
+        }
+        agents
+    }
+
+    /// Freezes the host and describes its agents; thaws on an error or a
+    /// panic.
+    fn freeze_for_handoff(&self, deadline: Instant) -> io::Result<Vec<HandoffAgent>> {
+        // A failed freeze thaws itself, or was not ours to thaw (busy).
+        let frozen = self.host.freeze(deadline)?;
+        let thaw = OnDrop::new(|| self.host.thaw());
+        let described = self
+            .wait_for_exiting(&frozen, deadline)
+            .and_then(|()| self.describe_frozen(frozen));
+        if described.is_ok() {
+            thaw.disarm();
+        }
+        described
+    }
+
+    /// Waits until `deadline` for every live agent the freeze did not list
+    /// to be retired. Such an agent's output has ended, but its reader has
+    /// not yet reaped it and recorded its exit (`on_exit`): usually a matter
+    /// of milliseconds, but a process that closed its terminal and keeps
+    /// running holds its reader in `waitpid` for as long as it runs. Handed
+    /// over neither way, it would be marked lost and left running untracked
+    /// by the successor; so the handoff fails with "an agent is exiting; try
+    /// again" if one remains.
+    fn wait_for_exiting(&self, frozen: &[crate::FrozenAgent], deadline: Instant) -> io::Result<()> {
+        let frozen: HashSet<AgentId> = frozen.iter().map(|a| a.id).collect();
+        loop {
+            let exiting = lock(&self.agents)
+                .live
+                .values()
+                .filter(|live| !frozen.contains(&live.host_id))
+                .count();
+            if exiting == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    agents = exiting,
+                    "agents still exiting at the handoff deadline"
+                );
+                return Err(handoff::agent_exiting());
+            }
+            std::thread::sleep(handoff::EXITING_POLL);
+        }
+    }
+
+    fn describe_frozen(&self, frozen: Vec<crate::FrozenAgent>) -> io::Result<Vec<HandoffAgent>> {
+        // No spawn is in flight, so every frozen agent is registered.
+        let by_host: HashMap<AgentId, (u64, AgentPipeline)> = lock(&self.agents)
+            .live
+            .iter()
+            .map(|(&id, live)| (live.host_id, (id, live.pipeline.clone())))
+            .collect();
+        test_panic_describing();
+        frozen
+            .into_iter()
+            .map(|agent| {
+                let (id, pipeline) = by_host
+                    .get(&agent.id)
+                    .ok_or_else(|| io::Error::other("a frozen agent is unknown to the node"))?;
+                let (snapshot, (cols, rows)) = pipeline.hand_off()?;
+                let pid = i32::try_from(agent.pid).map_err(io::Error::other)?;
+                let terminal = match agent.terminal {
+                    TerminalHandle::Fd(fd) => handoff_agent::Terminal::Fd(fd),
+                };
+                Ok(HandoffAgent {
+                    id: *id,
+                    pid,
+                    cols: cols.into(),
+                    rows: rows.into(),
+                    snapshot,
+                    terminal: Some(terminal),
+                })
+            })
+            .collect()
+    }
+
+    /// Undoes [`Node::prepare_handoff`]: output is read and input accepted
+    /// again, then spawns, restarts and forgets. Idempotent.
+    pub fn thaw(&self) {
+        self.host.thaw();
+        self.handoff.end();
+        info!("handoff undone; serving on");
+    }
+
+    /// [`Node::open`] for a daemon started from a handoff: the agents a
+    /// predecessor handed over (`agents`, from its
+    /// [`Node::prepare_handoff`]) are not marked lost but adopted, each with
+    /// its scrollback ring and history reopened and its screen replayed from
+    /// the snapshot. Every other agent left running is marked lost, as by
+    /// [`Node::open`].
+    ///
+    /// Owns every fd the record names (as an `exec` passes them on) that is
+    /// a terminal. One the process does not have open when this is called,
+    /// or that is not a terminal, is never touched, and its agent fails, so
+    /// a stale or corrupt record cannot make the node close one of its own
+    /// files (or the daemon's listener, lock or log).
+    ///
+    /// Returns the node and the ids kept and failed. An agent that fails to
+    /// be restored is ended (SIGTERM to its group, SIGKILL after
+    /// [`SHUTDOWN_GRACE`]) and recorded as exited with code -1, as when
+    /// waiting for an agent fails. If the node cannot be opened at all,
+    /// every agent in the record is ended so none runs untracked.
+    ///
+    /// A corrupt record may name one fd or one id twice. A later entry
+    /// naming an fd already claimed fails like any agent without a
+    /// terminal. A later entry repeating an id is dropped (its fd, if
+    /// claimed, closed) without touching that id's row, which belongs to
+    /// the first entry, so no id is registered twice; its process is ended
+    /// unless a kept agent has the same pid.
+    pub fn open_with_handoff(
+        state_dir: &Path,
+        agents: Vec<HandoffAgent>,
+    ) -> io::Result<(Node, Vec<u64>, Vec<u64>)> {
+        // Before the node opens any file of its own.
+        let mut fds = HashSet::new();
+        let mut ids = HashSet::new();
+        let mut repeated = Vec::new();
+        let mut claimed: Vec<(HandoffAgent, Option<OwnedFd>)> = Vec::new();
+        for mut agent in agents {
+            let fd = handoff::claim_terminal(agent.terminal.take(), &mut fds);
+            if ids.insert(agent.id) {
+                claimed.push((agent, fd));
+            } else {
+                warn!(
+                    agent = agent.id,
+                    "the handoff record repeats an agent; ending the copy"
+                );
+                repeated.push(agent.pid);
+            }
+        }
+        let keep: Vec<u64> = claimed.iter().map(|(a, _)| a.id).collect();
+        let node = match Self::open_sparing(state_dir, &keep) {
+            Ok(node) => node,
+            Err(e) => {
+                let mut pids: Vec<i32> = claimed.iter().map(|(a, _)| a.pid).collect();
+                pids.extend(repeated);
+                drop(claimed);
+                handoff::end_unrestored(&pids, SHUTDOWN_GRACE);
+                return Err(e);
+            }
+        };
+        let (mut kept, mut failed) = (Vec::new(), Vec::new());
+        let mut kept_pids = HashSet::new();
+        for (agent, fd) in claimed {
+            match node.restore_agent(&agent, fd) {
+                Ok(()) => {
+                    info!(agent = agent.id, "agent restored");
+                    kept.push(agent.id);
+                    kept_pids.insert(agent.pid);
+                }
+                Err(e) => {
+                    warn!(agent = agent.id, error = %e, "restoring the agent failed; ending it");
+                    failed.push(agent);
+                }
+            }
+        }
+        // Never a kept agent's process, whatever else the record says.
+        let pids: Vec<i32> = failed
+            .iter()
+            .map(|a| a.pid)
+            .chain(repeated)
+            .filter(|pid| !kept_pids.contains(pid))
+            .collect();
+        handoff::end_unrestored(&pids, SHUTDOWN_GRACE);
+        let failed: Vec<u64> = failed.into_iter().map(|a| a.id).collect();
+        for &id in &failed {
+            if let Err(e) = lock(&node.store).set_exited(id, -1) {
+                warn!(agent = id, error = %e, "recording the unrestored agent's exit failed");
+            }
+        }
+        info!(
+            kept = kept.len(),
+            failed = failed.len(),
+            "opened from a handoff"
+        );
+        Ok((node, kept, failed))
+    }
+
+    /// Adopts one handed-over agent: reopens its scrollback and history,
+    /// replays its screen into a fresh grid of the recorded size, and has the
+    /// host take over its process and terminal.
+    fn restore_agent(&self, agent: &HandoffAgent, terminal: Option<OwnedFd>) -> io::Result<()> {
+        let id = agent.id;
+        let terminal =
+            terminal.ok_or_else(|| invalid("no open terminal fd in the record".into()))?;
+        let (cols, rows) = checked_size(agent.cols, agent.rows)?;
+        let pid = u32::try_from(agent.pid).map_err(|_| invalid("invalid agent pid".into()))?;
+        let record = lock(&self.store).agent(id).map_err(store_err)?;
+        let record = match record {
+            Some(rec) if rec.state == store::AgentState::Running => rec,
+            _ => return Err(invalid(format!("agent {id} is not running in the store"))),
+        };
+        let scrollback = Scrollback::open(Path::new(&record.scrollback_path))?;
+        let history = History::open(&lock(&self.histories).path(id))?;
+        let pipeline = AgentPipeline::with_history(cols, rows, scrollback, Some(history));
+        pipeline.restore_screen(&agent.snapshot);
+        let spec = AdoptSpec {
+            pid,
+            terminal: TerminalHandle::Fd(terminal.into_raw_fd()),
+            cols,
+            rows,
+        };
+        let host_id = self.host.adopt(spec, Box::new(self.sink(id, &pipeline)))?;
+        let evicted = lock(&self.agents).register(&*self.host, id, LiveAgent { host_id, pipeline });
+        if let Some(evicted) = evicted {
+            lock(&self.histories).delete(evicted, "beyond retention");
+        }
+        Ok(())
     }
 }
 
