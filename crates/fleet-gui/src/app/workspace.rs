@@ -27,7 +27,7 @@ use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
 use super::theme::{Theme, Typography};
-use super::titlebar_view::{BarData, render_bar};
+use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use crate::core::config::save_connection;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
@@ -793,6 +793,7 @@ impl Render for Workspace {
                         .items_start()
                         .justify_center()
                         .pt(px(chrome::BAR_HEIGHT + space::XL))
+                        .child(sheet_drag_strip("connect-drag-strip"))
                         .child(appear(
                             div().child(sheet.clone()),
                             "connect-appear",
@@ -816,6 +817,7 @@ impl Render for Workspace {
                     .justify_center()
                     // Hung from the bar, like an AppKit sheet.
                     .pt(px(chrome::BAR_HEIGHT + space::SM))
+                    .child(sheet_drag_strip("sheet-drag-strip"))
                     .child(appear(
                         div().child(sheet.clone()),
                         "sheet-appear",
@@ -2204,6 +2206,29 @@ mod tests {
         let tab = s.cx.debug_bounds("tab-7").unwrap();
         assert!(bar.bottom() <= tab.top());
         click(&mut s, "new-agent");
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
+    }
+
+    #[gpui::test]
+    fn the_bar_stays_a_drag_strip_under_a_sheet(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![ended(8, "/w", 2, AgentState::Exited)]);
+        let bar = s.cx.debug_bounds("titlebar").unwrap();
+        let clear = center(&mut s, "clear-exited");
+        s.cx.simulate_keystrokes("cmd-n");
+        assert!(drawn(&mut s, "sheet-drag-strip"));
+        let strip = s.cx.debug_bounds("sheet-drag-strip").unwrap();
+        assert_eq!(
+            (strip.top(), strip.size.height),
+            (bar.top(), bar.size.height)
+        );
+        assert!(strip.size.width >= bar.size.width);
+        // The bar's buttons are inert under it; the sheet stays.
+        s.cx.simulate_click(clear, Modifiers::none());
+        s.cx.run_until_parked();
+        assert!(!fake.calls().contains(&Call::ClearExited));
         assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
     }
 

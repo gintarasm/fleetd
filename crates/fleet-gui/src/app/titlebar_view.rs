@@ -5,8 +5,8 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px,
+    App, AppContext, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
 use super::controls::{Tooltip, icon_button};
@@ -35,6 +35,30 @@ pub fn clear_exited_tooltip(ended: usize) -> Option<String> {
         1 => Some("Remove 1 exited agent".to_owned()),
         n => Some(format!("Remove {n} exited agents")),
     }
+}
+
+/// A press on the bar: drags the window; a double click zooms or
+/// minimises it, as System Settings say.
+fn drag_window(ev: &MouseDownEvent, window: &mut Window, _: &mut App) {
+    if ev.click_count >= 2 {
+        window.titlebar_double_click();
+    } else {
+        native::begin_window_drag();
+    }
+}
+
+/// Laid over the bar while a sheet's backdrop covers the window: the
+/// window still drags by its bar, whose buttons are inert meanwhile.
+pub fn sheet_drag_strip(id: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(chrome::BAR_HEIGHT))
+        .on_mouse_down(MouseButton::Left, drag_window)
 }
 
 pub fn render_bar(
@@ -131,13 +155,7 @@ pub fn render_bar(
         .h(px(chrome::BAR_HEIGHT))
         .pr(px(space::SM))
         .gap(px(space::XS))
-        .on_mouse_down(MouseButton::Left, |ev, window, _| {
-            if ev.click_count >= 2 {
-                window.titlebar_double_click();
-            } else {
-                native::begin_window_drag();
-            }
-        })
+        .on_mouse_down(MouseButton::Left, drag_window)
         .child(div().flex_none().w(px(lights)))
         .child(target)
         .child(div().flex_1())
