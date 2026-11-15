@@ -212,13 +212,15 @@ fleet rm --exited --selector project=fleetd
 ### Let agents use the fleet
 
 ```sh
-fleet skill install                  # writes ~/.claude/skills/fleet/SKILL.md
+fleet skill install                  # writes ~/.claude/skills/fleet/SKILL.md (Claude Code)
+fleet skill install --agent omp      # writes ~/.omp/agent/skills/fleet/SKILL.md (omp)
+fleet skill install --agent detected # both, for whichever of ~/.claude and ~/.omp exist
 fleet skill install --project        # writes ./.claude/skills/fleet/SKILL.md (or --project DIR)
-fleet skill uninstall                # removes it (add --project to remove the project copy)
+fleet skill uninstall                # removes it (takes the same --agent and --project)
 fleet skill print                    # prints the skill
 ```
 
-The skill teaches an agent (Claude Code for now) to use `fleet`: list agents (`ls --json`), read another agent's `screen` or `history`, `send` it input, and `spawn` or `kill` agents when you ask it to. Each agent knows its own id from `$FLEET_AGENT_ID`. The skill is built into the `fleet` binary, so re-running `install` after an upgrade updates it. It does not need a running daemon.
+The skill teaches an agent (Claude Code or omp) to use `fleet`: list agents (`ls --json`), read another agent's `screen` or `history`, `send` it input, and `spawn` or `kill` agents when you ask it to. Each agent knows its own id from `$FLEET_AGENT_ID`. The skill is built into the `fleet` binary, so re-running `install` after an upgrade updates it. It does not need a running daemon. `--agent` defaults to `claude`. `--project` is Claude Code only: omp has no known project skill folder, so `--agent omp --project` is an error. The GUI's "Install agent skill" runs `--agent detected` on its target and says which agents it installed for.
 
 ### Read the daemon's log
 

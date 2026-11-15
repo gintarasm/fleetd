@@ -729,22 +729,137 @@ fn skill_uninstall_removes() {
 }
 
 #[test]
-fn skill_unknown_target_errors() {
+fn skill_unknown_agent_errors() {
     let home = TempDir::new().unwrap();
     let out = fleet_home(
         home.path(),
         home.path(),
-        &["skill", "install", "--target", "codex"],
+        &["skill", "install", "--agent", "codex"],
     );
-    assert_eq!(out.status.code(), Some(1));
+    assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("M4"), "{err}");
+    assert!(err.contains("codex") && err.contains("omp"), "{err}");
     assert!(!home.path().join(".claude").exists());
+    // `--target` is the old spelling of `--agent`.
     assert_ok(&fleet_home(
         home.path(),
         home.path(),
         &["skill", "install", "--target", "claude"],
     ));
+    assert!(home.path().join(".claude/skills/fleet/SKILL.md").is_file());
+}
+
+#[test]
+fn skill_install_default_agent_is_claude() {
+    let home = TempDir::new().unwrap();
+    std::fs::create_dir(home.path().join(".omp")).unwrap();
+    let explicit = TempDir::new().unwrap();
+    let a = assert_ok(&fleet_home(home.path(), home.path(), &["skill", "install"]));
+    let b = assert_ok(&fleet_home(
+        explicit.path(),
+        explicit.path(),
+        &["skill", "install", "--agent", "claude"],
+    ));
+    assert_eq!(
+        a.trim(),
+        home.path()
+            .join(".claude/skills/fleet/SKILL.md")
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(
+        b.trim(),
+        explicit
+            .path()
+            .join(".claude/skills/fleet/SKILL.md")
+            .to_str()
+            .unwrap()
+    );
+    assert!(
+        !home.path().join(".omp/agent").exists(),
+        "default is not omp"
+    );
+}
+
+#[test]
+fn skill_install_omp_writes_and_overwrites() {
+    let home = TempDir::new().unwrap();
+    let path = home.path().join(".omp/agent/skills/fleet/SKILL.md");
+    let args = ["skill", "install", "--agent", "omp"];
+    let out = assert_ok(&fleet_home(home.path(), home.path(), &args));
+    assert_eq!(out.trim(), path.to_str().unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL);
+    std::fs::write(&path, "stale").unwrap();
+    assert_ok(&fleet_home(home.path(), home.path(), &args));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), SKILL);
+    assert!(!home.path().join(".claude").exists());
+    assert_ok(&fleet_home(
+        home.path(),
+        home.path(),
+        &["skill", "uninstall", "--agent", "omp"],
+    ));
+    assert!(!path.parent().unwrap().exists());
+    assert!(home.path().join(".omp/agent/skills").is_dir());
+}
+
+#[test]
+fn skill_omp_project_errors() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    for action in ["install", "uninstall"] {
+        let out = fleet_home(
+            home.path(),
+            project.path(),
+            &["skill", action, "--agent", "omp", "--project"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{action}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("--project") && err.contains("omp"),
+            "{action}: {err}"
+        );
+    }
+    assert!(std::fs::read_dir(project.path()).unwrap().next().is_none());
+    assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn skill_install_detected_covers_existing_homes() {
+    let skill = |home: &Path, rel: &str| home.join(rel).join("skills/fleet/SKILL.md");
+    let args = ["skill", "install", "--agent", "detected"];
+    // Both homes: both installs, one path per line, claude first.
+    let both = TempDir::new().unwrap();
+    std::fs::create_dir(both.path().join(".claude")).unwrap();
+    std::fs::create_dir(both.path().join(".omp")).unwrap();
+    let out = assert_ok(&fleet_home(both.path(), both.path(), &args));
+    let lines: Vec<_> = out.lines().collect();
+    let claude = skill(both.path(), ".claude");
+    let omp = skill(both.path(), ".omp/agent");
+    assert_eq!(lines, [claude.to_str().unwrap(), omp.to_str().unwrap()]);
+    assert_eq!(std::fs::read_to_string(&omp).unwrap(), SKILL);
+    // Only omp.
+    let only = TempDir::new().unwrap();
+    std::fs::create_dir(only.path().join(".omp")).unwrap();
+    let out = assert_ok(&fleet_home(only.path(), only.path(), &args));
+    assert_eq!(
+        out.trim(),
+        skill(only.path(), ".omp/agent").to_str().unwrap()
+    );
+    assert!(!only.path().join(".claude").exists());
+    // Neither: a clear error, nothing written.
+    let none = TempDir::new().unwrap();
+    let out = fleet_home(none.path(), none.path(), &args);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("~/.claude") && err.contains("~/.omp"), "{err}");
+    assert!(std::fs::read_dir(none.path()).unwrap().next().is_none());
+    // `--project` is claude-only.
+    let out = fleet_home(
+        both.path(),
+        both.path(),
+        &["skill", "install", "--agent", "detected", "--project"],
+    );
+    assert_eq!(out.status.code(), Some(1));
 }
 
 #[test]
