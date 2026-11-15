@@ -733,7 +733,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
         let theme = self.app.read(cx).theme;
-        let (rows, home, error, notice, titles, marks, update_available) = {
+        let (rows, home, error, notice, titles, marks, update) = {
             let app = self.app.read(cx);
             (
                 app.agents.clone(),
@@ -742,7 +742,7 @@ impl Render for Workspace {
                 app.notice.clone(),
                 app.titles.clone(),
                 app.tab_marks(),
-                app.update_available,
+                app.update_button(),
             )
         };
         let mark = move |id: u64| marks.get(&id).copied().unwrap_or(TabMark::None);
@@ -752,7 +752,6 @@ impl Render for Workspace {
             now_ms: now_ms(),
             titles: &titles,
             mark: &mark,
-            update_available,
         };
         let sidebar = render_sidebar(&data, &theme, cx);
         let ended_rows = rows.iter().filter(|r| ended(r)).count();
@@ -775,6 +774,7 @@ impl Render for Workspace {
                 title,
                 ended: ended_rows,
                 fullscreen: window.is_fullscreen(),
+                update,
             }
         };
         let bar = render_bar(&bar, &theme, cx);
@@ -1007,6 +1007,7 @@ mod tests {
         replaced: Mutex<HashMap<u64, u64>>,
         update_available: std::sync::atomic::AtomicBool,
         daemon_restarts: std::sync::atomic::AtomicUsize,
+        restart_pending: std::sync::atomic::AtomicBool,
     }
 
     impl Fake {
@@ -1048,6 +1049,13 @@ mod tests {
         fn restart_daemon(&self) {
             self.daemon_restarts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.restart_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn restart_pending(&self) -> bool {
+            self.restart_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn spawn(
@@ -1595,28 +1603,46 @@ mod tests {
     }
 
     #[gpui::test]
-    fn update_notice_offers_restart_and_outcomes_show_as_toasts(cx: &mut TestAppContext) {
+    fn update_button_restarts_once_and_outcomes_show_as_toasts(cx: &mut TestAppContext) {
         use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(Fake::default());
         let s = setup(cx, &fake, dir.path());
         let shown = |s: &Setup<'_>| s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
+        let button = |s: &Setup<'_>| s.app.read_with(s.cx, |a, _| a.update_button());
         assert!(s.cx.debug_bounds("fleetd-update").is_none());
+        assert_eq!(button(&s), None);
 
-        // A newer binary is noticed on the next connect, and Restart asks
-        // the session to restart.
+        // A newer binary is noticed on the next connect: the bar offers
+        // Update fleetd.
         fake.update_available.store(true, Ordering::SeqCst);
         s.ui.try_send(UiEvent::Connection(ConnState::Connected))
             .unwrap();
         s.cx.run_until_parked();
-        assert!(s.cx.debug_bounds("fleetd-update").is_some());
-        let restart = s.cx.debug_bounds("fleetd-update-restart").unwrap();
-        s.cx.simulate_click(restart.center(), Modifiers::none());
+        assert_eq!(button(&s).map(|b| b.label), Some("Update fleetd"));
+        let update = s.cx.debug_bounds("fleetd-update").unwrap();
+        let bar = s.cx.debug_bounds("titlebar").unwrap();
+        assert!(bar.contains(&update.center()), "the button is in the bar");
+
+        // A double click asks the session once; the button says it is
+        // running and does nothing more.
+        s.cx.simulate_click(update.center(), Modifiers::none());
+        s.cx.run_until_parked();
+        s.cx.simulate_click(update.center(), Modifiers::none());
+        s.cx.run_until_parked();
         assert_eq!(fake.daemon_restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            button(&s),
+            Some(crate::core::titlebar::UpdateButton {
+                label: "Updating fleetd…",
+                enabled: false
+            })
+        );
 
         // After the restart the binary matches again (gpui keeps the bounds
-        // of elements it once drew, so the app's flag is what is checked);
+        // of elements it once drew, so the app's state is what is checked);
         // the toast says what happened, in the CLI's words.
+        fake.restart_pending.store(false, Ordering::SeqCst);
         fake.update_available.store(false, Ordering::SeqCst);
         s.ui.try_send(UiEvent::DaemonRestarted(
             fleet_client::RestartOutcome::Restarted { kept: 2 },
@@ -1629,6 +1655,7 @@ mod tests {
         assert_eq!(notice.as_deref(), Some("fleetd restarted: 2 agents kept"));
         assert!(s.cx.debug_bounds("error-toast").is_some());
         assert!(!s.app.read_with(s.cx, |a, _| a.update_available));
+        assert_eq!(button(&s), None, "the button goes away");
         s.ui.try_send(UiEvent::DaemonRestarted(
             fleet_client::RestartOutcome::Partial {
                 kept: 1,

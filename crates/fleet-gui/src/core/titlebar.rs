@@ -43,6 +43,39 @@ pub fn bar_title(target: &Target, link: Link, running: usize, ended: usize) -> B
     BarTitle { title, subtitle }
 }
 
+/// The bar's Update fleetd button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpdateButton {
+    pub label: &'static str,
+    /// False while the restart it asked for is in flight: a second click
+    /// does nothing.
+    pub enabled: bool,
+}
+
+/// Its label while a restart runs.
+pub const UPDATING: &str = "Updating fleetd…";
+/// Its label otherwise.
+pub const UPDATE: &str = "Update fleetd";
+
+/// The button while a newer fleetd is on disk (`update_available`) or the
+/// restart onto it is in flight (`updating`); none otherwise, so it goes
+/// away once the daemon runs the build on disk.
+pub fn update_button(update_available: bool, updating: bool) -> Option<UpdateButton> {
+    if updating {
+        Some(UpdateButton {
+            label: UPDATING,
+            enabled: false,
+        })
+    } else if update_available {
+        Some(UpdateButton {
+            label: UPDATE,
+            enabled: true,
+        })
+    } else {
+        None
+    }
+}
+
 /// The window's title (the Window menu, Mission Control): the bar's
 /// title after the app's name.
 pub fn window_title(bar: &BarTitle) -> String {
@@ -51,7 +84,7 @@ pub fn window_title(bar: &BarTitle) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BarTitle, Link, bar_title, window_title};
+    use super::{BarTitle, Link, UpdateButton, bar_title, update_button, window_title};
     use crate::core::target::Target;
 
     fn ssh(dest: &str) -> Target {
@@ -100,5 +133,24 @@ mod tests {
             subtitle: String::new(),
         };
         assert_eq!(window_title(&bar), "fleet — box");
+    }
+
+    #[test]
+    fn update_button_only_while_an_update_is_available_or_running() {
+        assert_eq!(update_button(false, false), None);
+        assert_eq!(
+            update_button(true, false),
+            Some(UpdateButton {
+                label: "Update fleetd",
+                enabled: true
+            })
+        );
+        // In flight: shown, but a second click does nothing.
+        let running = Some(UpdateButton {
+            label: "Updating fleetd…",
+            enabled: false,
+        });
+        assert_eq!(update_button(true, true), running);
+        assert_eq!(update_button(false, true), running);
     }
 }

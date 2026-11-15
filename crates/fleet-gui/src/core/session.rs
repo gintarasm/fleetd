@@ -402,6 +402,9 @@ struct Inner {
     /// How long a restart waits for the old daemon's answer
     /// ([`RESTART_ANSWER_WAIT`]; a test hook shortens it).
     restart_answer_wait: Mutex<Duration>,
+    /// The local `fleetd` the update check and a restart use, in place of
+    /// [`find_tool`]'s (a test hook sets it).
+    fleetd: Mutex<Option<PathBuf>>,
     panes: Mutex<HashMap<PaneId, PaneLink>>,
     palette: Mutex<Palette>,
     shut_down: AtomicBool,
@@ -454,6 +457,7 @@ impl Session {
             daemon: Arc::default(),
             restart_wait: Mutex::new(RESTART_WAIT),
             restart_answer_wait: Mutex::new(RESTART_ANSWER_WAIT),
+            fleetd: Mutex::default(),
             panes: Mutex::default(),
             palette: Mutex::new(DEFAULT_PALETTE),
             shut_down: AtomicBool::new(false),
@@ -599,7 +603,8 @@ impl Session {
     /// asked for twice.
     pub fn restart_daemon(&self) {
         let binary = match self.inner.ctx.target {
-            Target::Local => find_tool("fleetd")
+            Target::Local => self
+                .local_fleetd()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             Target::Ssh { .. } => String::new(),
@@ -677,8 +682,21 @@ impl Session {
         update_available(
             &self.inner.ctx.target,
             &running,
-            find_tool("fleetd").as_deref(),
+            self.local_fleetd().as_deref(),
         )
+    }
+
+    /// A [`Session::restart_daemon`] is in flight: asked for and not yet
+    /// decided, refused or timed out. A further ask is ignored meanwhile.
+    pub fn restart_pending(&self) -> bool {
+        lock(&self.inner.daemon).restart.is_some()
+    }
+
+    /// The local `fleetd` a restart goes onto and the update check stats.
+    fn local_fleetd(&self) -> Option<PathBuf> {
+        lock(&self.inner.fleetd)
+            .clone()
+            .or_else(|| find_tool("fleetd"))
     }
 
     /// Forgets every exited or lost agent on the target.
@@ -786,6 +804,14 @@ impl Session {
     #[doc(hidden)]
     pub fn set_restart_wait_for_test(&self, d: Duration) {
         *lock(&self.inner.restart_wait) = d;
+    }
+
+    /// Test hook: the local `fleetd` on disk, in place of the one next to
+    /// this app or on `PATH`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_fleetd_for_test(&self, path: PathBuf) {
+        *lock(&self.inner.fleetd) = Some(path);
     }
 
     /// Test hook: how long a restart waits for the old daemon's answer.
