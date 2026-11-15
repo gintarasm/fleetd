@@ -170,6 +170,19 @@ impl Tokens {
         }
     }
 
+    /// These tokens with the window tint at alpha `a` (`[gui]
+    /// window_opacity`), kept within the range text stays readable in.
+    pub fn with_window_opacity(self, a: f32) -> Tokens {
+        use super::settings::{OPACITY_MAX, OPACITY_MIN};
+        Tokens {
+            window: Rgba {
+                a: a.clamp(OPACITY_MIN, OPACITY_MAX),
+                ..self.window
+            },
+            ..self
+        }
+    }
+
     /// These tokens for an opaque window (Reduce Transparency is on): the
     /// window tint as it looks over a plain backdrop, and the cards and
     /// sheets as they look over that.
@@ -311,6 +324,20 @@ mod tests {
             // Only the surfaces change.
             assert_eq!(o.text, t.text);
             assert_eq!(o.palette, t.palette);
+        }
+    }
+
+    #[test]
+    fn text_stays_readable_across_the_window_opacity_range() {
+        use crate::core::settings::{OPACITY_MAX, OPACITY_MIN};
+        for t in [Tokens::dark(), Tokens::light()] {
+            for a in [OPACITY_MIN, 0.84, OPACITY_MAX] {
+                let o = t.with_window_opacity(a);
+                assert_eq!(o.window.a, a);
+                check(&o);
+            }
+            assert_eq!(t.with_window_opacity(0.1).window.a, OPACITY_MIN);
+            assert_eq!(t.with_window_opacity(0.84), t);
         }
     }
 
