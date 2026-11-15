@@ -14,7 +14,6 @@ use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -36,7 +35,9 @@ pub const LOG_FILTER_ENV: &str = "FLEETD_LOG";
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Rotated files kept: `<name>.1` (newer) and `<name>.2`.
 pub const KEEP_ROTATED: usize = 2;
-/// Lines queued for the writer thread; more are dropped and counted.
+/// Lines queued for the writer thread; more are dropped and counted. The
+/// queue allocates its slots as lines arrive (tokio's block list), not all
+/// up front: an idle daemon does not hold 4096 empty slots.
 pub const QUEUE_LINES: usize = 4096;
 /// Lines queued for one `ReadLogs` follower; more are dropped and counted.
 pub const FOLLOW_QUEUE_LINES: usize = 1024;
@@ -225,7 +226,7 @@ enum Msg {
 /// The subscriber's writer: hands each formatted event to the writer
 /// thread's queue, dropping it (counted) when the queue is full.
 struct QueueWriter {
-    tx: SyncSender<Msg>,
+    tx: mpsc::Sender<Msg>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -260,15 +261,15 @@ impl QueueWriter {
         if self.dropped.load(Ordering::Relaxed) > 0 {
             let n = self.dropped.swap(0, Ordering::Relaxed);
             if n > 0
-                && let Err(TrySendError::Full(_)) = self.tx.try_send(Msg::Dropped(n))
+                && let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(Msg::Dropped(n))
             {
                 self.dropped.fetch_add(n + 1, Ordering::Relaxed);
                 return;
             }
         }
         match self.tx.try_send(Msg::Line(escape_controls(line))) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-            Err(TrySendError::Full(_)) => {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -295,9 +296,15 @@ impl<'a> MakeWriter<'a> for QueueWriter {
     }
 }
 
+/// The writer thread's queue, holding [`QUEUE_LINES`] messages.
+fn writer_queue() -> (mpsc::Sender<Msg>, mpsc::Receiver<Msg>) {
+    mpsc::channel(QUEUE_LINES)
+}
+
 /// Writes queued lines and notes of dropped ones.
-fn run_writer(rx: Receiver<Msg>, out: Arc<Mutex<Output>>) {
-    while let Ok(first) = rx.recv() {
+fn run_writer(mut rx: mpsc::Receiver<Msg>, out: Arc<Mutex<Output>>) {
+    // A plain thread, outside any runtime, so it may block.
+    while let Some(first) = rx.blocking_recv() {
         let mut out = lock(&out);
         let mut next = Some(first);
         let mut handled = 0;
@@ -352,7 +359,7 @@ pub fn logs() -> Option<&'static Logs> {
 
 /// Flushes queued lines (bounded by a timeout) when dropped.
 pub struct LogGuard {
-    tx: SyncSender<Msg>,
+    tx: mpsc::Sender<Msg>,
 }
 
 impl Drop for LogGuard {
@@ -363,7 +370,7 @@ impl Drop for LogGuard {
         loop {
             match self.tx.try_send(msg) {
                 Ok(()) => break,
-                Err(TrySendError::Full(m)) if std::time::Instant::now() < deadline => {
+                Err(mpsc::error::TrySendError::Full(m)) if std::time::Instant::now() < deadline => {
                     msg = m;
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -395,7 +402,7 @@ pub fn init(state_dir: &Path, file_name: &str) -> io::Result<LogGuard> {
         file,
         followers: Vec::new(),
     }));
-    let (tx, rx) = sync_channel(QUEUE_LINES);
+    let (tx, rx) = writer_queue();
     let dropped = Arc::new(AtomicU64::new(0));
     {
         let out = Arc::clone(&out);
@@ -673,10 +680,24 @@ mod tests {
     }
 
     #[test]
+    fn writer_queue_holds_queue_lines_then_drops() {
+        let (tx, _rx) = writer_queue();
+        let w = QueueWriter {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
+        // No writer thread drains it: exactly QUEUE_LINES fit.
+        for _ in 0..QUEUE_LINES + 3 {
+            (&w).write_all(b"x\n").unwrap();
+        }
+        assert_eq!(w.dropped.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
     fn full_queue_drops_and_the_next_line_notes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let out = output(tmp.path());
-        let (tx, rx) = sync_channel(4);
+        let (tx, rx) = mpsc::channel(4);
         let w = QueueWriter {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
@@ -693,11 +714,11 @@ mod tests {
         // Wait until the writer drained the queue, then queue one more line:
         // the note marks the gap, before it.
         let (ack, done) = std::sync::mpsc::channel();
-        w.tx.send(Msg::Flush(ack)).unwrap();
+        w.tx.blocking_send(Msg::Flush(ack)).unwrap();
         done.recv().unwrap();
         let (ack, done) = std::sync::mpsc::channel();
         (&w).write_all(b"after\n").unwrap();
-        w.tx.send(Msg::Flush(ack)).unwrap();
+        w.tx.blocking_send(Msg::Flush(ack)).unwrap();
         done.recv().unwrap();
         drop(w);
         writer.join().unwrap();

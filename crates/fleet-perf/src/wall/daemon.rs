@@ -503,15 +503,29 @@ pub(super) fn spawn_fake_agent(
     bytes: u64,
     seed: usize,
 ) -> Result<u64, String> {
+    spawn_fake(
+        client,
+        streams,
+        fake_agent,
+        &["--bytes".into(), bytes.to_string()],
+        seed,
+    )
+}
+
+/// Spawns one `fake-agent <len> --ansi --seed <seed>`, where `len` is
+/// `--bytes <n>` or `--forever`; returns its id.
+pub(super) fn spawn_fake(
+    client: &mut Client,
+    streams: &mut Streams,
+    fake_agent: &Path,
+    len: &[String],
+    seed: usize,
+) -> Result<u64, String> {
+    let mut args = len.to_vec();
+    args.extend(["--ansi".into(), "--seed".into(), seed.to_string()]);
     let spawn = SpawnAgent {
         program: fake_agent.to_string_lossy().into_owned(),
-        args: vec![
-            "--bytes".into(),
-            bytes.to_string(),
-            "--ansi".into(),
-            "--seed".into(),
-            seed.to_string(),
-        ],
+        args,
         cols: COLS,
         rows: ROWS,
         ..SpawnAgent::default()
