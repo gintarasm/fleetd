@@ -1,6 +1,6 @@
 //! SQLite agent store (decision 0010): one WAL-mode DB per node.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -462,6 +462,13 @@ impl Store {
             }
         }
         Ok((good, bad))
+    }
+
+    /// The id of every row, including rows that do not decode.
+    pub fn agent_ids(&self) -> rusqlite::Result<HashSet<u64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM agents")?;
+        let ids = stmt.query_map([], |r| r.get::<_, i64>(0).map(|id| id as u64))?;
+        ids.collect()
     }
 
     /// Every agent's labels, by agent id.

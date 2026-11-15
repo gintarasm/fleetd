@@ -138,16 +138,26 @@ fn forgotten_id_is_not_reused() {
     assert!(next > id);
 }
 
+/// A row left `running` by a daemon that died; [`Node::open`] marks it lost.
+fn insert_running_row(state_dir: &std::path::Path) -> u64 {
+    std::fs::create_dir_all(state_dir).unwrap();
+    let store = fleet_node::store::Store::open(&state_dir.join("state.db")).unwrap();
+    store
+        .insert_agent(&fleet_node::store::NewAgent {
+            program: "/bin/sh".into(),
+            args: vec![],
+            cwd: "/".into(),
+            created_unix_ms: 1,
+            scrollback_path: String::new(),
+            labels: Labels::new(),
+        })
+        .unwrap()
+}
+
 #[test]
 fn forget_removes_lost_agent() {
     let dir = tempfile::tempdir().unwrap();
-    let id = {
-        let node = Node::open(dir.path()).unwrap();
-        let id = spawn_sh(&node, "exec sleep 100");
-        // Dropping the node without shutdown leaves the row `running`.
-        std::mem::forget(node);
-        id
-    };
+    let id = insert_running_row(dir.path());
     let node = Node::open(dir.path()).unwrap();
     let info = node
         .list()
@@ -159,6 +169,25 @@ fn forget_removes_lost_agent() {
     let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
     assert_eq!(out.forgotten, vec![id]);
     assert!(!ids(&node).contains(&id));
+}
+
+#[test]
+fn open_deletes_orphan_scrollback_rings() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = insert_running_row(dir.path());
+    let sb = dir.path().join("scrollback");
+    std::fs::create_dir_all(&sb).unwrap();
+    let kept_ring = sb.join(format!("{kept}.ring"));
+    let orphan = sb.join(format!("{}.ring", kept + 41));
+    let other = sb.join("notes.txt");
+    for f in [&kept_ring, &orphan, &other] {
+        std::fs::write(f, b"secret output").unwrap();
+    }
+    let node = Node::open(dir.path()).unwrap();
+    assert!(kept_ring.exists(), "a ring with a store row is kept");
+    assert!(!orphan.exists(), "a ring without a store row is deleted");
+    assert!(other.exists(), "files that are not rings are left alone");
+    drop(node);
 }
 
 fn wait_exited(exits: &mut tokio::sync::broadcast::Receiver<fleet_proto::AgentExited>, id: u64) {

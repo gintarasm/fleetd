@@ -1417,6 +1417,34 @@ fn prune_history_dirs(dir: &Path, keep: &HashSet<u64>) -> io::Result<()> {
     Ok(())
 }
 
+/// Deletes the `<id>.ring` files under `dir` whose id has no store row (a
+/// forget or restart that failed to delete it, or a crash in between): rings
+/// hold raw output, which may contain secrets.
+fn prune_orphan_rings(dir: &Path, rows: &HashSet<u64>) -> io::Result<()> {
+    let mut pruned = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let id = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".ring"))
+            .and_then(|n| n.parse::<u64>().ok());
+        if id.is_some_and(|id| !rows.contains(&id)) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => pruned += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(path = ?entry.path(), error = %e, "removing orphan scrollback failed")
+                }
+            }
+        }
+    }
+    if pruned > 0 {
+        info!(rings = pruned, "deleted scrollback of unknown agents");
+    }
+    Ok(())
+}
+
 /// The agents whose history [`Node::open`] keeps: running ones and the
 /// [`RETAINED_EXITED`] most recently created others.
 fn retained_history(records: &[AgentRecord]) -> HashSet<u64> {
@@ -1645,7 +1673,8 @@ impl Node {
     /// Opens the node's state under `state_dir` (`state.db`, `scrollback/`,
     /// `history/`), marks agents left running by a previous daemon as lost
     /// and deletes the history of all but the [`RETAINED_EXITED`] most
-    /// recently created of them.
+    /// recently created of them, and the scrollback rings of agents with no
+    /// store row.
     pub fn open(state_dir: &Path) -> io::Result<Node> {
         let scrollback_dir = state_dir.join("scrollback");
         let history_dir = state_dir.join("history");
@@ -1660,6 +1689,7 @@ impl Node {
         // A corrupt row's history is not kept (its id is unknown).
         let (records, _) = store.list_agents_lossy_unlabeled().map_err(store_err)?;
         prune_history_dirs(&history_dir, &retained_history(&records))?;
+        prune_orphan_rings(&scrollback_dir, &store.agent_ids().map_err(store_err)?)?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
