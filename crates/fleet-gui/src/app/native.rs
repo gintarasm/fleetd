@@ -1,9 +1,10 @@
 //! AppKit (objc2) calls for what gpui 0.2.2 does not offer: dragging the
-//! window by our own titlebar and the system accent colour. Main thread
-//! only; elsewhere, or without the event they need, they do nothing.
+//! window by our own titlebar, the system accent colour and the
+//! accessibility display settings. Main thread only; elsewhere, or without
+//! the event they need, they do nothing.
 
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSColor, NSColorSpace, NSEventType};
+use objc2_app_kit::{NSApplication, NSColor, NSColorSpace, NSEventType, NSWorkspace};
 
 /// Lets the window server move the window with the mouse, from the left
 /// mouse-down being handled (a press on the unified bar). The window
@@ -36,4 +37,11 @@ pub fn accent_color() -> Option<(f32, f32, f32)> {
         c(color.greenComponent()),
         c(color.blueComponent()),
     ))
+}
+
+/// System Settings › Accessibility › Display › Reduce transparency: the
+/// window is then opaque.
+pub fn reduce_transparency() -> bool {
+    MainThreadMarker::new().is_some()
+        && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency()
 }

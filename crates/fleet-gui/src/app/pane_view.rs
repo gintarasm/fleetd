@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
+    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
     InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, Subscription, UTF16Selection, Window, div,
@@ -772,6 +772,13 @@ impl Render for PaneView {
             .flex_col()
             .rounded(px(radius::LG))
             .overflow_hidden()
+            // A card lifted off the window's material.
+            .shadow(vec![BoxShadow {
+                color: theme.shadow,
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(space::XS),
+                spread_radius: px(0.),
+            }])
             .border_1()
             .border_color(if chrome.focused {
                 theme.accent.opacity(0.55)

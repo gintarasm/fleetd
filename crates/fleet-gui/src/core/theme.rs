@@ -170,6 +170,23 @@ impl Tokens {
         }
     }
 
+    /// These tokens for an opaque window (Reduce Transparency is on): the
+    /// window tint as it looks over a plain backdrop, and the cards and
+    /// sheets as they look over that.
+    pub fn opaque(self) -> Tokens {
+        let backdrop = match self.appearance {
+            Appearance::Dark => rgb(0x000000),
+            Appearance::Light => rgb(0xffffff),
+        };
+        let window = self.window.over(backdrop);
+        Tokens {
+            window,
+            card: self.card.over(window),
+            raised: self.raised.over(window),
+            ..self
+        }
+    }
+
     pub fn dark() -> Tokens {
         Tokens {
             appearance: Appearance::Dark,
@@ -279,6 +296,21 @@ mod tests {
             // paints the default background blends in.
             let p = t.palette.bg;
             assert_eq!((t.card.r, t.card.g, t.card.b), p);
+        }
+    }
+
+    #[test]
+    fn opaque_tokens_keep_the_look_without_alpha() {
+        for t in [Tokens::dark(), Tokens::light()] {
+            let o = t.opaque();
+            assert_eq!(o.window.a, 1.0);
+            assert_eq!(o.card.a, 1.0);
+            assert_eq!(o.raised.a, 1.0);
+            assert!(contrast(o.text, o.window) >= 4.5);
+            assert!(contrast(o.text, o.card) >= 7.0);
+            // Only the surfaces change.
+            assert_eq!(o.text, t.text);
+            assert_eq!(o.palette, t.palette);
         }
     }
 

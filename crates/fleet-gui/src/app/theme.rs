@@ -75,6 +75,11 @@ impl Theme {
         Theme::from_tokens(&Tokens::for_appearance(appearance_of(appearance)))
     }
 
+    /// For an opaque window (Reduce Transparency).
+    pub fn opaque_for_appearance(appearance: WindowAppearance) -> Self {
+        Theme::from_tokens(&Tokens::for_appearance(appearance_of(appearance)).opaque())
+    }
+
     /// This theme with `accent` (the user's system accent colour) for
     /// the accent and the selection tint.
     pub fn with_accent(mut self, accent: Hsla) -> Self {

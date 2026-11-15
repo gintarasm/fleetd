@@ -9,7 +9,8 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
     IntoElement, MouseButton, ParentElement, Pixels, Point, PromptButton, PromptLevel, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, anchored, deferred, div, point, px, relative, size,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, anchored, deferred, div, point, px,
+    relative, size,
 };
 
 use super::app_state::AppState;
@@ -62,6 +63,14 @@ pub fn open_main_window(cx: &mut App) {
             traffic_light_position: Some(point(px(lights.0), px(lights.1))),
         }),
         window_min_size: Some(size(px(640.), px(400.))),
+        // The desktop shows through, blurred, under the theme's window
+        // tint; Reduce Transparency keeps the window opaque (read when the
+        // window opens).
+        window_background: if native::reduce_transparency() {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            WindowBackgroundAppearance::Blurred
+        },
         ..Default::default()
     };
     let state = app.clone();
@@ -858,7 +867,11 @@ impl Render for Workspace {
 
 /// The theme for the window's appearance, in the user's accent colour.
 fn window_theme(window: &Window) -> Theme {
-    let theme = Theme::for_appearance(window.appearance());
+    let theme = if native::reduce_transparency() {
+        Theme::opaque_for_appearance(window.appearance())
+    } else {
+        Theme::for_appearance(window.appearance())
+    };
     match native::accent_color() {
         Some((r, g, b)) => theme.with_accent(gpui::Rgba { r, g, b, a: 1.0 }.into()),
         None => theme,
@@ -2102,9 +2115,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn bar_new_agent_button_opens_the_sheet_and_the_title_counts_agents(
-        cx: &mut TestAppContext,
-    ) {
+    fn bar_new_agent_button_opens_the_sheet_and_the_title_counts_agents(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(Fake::default());
         let mut s = setup(cx, &fake, dir.path());
