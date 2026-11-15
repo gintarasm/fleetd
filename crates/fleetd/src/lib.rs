@@ -325,6 +325,8 @@ impl Daemon {
         let node = Arc::new(node);
         let identity = handoff::Identity::current();
         let instance = identity.instance;
+        // What a restart with no binary named restarts onto.
+        let own_binary = identity.binary.path.clone();
         let server = Server::new(Arc::clone(&node), identity, restore);
         let restarts = server.restarts();
         // The restart whose binary is being checked.
@@ -347,7 +349,7 @@ impl Daemon {
                 // One restart at a time: the server refuses a second while
                 // one is pending.
                 req = restarts.next(), if check.is_none() => {
-                    check = restart::check(&restarts, req);
+                    check = restart::check(&restarts, req, &own_binary);
                 }
                 checked = async { check.as_mut().expect("guarded").await }, if check.is_some() => {
                     check = None;

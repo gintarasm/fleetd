@@ -145,7 +145,7 @@ enum DaemonCmd {
     },
     /// Restart fleetd into a new binary; running agents keep running
     Restart {
-        /// The fleetd binary to restart into (default: `fleetd` on the daemon's PATH)
+        /// The fleetd binary to restart into (default: the daemon's own binary, as now on disk)
         #[arg(long)]
         binary: Option<PathBuf>,
     },
@@ -269,9 +269,10 @@ fn binary_for_daemon(binary: &Path) -> String {
     binary.to_string_lossy().into_owned()
 }
 
-/// `fleet daemon restart`: asks the daemon to exec into `binary`, waits for
-/// whichever daemon answers next and reports what it says. Success goes to
-/// stdout, every other outcome to stderr with exit 1.
+/// `fleet daemon restart`: asks the daemon to exec into `binary` (none:
+/// the binary the daemon runs from, as rebuilt), waits for whichever daemon
+/// answers next and reports what it says. Success goes to stdout, every
+/// other outcome to stderr with exit 1.
 fn daemon_restart(client: Connection, sock: &Path, binary: Option<PathBuf>) -> Result<u8> {
     let binary = binary.map(|b| binary_for_daemon(&b)).unwrap_or_default();
     Ok(match restart_daemon(client, sock, "fleet", &binary)? {

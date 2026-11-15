@@ -340,21 +340,28 @@ fn is_child(pid: i32) -> bool {
     unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) == 0 }
 }
 
-/// Resolves the binary a restart asked for: empty means `fleetd` on the
-/// daemon's `PATH`; a name without `/` is looked up on `PATH`; a path is
-/// made absolute (against the daemon's working directory). Whether it is
-/// executable is the check's business. The `Err` is fit for the user.
-pub fn resolve_binary(binary: &str) -> Result<PathBuf, String> {
-    let name = if binary.is_empty() { "fleetd" } else { binary };
-    if name.contains('/') {
-        return std::path::absolute(name).map_err(|e| format!("{name}: {e}"));
+/// Resolves the binary a restart asked for: empty means `own`, the path of
+/// the binary this daemon runs (its [`Identity`](super::Identity)), so a
+/// file rebuilt or reinstalled at that path is what it restarts onto; a name
+/// without `/` is looked up on the daemon's `PATH`; any other path is made
+/// absolute (against the daemon's working directory: clients send absolute
+/// paths). Whether it is executable is the check's business: an `own` that
+/// no longer exists (or is unknown, empty) fails it, with no `PATH`
+/// fallback, as restarting onto some other build would be a surprise. The
+/// `Err` is fit for the user.
+pub fn resolve_binary(binary: &str, own: &str) -> Result<PathBuf, String> {
+    if binary.is_empty() {
+        return Ok(PathBuf::from(own));
+    }
+    if binary.contains('/') {
+        return std::path::absolute(binary).map_err(|e| format!("{binary}: {e}"));
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(binary))
         .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
-        .ok_or_else(|| format!("no {name} on the daemon's PATH"))
+        .ok_or_else(|| format!("no {binary} on the daemon's PATH"))
 }
 
 // Test hooks for the integration tests, read from the environment in debug

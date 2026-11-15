@@ -146,6 +146,55 @@ fn relative_binary_resolves_where_fleet_runs_not_where_the_daemon_does() {
 }
 
 #[test]
+fn no_binary_restarts_onto_the_daemons_own_path_as_rebuilt() {
+    use std::os::unix::fs::MetadataExt;
+    let bin_dir = TempDir::new().unwrap();
+    let own = bin_dir.path().join("fleetd");
+    fs::copy(fleetd_bin(), &own).unwrap();
+    let d = Daemon::start_from(&own);
+    let id = text(&fleet(d.dir.path(), &["spawn", "--", "cat"]).stdout);
+    // A different build lands at the daemon's path (a new file there).
+    let next = bin_dir.path().join("fleetd.new");
+    fs::copy(fleetd_bin(), &next).unwrap();
+    fs::rename(&next, &own).unwrap();
+    let rebuilt = fs::metadata(&own).unwrap().ino();
+    // macOS scans a new executable on its first run, which under load can
+    // outlast the daemon's 2 s check: run it once first.
+    let warm = Command::new(&own).arg("--handoff-check").output().unwrap();
+    assert!(warm.status.success());
+
+    let out = fleet(d.dir.path(), &["daemon", "restart"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "fleetd restarted: 1 agents kept\n");
+    assert_eq!(running_ino(d.dir.path()), rebuilt);
+    let ls = text(&fleet(d.dir.path(), &["ls"]).stdout);
+    let row: Vec<_> = ls.lines().nth(1).unwrap().split_whitespace().collect();
+    assert_eq!(&row[..2], [id.trim(), "running"], "{ls}");
+}
+
+/// The inode of the binary the daemon on `dir` reports it runs.
+fn running_ino(dir: &Path) -> u64 {
+    let mut s = std::os::unix::net::UnixStream::connect(dir.join("fleetd.sock")).unwrap();
+    let mut out = BytesMut::new();
+    let hello = Frame::Hello(fleet_proto::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client: "restart-test".into(),
+    });
+    FrameCodec::default().encode(hello, &mut out).unwrap();
+    s.write_all(&out).unwrap();
+    let mut buf = BytesMut::new();
+    loop {
+        if let Some(Frame::HelloOk(ok)) = FrameCodec::default().decode(&mut buf).unwrap() {
+            return ok.binary.expect("binary identity").ino;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "the daemon closed the handshake");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+#[test]
 fn failing_binary_is_refused_and_the_old_daemon_serves() {
     let d = Daemon::start();
     let bin = script(d.dir.path(), "bad", "exit 3");

@@ -330,6 +330,11 @@ impl Client {
             binary: binary.to_string_lossy().into_owned(),
         }))
     }
+
+    /// Asks for a restart naming no binary: onto the daemon's own path.
+    fn restart_daemon_onto_itself(&mut self) -> u64 {
+        self.send(request::Kind::RestartDaemon(RestartDaemon::default()))
+    }
 }
 
 fn fleetd() -> &'static Path {
@@ -410,6 +415,15 @@ fn assert_gone(pid: i32) {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ESRCH)
     );
+}
+
+/// Runs `binary --handoff-check` once (see its callers).
+fn warm_up(binary: &Path) {
+    let out = Command::new(binary)
+        .arg("--handoff-check")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
 }
 
 /// The agent's state as the store on disk has it.
@@ -742,4 +756,39 @@ fn panic_opening_the_handoff_ends_every_agent() {
         let state = stored_state(daemon.path(), id);
         assert_ne!(state, fleet_node::store::AgentState::Running, "agent {id}");
     }
+}
+
+#[test]
+fn no_binary_named_restarts_onto_the_daemons_own_path_rebuilt() {
+    use std::os::unix::fs::MetadataExt;
+    let bin_dir = tempfile::tempdir().unwrap();
+    let own = bin_dir.path().join("fleetd");
+    fs::copy(fleetd(), &own).unwrap();
+    let daemon = Daemon::start_from(&own, &[]);
+    let (mut c, hello) = daemon.connect();
+    let shell = c.sh(SHELL);
+    let started_from = hello.binary.as_deref().expect("binary identity").ino;
+    assert_eq!(started_from, fs::metadata(&own).unwrap().ino());
+
+    // A new build replaces the file at that path (a new inode).
+    let next = bin_dir.path().join("fleetd.new");
+    fs::copy(fleetd(), &next).unwrap();
+    fs::rename(&next, &own).unwrap();
+    let rebuilt = fs::metadata(&own).unwrap().ino();
+    assert_ne!(rebuilt, started_from);
+    // macOS scans a new executable on its first run, which under load can
+    // outlast the 2 s check: run it once first.
+    warm_up(&own);
+
+    let id = c.restart_daemon_onto_itself();
+    assert_eq!(restarting_agents(c.response(id)), 1);
+    let (mut c, after) = daemon.reconnect_new(hello.instance);
+    assert_eq!(after.binary.as_deref().unwrap().ino, rebuilt);
+    assert_eq!(after.restore.as_deref().unwrap().kept, vec![shell]);
+
+    // Its path gone: refused, no fallback to `fleetd` on PATH.
+    fs::remove_file(&own).unwrap();
+    let id = c.restart_daemon_onto_itself();
+    let e = error_message(c.response(id));
+    assert_eq!(e, "not an executable file");
 }

@@ -186,18 +186,21 @@ mod tests {
 
     #[test]
     fn binaries_resolve_by_path_or_on_path() {
+        let own = "/opt/own/fleetd";
         assert_eq!(
-            resolve_binary("/opt/x/fleetd").unwrap(),
+            resolve_binary("/opt/x/fleetd", own).unwrap(),
             Path::new("/opt/x/fleetd")
         );
-        assert!(resolve_binary("rel/fleetd").unwrap().is_absolute());
+        assert!(resolve_binary("rel/fleetd", own).unwrap().is_absolute());
         // `sh` is on every PATH the tests run with.
-        let sh = resolve_binary("sh").unwrap();
+        let sh = resolve_binary("sh", own).unwrap();
         assert!(sh.is_absolute() && sh.ends_with("sh"));
         assert_eq!(
-            resolve_binary("no-such-fleetd-binary").unwrap_err(),
+            resolve_binary("no-such-fleetd-binary", own).unwrap_err(),
             "no no-such-fleetd-binary on the daemon's PATH"
         );
+        // Empty: the daemon's own binary, never `fleetd` on PATH.
+        assert_eq!(resolve_binary("", own).unwrap(), Path::new(own));
     }
 
     #[test]

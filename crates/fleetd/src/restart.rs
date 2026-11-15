@@ -132,11 +132,16 @@ impl Drop for HandedAgents {
     }
 }
 
-/// Resolves the restart's binary and checks it with `--handoff-check` on
-/// a blocking thread (the serve loop accepts meanwhile); `None` if it was
-/// refused at once.
-pub(crate) fn check(restarts: &Restarts, req: RestartRequest) -> Option<JoinHandle<Checked>> {
-    let binary = match handoff::resolve_binary(&req.binary) {
+/// Resolves the restart's binary (none named: `own_binary`, the path this
+/// daemon runs from) and checks it with `--handoff-check` on a blocking
+/// thread (the serve loop accepts meanwhile); `None` if it was refused at
+/// once.
+pub(crate) fn check(
+    restarts: &Restarts,
+    req: RestartRequest,
+    own_binary: &str,
+) -> Option<JoinHandle<Checked>> {
+    let binary = match handoff::resolve_binary(&req.binary, own_binary) {
         Ok(binary) => binary,
         Err(reason) => {
             refuse(restarts, req.reply, &reason);
