@@ -59,7 +59,7 @@ use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
 use bytes::{Bytes, BytesMut};
-use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AttachOk, SpawnAgent};
+use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AgentRemoved, AttachOk, SpawnAgent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -1382,9 +1382,9 @@ impl Histories {
     }
 
     /// Closes and deletes the agent's history.
-    fn delete(&mut self, id: u64) {
+    fn delete(&mut self, id: u64, reason: &str) {
         self.open.retain(|(i, _)| *i != id);
-        debug!(agent = id, "deleting history: beyond retention");
+        debug!(agent = id, reason, "deleting history");
         remove_history_dir(&self.path(id));
     }
 }
@@ -1415,6 +1415,48 @@ fn prune_history_dirs(dir: &Path, keep: &HashSet<u64>) -> io::Result<()> {
         info!(agents = pruned, "deleted history beyond retention");
     }
     Ok(())
+}
+
+/// Deletes the `<id>.ring` files under `dir` whose id has no store row (a
+/// forget or restart that failed to delete it, or a crash in between): rings
+/// hold raw output, which may contain secrets.
+fn prune_orphan_rings(dir: &Path, rows: &HashSet<u64>) -> io::Result<()> {
+    let entries = std::fs::read_dir(dir)?.map(|e| e.map(|e| e.path()));
+    prune_ring_paths(entries, rows);
+    Ok(())
+}
+
+/// [`prune_orphan_rings`] over `entries`, best effort: an unreadable entry
+/// is logged and skipped. Only canonical names (`7.ring`, not `007.ring`)
+/// are rings.
+fn prune_ring_paths(entries: impl IntoIterator<Item = io::Result<PathBuf>>, rows: &HashSet<u64>) {
+    let mut pruned = 0usize;
+    for entry in entries {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(error = %e, "reading a scrollback directory entry failed");
+                continue;
+            }
+        };
+        let id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".ring"))
+            .and_then(|n| n.parse::<u64>().ok().filter(|id| id.to_string() == n));
+        if id.is_some_and(|id| !rows.contains(&id)) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => pruned += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(path = ?path, error = %e, "removing orphan scrollback failed")
+                }
+            }
+        }
+    }
+    if pruned > 0 {
+        info!(rings = pruned, "deleted scrollback of unknown agents");
+    }
 }
 
 /// The agents whose history [`Node::open`] keeps: running ones and the
@@ -1476,7 +1518,7 @@ impl OutputSink for NodeSink {
         };
         drop(agents);
         if let Some(evicted) = evicted {
-            lock(&self.histories).delete(evicted);
+            lock(&self.histories).delete(evicted, "beyond retention");
         }
         // No receivers is fine.
         let _ = self.exits.send(AgentExited {
@@ -1495,6 +1537,7 @@ pub struct Node {
     store: Arc<Mutex<Store>>,
     agents: Arc<Mutex<Agents>>,
     exits: broadcast::Sender<AgentExited>,
+    removed: broadcast::Sender<Removed>,
     scrollback_dir: PathBuf,
     histories: Arc<Mutex<Histories>>,
     activity: Arc<ActivityHub>,
@@ -1509,6 +1552,68 @@ impl Drop for Node {
     }
 }
 
+/// An agent removed from the node, as announced by [`Node::removed_events`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Removed {
+    pub event: AgentRemoved,
+    /// The connection whose request caused the removal, if any.
+    pub origin: Option<ConnId>,
+}
+
+/// The result of [`Node::forget`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForgetOutcome {
+    pub forgotten: Vec<u64>,
+    /// Running, unknown or being-restarted agents, left untouched.
+    pub refused: Vec<u64>,
+}
+
+/// [`Node::forget`] failed: `partial` is what it did before the error
+/// (each id in `partial.forgotten` was removed and announced).
+#[derive(Debug)]
+pub struct ForgetError {
+    pub error: io::Error,
+    pub partial: ForgetOutcome,
+}
+
+impl std::fmt::Display for ForgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ForgetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<io::Error> for ForgetError {
+    fn from(error: io::Error) -> Self {
+        ForgetError {
+            error,
+            partial: ForgetOutcome::default(),
+        }
+    }
+}
+
+impl From<ForgetError> for io::Error {
+    fn from(e: ForgetError) -> Self {
+        e.error
+    }
+}
+
+/// The result of [`Node::restart`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestartOutcome {
+    /// The new agent.
+    pub info: AgentInfo,
+    /// The store recorded the new agent as replacing the old one: the old
+    /// one is forgotten and its [`Removed`] announced. `false` if recording
+    /// failed: both agents stay known and nothing is announced.
+    pub replaced: bool,
+}
+
 #[derive(Default)]
 struct Agents {
     /// Running agents.
@@ -1517,6 +1622,21 @@ struct Agents {
     exited: VecDeque<ExitedAgent>,
     /// Set by [`Node::shutdown`]: no new agents.
     closing: bool,
+    /// Agents being restarted ([`Node::restart`]): neither restarted again
+    /// nor forgotten meanwhile.
+    restarting: HashSet<u64>,
+}
+
+/// Removes an agent from [`Agents::restarting`] when the restart ends.
+struct Restarting<'a> {
+    agents: &'a Mutex<Agents>,
+    id: u64,
+}
+
+impl Drop for Restarting<'_> {
+    fn drop(&mut self) {
+        lock(self.agents).restarting.remove(&self.id);
+    }
 }
 
 impl Agents {
@@ -1567,7 +1687,8 @@ impl Node {
     /// Opens the node's state under `state_dir` (`state.db`, `scrollback/`,
     /// `history/`), marks agents left running by a previous daemon as lost
     /// and deletes the history of all but the [`RETAINED_EXITED`] most
-    /// recently created of them.
+    /// recently created of them, and the scrollback rings of agents with no
+    /// store row.
     pub fn open(state_dir: &Path) -> io::Result<Node> {
         let scrollback_dir = state_dir.join("scrollback");
         let history_dir = state_dir.join("history");
@@ -1582,13 +1703,16 @@ impl Node {
         // A corrupt row's history is not kept (its id is unknown).
         let (records, _) = store.list_agents_lossy_unlabeled().map_err(store_err)?;
         prune_history_dirs(&history_dir, &retained_history(&records))?;
+        prune_orphan_rings(&scrollback_dir, &store.agent_ids().map_err(store_err)?)?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
+        let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
         Ok(Node {
             host: Arc::new(PtyHost::new()),
             store: Arc::new(Mutex::new(store)),
             agents: Arc::new(Mutex::new(Agents::default())),
             exits,
+            removed,
             scrollback_dir,
             histories: Arc::new(Mutex::new(Histories {
                 dir: history_dir,
@@ -1612,6 +1736,12 @@ impl Node {
         self.exits.subscribe()
     }
 
+    /// Receives every agent removal ([`Node::forget`], [`Node::restart`])
+    /// from now on.
+    pub fn removed_events(&self) -> broadcast::Receiver<Removed> {
+        self.removed.subscribe()
+    }
+
     /// Receives agents' activity from now on: for each running agent with
     /// output, at most one event per [`ACTIVITY_TICK`] carrying its last
     /// non-blank visible row. Latest-value: a receiver that falls behind
@@ -1627,6 +1757,7 @@ impl Node {
     /// The labels must pass the label limits, without reserved keys.
     /// `req.attach` is ignored (see [`Node::spawn_attached`]).
     pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
+        check_labels(&req.labels)?;
         self.start(req, None).map(|(info, _)| info)
     }
 
@@ -1641,13 +1772,144 @@ impl Node {
         conn: ConnId,
         before_start: impl FnOnce(u64),
     ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
+        check_labels(&req.labels)?;
         let (info, attached) = self.start(req, Some((conn, Box::new(before_start))))?;
         let (ok, sub) = attached.expect("an attached start returns its attachment");
         Ok((info, ok, sub))
     }
 
+    /// Restarts an exited or lost agent: a new agent (new id) runs the same
+    /// program, args and cwd with the same labels, in a fresh environment
+    /// (the base env and its own `FLEET_AGENT_ID`; the old agent's env is
+    /// not kept). Once it started, the old agent is forgotten, recorded as
+    /// replaced by the new one, and a [`Removed`] is announced; if it fails
+    /// to start, the old agent is untouched. Running agents are refused,
+    /// never killed. `cols`/`rows` are as for [`Node::spawn`].
+    pub fn restart(
+        &self,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        origin: Option<ConnId>,
+    ) -> io::Result<RestartOutcome> {
+        self.restart_with(id, cols, rows, None, origin)
+            .map(|(out, _)| out)
+    }
+
+    /// [`Node::restart`], with the new agent attached by `conn` as for
+    /// [`Node::spawn_attached`]. The removal's origin is `conn`.
+    pub fn restart_attached(
+        &self,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        conn: ConnId,
+        before_start: impl FnOnce(u64),
+    ) -> io::Result<(RestartOutcome, AttachOk, Subscription)> {
+        let (out, attached) = self.restart_with(
+            id,
+            cols,
+            rows,
+            Some((conn, Box::new(before_start))),
+            Some(conn),
+        )?;
+        let (ok, sub) = attached.expect("an attached start returns its attachment");
+        Ok((out, ok, sub))
+    }
+
+    fn restart_with(
+        &self,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        attach: Option<(ConnId, BeforeStart<'_>)>,
+        origin: Option<ConnId>,
+    ) -> io::Result<(RestartOutcome, Option<(AttachOk, Subscription)>)> {
+        let (old, _restarting) = {
+            let mut agents = lock(&self.agents);
+            if agents.restarting.contains(&id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("agent {id} is being restarted"),
+                ));
+            }
+            // Under the agents lock, as in `forget`: an agent still `live`
+            // (its row may already say exited) or being spawned is running.
+            let busy =
+                agents.live.contains_key(&id) || lock(&self.histories).spawning.contains(&id);
+            let old = lock(&self.store).agent(id).map_err(store_err)?;
+            let old = match old {
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("unknown agent {id}"),
+                    ));
+                }
+                Some(rec) if busy || rec.state == store::AgentState::Running => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("agent {id} is running"),
+                    ));
+                }
+                Some(rec) => rec,
+            };
+            agents.restarting.insert(id);
+            (
+                old,
+                Restarting {
+                    agents: &self.agents,
+                    id,
+                },
+            )
+        };
+        // portable-pty starts a child whose cwd is gone in the home
+        // directory instead; a restart must run where the agent ran.
+        if !Path::new(&old.cwd).is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("working directory {} does not exist", old.cwd),
+            ));
+        }
+        // Stored labels were checked when set; not re-checked here.
+        let req = SpawnAgent {
+            program: old.program,
+            args: old.args,
+            cwd: old.cwd,
+            cols,
+            rows,
+            labels: old.labels,
+            env: HashMap::new(),
+            attach: false,
+        };
+        let (info, attached) = self.start(req, attach)?;
+        if let Err(e) = lock(&self.store).replace_agent(id, info.id) {
+            // Both agents stay known: never neither.
+            warn!(agent = id, replaced_by = info.id, error = %e, "recording the restart failed");
+            let out = RestartOutcome {
+                info,
+                replaced: false,
+            };
+            return Ok((out, attached));
+        }
+        self.drop_agent_files(id);
+        info!(agent = id, replaced_by = info.id, "agent restarted");
+        // No receivers is fine.
+        let _ = self.removed.send(Removed {
+            event: AgentRemoved {
+                agent_id: id,
+                replaced_by: Some(info.id),
+            },
+            origin,
+        });
+        let out = RestartOutcome {
+            info,
+            replaced: true,
+        };
+        Ok((out, attached))
+    }
+
     /// Spawns an agent; with `attach`, also attaches to it before the process
-    /// starts, calling `attach` with its id first.
+    /// starts, calling `attach` with its id first. The labels are not checked.
     fn start(
         &self,
         req: SpawnAgent,
@@ -1659,7 +1921,6 @@ impl Node {
         if req.program.is_empty() {
             return Err(invalid("program is empty".into()));
         }
-        check_labels(&req.labels)?;
         // Waits (bounded) for a login-env capture still running, before
         // anything is recorded.
         let base_env = self.base_env.wait();
@@ -1773,7 +2034,7 @@ impl Node {
         let mut histories = lock(&self.histories);
         histories.spawning.remove(&id);
         if let Some(evicted) = evicted {
-            histories.delete(evicted);
+            histories.delete(evicted, "beyond retention");
         }
         drop(histories);
         // Label keys only: values, args and env may hold secrets.
@@ -1817,6 +2078,97 @@ impl Node {
         let mut agents = self.list()?;
         agents.retain(|a| labels_match(&a.labels, selector));
         Ok(agents)
+    }
+
+    /// The replacement records: old agent id to the agent that replaced it.
+    pub fn replacements(&self) -> io::Result<HashMap<u64, u64>> {
+        lock(&self.store).replacements().map_err(store_err)
+    }
+
+    /// Forgets exited or lost agents: their record, history and scrollback
+    /// are deleted and a [`Removed`] is announced for each. Running and
+    /// unknown agents are refused, never killed. With `exited_only`, `ids`
+    /// must be empty and every non-running agent matching `selector` is
+    /// forgotten. A store error stops it; the [`ForgetError`] carries the
+    /// agents forgotten (and announced) before it.
+    pub fn forget(
+        &self,
+        ids: &[u64],
+        exited_only: bool,
+        selector: &Labels,
+        origin: Option<ConnId>,
+    ) -> Result<ForgetOutcome, ForgetError> {
+        let targets: Vec<u64> = if exited_only {
+            if !ids.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exited_only cannot be combined with agent ids",
+                )
+                .into());
+            }
+            self.list_matching(selector)?
+                .into_iter()
+                .filter(|a| a.state != fleet_proto::AgentState::Running as i32)
+                .map(|a| a.id)
+                .collect()
+        } else {
+            ids.to_vec()
+        };
+        let mut out = ForgetOutcome::default();
+        for id in targets {
+            // Under the agents lock, so an exit cannot retire the agent
+            // between the check and the delete: an agent still `live` (its
+            // row may already say exited while its pipeline finishes) or
+            // still being spawned is refused.
+            let agents = lock(&self.agents);
+            let busy = agents.live.contains_key(&id)
+                || agents.restarting.contains(&id)
+                || lock(&self.histories).spawning.contains(&id);
+            let gone = if busy {
+                Ok(false)
+            } else {
+                lock(&self.store).forget_agent(id)
+            };
+            drop(agents);
+            let gone = match gone {
+                Ok(gone) => gone,
+                Err(e) => {
+                    return Err(ForgetError {
+                        error: store_err(e),
+                        partial: out,
+                    });
+                }
+            };
+            if !gone {
+                out.refused.push(id);
+                continue;
+            }
+            self.drop_agent_files(id);
+            info!(agent = id, "agent forgotten");
+            // No receivers is fine.
+            let _ = self.removed.send(Removed {
+                event: AgentRemoved {
+                    agent_id: id,
+                    replaced_by: None,
+                },
+                origin,
+            });
+            out.forgotten.push(id);
+        }
+        Ok(out)
+    }
+
+    /// Drops everything the node keeps of a removed agent besides its row:
+    /// retained final screen, history, scrollback ring and activity sink.
+    fn drop_agent_files(&self, id: u64) {
+        lock(&self.agents).exited.retain(|a| a.id != id);
+        lock(&self.histories).delete(id, "agent removed");
+        match std::fs::remove_file(self.scrollback_dir.join(format!("{id}.ring"))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!(agent = id, error = %e, "removing agent scrollback failed"),
+        }
+        self.activity.sinks.forget(id);
     }
 
     /// Sets, then removes, labels of a known agent (running or not). Keys
@@ -2056,6 +2408,127 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruning_skips_unreadable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("7.ring");
+        std::fs::write(&orphan, b"secret output").unwrap();
+        let entries = vec![
+            Err(io::Error::other("unreadable entry")),
+            Ok(orphan.clone()),
+        ];
+        prune_ring_paths(entries, &HashSet::new());
+        assert!(!orphan.exists(), "later entries are still pruned");
+    }
+
+    #[test]
+    fn forget_refuses_agent_still_live_after_its_row_says_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let id = spawn_sized(&node, 80, 24).unwrap().id;
+        // The window in `on_exit`: row exited, agent not yet retired.
+        lock(&node.store).set_exited(id, 0).unwrap();
+        let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
+        assert_eq!(out.refused, vec![id]);
+        assert!(out.forgotten.is_empty());
+        assert!(node.list().unwrap().iter().any(|a| a.id == id));
+        node.shutdown();
+    }
+
+    #[test]
+    fn restart_refuses_agent_still_live_after_its_row_says_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let id = spawn_sized(&node, 80, 24).unwrap().id;
+        lock(&node.store).set_exited(id, 0).unwrap();
+        let e = node.restart(id, 0, 0, None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(node.list().unwrap().len(), 1);
+        node.shutdown();
+    }
+
+    #[test]
+    fn agent_being_restarted_is_neither_restarted_nor_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let id = spawn_sized(&node, 80, 24).unwrap().id;
+        node.kill(id).unwrap();
+        while node.list().unwrap()[0].state == fleet_proto::AgentState::Running as i32 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        lock(&node.agents).restarting.insert(id);
+        let e = node.restart(id, 0, 0, None).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
+        assert_eq!(out.refused, vec![id]);
+        lock(&node.agents).restarting.remove(&id);
+        assert!(node.restart(id, 0, 0, None).is_ok());
+        node.shutdown();
+    }
+
+    /// Runs `sql` on a second connection to the node's state DB (e.g. a
+    /// trigger that makes a store write fail).
+    fn inject(dir: &Path, sql: &str) {
+        rusqlite::Connection::open(dir.join("state.db"))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    /// An agent that ran and was retired (its exit event is sent after).
+    fn exited(node: &Node) -> u64 {
+        let mut exits = node.exit_events();
+        let id = spawn_sized(node, 80, 24).unwrap().id;
+        node.kill(id).unwrap();
+        while exits.blocking_recv().unwrap().agent_id != id {}
+        id
+    }
+
+    #[test]
+    fn restart_whose_record_fails_says_so_and_announces_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let old = exited(&node);
+        let mut removed = node.removed_events();
+        inject(
+            dir.path(),
+            "CREATE TRIGGER no_replace BEFORE INSERT ON agent_replacements \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        );
+        let out = node.restart(old, 0, 0, None).unwrap();
+        assert!(!out.replaced);
+        assert_ne!(out.info.id, old);
+        // Both agents stay known, and nobody is told the old one is gone.
+        let ids: Vec<u64> = node.list().unwrap().iter().map(|a| a.id).collect();
+        assert!(ids.contains(&old) && ids.contains(&out.info.id), "{ids:?}");
+        assert!(node.replacements().unwrap().is_empty());
+        assert!(removed.try_recv().is_err());
+        node.shutdown();
+    }
+
+    #[test]
+    fn forget_that_fails_midway_reports_what_it_forgot() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let (a, b, c) = (exited(&node), exited(&node), exited(&node));
+        inject(
+            dir.path(),
+            &format!(
+                "CREATE TRIGGER no_forget BEFORE DELETE ON agents WHEN OLD.id = {b} \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+            ),
+        );
+        let e = node
+            .forget(&[a, b, c], false, &Labels::new(), None)
+            .unwrap_err();
+        assert_eq!(e.partial.forgotten, vec![a]);
+        assert!(e.partial.refused.is_empty());
+        assert!(e.to_string().contains("injected"), "{e}");
+        let ids: Vec<u64> = node.list().unwrap().iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![b, c]);
+        node.shutdown();
+    }
 
     fn spawn_sized(node: &Node, cols: u32, rows: u32) -> io::Result<AgentInfo> {
         node.spawn(SpawnAgent {

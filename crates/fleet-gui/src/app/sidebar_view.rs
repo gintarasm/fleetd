@@ -1,6 +1,7 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
-//! directory, and "+ New agent" at the bottom. A click shows the agent in
-//! the focused pane; a right-click offers Kill and Open in new split.
+//! directory, "Clear exited" above them and "+ New agent" at the bottom.
+//! A click shows the agent in the focused pane; a right-click offers Open
+//! in new split, and Kill (running) or Restart and Remove (ended).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -8,8 +9,8 @@ use std::path::Path;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px,
+    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
 use super::tail_text::tail_text;
@@ -52,6 +53,38 @@ pub struct SidebarData<'a> {
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
     pub mark: &'a dyn Fn(u64) -> TabMark,
+    /// Exited or lost agents (what Clear exited removes).
+    pub ended: usize,
+}
+
+/// The Clear exited button's tooltip; `None` while it is disabled.
+pub fn clear_exited_tooltip(ended: usize) -> Option<String> {
+    match ended {
+        0 => None,
+        1 => Some("Remove 1 exited agent".to_owned()),
+        n => Some(format!("Remove {n} exited agents")),
+    }
+}
+
+/// A plain text tooltip.
+struct Tooltip {
+    text: SharedString,
+    theme: Theme,
+}
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(self.theme.dim_text)
+            .bg(self.theme.header_bg)
+            .text_color(self.theme.fg())
+            .text_size(px(12.))
+            .child(self.text.clone())
+    }
 }
 
 /// A tab's title: the agent's OSC title if a pane knows it, else the
@@ -106,6 +139,36 @@ pub fn render_sidebar(
         .hover(|s| s.bg(theme.header_bg).text_color(theme.fg()))
         .child("+ New agent")
         .on_click(cx.listener(|this, _, window, cx| this.open_new_agent(window, cx)));
+    let tooltip = clear_exited_tooltip(data.ended);
+    let enabled = tooltip.is_some();
+    let tooltip_theme = *theme;
+    let clear = div()
+        .id("clear-exited")
+        .debug_selector(|| "clear-exited".to_owned())
+        .px(px(6.))
+        .py(px(2.))
+        .rounded(px(4.))
+        .text_size(px(11.))
+        .text_color(theme.dim_text)
+        .child("Clear exited")
+        .when(!enabled, |s| s.opacity(0.4))
+        .when_some(tooltip, |s, text| {
+            let text = SharedString::from(text);
+            s.cursor_pointer()
+                .hover(|s| s.bg(theme.header_bg).text_color(theme.fg()))
+                .tooltip(move |_, cx| {
+                    let (text, theme) = (text.clone(), tooltip_theme);
+                    cx.new(|_| Tooltip { text, theme }).into()
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.clear_exited(cx)))
+        });
+    let header = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .justify_end()
+        .px(px(8.))
+        .child(clear);
     div()
         .flex()
         .flex_col()
@@ -115,6 +178,7 @@ pub fn render_sidebar(
         .py(px(8.))
         .text_color(theme.fg())
         .text_size(px(13.))
+        .child(header)
         .child(
             div()
                 .id("tabs")
@@ -219,7 +283,7 @@ fn one_line(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{program_name, state_mark};
+    use super::{clear_exited_tooltip, program_name, state_mark};
     use crate::core::session::AgentRow;
     use fleet_proto::{AgentInfo, AgentState};
 
@@ -234,6 +298,19 @@ mod tests {
             last_line: String::new(),
             last_output_unix_ms: None,
         }
+    }
+
+    #[test]
+    fn clear_exited_tooltip_counts_ended_agents() {
+        assert_eq!(clear_exited_tooltip(0), None);
+        assert_eq!(
+            clear_exited_tooltip(1).as_deref(),
+            Some("Remove 1 exited agent")
+        );
+        assert_eq!(
+            clear_exited_tooltip(3).as_deref(),
+            Some("Remove 3 exited agents")
+        );
     }
 
     #[test]

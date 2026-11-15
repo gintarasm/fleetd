@@ -1,12 +1,12 @@
 //! SQLite agent store (decision 0010): one WAL-mode DB per node.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -68,9 +68,34 @@ fn conversion_err(col: usize, e: Box<dyn std::error::Error + Send + Sync>) -> ru
     rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, e)
 }
 
+const AGENT_COLUMNS: &str = "SELECT id, program, args_json, cwd, state, exit_code, \
+     created_unix_ms, scrollback_path FROM agents";
+
+/// Decodes an `AGENT_COLUMNS` row, taking its labels out of `labels`.
+fn decode_agent(
+    r: &rusqlite::Row<'_>,
+    labels: &mut HashMap<u64, Labels>,
+) -> rusqlite::Result<AgentRecord> {
+    let args_json: String = r.get(2)?;
+    let state: String = r.get(4)?;
+    let id = r.get::<_, i64>(0)? as u64;
+    Ok(AgentRecord {
+        id,
+        program: r.get(1)?,
+        args: serde_json::from_str(&args_json).map_err(|e| conversion_err(2, Box::new(e)))?,
+        cwd: r.get(3)?,
+        state: AgentState::parse(&state)
+            .ok_or_else(|| conversion_err(4, format!("unknown state {state:?}").into()))?,
+        exit_code: r.get(5)?,
+        created_unix_ms: r.get(6)?,
+        scrollback_path: r.get(7)?,
+        labels: labels.remove(&id).unwrap_or_default(),
+    })
+}
+
 impl Store {
     /// Opens (creating with mode 0600 if new) the DB, enables WAL and
-    /// migrates to schema v2. Fails on a DB written by a newer schema.
+    /// migrates to schema v3. Fails on a DB written by a newer schema.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if !path.exists() {
             use std::os::unix::fs::OpenOptionsExt;
@@ -107,23 +132,14 @@ impl Store {
                 )),
             ));
         }
-        if version < 1 {
-            self.conn.execute_batch(
-                "BEGIN;
-                 CREATE TABLE agents (
-                     id INTEGER PRIMARY KEY,
-                     program TEXT NOT NULL,
-                     args_json TEXT NOT NULL,
-                     cwd TEXT NOT NULL,
-                     state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
-                     exit_code INTEGER,
-                     created_unix_ms INTEGER NOT NULL,
-                     scrollback_path TEXT NOT NULL
-                 );
-                 PRAGMA user_version = 1;
-                 COMMIT;",
-            )?;
+        if version == 0 {
+            // A new DB gets the v3 schema at once: replaying v1 -> v2 -> v3
+            // (a table rebuild) leaves ~1 MB of SQLite heap behind, which
+            // shows in the daemon's idle RSS.
+            return self.create_v3();
         }
+        // An existing DB is at v1 or later here (v1 created the `agents`
+        // table); it migrates in place.
         if version < 2 {
             self.conn.execute_batch(
                 "BEGIN;
@@ -137,7 +153,100 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 3 {
+            self.migrate_to_v3()?;
+        }
         Ok(())
+    }
+
+    /// The v3 schema for a new DB; the same tables the v1 -> v2 -> v3
+    /// migrations produce.
+    fn create_v3(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE agents (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 program TEXT NOT NULL,
+                 args_json TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
+                 exit_code INTEGER,
+                 created_unix_ms INTEGER NOT NULL,
+                 scrollback_path TEXT NOT NULL
+             );
+             CREATE TABLE agent_labels (
+                 agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (agent_id, key)
+             );
+             CREATE TABLE agent_replacements (
+                 old_id INTEGER PRIMARY KEY,
+                 new_id INTEGER NOT NULL
+             );
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )
+    }
+
+    /// v3: agent ids use AUTOINCREMENT so they are never reused, and
+    /// `agent_replacements` records restarted agents' successors. The table
+    /// rebuild needs foreign keys off (a no-op inside a transaction) so the
+    /// DROP does not cascade into `agent_labels`.
+    fn migrate_to_v3(&self) -> rusqlite::Result<()> {
+        self.conn.pragma_update(None, "foreign_keys", "OFF")?;
+        let result = self.rebuild_agents_v3();
+        let restore = self.conn.pragma_update(None, "foreign_keys", "ON");
+        result?;
+        restore
+    }
+
+    /// The `agents_v3` and `agent_replacements` DDL here must stay in sync
+    /// with `create_v3` (the schema-equality test compares the two).
+    fn rebuild_agents_v3(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        let run = || -> rusqlite::Result<()> {
+            self.conn.execute_batch(
+                "CREATE TABLE agents_v3 (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     program TEXT NOT NULL,
+                     args_json TEXT NOT NULL,
+                     cwd TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
+                     exit_code INTEGER,
+                     created_unix_ms INTEGER NOT NULL,
+                     scrollback_path TEXT NOT NULL
+                 );
+                 INSERT INTO agents_v3 SELECT * FROM agents;
+                 DROP TABLE agents;
+                 ALTER TABLE agents_v3 RENAME TO agents;
+                 CREATE TABLE agent_replacements (
+                     old_id INTEGER PRIMARY KEY,
+                     new_id INTEGER NOT NULL
+                 );",
+            )?;
+            let violations: i64 =
+                self.conn
+                    .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                        r.get(0)
+                    })?;
+            if violations > 0 {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                    Some("v3 migration left foreign key violations".into()),
+                ));
+            }
+            self.conn.execute_batch("PRAGMA user_version = 3")
+        };
+        // A failed COMMIT (e.g. SQLITE_BUSY) can leave the transaction open;
+        // roll it back like any other error so the connection is usable.
+        match run().and_then(|()| self.conn.execute_batch("COMMIT")) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Inserts a running agent and its labels, in one transaction.
@@ -232,6 +341,70 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes an agent that is not running (labels cascade) and any
+    /// replacement records pointing at it. `Ok(false)` if it is unknown or
+    /// running; nothing is deleted then.
+    pub fn forget_agent(&self, id: u64) -> rusqlite::Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let n = self.conn.execute(
+            "DELETE FROM agents WHERE id = ?1 AND state != 'running'",
+            (id as i64,),
+        )?;
+        if n == 1 {
+            self.conn.execute(
+                "DELETE FROM agent_replacements WHERE new_id = ?1",
+                (id as i64,),
+            )?;
+        }
+        tx.commit()?;
+        Ok(n == 1)
+    }
+
+    /// Records that `new` replaced `old`: deletes `old`, re-points anything
+    /// that pointed at `old` to `new` (chains collapse), in one transaction.
+    pub fn replace_agent(&self, old: u64, new: u64) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.conn
+            .execute("DELETE FROM agents WHERE id = ?1", (old as i64,))?;
+        self.conn.execute(
+            "UPDATE agent_replacements SET new_id = ?2 WHERE new_id = ?1",
+            (old as i64, new as i64),
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO agent_replacements (old_id, new_id) VALUES (?1, ?2)",
+            (old as i64, new as i64),
+        )?;
+        tx.commit()
+    }
+
+    /// Old agent id -> the agent that replaced it.
+    pub fn replacements(&self) -> rusqlite::Result<HashMap<u64, u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT old_id, new_id FROM agent_replacements")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.collect()
+    }
+
+    /// One agent with its labels; `None` if unknown.
+    pub fn agent(&self, id: u64) -> rusqlite::Result<Option<AgentRecord>> {
+        let rec = self
+            .conn
+            .query_row(
+                &format!("{AGENT_COLUMNS} WHERE id = ?1"),
+                (id as i64,),
+                |r| decode_agent(r, &mut HashMap::new()),
+            )
+            .optional()?;
+        let Some(mut rec) = rec else {
+            return Ok(None);
+        };
+        rec.labels = self.labels(id)?.unwrap_or_default();
+        Ok(Some(rec))
+    }
+
     /// running -> exited. Errors if the agent is unknown or not running.
     pub fn set_exited(&self, id: u64, code: i32) -> rusqlite::Result<()> {
         let n = self.conn.execute(
@@ -291,6 +464,13 @@ impl Store {
         Ok((good, bad))
     }
 
+    /// The id of every row, including rows that do not decode.
+    pub fn agent_ids(&self) -> rusqlite::Result<HashSet<u64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM agents")?;
+        let ids = stmt.query_map([], |r| r.get::<_, i64>(0).map(|id| id as u64))?;
+        ids.collect()
+    }
+
     /// Every agent's labels, by agent id.
     fn all_labels(&self) -> rusqlite::Result<HashMap<u64, Labels>> {
         let mut stmt = self
@@ -319,28 +499,8 @@ impl Store {
         } else {
             HashMap::new()
         };
-        let mut stmt = self.conn.prepare(
-            "SELECT id, program, args_json, cwd, state, exit_code, created_unix_ms, scrollback_path
-             FROM agents ORDER BY id",
-        )?;
-        let mut rows = stmt.query_map([], |r| {
-            let args_json: String = r.get(2)?;
-            let state: String = r.get(4)?;
-            let id = r.get::<_, i64>(0)? as u64;
-            Ok(AgentRecord {
-                id,
-                program: r.get(1)?,
-                args: serde_json::from_str(&args_json)
-                    .map_err(|e| conversion_err(2, Box::new(e)))?,
-                cwd: r.get(3)?,
-                state: AgentState::parse(&state)
-                    .ok_or_else(|| conversion_err(4, format!("unknown state {state:?}").into()))?,
-                exit_code: r.get(5)?,
-                created_unix_ms: r.get(6)?,
-                scrollback_path: r.get(7)?,
-                labels: labels.remove(&id).unwrap_or_default(),
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!("{AGENT_COLUMNS} ORDER BY id"))?;
+        let mut rows = stmt.query_map([], |r| decode_agent(r, &mut labels))?;
         collect(&mut rows)
     }
 
@@ -451,7 +611,7 @@ mod tests {
         let (_d, p, s) = open_tmp();
         drop(s);
         let _s = Store::open(&p).unwrap();
-        assert_eq!(user_version(&p), 2);
+        assert_eq!(user_version(&p), 3);
     }
 
     #[test]
@@ -460,7 +620,7 @@ mod tests {
         drop(s);
         Connection::open(&p)
             .unwrap()
-            .pragma_update(None, "user_version", 3)
+            .pragma_update(None, "user_version", 4)
             .unwrap();
         assert!(Store::open(&p).is_err());
     }
@@ -572,7 +732,7 @@ mod tests {
         drop(conn);
 
         let s = Store::open(&p).unwrap();
-        assert_eq!(user_version(&p), 2);
+        assert_eq!(user_version(&p), 3);
         let l = s.list_agents().unwrap();
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].program, "claude");
@@ -587,6 +747,212 @@ mod tests {
             s.list_agents().unwrap()[0].labels,
             labels(&[("project", "old")])
         );
+    }
+
+    #[test]
+    fn ids_are_not_reused_after_delete() {
+        let (_d, _p, s) = open_tmp();
+        s.insert_agent(&new_agent(1)).unwrap();
+        let b = s.insert_agent(&new_agent(2)).unwrap();
+        s.set_exited(b, 0).unwrap();
+        assert!(s.forget_agent(b).unwrap());
+        assert_eq!(s.insert_agent(&new_agent(3)).unwrap(), 3);
+    }
+
+    /// Columns, foreign keys and indexes of every table, for comparing schemas.
+    fn schema(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut out = Vec::new();
+        for table in [
+            "agents",
+            "agent_labels",
+            "agent_replacements",
+            "sqlite_sequence",
+        ] {
+            for pragma in ["table_info", "foreign_key_list", "index_list"] {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM pragma_{pragma}('{table}')"))
+                    .unwrap();
+                let n = stmt.column_count();
+                let rows = stmt
+                    .query_map([], |r| {
+                        (0..n)
+                            .map(|i| {
+                                r.get::<_, rusqlite::types::Value>(i)
+                                    .map(|v| format!("{v:?}"))
+                            })
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap();
+                for row in rows {
+                    out.push(format!("{table} {pragma} {}", row.unwrap().join(",")));
+                }
+            }
+        }
+        let autoinc: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'agents' AND sql LIKE '%AUTOINCREMENT%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        out.push(format!("agents autoincrement {autoinc}"));
+        // The full DDL (covers the CHECK constraint), normalised: SQLite
+        // quotes the name of a renamed table and keeps the original spacing.
+        for table in ["agents", "agent_labels", "agent_replacements"] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let sql = sql.replace(['"', '\''], "").replace("agents_v3", "agents");
+            let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push(format!("{table} sql {sql}"));
+        }
+        out
+    }
+
+    #[test]
+    fn new_database_is_created_at_v3_like_a_migrated_one() {
+        let (_d, fresh, s) = open_tmp();
+        assert_eq!(user_version(&fresh), 3);
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        s.set_exited(a, 0).unwrap();
+        assert!(s.forget_agent(a).unwrap());
+        let b = s.insert_agent(&new_agent(2)).unwrap();
+        assert_ne!(a, b, "a forgotten id is not reused");
+        s.set_exited(b, 0).unwrap();
+        let c = s.insert_agent(&new_agent(3)).unwrap();
+        s.replace_agent(b, c).unwrap();
+        assert_eq!(s.replacements().unwrap(), HashMap::from([(b, c)]));
+        drop(s);
+
+        // A v1 DB migrated through v2 to v3 has the same schema.
+        let dir = tempfile::tempdir().unwrap();
+        let migrated = dir.path().join("state.db");
+        Connection::open(&migrated)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE agents (
+                     id INTEGER PRIMARY KEY,
+                     program TEXT NOT NULL,
+                     args_json TEXT NOT NULL,
+                     cwd TEXT NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
+                     exit_code INTEGER,
+                     created_unix_ms INTEGER NOT NULL,
+                     scrollback_path TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(Store::open(&migrated).unwrap());
+        let fresh_schema = schema(&fresh);
+        assert!(
+            fresh_schema
+                .iter()
+                .any(|l| l.starts_with("agent_replacements table_info"))
+        );
+        assert!(fresh_schema.contains(&"agents autoincrement 1".to_string()));
+        assert_eq!(fresh_schema, schema(&migrated));
+    }
+
+    #[test]
+    fn v2_database_migrates_to_v3_keeping_rows_and_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.db");
+        let conn = Connection::open(&p).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE agents (
+                 id INTEGER PRIMARY KEY,
+                 program TEXT NOT NULL,
+                 args_json TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
+                 exit_code INTEGER,
+                 created_unix_ms INTEGER NOT NULL,
+                 scrollback_path TEXT NOT NULL
+             );
+             CREATE TABLE agent_labels (
+                 agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                 key TEXT NOT NULL,
+                 value TEXT NOT NULL,
+                 PRIMARY KEY (agent_id, key)
+             );
+             PRAGMA user_version = 2;
+             COMMIT;
+             INSERT INTO agents (id, program, args_json, cwd, state, exit_code, created_unix_ms, scrollback_path)
+             VALUES (7, 'claude', '[]', '/w', 'exited', 0, 42, '/sb/7.ring');
+             INSERT INTO agent_labels (agent_id, key, value) VALUES (7, 'project', 'x');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let s = Store::open(&p).unwrap();
+        assert_eq!(user_version(&p), 3);
+        assert_eq!(
+            s.agent(7).unwrap().unwrap().labels,
+            labels(&[("project", "x")])
+        );
+        let n: i64 = s
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let next = s.insert_agent(&new_agent(1)).unwrap();
+        assert_eq!(next, 8);
+        s.set_exited(next, 0).unwrap();
+        assert!(s.forget_agent(next).unwrap());
+        assert_eq!(s.insert_agent(&new_agent(2)).unwrap(), 9);
+    }
+
+    #[test]
+    fn forget_refuses_running() {
+        let (_d, _p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        assert!(!s.forget_agent(a).unwrap());
+        assert!(s.agent(a).unwrap().is_some());
+    }
+
+    #[test]
+    fn forget_unknown_is_false_and_lost_is_forgettable() {
+        let (_d, _p, s) = open_tmp();
+        assert!(!s.forget_agent(999).unwrap());
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        assert_eq!(s.mark_running_as_lost().unwrap(), 1);
+        assert!(s.forget_agent(a).unwrap());
+        assert!(s.agent(a).unwrap().is_none());
+    }
+
+    #[test]
+    fn replacement_chains_collapse() {
+        let (_d, _p, s) = open_tmp();
+        for n in 1..=3 {
+            s.insert_agent(&new_agent(n)).unwrap();
+        }
+        s.set_exited(1, 0).unwrap();
+        s.replace_agent(1, 2).unwrap();
+        s.set_exited(2, 0).unwrap();
+        s.replace_agent(2, 3).unwrap();
+        assert_eq!(s.replacements().unwrap(), HashMap::from([(1, 3), (2, 3)]));
+        assert!(s.agent(1).unwrap().is_none());
+        assert!(s.agent(2).unwrap().is_none());
+    }
+
+    #[test]
+    fn forgetting_a_successor_drops_its_replacements() {
+        let (_d, _p, s) = open_tmp();
+        s.insert_agent(&new_agent(1)).unwrap();
+        s.insert_agent(&new_agent(2)).unwrap();
+        s.set_exited(1, 0).unwrap();
+        s.replace_agent(1, 2).unwrap();
+        s.set_exited(2, 0).unwrap();
+        assert!(s.forget_agent(2).unwrap());
+        assert!(s.replacements().unwrap().is_empty());
     }
 
     #[test]

@@ -158,6 +158,12 @@ pub fn banner(chrome: &PaneChrome, state: PaneState) -> Option<String> {
     }
 }
 
+/// The exit banner offers Restart (as ⌘R does): the pane's agent exited
+/// or is gone.
+pub fn restartable(chrome: &PaneChrome, state: PaneState) -> bool {
+    chrome.has_agent && matches!(state, PaneState::Exited(_) | PaneState::Lost)
+}
+
 /// The text centred in a pane with no agent.
 pub fn empty_message(chrome: &PaneChrome) -> Option<&'static str> {
     match (chrome.has_agent, chrome.starting) {
@@ -193,6 +199,8 @@ pub enum PaneEvent {
     SplitDown,
     ToggleMaximize,
     Close,
+    /// The exit banner's Restart: the ended agent again, in this pane.
+    Restart,
 }
 
 impl EventEmitter<PaneEvent> for PaneView {}
@@ -687,18 +695,37 @@ impl Render for PaneView {
             .overflow_hidden()
             .child(element);
         if let Some(text) = banner(chrome, state) {
+            let number = chrome.number;
+            let restart = restartable(chrome, state).then(|| {
+                div()
+                    .id("restart")
+                    .debug_selector(move || format!("pane-{number}-restart"))
+                    .px(px(6.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(theme.dim_text)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.window_bg))
+                    .child("Restart")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Restart)))
+            });
             grid = grid.child(
                 div()
                     .absolute()
                     .top(px(4.))
                     .right(px(4.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
                     .px(px(8.))
                     .py(px(2.))
                     .rounded(px(4.))
                     .bg(theme.header_bg)
                     .text_color(theme.fg())
                     .text_size(px(12.))
-                    .child(SharedString::from(text)),
+                    .child(SharedString::from(text))
+                    .children(restart),
             );
         }
         if let Some(text) = empty_message(chrome) {

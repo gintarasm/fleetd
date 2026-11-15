@@ -838,6 +838,24 @@ mod tests {
         }
 
         fn kill(&self, _agent_id: u64) {}
+        fn restart(&self, _agent_id: u64) {}
+
+        fn restart_in_pane(
+            &self,
+            _pane: PaneId,
+            _agent_id: u64,
+            _cols: u16,
+            _rows: u16,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn forget(&self, _ids: Vec<u64>) {}
+        fn clear_exited(&self) {}
+
+        fn replaced(&self) -> std::collections::HashMap<u64, u64> {
+            std::collections::HashMap::new()
+        }
 
         fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
             self.calls

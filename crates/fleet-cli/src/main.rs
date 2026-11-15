@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fleet_proto::{AgentInfo, AgentState, KillAgent, ListAgents, SendInput, SetLabels, SpawnAgent};
+use fleet_proto::{
+    AgentInfo, AgentState, ForgetAgents, KillAgent, ListAgents, RestartAgent, SendInput, SetLabels,
+    SpawnAgent,
+};
 use fleet_proto::{request, response};
 
 use fleet_client::{Connection, Error, Result};
@@ -73,6 +76,24 @@ enum Command {
     Screen { id: u64 },
     /// Kill an agent
     Kill { id: u64 },
+    /// Restart an exited agent (same command, cwd and labels; new id). Its environment is not restored.
+    Restart {
+        id: u64,
+        /// Attach to the new agent
+        #[arg(long)]
+        attach: bool,
+    },
+    /// Remove exited or lost agents and their history
+    Rm {
+        /// Agents to remove (must be exited or lost)
+        ids: Vec<u64>,
+        /// Remove every exited or lost agent instead
+        #[arg(long, conflicts_with = "ids", required_unless_present = "ids")]
+        exited: bool,
+        /// With --exited: only agents with this label, as k=v
+        #[arg(long = "selector", value_name = "K=V", requires = "exited")]
+        selector: Vec<String>,
+    },
     /// Send text to an agent's terminal
     Send {
         id: u64,
@@ -194,6 +215,28 @@ fn print_table(agents: &[AgentInfo]) {
     }
 }
 
+/// An old daemon answers requests it does not know with "empty request".
+fn old_daemon(e: Error) -> Error {
+    match e {
+        Error::Server(m) if m == "empty request" => {
+            Error::Server("the daemon is too old to restart/remove agents".into())
+        }
+        e => e,
+    }
+}
+
+/// Attaches interactively; the exit code of `fleet attach`.
+fn attach_interactive(client: Connection, id: u64) -> Result<u8> {
+    Ok(match attach::run(client, id)? {
+        attach::Outcome::Lagged => {
+            eprintln!("fleet: output lagged behind; re-attach");
+            2
+        }
+        attach::Outcome::Signaled(sig) => 128 + sig as u8,
+        attach::Outcome::Exited | attach::Outcome::Detached => 0,
+    })
+}
+
 /// Exit code of a finished command.
 fn run(cli: Cli) -> Result<u8> {
     if let Command::Skill(args) = cli.command {
@@ -253,6 +296,56 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Kill { id } => {
             client.call(request::Kind::Kill(KillAgent { agent_id: id }))?;
         }
+        Command::Restart { id, attach } => {
+            let req = RestartAgent {
+                agent_id: id,
+                ..Default::default()
+            };
+            let new_id = match client
+                .call(request::Kind::Restart(req))
+                .map_err(old_daemon)?
+            {
+                response::Kind::Restarted(r) => {
+                    r.agent
+                        .ok_or_else(|| Error::Protocol("restart reply without agent".into()))?
+                        .id
+                }
+                _ => return Err(Error::Protocol("unexpected reply to restart".into())),
+            };
+            if !attach {
+                println!("{new_id}");
+            } else {
+                return attach_interactive(client, new_id);
+            }
+        }
+        Command::Rm {
+            ids,
+            exited,
+            selector,
+        } => {
+            let req = ForgetAgents {
+                ids,
+                exited_only: exited,
+                selector: parse_labels(&selector)?,
+            };
+            match client
+                .call(request::Kind::Forget(req))
+                .map_err(old_daemon)?
+            {
+                response::Kind::Forgotten(f) => {
+                    if exited {
+                        println!("removed {} agents", f.ids.len());
+                    }
+                    for id in &f.refused {
+                        eprintln!("fleet: agent {id} not removed (running or unknown)");
+                    }
+                    if !f.refused.is_empty() {
+                        return Ok(1);
+                    }
+                }
+                _ => return Err(Error::Protocol("unexpected reply to rm".into())),
+            }
+        }
         Command::Send { id, text, enter } => {
             let mut data = text.into_bytes();
             if enter {
@@ -264,14 +357,7 @@ fn run(cli: Cli) -> Result<u8> {
             id,
             snapshot_only: true,
         } => attach::snapshot_only(client, id)?,
-        Command::Attach { id, .. } => match attach::run(client, id)? {
-            attach::Outcome::Lagged => {
-                eprintln!("fleet: output lagged behind; re-attach");
-                return Ok(2);
-            }
-            attach::Outcome::Signaled(sig) => return Ok(128 + sig as u8),
-            attach::Outcome::Exited | attach::Outcome::Detached => {}
-        },
+        Command::Attach { id, .. } => return attach_interactive(client, id),
         Command::Logs { lines, follow } => logs(client, lines, follow)?,
         Command::Skill(_) => unreachable!("handled before connecting"),
     }

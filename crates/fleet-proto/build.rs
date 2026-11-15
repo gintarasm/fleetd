@@ -12,6 +12,7 @@ fn main() {
         .boxed(".fleet.v1.Response.kind.spawned")
         .boxed(".fleet.v1.Response.kind.attached")
         .boxed(".fleet.v1.Response.kind.spawned_attached")
+        .boxed(".fleet.v1.Response.kind.restarted")
         .compile_fds(fds)
         .expect("generate prost types");
     println!("cargo:rerun-if-changed=proto/fleet.proto");

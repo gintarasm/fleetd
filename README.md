@@ -168,6 +168,21 @@ fleet kill 1
 
 Sends SIGTERM to the agent's process group. There is no SIGKILL follow-up yet, so an agent that ignores SIGTERM keeps running until `fleetd` stops.
 
+### Restart and remove agents
+
+```sh
+fleet restart 1             # same program, args, cwd and labels, new id; the old agent is removed
+fleet restart 1 --attach    # and attach to the new one
+fleet rm 1 2                # forget exited or lost agents: list entry, history, scrollback
+fleet rm --exited           # forget every exited or lost agent
+fleet rm --exited --selector project=fleetd
+```
+
+- Only exited or lost agents can be restarted or removed; running ones are refused. `fleet rm` exits non-zero if any id was refused.
+- The environment given at spawn is not stored, so a restarted agent gets the daemon's base environment, not the original `--env`.
+- Ids are never reused.
+- An older daemon answers "the daemon is too old to restart/remove agents".
+
 ### Let agents use the fleet
 
 ```sh

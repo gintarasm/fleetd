@@ -39,6 +39,37 @@ pub struct SavedLayout {
     pub root: SavedNode,
 }
 
+impl SavedLayout {
+    /// Every leaf showing `old` shows `new` instead (an agent restarted or
+    /// removed while this layout was not loaded); `true` if any did.
+    pub fn replace_agent(&mut self, old: u64, new: Option<u64>) -> bool {
+        self.root.replace_agent(old, new)
+    }
+}
+
+impl SavedNode {
+    fn replace_agent(&mut self, old: u64, new: Option<u64>) -> bool {
+        // Iterative: a saved tree is read from disk and may be deep.
+        let mut changed = false;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                SavedNode::Leaf { agent, .. } => {
+                    if *agent == Some(old) {
+                        *agent = new;
+                        changed = true;
+                    }
+                }
+                SavedNode::Split { first, second, .. } => {
+                    stack.push(second);
+                    stack.push(first);
+                }
+            }
+        }
+        changed
+    }
+}
+
 impl Default for SavedLayout {
     fn default() -> Self {
         Layout::single().to_saved()
@@ -117,6 +148,21 @@ impl Node {
         match self {
             Node::Leaf { pane, agent } => (*pane == id).then_some(agent),
             Node::Split { first, second, .. } => first.leaf_mut(id).or_else(|| second.leaf_mut(id)),
+        }
+    }
+
+    fn replace_agent(&mut self, old: u64, new: Option<u64>, out: &mut Vec<PaneId>) {
+        match self {
+            Node::Leaf { pane, agent } => {
+                if *agent == Some(old) {
+                    *agent = new;
+                    out.push(*pane);
+                }
+            }
+            Node::Split { first, second, .. } => {
+                first.replace_agent(old, new, out);
+                second.replace_agent(old, new, out);
+            }
         }
     }
 
@@ -353,6 +399,14 @@ impl Layout {
         }
     }
 
+    /// Every pane showing `old` shows `new` instead (`None`: empty); returns
+    /// those panes, in tree order.
+    pub fn replace_agent(&mut self, old: u64, new: Option<u64>) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        self.root.replace_agent(old, new, &mut out);
+        out
+    }
+
     pub fn agent(&self, pane: PaneId) -> Option<u64> {
         self.root.leaf(pane).flatten()
     }
@@ -556,6 +610,51 @@ mod tests {
             first: Box::new(first),
             second: Box::new(second),
         }
+    }
+
+    #[test]
+    fn replace_agent_rewrites_every_leaf() {
+        let (mut l, [a, b, c, d]) = four();
+        l.set_agent(a, Some(5));
+        l.set_agent(c, Some(5));
+        l.set_agent(b, Some(6));
+        let mut changed = l.replace_agent(5, Some(9));
+        changed.sort_unstable_by_key(|p| p.0);
+        let mut want = vec![a, c];
+        want.sort_unstable_by_key(|p| p.0);
+        assert_eq!(changed, want);
+        assert_eq!(l.agent(a), Some(9));
+        assert_eq!(l.agent(c), Some(9));
+        assert_eq!(l.agent(b), Some(6));
+        assert_eq!(l.agent(d), None);
+    }
+
+    #[test]
+    fn replace_with_none_empties() {
+        let (mut l, [a, b, ..]) = four();
+        l.set_agent(a, Some(5));
+        l.set_agent(b, Some(6));
+        assert_eq!(l.replace_agent(5, None), vec![a]);
+        assert_eq!(l.agent(a), None);
+        assert_eq!(l.agent(b), Some(6));
+        assert!(l.replace_agent(5, None).is_empty());
+    }
+
+    #[test]
+    fn saved_layout_replace_agent() {
+        let (mut l, [a, b, c, _]) = four();
+        l.set_agent(a, Some(5));
+        l.set_agent(c, Some(5));
+        l.set_agent(b, Some(6));
+        let mut saved = l.to_saved();
+        assert!(saved.replace_agent(5, Some(9)));
+        let back = Layout::from_saved(&saved);
+        assert_eq!(back.agent(a), Some(9));
+        assert_eq!(back.agent(c), Some(9));
+        assert_eq!(back.agent(b), Some(6));
+        assert!(!saved.replace_agent(5, Some(9)));
+        assert!(saved.replace_agent(6, None));
+        assert_eq!(Layout::from_saved(&saved).agent(b), None);
     }
 
     #[test]

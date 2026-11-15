@@ -16,7 +16,8 @@ use super::app_state::AppState;
 use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
 use super::keymap::{
     ClosePane, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
-    FocusUp, Kill, NewAgent, SplitDown, SplitRight, ToggleMaximize,
+    FocusUp, Kill, NewAgent, Remove, Restart, RestartPane, SplitDown, SplitRight, ToggleMaximize,
+    WORKSPACE_CONTEXT,
 };
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
@@ -25,6 +26,7 @@ use super::theme::Theme;
 use crate::core::config::save_connection;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::session::PaneId;
+use crate::core::sidebar::ended;
 use crate::core::target::Target;
 
 /// Between pane cards, and around them.
@@ -70,6 +72,15 @@ struct RowMenu {
     at: Point<Pixels>,
 }
 
+/// An item of the row menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuItem {
+    OpenSplit,
+    Kill,
+    Restart,
+    Remove,
+}
+
 /// The window's root view, over [`AppState`].
 pub struct Workspace {
     app: Entity<AppState>,
@@ -80,8 +91,9 @@ pub struct Workspace {
     /// The [`AppState::session_epoch`] last seen; a change closes the
     /// new-agent sheet and the row menu.
     epoch: u64,
-    /// Focus-in and header-button subscriptions, by pane.
-    pane_focus: HashMap<PaneId, (EntityId, [Subscription; 2])>,
+    /// Each pane's view, its focus handle, and its focus-in and
+    /// header-button subscriptions.
+    pane_focus: HashMap<PaneId, (EntityId, FocusHandle, [Subscription; 2])>,
     /// The panes drawn by the last render.
     drawn: Vec<PaneId>,
     _subscriptions: Vec<Subscription>,
@@ -426,6 +438,35 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Restarts an ended agent from the row menu: no confirmation.
+    fn restart(&mut self, action: &Restart, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.app.read(cx).restart(action.agent_id);
+        cx.notify();
+    }
+
+    /// Forgets an ended agent from the row menu: no confirmation.
+    fn remove(&mut self, action: &Remove, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.app.read(cx).forget(action.agent_id);
+        cx.notify();
+    }
+
+    /// The sidebar's Clear exited: forgets every ended agent.
+    pub fn clear_exited(&mut self, cx: &mut Context<Self>) {
+        if self.app.read(cx).ended_count() > 0 {
+            self.app.read(cx).clear_exited();
+        }
+    }
+
+    /// ⌘R: restarts the focused pane's agent in place if it ended.
+    fn restart_pane(&mut self, _: &RestartPane, _: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        self.app.update(cx, |a, cx| a.restart_focused(cx));
+    }
+
     fn open_menu_split(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         if self
@@ -448,13 +489,20 @@ impl Workspace {
                 .filter_map(|p| Some((p, app.pane_view(p)?.clone())))
                 .collect()
         };
-        // A pane id can get a new view (closing the last pane replaces it):
-        // subscriptions follow the view, not the id.
-        self.pane_focus.retain(|p, (id, _)| {
-            views
+        // A pane id can get a new view (closing the last pane, or its
+        // agent removed): subscriptions follow the view, not the id, and
+        // the keyboard follows a focused view's replacement.
+        let mut refocus = false;
+        self.pane_focus.retain(|p, (id, handle, _)| {
+            let kept = views
                 .iter()
-                .any(|(pane, view)| pane == p && view.entity_id() == *id)
+                .any(|(pane, view)| pane == p && view.entity_id() == *id);
+            refocus |= !kept && handle.is_focused(window);
+            kept
         });
+        if refocus {
+            cx.defer_in(window, |this, window, cx| this.focus_current(window, cx));
+        }
         for (pane, view) in views {
             if self.pane_focus.contains_key(&pane) {
                 continue;
@@ -467,7 +515,7 @@ impl Workspace {
                 this.pane_event(pane, *event, window, cx);
             });
             self.pane_focus
-                .insert(pane, (view.entity_id(), [focus, events]));
+                .insert(pane, (view.entity_id(), handle, [focus, events]));
         }
     }
 
@@ -488,6 +536,7 @@ impl Workspace {
             PaneEvent::SplitDown => self.split(Axis::Vertical, window, cx),
             PaneEvent::ToggleMaximize => self.toggle_maximize(&ToggleMaximize, window, cx),
             PaneEvent::Close => self.close_pane(&ClosePane, window, cx),
+            PaneEvent::Restart => self.restart_pane(&RestartPane, window, cx),
         }
     }
 
@@ -541,6 +590,24 @@ impl Workspace {
         )
     }
 
+    /// The row menu's items for `agent_id`: Open in new split (while a
+    /// pane can be added), then Kill for a running agent, or Restart and
+    /// Remove for one that exited or is lost.
+    fn menu_items(&self, agent_id: u64, cx: &App) -> Vec<MenuItem> {
+        let app = self.app.read(cx);
+        let mut items = Vec::new();
+        if app.layout.panes().len() < MAX_PANES {
+            items.push(MenuItem::OpenSplit);
+        }
+        let is_ended = app.agents.iter().any(|r| r.info.id == agent_id && ended(r));
+        if is_ended {
+            items.extend([MenuItem::Restart, MenuItem::Remove]);
+        } else {
+            items.push(MenuItem::Kill);
+        }
+        items
+    }
+
     fn render_menu(
         &self,
         menu: &RowMenu,
@@ -548,10 +615,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let agent_id = menu.agent_id;
-        let can_split = self.app.read(cx).layout.panes().len() < MAX_PANES;
         let item = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
+                .debug_selector(move || format!("menu-{id}"))
                 .px(px(10.))
                 .py(px(4.))
                 .rounded(px(3.))
@@ -572,14 +639,28 @@ impl Workspace {
             .bg(theme.header_bg)
             .text_color(theme.fg())
             .text_size(px(13.));
-        if can_split {
-            items = items.child(item("open-split", "Open in new split").on_click(
-                cx.listener(move |this, _, window, cx| this.open_menu_split(agent_id, window, cx)),
-            ));
+        for entry in self.menu_items(agent_id, cx) {
+            let el =
+                match entry {
+                    MenuItem::OpenSplit => item("open-split", "Open in new split").on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_menu_split(agent_id, window, cx);
+                        }),
+                    ),
+                    MenuItem::Kill => {
+                        item("kill", "Kill").on_click(cx.listener(move |this, _, window, cx| {
+                            this.kill(&Kill { agent_id }, window, cx)
+                        }))
+                    }
+                    MenuItem::Restart => item("restart", "Restart").on_click(cx.listener(
+                        move |this, _, window, cx| this.restart(&Restart { agent_id }, window, cx),
+                    )),
+                    MenuItem::Remove => item("remove", "Remove").on_click(cx.listener(
+                        move |this, _, window, cx| this.remove(&Remove { agent_id }, window, cx),
+                    )),
+                };
+            items = items.child(el);
         }
-        items = items.child(item("kill", "Kill").on_click(
-            cx.listener(move |this, _, window, cx| this.kill(&Kill { agent_id }, window, cx)),
-        ));
         // A click anywhere else closes the menu.
         let backdrop = div()
             .id("menu-backdrop")
@@ -626,6 +707,7 @@ impl Render for Workspace {
             now_ms: now_ms(),
             titles: &titles,
             mark: &mark,
+            ended: rows.iter().filter(|r| ended(r)).count(),
         };
         let sidebar = render_sidebar(&data, &theme, cx);
         super::bench::sidebar_drawn(window);
@@ -696,6 +778,7 @@ impl Render for Workspace {
         });
         div()
             .id("workspace")
+            .key_context(WORKSPACE_CONTEXT)
             .size_full()
             .relative()
             .flex()
@@ -718,6 +801,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FocusPane4, w, cx| this.focus_number(4, w, cx)))
             .on_action(cx.listener(Self::new_agent))
             .on_action(cx.listener(Self::kill))
+            .on_action(cx.listener(Self::restart))
+            .on_action(cx.listener(Self::remove))
+            .on_action(cx.listener(Self::restart_pane))
             .child(sidebar)
             .child(panes)
             .children(toast)
@@ -743,16 +829,17 @@ mod tests {
     use fleet_term::Palette;
     use gpui::{
         AppContext, Entity, Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent,
-        TestAppContext, TouchPhase, VisualTestContext, point,
+        TestAppContext, TouchPhase, VisualTestContext, point, px,
     };
 
-    use super::Workspace;
+    use super::{MenuItem, Workspace};
     use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
     use crate::app::keymap::{Kill, bind_keys};
     use crate::app::pane_view::InputSink;
     use crate::app::sidebar_view::TabMark;
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
+    use crate::core::layout::Layout;
     use crate::core::pane::PaneModel;
     use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
     use crate::core::state::GuiState;
@@ -764,6 +851,14 @@ mod tests {
         Attach(PaneId, u64),
         Close(PaneId),
         Kill(u64),
+        Restart(u64),
+        RestartInPane {
+            pane: PaneId,
+            agent_id: u64,
+            size: (u16, u16),
+        },
+        Forget(Vec<u64>),
+        ClearExited,
         Spawn {
             program: String,
             args: Vec<String>,
@@ -781,6 +876,8 @@ mod tests {
         models: Mutex<HashMap<PaneId, Arc<Mutex<PaneModel>>>>,
         spawn_error: Mutex<Option<String>>,
         listed: std::sync::atomic::AtomicBool,
+        lists: std::sync::atomic::AtomicU64,
+        replaced: Mutex<HashMap<u64, u64>>,
     }
 
     impl Fake {
@@ -810,6 +907,10 @@ mod tests {
             self.listed.load(std::sync::atomic::Ordering::SeqCst)
         }
 
+        fn lists(&self) -> u64 {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn spawn(
             &self,
             program: String,
@@ -836,6 +937,37 @@ mod tests {
             self.calls.lock().unwrap().push(Call::Kill(agent_id));
         }
 
+        fn restart(&self, agent_id: u64) {
+            self.calls.lock().unwrap().push(Call::Restart(agent_id));
+        }
+
+        fn restart_in_pane(
+            &self,
+            pane: PaneId,
+            agent_id: u64,
+            cols: u16,
+            rows: u16,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push(Call::RestartInPane {
+                pane,
+                agent_id,
+                size: (cols, rows),
+            });
+            Ok(())
+        }
+
+        fn forget(&self, ids: Vec<u64>) {
+            self.calls.lock().unwrap().push(Call::Forget(ids));
+        }
+
+        fn clear_exited(&self) {
+            self.calls.lock().unwrap().push(Call::ClearExited);
+        }
+
+        fn replaced(&self) -> HashMap<u64, u64> {
+            self.replaced.lock().unwrap().clone()
+        }
+
         fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
             self.calls.lock().unwrap().push(Call::Open(pane, agent_id));
             let model = Arc::new(Mutex::new(PaneModel::new(Theme::dark().palette)));
@@ -855,6 +987,15 @@ mod tests {
         }
 
         fn set_palette(&self, _palette: Palette) {}
+    }
+
+    fn ended(id: u64, cwd: &str, created: i64, state: AgentState) -> AgentRow {
+        let mut r = row(id, cwd, created);
+        r.info.set_state(state);
+        if state == AgentState::Exited {
+            r.info.exit_code = Some(3);
+        }
+        r
     }
 
     fn row(id: u64, cwd: &str, created: i64) -> AgentRow {
@@ -1577,5 +1718,352 @@ mod tests {
         });
         assert!(f, "pane 2 focused by the click");
         assert_eq!(marks(&mut s).get(&8), Some(&TabMark::Focused));
+    }
+
+    fn drawn(s: &mut Setup<'_>, selector: &'static str) -> bool {
+        s.cx.run_until_parked();
+        s.cx.debug_bounds(selector).is_some()
+    }
+
+    fn open_menu(s: &mut Setup<'_>, agent_id: u64) {
+        s.ws.update(s.cx, |ws, cx| {
+            ws.open_row_menu(agent_id, point(px(20.), px(20.)), cx)
+        });
+        s.cx.run_until_parked();
+    }
+
+    fn shown(s: &mut Setup<'_>, pane: PaneId) -> Option<u64> {
+        s.app.read_with(s.cx, |a, _| a.layout().agent(pane))
+    }
+
+    #[gpui::test]
+    fn row_menu_offers_restart_and_remove_for_exited(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                row(7, "/w", 1),
+                ended(8, "/w", 2, AgentState::Exited),
+                ended(6, "/w", 3, AgentState::Lost),
+            ],
+        );
+        // Drawn bounds outlive a frame in gpui's test window, so absence is
+        // checked as the menu lists its items, presence also as drawn.
+        let items = |s: &mut Setup<'_>, id: u64| s.ws.read_with(s.cx, |w, cx| w.menu_items(id, cx));
+        assert_eq!(items(&mut s, 7), [MenuItem::OpenSplit, MenuItem::Kill]);
+        open_menu(&mut s, 7);
+        assert!(drawn(&mut s, "menu-open-split") && drawn(&mut s, "menu-kill"));
+        for id in [8, 6] {
+            assert_eq!(
+                items(&mut s, id),
+                [MenuItem::OpenSplit, MenuItem::Restart, MenuItem::Remove]
+            );
+        }
+        open_menu(&mut s, 6);
+        assert!(drawn(&mut s, "menu-restart") && drawn(&mut s, "menu-remove"));
+        // Restart asks for nothing: it goes out at once and closes the menu.
+        click(&mut s, "menu-restart");
+        assert!(!s.cx.has_pending_prompt());
+        assert_eq!(fake.calls().last(), Some(&Call::Restart(6)));
+        assert!(s.ws.read_with(s.cx, |w, _| w.menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn remove_calls_forget(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![ended(8, "/w", 2, AgentState::Exited)]);
+        open_menu(&mut s, 8);
+        click(&mut s, "menu-remove");
+        assert!(!s.cx.has_pending_prompt());
+        assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![8])));
+        assert!(s.ws.read_with(s.cx, |w, _| w.menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn cmd_r_restarts_exited_pane_in_place(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        let restarts = |f: &Fake| {
+            f.calls()
+                .into_iter()
+                .filter(|c| matches!(c, Call::RestartInPane { .. }))
+                .collect::<Vec<_>>()
+        };
+        // Live: cmd-r does nothing, and there is no Restart button.
+        s.cx.simulate_keystrokes("cmd-r");
+        assert!(restarts(&fake).is_empty());
+        assert!(!drawn(&mut s, "pane-1-restart"));
+
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("cmd-r");
+        let size = s.app.read_with(s.cx, |a, cx| {
+            a.pane_view(PaneId(1)).unwrap().read(cx).grid().unwrap()
+        });
+        let want = Call::RestartInPane {
+            pane: PaneId(1),
+            agent_id: 5,
+            size,
+        };
+        assert_eq!(restarts(&fake), std::slice::from_ref(&want));
+        // The exit banner's button does the same.
+        click(&mut s, "pane-1-restart");
+        assert_eq!(restarts(&fake), [want.clone(), want]);
+
+        // The pane started the new agent itself: it is not attached again
+        // when the control connection names the successor.
+        s.ui.try_send(UiEvent::AgentRemoved {
+            agent_id: 5,
+            replaced_by: Some(9),
+        })
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+        assert!(!fake.calls().contains(&Call::Attach(PaneId(1), 9)));
+        // Output from the old agent before the reply does not revert it.
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
+    /// Pane 1 shows agent 5, exited, and cmd-r restarts it in place.
+    fn restart_in_pane_1(s: &mut Setup<'_>, fake: &Fake) {
+        agents(s, fake, vec![ended(5, "/w", 1, AgentState::Exited)]);
+        click(s, "tab-5");
+        attach_model(fake, PaneId(1), 5);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("cmd-r");
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| matches!(c, Call::RestartInPane { agent_id: 5, .. }))
+        );
+    }
+
+    #[gpui::test]
+    fn pane_whose_restart_reply_was_lost_attaches_the_successor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        restart_in_pane_1(&mut s, &fake);
+        // The control connection names the successor; the pane expects its
+        // own reply to show it, so nothing attaches yet.
+        s.ui.try_send(UiEvent::AgentRemoved {
+            agent_id: 5,
+            replaced_by: Some(9),
+        })
+        .unwrap();
+        s.cx.run_until_parked();
+        assert!(!fake.calls().contains(&Call::Attach(PaneId(1), 9)));
+        // That reply was lost with the pane's connection.
+        s.ui.try_send(UiEvent::LaunchDropped(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::Attach(PaneId(1), 9)));
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
+    #[gpui::test]
+    fn pane_whose_restart_reply_was_lost_follows_a_later_successor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        restart_in_pane_1(&mut s, &fake);
+        let attaches = |f: &Fake| {
+            f.calls()
+                .into_iter()
+                .filter(|c| matches!(c, Call::Attach(PaneId(1), _)))
+                .count()
+        };
+        let before = attaches(&fake);
+        // The reply is lost before the successor is announced: the pane
+        // shows the agent its layout names again...
+        s.ui.try_send(UiEvent::LaunchDropped(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::Attach(PaneId(1), 5)));
+        assert_eq!(attaches(&fake), before + 1);
+        // ...and attaches the successor once it is.
+        s.ui.try_send(UiEvent::AgentRemoved {
+            agent_id: 5,
+            replaced_by: Some(9),
+        })
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::Attach(PaneId(1), 9)));
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
+    #[gpui::test]
+    fn agent_removed_moves_pane_to_successor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1), row(7, "/w", 2)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        s.cx.simulate_keystrokes("cmd-d");
+        click(&mut s, "tab-7");
+        s.ui.try_send(UiEvent::AgentRemoved {
+            agent_id: 5,
+            replaced_by: Some(9),
+        })
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+        assert_eq!(shown(&mut s, PaneId(2)), Some(7));
+        assert!(fake.calls().contains(&Call::Attach(PaneId(1), 9)));
+        // Output from the old agent before the attach does not revert it.
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+        s.cx.executor().advance_clock(SAVE_DEBOUNCE);
+        s.cx.run_until_parked();
+        let saved = s.app.read_with(s.cx, |a, _| a.layout().to_saved());
+        assert_eq!(GuiState::load(dir.path()).layouts["local"], saved);
+        assert_eq!(Layout::from_saved(&saved).agent(PaneId(1)), Some(9));
+
+        // Forgotten: the pane is emptied, on a fresh connection.
+        s.ui.try_send(UiEvent::AgentRemoved {
+            agent_id: 7,
+            replaced_by: None,
+        })
+        .unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s, PaneId(2)), None);
+        assert_eq!(fake.calls().last(), Some(&Call::Open(PaneId(2), None)));
+        // The focused pane keeps the keyboard though its view was replaced.
+        let app = s.app.clone();
+        let has_focus = s.cx.update(|window, cx| {
+            let view = app.read(cx).pane_view(PaneId(2)).unwrap().clone();
+            view.read(cx).focus_handle().is_focused(window)
+        });
+        assert!(has_focus);
+    }
+
+    #[gpui::test]
+    fn list_follows_replacement_into_layout(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1), row(6, "/w", 2)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        s.cx.simulate_keystrokes("cmd-d");
+        click(&mut s, "tab-6");
+        // Agent 6 is gone from the node (a lost attach), 5 was restarted
+        // as 9 while the GUI did not hear of it.
+        fake.model(PaneId(2)).lock().unwrap().on_lost();
+        *fake.replaced.lock().unwrap() = HashMap::from([(5, 9)]);
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        agents(&mut s, &fake, vec![row(9, "/w", 3)]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+        assert!(fake.calls().contains(&Call::Attach(PaneId(1), 9)));
+        assert_eq!(shown(&mut s, PaneId(2)), None);
+        assert_eq!(fake.calls().last(), Some(&Call::Open(PaneId(2), None)));
+    }
+
+    /// A `ListAgents` reply with `rows`.
+    fn list(s: &mut Setup<'_>, fake: &Fake, rows: Vec<AgentRow>) {
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        fake.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        agents(s, fake, rows);
+    }
+
+    #[gpui::test]
+    fn exited_pane_unlisted_by_two_lists_is_emptied(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        list(&mut s, &fake, vec![ended(8, "/w", 1, AgentState::Exited)]);
+        click(&mut s, "tab-8");
+        attach_model(&fake, PaneId(1), 8);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        // Agent 8 is forgotten while the GUI misses the `AgentRemoved`.
+        // One list without it might just predate it (a new agent that
+        // exited at once): the pane keeps its final screen...
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(8));
+        // ...as it does for events that are not lists.
+        agents(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(8));
+        // The next list confirms it is gone.
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), None);
+        assert_eq!(fake.calls().last(), Some(&Call::Open(PaneId(1), None)));
+    }
+
+    #[gpui::test]
+    fn exited_pane_listed_again_is_kept(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        list(&mut s, &fake, vec![]);
+        // A spawn lands and its agent exits before any list shows it.
+        spawn_via_sheet(&mut s, "/w");
+        attach_model(&fake, PaneId(1), 9);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(0);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+        list(&mut s, &fake, vec![]);
+        list(&mut s, &fake, vec![ended(9, "/w", 1, AgentState::Exited)]);
+        // Absent once, then listed: absent once more is not two in a row.
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
+    #[gpui::test]
+    fn unlisted_pane_with_a_restart_on_its_way_is_kept(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        list(&mut s, &fake, vec![ended(6, "/w", 1, AgentState::Lost)]);
+        s.app.update(s.cx, |a, cx| a.show_agent(6, cx));
+        fake.model(PaneId(1)).lock().unwrap().on_lost();
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("cmd-r");
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|c| matches!(c, Call::RestartInPane { agent_id: 6, .. }))
+        );
+        // Lists taken before the restart's successor is known.
+        list(&mut s, &fake, vec![]);
+        list(&mut s, &fake, vec![]);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(6));
+    }
+
+    #[gpui::test]
+    fn clear_exited_disabled_without_exited_rows(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        click(&mut s, "clear-exited");
+        assert!(!fake.calls().contains(&Call::ClearExited));
+        agents(
+            &mut s,
+            &fake,
+            vec![row(7, "/w", 1), ended(8, "/w", 2, AgentState::Exited)],
+        );
+        click(&mut s, "clear-exited");
+        assert!(!s.cx.has_pending_prompt());
+        assert_eq!(fake.calls().last(), Some(&Call::ClearExited));
     }
 }

@@ -67,6 +67,11 @@ pub fn handle(entry: StatusEntry, cx: &mut App) {
             show_window(cx);
             with_workspace(cx, |ws, window, cx| ws.open_new_agent(window, cx));
         }
+        StatusEntry::ClearExited => {
+            if let Some(app) = AppState::global(cx) {
+                app.read(cx).clear_exited();
+            }
+        }
         StatusEntry::SwitchFleetd => {
             set_accessory(false);
             switch_fleetd(cx);

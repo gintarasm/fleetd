@@ -26,6 +26,7 @@ actions!(
         ToggleMaximize,
         SwitchFleetd,
         InstallSkill,
+        RestartPane,
     ]
 );
 
@@ -36,6 +37,22 @@ pub struct Kill {
     pub agent_id: u64,
 }
 
+/// Restart an exited or lost agent from the sidebar (no confirmation).
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = fleet, no_json)]
+pub struct Restart {
+    pub agent_id: u64,
+}
+
+/// Forget an exited or lost agent (no confirmation).
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = fleet, no_json)]
+pub struct Remove {
+    pub agent_id: u64,
+}
+
+/// Key context of the workspace window.
+pub const WORKSPACE_CONTEXT: &str = "Workspace";
 /// Key context of a terminal pane.
 pub const TERMINAL_CONTEXT: &str = "Terminal";
 /// Key context of a text field.
@@ -56,6 +73,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-4", FocusPane4, None),
         KeyBinding::new("cmd-n", NewAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
+        KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
