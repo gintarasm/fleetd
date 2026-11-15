@@ -478,10 +478,28 @@ fn new_terminal_spawns_a_labelled_login_shell() {
     wait_until("the pane to show the shell", || {
         model.lock().unwrap().agent_id() == Some(info.id)
     });
-    s.input(pane, b"pwd\n".to_vec());
-    wait_until("the shell's pwd", || {
-        grid(&model).iter().any(|l| l.trim() == cwd)
-    });
+    // A login shell may still be reading its profile when the first `pwd`
+    // arrives, and a profile script can swallow typed input (the likely
+    // cause of a timeout on CI's Ubuntu runner), so type it again until
+    // its output shows.
+    let deadline = Instant::now() + DEADLINE;
+    let mut typed: Option<Instant> = None;
+    loop {
+        if typed.is_none_or(|t| t.elapsed() >= Duration::from_millis(500)) {
+            s.input(pane, b"pwd\n".to_vec());
+            typed = Some(Instant::now());
+        }
+        let screen = grid(&model);
+        if screen.iter().any(|l| l.trim() == cwd) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the shell's pwd ({cwd}); screen:\n{}",
+            screen.join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     s.shutdown();
 }
 
