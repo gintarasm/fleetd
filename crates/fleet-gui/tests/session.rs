@@ -471,6 +471,22 @@ impl FakeFleetd {
         on_restart: Option<response::Kind>,
         wait_before_serving_again: Duration,
     ) -> FakeFleetd {
+        Self::start_answering_after(
+            hellos,
+            on_restart,
+            wait_before_serving_again,
+            Duration::ZERO,
+        )
+    }
+
+    /// [`FakeFleetd::start`], answering `RestartDaemon` only after
+    /// `answer_delay` (as a daemon checking and freezing does).
+    fn start_answering_after(
+        hellos: Vec<HelloOk>,
+        on_restart: Option<response::Kind>,
+        wait_before_serving_again: Duration,
+        answer_delay: Duration,
+    ) -> FakeFleetd {
         use bytes::BytesMut;
         use fleet_proto::FrameCodec;
         use std::io::{Read, Write};
@@ -523,6 +539,7 @@ impl FakeFleetd {
                                             });
                                             let restarting =
                                                 matches!(kind, response::Kind::RestartingDaemon(_));
+                                            std::thread::sleep(answer_delay);
                                             send(
                                                 &mut stream,
                                                 Frame::Response(Response {
@@ -667,9 +684,67 @@ fn restart_of_an_old_daemon_reports_it_is_too_old() {
 }
 
 #[test]
+fn restart_wait_runs_from_the_answer_not_the_click() {
+    let kept = RestoreSummary {
+        previous_instance: 5,
+        kept: vec![1, 2],
+        ..Default::default()
+    };
+    // The answer takes longer than the wait for the new daemon: that wait
+    // has not started yet.
+    let fake = FakeFleetd::start_answering_after(
+        vec![hello(5, None), hello(6, Some(kept))],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+        Duration::from_millis(900),
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_restart_wait_for_test(Duration::from_millis(400));
+    connected(&events);
+    s.restart_daemon();
+    wait_until("the outcome", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestarted(_)))
+    });
+    assert!(events.has(|e| {
+        *e == UiEvent::DaemonRestarted(fleet_client::RestartOutcome::Restarted { kept: 2 })
+    }));
+    assert!(!events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_))));
+    s.shutdown();
+}
+
+#[test]
+fn restart_never_answered_times_out_after_the_answer_wait() {
+    let fake = FakeFleetd::start_answering_after(
+        vec![hello(5, None)],
+        Some(response::Kind::RestartingDaemon(RestartingDaemon {
+            agents: 2,
+        })),
+        Duration::ZERO,
+        Duration::from_secs(5),
+    );
+    let (s, events) = start_session_in(fake.dir.path());
+    s.set_restart_answer_wait_for_test(Duration::from_millis(300));
+    connected(&events);
+    let asked = Instant::now();
+    s.restart_daemon();
+    wait_until("the timeout", || {
+        events.has(|e| matches!(e, UiEvent::DaemonRestartFailed(_)))
+    });
+    // Well before the answer (5 s) or the wait for the new daemon (10 s).
+    assert!(asked.elapsed() < Duration::from_secs(3));
+    assert!(events.has(|e| {
+        *e == UiEvent::DaemonRestartFailed("fleetd did not come back within 10 s".into())
+    }));
+    s.shutdown();
+}
+
+#[test]
 fn restart_that_never_settles_times_out_once_and_a_second_ask_is_ignored() {
     // The daemon acknowledges the restart but the "new" one is still the
-    // old instance with no `restart_error`: never decided.
+    // old instance with no `restart_error`: never decided. The wait runs
+    // from that acknowledgement.
     let fake = FakeFleetd::start(
         vec![hello(5, None)],
         Some(response::Kind::RestartingDaemon(RestartingDaemon {

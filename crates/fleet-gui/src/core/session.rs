@@ -13,8 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fleet_client::{
-    Closer, Connection, FrameReader, RESTART_WAIT, RestartOutcome, Sender, TOO_OLD,
-    did_not_come_back, restart_failed, restart_outcome,
+    Closer, Connection, FrameReader, RESTART_ANSWER_WAIT, RESTART_WAIT, RestartOutcome, Sender,
+    TOO_OLD, did_not_come_back, restart_failed, restart_outcome,
 };
 use fleet_proto::{
     AgentInfo, AgentState, BinaryIdentity, ForgetAgents, Frame, HelloOk, KillAgent, ListAgents,
@@ -76,8 +76,9 @@ struct DaemonState {
 }
 
 /// A restart in flight. It ends when a handshake decides it
-/// ([`restart_outcome`] other than `Pending`), the daemon refuses, or
-/// [`RESTART_WAIT`] passes.
+/// ([`restart_outcome`] other than `Pending`), the daemon refuses, or it
+/// times out: [`RESTART_ANSWER_WAIT`] without the old daemon's answer, or
+/// [`RESTART_WAIT`] from that answer (as the CLI waits) without a decision.
 struct PendingRestart {
     /// Names this restart to its timer, so a later restart is not cut short
     /// by an earlier one's.
@@ -86,6 +87,8 @@ struct PendingRestart {
     old_instance: u64,
     /// `RestartingDaemon.agents`, once the old daemon has answered.
     agents: Option<u32>,
+    /// When that answer arrived: [`RESTART_WAIT`] runs from here.
+    answered_at: Option<Instant>,
 }
 
 impl DaemonState {
@@ -396,6 +399,9 @@ struct Inner {
     /// How long a restart waits for the new daemon ([`RESTART_WAIT`]; a
     /// test hook shortens it).
     restart_wait: Mutex<Duration>,
+    /// How long a restart waits for the old daemon's answer
+    /// ([`RESTART_ANSWER_WAIT`]; a test hook shortens it).
+    restart_answer_wait: Mutex<Duration>,
     panes: Mutex<HashMap<PaneId, PaneLink>>,
     palette: Mutex<Palette>,
     shut_down: AtomicBool,
@@ -447,6 +453,7 @@ impl Session {
             control_conn: Arc::default(),
             daemon: Arc::default(),
             restart_wait: Mutex::new(RESTART_WAIT),
+            restart_answer_wait: Mutex::new(RESTART_ANSWER_WAIT),
             panes: Mutex::default(),
             palette: Mutex::new(DEFAULT_PALETTE),
             shut_down: AtomicBool::new(false),
@@ -583,8 +590,9 @@ impl Session {
     }
 
     /// Restarts fleetd into the binary on disk, agents kept: the local
-    /// `fleetd` next to this app (or on `PATH`) for a local target, the
-    /// remote's own for ssh. The outcome arrives as
+    /// `fleetd` next to this app (or on `PATH`) for a local target; for ssh
+    /// none is named, so the remote daemon restarts onto its own binary's
+    /// path, as now on disk. The outcome arrives as
     /// [`UiEvent::DaemonRestarted`] or [`UiEvent::DaemonRestartFailed`],
     /// decided on the next handshake from the instance seen now; the control
     /// connection reconnects by itself. A restart already in flight is not
@@ -614,10 +622,13 @@ impl Session {
                 token,
                 old_instance,
                 agents: None,
+                answered_at: None,
             });
             token
         };
+        let asked_at = Instant::now();
         let wait = *lock(&self.inner.restart_wait);
+        let answer_wait = *lock(&self.inner.restart_answer_wait);
         let (ctx, daemon, stop) = (
             Arc::clone(&self.inner.ctx),
             Arc::clone(&self.inner.daemon),
@@ -626,14 +637,29 @@ impl Session {
         let _ = thread::Builder::new()
             .name("gui-restart-timer".into())
             .spawn(move || {
-                if stop.wait(wait) {
-                    return;
-                }
-                let mut d = lock(&daemon);
-                if d.restart.as_ref().is_some_and(|p| p.token == token) {
-                    d.restart = None;
+                // The deadline moves once the answer arrives; the timer
+                // looks again when the one it slept towards has passed.
+                loop {
+                    let mut d = lock(&daemon);
+                    let deadline = match d.restart.as_ref() {
+                        Some(p) if p.token == token => match p.answered_at {
+                            Some(at) => at + wait,
+                            None => asked_at + answer_wait,
+                        },
+                        // Decided, or a later restart's.
+                        _ => return,
+                    };
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        d.restart = None;
+                        drop(d);
+                        ctx.notify(UiEvent::DaemonRestartFailed(did_not_come_back()));
+                        return;
+                    }
                     drop(d);
-                    ctx.notify(UiEvent::DaemonRestartFailed(did_not_come_back()));
+                    if stop.wait(left) {
+                        return;
+                    }
                 }
             });
         self.control(ControlCmd::RestartDaemon(binary));
@@ -760,6 +786,13 @@ impl Session {
     #[doc(hidden)]
     pub fn set_restart_wait_for_test(&self, d: Duration) {
         *lock(&self.inner.restart_wait) = d;
+    }
+
+    /// Test hook: how long a restart waits for the old daemon's answer.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_restart_answer_wait_for_test(&self, d: Duration) {
+        *lock(&self.inner.restart_answer_wait) = d;
     }
 
     /// Test hook: the pane's reader stops reading for `d` (to force a
@@ -904,6 +937,7 @@ impl ControlReader {
                         // decides the outcome against this count.
                         if let Some(p) = lock(&self.daemon).restart.as_mut() {
                             p.agents = Some(r.agents);
+                            p.answered_at = Some(Instant::now());
                         }
                     }
                     Frame::Response(Response {
@@ -1102,6 +1136,7 @@ mod tests {
                 token: 1,
                 old_instance,
                 agents,
+                answered_at: agents.map(|_| Instant::now()),
             }),
             ..Default::default()
         }

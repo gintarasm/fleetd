@@ -20,8 +20,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 mod restart;
 pub use restart::{
-    RESTART_WAIT, Restart, RestartOutcome, TOO_OLD, did_not_come_back, restart_daemon,
-    restart_failed, restart_outcome,
+    RESTART_ANSWER_WAIT, RESTART_WAIT, Restart, RestartOutcome, TOO_OLD, did_not_come_back,
+    restart_daemon, restart_failed, restart_outcome,
 };
 
 #[derive(Debug)]
