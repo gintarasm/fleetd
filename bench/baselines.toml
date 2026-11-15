@@ -56,7 +56,7 @@ suite = "wall"
 unit = "count"
 # M1 node cannot stream 50 flooding agents to an attached client; see ADR 0018
 report_only = true
-baseline = 45
+baseline = 2
 
 [metrics.daemon_flood50_peak_rss_bytes]
 suite = "wall"
@@ -87,7 +87,7 @@ baseline = 3066
 [metrics.frame_decode_output_64x64k_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 17146
+baseline = 14323
 
 [metrics.terminal_feed_64k_instructions]
 suite = "instr"
@@ -97,7 +97,7 @@ baseline = 7591185
 [metrics.snapshot_120x40_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 755815
+baseline = 426713
 
 # M2a metrics: `baseline = 0` until recorded from the PR's CI artifacts
 # (bench/README.md, "Recording baselines").
@@ -114,22 +114,22 @@ baseline = 0
 [metrics.input_echo_flood50_ns]
 suite = "wall"
 unit = "ns"
-baseline = 0
+baseline = 488395.5
 
 [metrics.terminal_feed_scroll_64k_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 0
+baseline = 12031938
 
 [metrics.history_push_1k_lines_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 0
+baseline = 417527
 
 [metrics.history_read_page_instructions]
 suite = "instr"
 unit = "instructions"
-baseline = 0
+baseline = 681056
 
 # M2b metrics (fleet-gui, macOS window server): `baseline = 0` until
 # recorded from the PR's CI artifacts.
@@ -138,16 +138,16 @@ baseline = 0
 suite = "wall"
 unit = "ns"
 budget = 200000000     # GUI cold start < 200 ms (docs/plan.md)
-baseline = 0
+baseline = 154568750
 
 [metrics.input_to_render_ns]
 suite = "wall"
 unit = "ns"
 budget = 16000000      # key to presented frame < 16 ms (docs/plan.md)
-baseline = 0
+baseline = 13514896
 
 [metrics.input_to_render_flood50_ns]
 suite = "wall"
 unit = "ns"
 budget = 16000000      # the same while 50 agents flood
-baseline = 0
+baseline = 11537520
