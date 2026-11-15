@@ -1,4 +1,4 @@
-//! The node: [`Node`] ties the [`PtyHost`](crate::PtyHost), the agent
+//! The node: [`Node`] ties the [`AgentHost`](crate::AgentHost), the agent
 //! [`Store`] and one [`AgentPipeline`] per agent together.
 //!
 //! Per-agent output pipeline: PTY output feeds the agent's [`Terminal`] grid,
@@ -54,6 +54,7 @@
 
 use crate::env::LoginEnv;
 use crate::history::{History, HistoryInfo, Page};
+use crate::host::AgentHost;
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
@@ -1482,7 +1483,7 @@ struct NodeSink {
     id: u64,
     pipeline: AgentPipeline,
     store: Arc<Mutex<Store>>,
-    host: Arc<PtyHost>,
+    host: Arc<dyn AgentHost>,
     agents: Arc<Mutex<Agents>>,
     histories: Arc<Mutex<Histories>>,
     exits: broadcast::Sender<AgentExited>,
@@ -1513,7 +1514,7 @@ impl OutputSink for NodeSink {
         // If the spawn has not registered the agent yet, it retires it.
         let mut agents = lock(&self.agents);
         let evicted = match agents.live.remove(&self.id) {
-            Some(live) => agents.retire(&self.host, self.id, &live, code),
+            Some(live) => agents.retire(&*self.host, self.id, &live, code),
             None => None,
         };
         drop(agents);
@@ -1533,7 +1534,7 @@ impl OutputSink for NodeSink {
 /// Every method may block (SQLite, PTY writes, process spawn); call them off
 /// the async executor.
 pub struct Node {
-    host: Arc<PtyHost>,
+    host: Arc<dyn AgentHost>,
     store: Arc<Mutex<Store>>,
     agents: Arc<Mutex<Agents>>,
     exits: broadcast::Sender<AgentExited>,
@@ -1644,7 +1645,13 @@ impl Agents {
     /// [`RETAINED_EXITED`]) and drops everything else it held. Returns the
     /// evicted agent, whose history the caller deletes.
     #[must_use]
-    fn retire(&mut self, host: &PtyHost, id: u64, live: &LiveAgent, exit_code: i32) -> Option<u64> {
+    fn retire(
+        &mut self,
+        host: &dyn AgentHost,
+        id: u64,
+        live: &LiveAgent,
+        exit_code: i32,
+    ) -> Option<u64> {
         let (snapshot, (cols, rows)) = live.pipeline.snapshot_sized();
         let evicted = if self.exited.len() >= RETAINED_EXITED {
             self.exited.pop_front().map(|a| a.id)
@@ -2024,7 +2031,7 @@ impl Node {
             }
             // An agent that already exited was not found by its sink.
             match live.pipeline.exit_code() {
-                Some(code) => agents.retire(&self.host, id, &live, code),
+                Some(code) => agents.retire(&*self.host, id, &live, code),
                 None => {
                     agents.live.insert(id, live);
                     None
