@@ -66,7 +66,7 @@ fleetd --stdio              # bridge stdin/stdout to the daemon, starting one if
 - **One instance per state directory.** A second `fleetd` on the same directory exits with `fleetd already running` (exit code 2). If the running daemon is a different build, `fleetd` offers to restart it onto this binary (agents keep running); see **Updating fleetd**.
 - **Stopping.** SIGTERM, SIGINT (Ctrl-C) or SIGHUP stops every agent: each gets SIGTERM, then 2 s later SIGKILL. Their exits are recorded, then the socket is removed.
 - **Crashes.** If `fleetd` is killed hard, the agents it was running are shown as `lost` on the next start.
-- **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M5).
+- **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M6).
 - **Agent environment.** At startup the daemon asks your login shell (`$SHELL -lic`) for its environment, so agents see the same `PATH` and exports as a terminal would, even when `fleetd` was started by `ssh`, launchd or systemd. The capture runs in the background and gives up after 5 s; if it fails, agents get the daemon's own environment. Set `FLEETD_LOGIN_ENV=off` in the daemon's environment to skip it. Every agent also gets `TERM=xterm-256color` and `FLEET_AGENT_ID=<its id>`.
 
 The state directory (mode 0700) holds:
@@ -241,10 +241,10 @@ fleet logs -f              # then follow new lines until Ctrl-C
 
 ### Not yet in the CLI (TBD)
 
-- Workflows (git worktree per agent, diff view; `RunAction`): **TBD** (M3, [0025](docs/decisions/0025-core-knows-agents-workflows-own-hierarchy.md))
-- Remote nodes (`fleet node add user@host`): **TBD** (M5)
-- Plugins and agent adapters: **TBD** (M4)
-- Credentials and secret grants: **TBD** (M6)
+- Workflows (git worktree per agent, diff view; `RunAction`): **TBD** (M4, [0025](docs/decisions/0025-core-knows-agents-workflows-own-hierarchy.md))
+- Remote nodes (`fleet node add user@host`): **TBD** (M6)
+- Plugins and agent adapters: **TBD** (M5)
+- Credentials and secret grants: **TBD** (M7)
 - Agent-to-agent messages (`fleet msg`) and status reporting (`fleet status`): **TBD** (M4, [0019](docs/decisions/0019-control-plane-direction.md))
 - Setting environment variables for an agent from the CLI: **TBD** (the protocol supports it)
 
@@ -314,7 +314,7 @@ Advisory figures from one local wall run on a dev Mac (local wall numbers are ad
 
 ## Remote agents
 
-**TBD** (M5). Today you can already reach a daemon on another host with `ssh host fleetd --stdio`. Planned: `fleet node add user@host` installs `fleetd` on a Linux or macOS host over SSH and runs it as a user service. Agents run there and you attach from your machine. See [0011](docs/decisions/0011-remote-nodes.md).
+**TBD** (M6). Today you can already reach a daemon on another host with `ssh host fleetd --stdio`. Planned: `fleet node add user@host` installs `fleetd` on a Linux or macOS host over SSH and runs it as a user service. Agents run there and you attach from your machine. See [0011](docs/decisions/0011-remote-nodes.md).
 
 ## Development
 
