@@ -202,23 +202,6 @@ impl Client {
             })
             .collect()
     }
-
-    /// Collects `agent_id`'s output until it contains `needle`.
-    fn output_until(&mut self, agent_id: u64, needle: &str) -> String {
-        let mut out = Vec::new();
-        loop {
-            match self.next_frame() {
-                Some(Frame::Output { agent_id: a, data }) if a == agent_id => {
-                    out.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&out).contains(needle) {
-                        return String::from_utf8_lossy(&out).into_owned();
-                    }
-                }
-                Some(_) => {}
-                None => panic!("closed before {needle:?}"),
-            }
-        }
-    }
 }
 
 /// Waits for the agent's exit event (read now or earlier). The node sends
