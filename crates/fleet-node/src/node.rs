@@ -1417,6 +1417,48 @@ fn prune_history_dirs(dir: &Path, keep: &HashSet<u64>) -> io::Result<()> {
     Ok(())
 }
 
+/// Deletes the `<id>.ring` files under `dir` whose id has no store row (a
+/// forget or restart that failed to delete it, or a crash in between): rings
+/// hold raw output, which may contain secrets.
+fn prune_orphan_rings(dir: &Path, rows: &HashSet<u64>) -> io::Result<()> {
+    let entries = std::fs::read_dir(dir)?.map(|e| e.map(|e| e.path()));
+    prune_ring_paths(entries, rows);
+    Ok(())
+}
+
+/// [`prune_orphan_rings`] over `entries`, best effort: an unreadable entry
+/// is logged and skipped. Only canonical names (`7.ring`, not `007.ring`)
+/// are rings.
+fn prune_ring_paths(entries: impl IntoIterator<Item = io::Result<PathBuf>>, rows: &HashSet<u64>) {
+    let mut pruned = 0usize;
+    for entry in entries {
+        let path = match entry {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(error = %e, "reading a scrollback directory entry failed");
+                continue;
+            }
+        };
+        let id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".ring"))
+            .and_then(|n| n.parse::<u64>().ok().filter(|id| id.to_string() == n));
+        if id.is_some_and(|id| !rows.contains(&id)) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => pruned += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(path = ?path, error = %e, "removing orphan scrollback failed")
+                }
+            }
+        }
+    }
+    if pruned > 0 {
+        info!(rings = pruned, "deleted scrollback of unknown agents");
+    }
+}
+
 /// The agents whose history [`Node::open`] keeps: running ones and the
 /// [`RETAINED_EXITED`] most recently created others.
 fn retained_history(records: &[AgentRecord]) -> HashSet<u64> {
@@ -1645,7 +1687,8 @@ impl Node {
     /// Opens the node's state under `state_dir` (`state.db`, `scrollback/`,
     /// `history/`), marks agents left running by a previous daemon as lost
     /// and deletes the history of all but the [`RETAINED_EXITED`] most
-    /// recently created of them.
+    /// recently created of them, and the scrollback rings of agents with no
+    /// store row.
     pub fn open(state_dir: &Path) -> io::Result<Node> {
         let scrollback_dir = state_dir.join("scrollback");
         let history_dir = state_dir.join("history");
@@ -1660,6 +1703,7 @@ impl Node {
         // A corrupt row's history is not kept (its id is unknown).
         let (records, _) = store.list_agents_lossy_unlabeled().map_err(store_err)?;
         prune_history_dirs(&history_dir, &retained_history(&records))?;
+        prune_orphan_rings(&scrollback_dir, &store.agent_ids().map_err(store_err)?)?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
@@ -2364,6 +2408,19 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruning_skips_unreadable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("7.ring");
+        std::fs::write(&orphan, b"secret output").unwrap();
+        let entries = vec![
+            Err(io::Error::other("unreadable entry")),
+            Ok(orphan.clone()),
+        ];
+        prune_ring_paths(entries, &HashSet::new());
+        assert!(!orphan.exists(), "later entries are still pruned");
+    }
 
     #[test]
     fn forget_refuses_agent_still_live_after_its_row_says_exited() {

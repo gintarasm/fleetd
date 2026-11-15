@@ -202,23 +202,6 @@ impl Client {
             })
             .collect()
     }
-
-    /// Collects `agent_id`'s output until it contains `needle`.
-    fn output_until(&mut self, agent_id: u64, needle: &str) -> String {
-        let mut out = Vec::new();
-        loop {
-            match self.next_frame() {
-                Some(Frame::Output { agent_id: a, data }) if a == agent_id => {
-                    out.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&out).contains(needle) {
-                        return String::from_utf8_lossy(&out).into_owned();
-                    }
-                }
-                Some(_) => {}
-                None => panic!("closed before {needle:?}"),
-            }
-        }
-    }
 }
 
 /// Waits for the agent's exit event (read now or earlier). The node sends
@@ -301,7 +284,96 @@ fn restart_attached_over_the_wire() {
     let new = r.agent.expect("restarted agent").id;
     assert!(r.attached.is_some(), "attach: true sets Restarted.attached");
     assert!(a.pending_removed().is_empty());
-    a.output_until(new, "lifecycle-marker");
+    let is_new_output = |f: &Frame| matches!(f, Frame::Output { agent_id, .. } if *agent_id == new);
+    let is_new_exit = |f: &Frame| {
+        matches!(f, Frame::Event(fleet_proto::Event {
+            kind: Some(event::Kind::Exited(e)),
+        }) if e.agent_id == new)
+    };
+    assert!(
+        !a.pending.iter().any(|f| is_new_output(f) || is_new_exit(f)),
+        "nothing of the new agent precedes the reply: {:?}",
+        a.pending
+    );
+    a.pending.clear();
+
+    // In order: our AgentRemoved, then the new agent's output, then its exit.
+    let mut removed_seen = false;
+    let mut out = Vec::new();
+    loop {
+        match a.next_frame() {
+            Some(Frame::Event(fleet_proto::Event {
+                kind: Some(event::Kind::AgentRemoved(r)),
+            })) => {
+                assert_eq!(
+                    r,
+                    AgentRemoved {
+                        agent_id: old,
+                        replaced_by: Some(new)
+                    }
+                );
+                assert!(!removed_seen, "one AgentRemoved");
+                assert!(out.is_empty(), "AgentRemoved precedes the new output");
+                removed_seen = true;
+            }
+            Some(Frame::Output { agent_id, data }) if agent_id == new => {
+                assert!(removed_seen, "AgentRemoved precedes the new output");
+                out.extend_from_slice(&data);
+            }
+            Some(f) if is_new_exit(&f) => break,
+            Some(_) => {}
+            None => panic!("closed before the new agent exited"),
+        }
+    }
+    assert!(String::from_utf8_lossy(&out).contains("lifecycle-marker"));
+    // No second exit: the exit-event forwarder skipped the attached agent.
+    std::thread::sleep(Duration::from_millis(300));
+    a.list();
+    assert!(!a.pending.iter().any(is_new_exit), "{:?}", a.pending);
+}
+
+#[test]
+fn restart_unknown_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    match a.restart(9999, false) {
+        response::Kind::Error(e) => assert!(e.message.contains("unknown agent"), "{}", e.message),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+#[test]
+fn restart_whose_spawn_fails_keeps_the_old_agent() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    let _d = Daemon::start(dir.path());
+    let mut a = Client::open(dir.path());
+    let program = bin.path().join("agent.sh");
+    std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old = match a.request(request::Kind::Spawn(Box::new(SpawnAgent {
+        program: program.to_string_lossy().into_owned(),
+        cwd: bin.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    }))) {
+        response::Kind::Spawned(info) => info.id,
+        other => panic!("spawn failed: {other:?}"),
+    };
+    wait_not_running(&mut a, old);
+    std::fs::remove_file(&program).unwrap();
+    for attach in [false, true] {
+        match a.restart(old, attach) {
+            response::Kind::Error(_) => {}
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let list = a.list_full();
+        assert!(a.pending_removed().is_empty());
+        assert!(list.replaced.is_empty());
+        let ids: Vec<u64> = list.agents.iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec![old]);
+    }
 }
 
 #[test]

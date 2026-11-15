@@ -279,12 +279,47 @@ mod tests {
                     replaced: [(5u64, 9u64)].into_iter().collect(),
                 })),
             }),
+            Frame::Response(Response {
+                id: 1,
+                kind: Some(response::Kind::Restarted(Box::new(crate::Restarted {
+                    old_id: 5,
+                    agent: Some(crate::AgentInfo {
+                        id: 9,
+                        program: "claude".into(),
+                        ..Default::default()
+                    }),
+                    attached: Some(crate::AttachOk {
+                        agent_id: 9,
+                        cols: 80,
+                        rows: 24,
+                        ..Default::default()
+                    }),
+                }))),
+            }),
+            Frame::Request(Request {
+                id: 3,
+                kind: Some(request::Kind::Forget(crate::ForgetAgents {
+                    ids: vec![],
+                    exited_only: true,
+                    selector: [("project".to_string(), "x".to_string())]
+                        .into_iter()
+                        .collect(),
+                })),
+            }),
+            Frame::Response(Response {
+                id: 3,
+                kind: Some(response::Kind::Forgotten(crate::Forgotten {
+                    ids: vec![5, 6],
+                    refused: vec![7],
+                })),
+            }),
         ];
         for frame in frames {
             let mut buf = BytesMut::new();
             FrameCodec::new().encode(frame.clone(), &mut buf).unwrap();
             let got = FrameCodec::new().decode(&mut buf).unwrap().unwrap();
             assert_eq!(got, frame);
+            assert!(buf.is_empty());
         }
     }
 

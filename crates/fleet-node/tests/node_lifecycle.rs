@@ -138,16 +138,26 @@ fn forgotten_id_is_not_reused() {
     assert!(next > id);
 }
 
+/// A row left `running` by a daemon that died; [`Node::open`] marks it lost.
+fn insert_running_row(state_dir: &std::path::Path) -> u64 {
+    std::fs::create_dir_all(state_dir).unwrap();
+    let store = fleet_node::store::Store::open(&state_dir.join("state.db")).unwrap();
+    store
+        .insert_agent(&fleet_node::store::NewAgent {
+            program: "/bin/sh".into(),
+            args: vec![],
+            cwd: "/".into(),
+            created_unix_ms: 1,
+            scrollback_path: String::new(),
+            labels: Labels::new(),
+        })
+        .unwrap()
+}
+
 #[test]
 fn forget_removes_lost_agent() {
     let dir = tempfile::tempdir().unwrap();
-    let id = {
-        let node = Node::open(dir.path()).unwrap();
-        let id = spawn_sh(&node, "exec sleep 100");
-        // Dropping the node without shutdown leaves the row `running`.
-        std::mem::forget(node);
-        id
-    };
+    let id = insert_running_row(dir.path());
     let node = Node::open(dir.path()).unwrap();
     let info = node
         .list()
@@ -159,6 +169,30 @@ fn forget_removes_lost_agent() {
     let out = node.forget(&[id], false, &Labels::new(), None).unwrap();
     assert_eq!(out.forgotten, vec![id]);
     assert!(!ids(&node).contains(&id));
+}
+
+#[test]
+fn open_deletes_orphan_scrollback_rings() {
+    let dir = tempfile::tempdir().unwrap();
+    let kept = insert_running_row(dir.path());
+    let sb = dir.path().join("scrollback");
+    std::fs::create_dir_all(&sb).unwrap();
+    let kept_ring = sb.join(format!("{kept}.ring"));
+    let orphan = sb.join(format!("{}.ring", kept + 41));
+    let other = sb.join("notes.txt");
+    // Names that parse as an id but are not how fleetd writes one.
+    let padded = sb.join(format!("0{}.ring", kept + 41));
+    let signed = sb.join(format!("+{}.ring", kept + 41));
+    for f in [&kept_ring, &orphan, &other, &padded, &signed] {
+        std::fs::write(f, b"secret output").unwrap();
+    }
+    let node = Node::open(dir.path()).unwrap();
+    assert!(kept_ring.exists(), "a ring with a store row is kept");
+    assert!(!orphan.exists(), "a ring without a store row is deleted");
+    assert!(other.exists(), "files that are not rings are left alone");
+    assert!(padded.exists(), "non-canonical names are left alone");
+    assert!(signed.exists(), "non-canonical names are left alone");
+    drop(node);
 }
 
 fn wait_exited(exits: &mut tokio::sync::broadcast::Receiver<fleet_proto::AgentExited>, id: u64) {
@@ -274,6 +308,86 @@ fn restart_failure_keeps_old_agent() {
     assert!(node.replacements().unwrap().is_empty());
     assert!(node.attach(old, ConnId(1)).is_ok(), "old screen kept");
     assert!(removed.try_recv().is_err(), "nothing announced");
+}
+
+/// The files under `dir`, sorted.
+fn entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn restart_whose_spawn_fails_leaves_nothing_and_releases_the_guard() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let program = bin.path().join("agent.sh");
+    let write_program = || {
+        std::fs::write(&program, "#!/bin/sh\necho hi; exit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write_program();
+    let node = Node::open(dir.path()).unwrap();
+    let mut exits = node.exit_events();
+    let mut removed = node.removed_events();
+    let old = node
+        .spawn(SpawnAgent {
+            program: program.to_string_lossy().into_owned(),
+            cwd: work.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    wait_exited(&mut exits, old);
+    std::fs::remove_file(&program).unwrap();
+    let rings = entries(&dir.path().join("scrollback"));
+    let histories = entries(&dir.path().join("history"));
+
+    // The cwd is valid, so the spawn itself fails, inside `start`.
+    let e = node.restart(old, 0, 0, None).unwrap_err();
+    assert_ne!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+    assert_eq!(ids(&node), vec![old], "no new row");
+    assert_eq!(
+        entries(&dir.path().join("scrollback")),
+        rings,
+        "no new ring"
+    );
+    assert_eq!(
+        entries(&dir.path().join("history")),
+        histories,
+        "no new history"
+    );
+    assert!(node.replacements().unwrap().is_empty());
+    assert!(removed.try_recv().is_err(), "nothing announced");
+
+    // The `restarting` guard was released: a second attempt is not refused
+    // as being restarted, and the old agent restarts once it can.
+    let e = node.restart(old, 0, 0, None).unwrap_err();
+    assert_ne!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+    write_program();
+    let new = node.restart(old, 0, 0, None).unwrap();
+    assert!(new.replaced);
+    assert_eq!(ids(&node), vec![new.info.id]);
+}
+
+#[test]
+fn forget_after_a_failed_restart_is_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    let mut exits = node.exit_events();
+    let old = spawn_sh_in(&node, work.path(), "exit 0", &[]);
+    wait_exited(&mut exits, old);
+    drop(work);
+    assert!(node.restart(old, 0, 0, None).is_err());
+    let out = node.forget(&[old], false, &Labels::new(), None).unwrap();
+    assert_eq!(out.forgotten, vec![old]);
+    assert!(out.refused.is_empty());
 }
 
 #[test]

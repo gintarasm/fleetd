@@ -1,6 +1,6 @@
 //! SQLite agent store (decision 0010): one WAL-mode DB per node.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -201,6 +201,8 @@ impl Store {
         restore
     }
 
+    /// The `agents_v3` and `agent_replacements` DDL here must stay in sync
+    /// with `create_v3` (the schema-equality test compares the two).
     fn rebuild_agents_v3(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch("BEGIN")?;
         let run = || -> rusqlite::Result<()> {
@@ -236,8 +238,10 @@ impl Store {
             }
             self.conn.execute_batch("PRAGMA user_version = 3")
         };
-        match run() {
-            Ok(()) => self.conn.execute_batch("COMMIT"),
+        // A failed COMMIT (e.g. SQLITE_BUSY) can leave the transaction open;
+        // roll it back like any other error so the connection is usable.
+        match run().and_then(|()| self.conn.execute_batch("COMMIT")) {
+            Ok(()) => Ok(()),
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(e)
@@ -458,6 +462,13 @@ impl Store {
             }
         }
         Ok((good, bad))
+    }
+
+    /// The id of every row, including rows that do not decode.
+    pub fn agent_ids(&self) -> rusqlite::Result<HashSet<u64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM agents")?;
+        let ids = stmt.query_map([], |r| r.get::<_, i64>(0).map(|id| id as u64))?;
+        ids.collect()
     }
 
     /// Every agent's labels, by agent id.
@@ -786,6 +797,20 @@ mod tests {
             )
             .unwrap();
         out.push(format!("agents autoincrement {autoinc}"));
+        // The full DDL (covers the CHECK constraint), normalised: SQLite
+        // quotes the name of a renamed table and keeps the original spacing.
+        for table in ["agents", "agent_labels", "agent_replacements"] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let sql = sql.replace(['"', '\''], "").replace("agents_v3", "agents");
+            let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push(format!("{table} sql {sql}"));
+        }
         out
     }
 

@@ -232,6 +232,11 @@ impl PtyAttach {
 
     /// [`PtyAttach::start`] on a `cols`x`rows` terminal.
     fn start_sized(d: &Daemon, id: &str, paused: bool, cols: u16, rows: u16) -> Self {
+        Self::start_args(d, &["attach", id], paused, cols, rows)
+    }
+
+    /// Runs `fleet <args>` on a `cols`x`rows` pty.
+    fn start_args(d: &Daemon, args: &[&str], paused: bool, cols: u16, rows: u16) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -241,7 +246,8 @@ impl PtyAttach {
             })
             .unwrap();
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_fleet"));
-        cmd.args(["--state-dir", d.dir.path().to_str().unwrap(), "attach", id]);
+        cmd.args(["--state-dir", d.dir.path().to_str().unwrap()]);
+        cmd.args(args);
         let child = pair.slave.spawn_command(cmd).unwrap();
         drop(pair.slave);
         let mut p = PtyAttach {
@@ -926,4 +932,109 @@ fn rm_exited_counts() {
     let live = d.ok(&["spawn", "--", "cat"]).trim().to_string();
     assert_eq!(d.ok(&["rm", "--exited"]).trim(), "removed 2 agents");
     assert_eq!(ls_ids(&d), [live]);
+}
+
+#[test]
+fn restart_attach_attaches_to_the_new_agent() {
+    let d = Daemon::start();
+    let old = d
+        .ok(&[
+            "spawn",
+            "--",
+            "sh",
+            "-c",
+            "echo hello-$FLEET_AGENT_ID; read x; echo got-$x",
+        ])
+        .trim()
+        .to_string();
+    d.ok(&["send", "--enter", &old, "first"]);
+    wait_for("exited", || {
+        let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"].as_u64().unwrap().to_string() == old && a["state"] == "exited")
+    });
+    let mut p = PtyAttach::start_args(&d, &["restart", "--attach", &old], false, 80, 24);
+    p.until("hello-");
+    let ids = ls_ids(&d);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_ne!(ids[0], old);
+    p.until(&format!("hello-{}", ids[0]));
+    p.writer.write_all(b"again\r").unwrap();
+    p.until("got-again");
+    p.until(RESTORE);
+    assert_eq!(p.exit_code(), 0);
+}
+
+/// A daemon that completes the handshake, then answers every request with
+/// `Error "empty request"`, as one that predates the request does.
+fn fake_old_daemon(dir: &Path) -> std::thread::JoinHandle<()> {
+    fn varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn write_frame(s: &mut impl Write, kind: u8, payload: &[u8]) {
+        let len = (payload.len() + 1) as u32;
+        s.write_all(&len.to_be_bytes()).unwrap();
+        s.write_all(&[kind]).unwrap();
+        s.write_all(payload).unwrap();
+    }
+    fn read_frame(s: &mut impl Read) -> Option<(u8, Vec<u8>)> {
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).ok()?;
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        s.read_exact(&mut body).ok()?;
+        Some((body[0], body[1..].to_vec()))
+    }
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("fleetd.sock")).unwrap();
+    std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        read_frame(&mut s).expect("hello");
+        // HelloOk { protocol_version, server: "old" }
+        let mut ok = vec![0x08];
+        varint(&mut ok, u64::from(fleet_proto::PROTOCOL_VERSION));
+        ok.extend_from_slice(&[0x12, 3, b'o', b'l', b'd']);
+        write_frame(&mut s, 2, &ok);
+        while let Some((_, req)) = read_frame(&mut s) {
+            // Request.id is field 1 (absent when 0).
+            let mut id = 0u64;
+            if req.first() == Some(&0x08) {
+                for (i, b) in req[1..].iter().enumerate() {
+                    id |= u64::from(b & 0x7f) << (7 * i);
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            let msg = b"empty request";
+            let mut error = vec![0x0a, msg.len() as u8];
+            error.extend_from_slice(msg);
+            // Response { id, error (field 6) }
+            let mut resp = vec![0x08];
+            varint(&mut resp, id);
+            resp.extend_from_slice(&[0x32, error.len() as u8]);
+            resp.extend_from_slice(&error);
+            write_frame(&mut s, 5, &resp);
+        }
+    })
+}
+
+#[test]
+fn restart_and_rm_against_an_old_daemon_say_so() {
+    for args in [&["restart", "1"][..], &["rm", "1"][..]] {
+        let dir = TempDir::new().unwrap();
+        let daemon = fake_old_daemon(dir.path());
+        let out = fleet(dir.path(), args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim(),
+            "fleet: the daemon is too old to restart/remove agents",
+            "{args:?}"
+        );
+        daemon.join().unwrap();
+    }
 }

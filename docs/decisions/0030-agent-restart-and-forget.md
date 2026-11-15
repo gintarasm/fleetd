@@ -39,9 +39,13 @@ A crash between steps 3 and 4 leaves both rows (old exited, new running), never 
 
 ### Forget
 
-For each id, under the agents lock: refuse it if it is in `agents.live`, `histories.spawning` or being restarted, or if the store has no non-running row for it (unknown, or its row says running). A refused id goes into `Forgotten.refused`, untouched; there is no per-id reason, so `fleet rm` reports it as "not removed (running or unknown)" even when it was refused for being mid-restart. Otherwise: delete the store row, then drop it from `Agents.exited` and delete the history directory (closing an open handle) and `<state>/scrollback/<id>.ring` (raw output, may contain secrets; never deleted before), and announce `AgentRemoved`.
+For each id, under the agents lock: refuse it if it is in `agents.live`, `histories.spawning` or being restarted, or if the store has no non-running row for it (unknown, or its row says running). A refused id goes into `Forgotten.refused`, untouched; there is no per-id reason, so `fleet rm` reports it as "not removed (running or unknown)" even when it was refused for being mid-restart. Otherwise: delete the store row, then drop it from `Agents.exited` and delete the history directory (closing an open handle) and `<state>/scrollback/<id>.ring` (raw output, may contain secrets; before this ADR no code path deleted rings), and announce `AgentRemoved`.
 
 A store error stops the loop. The request is answered with an `Error` (not `Forgotten`: the request failed, and a partial success would hide that), but the ids forgotten before it were already announced to other connections, so the requester's `AgentRemoved` for each of them is still queued after the `Error`. `Node::forget` returns them in `ForgetError.partial`.
+
+### Orphan rings
+
+A ring can outlive its row: deleting it can fail after the row is gone, or the node can crash in between. `Node::open` therefore deletes every `<state>/scrollback/<id>.ring` whose id has no store row. It is best-effort: an unreadable directory entry or a failed delete is logged and skipped, never fails the open. Only canonical names (the decimal id, so `7.ring` but not `007.ring` or `+7.ring`) count as rings; anything else in the directory is left alone.
 
 ### Environment is not restored
 

@@ -162,12 +162,16 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
     reader.decoder_mut().set_max(MAX_FRAME);
 
     let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
+    // Removals other connections caused, for the request loop to drop
+    // this connection's state for them.
+    let (removed_tx, mut removed_rx) = mpsc::unbounded_channel();
     let mut conn = Connection {
         node,
         id,
         outbox,
         forwarders: HashMap::new(),
         attached: Arc::new(Mutex::new(HashSet::new())),
+        removed_pending: HashSet::new(),
         log_follower: None,
     };
     let tasks = Tasks(vec![
@@ -178,19 +182,27 @@ async fn connection(node: Arc<Node>, stream: UnixStream, _slot: OwnedSemaphorePe
             Arc::clone(&conn.attached),
         )),
         tokio::spawn(forward_activity(activity, conn.outbox.clone())),
-        tokio::spawn(forward_removed(removed, conn.outbox.clone(), id)),
+        tokio::spawn(forward_removed(
+            removed,
+            conn.outbox.clone(),
+            id,
+            removed_tx,
+        )),
     ]);
 
     let reason = loop {
-        match reader.next().await {
-            None => break "client closed".to_string(),
-            Some(Ok(Frame::Request(req))) => {
-                if !conn.handle(req).await {
-                    break "write failed".to_string();
+        tokio::select! {
+            frame = reader.next() => match frame {
+                None => break "client closed".to_string(),
+                Some(Ok(Frame::Request(req))) => {
+                    if !conn.handle(req).await {
+                        break "write failed".to_string();
+                    }
                 }
-            }
-            Some(Ok(_)) => break "unexpected frame from client".to_string(),
-            Some(Err(e)) => break format!("read error: {e}"),
+                Some(Ok(_)) => break "unexpected frame from client".to_string(),
+                Some(Err(e)) => break format!("read error: {e}"),
+            },
+            Some(agent_id) = removed_rx.recv() => conn.removed_elsewhere(agent_id).await,
         }
     };
     info!(conn = id.0, reason, "connection closed");
@@ -220,6 +232,10 @@ struct Connection {
     /// Agents whose exit event the forwarder delivers (in order after their
     /// output), so the exit-event forwarder skips them.
     attached: Arc<Mutex<HashSet<u64>>>,
+    /// Agents another connection removed while their forwarder here was
+    /// still running; dropped once it finishes (see
+    /// [`Connection::removed_elsewhere`]).
+    removed_pending: HashSet<u64>,
     /// Streams new log lines while the client follows the log.
     log_follower: Option<JoinHandle<()>>,
 }
@@ -260,6 +276,7 @@ fn error(message: String) -> response::Kind {
 impl Connection {
     /// Answers one request; `false` once the writer is gone.
     async fn handle(&mut self, req: Request) -> bool {
+        self.sweep_removed().await;
         let kind = match req.kind {
             None => error("empty request".into()),
             Some(request::Kind::Spawn(spawn)) if spawn.attach => {
@@ -596,6 +613,33 @@ impl Connection {
         lock(&self.attached).remove(&agent_id);
     }
 
+    /// Another connection removed `agent_id`: drops this connection's
+    /// finished forwarder and `attached` mark for it, so a long-lived
+    /// connection does not keep them. A forwarder still running (the
+    /// removal can precede the exit) is left to deliver the exit and
+    /// remembered, to be dropped by a later removal or request once done.
+    async fn removed_elsewhere(&mut self, agent_id: u64) {
+        self.removed_pending.insert(agent_id);
+        self.sweep_removed().await;
+    }
+
+    /// Drops the state of removed agents whose forwarder has finished.
+    async fn sweep_removed(&mut self) {
+        if self.removed_pending.is_empty() {
+            return;
+        }
+        let done: Vec<u64> = self
+            .removed_pending
+            .iter()
+            .copied()
+            .filter(|id| self.forwarders.get(id).is_none_or(JoinHandle::is_finished))
+            .collect();
+        for agent_id in done {
+            self.removed_pending.remove(&agent_id);
+            self.forget_local(agent_id).await;
+        }
+    }
+
     /// Queues this connection's own `AgentRemoved`, which its removal
     /// forwarder skips.
     async fn queue_removed(&self, agent_id: u64, replaced_by: Option<u64>) -> bool {
@@ -725,11 +769,13 @@ fn removed_event(e: AgentRemoved) -> Frame {
 
 /// Announces removals this connection did not cause (its own are queued
 /// after its response). Missed events are not resent: clients recover by
-/// relisting, whose `replaced` map carries restarts.
+/// relisting, whose `replaced` map carries restarts. Each forwarded removal
+/// is also handed to the request loop (`local`).
 async fn forward_removed(
     mut removed: broadcast::Receiver<Removed>,
     outbox: mpsc::Sender<Frame>,
     own: ConnId,
+    local: mpsc::UnboundedSender<u64>,
 ) {
     loop {
         match removed.recv().await {
@@ -737,9 +783,11 @@ async fn forward_removed(
                 if r.origin == Some(own) {
                     continue;
                 }
+                let agent_id = r.event.agent_id;
                 if outbox.send(removed_event(r.event)).await.is_err() {
                     return;
                 }
+                let _ = local.send(agent_id);
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(
@@ -804,5 +852,158 @@ async fn write_frames(conn: ConnId, mut writer: Writer, mut outbox: mpsc::Receiv
             debug!(conn = conn.0, error = %e, "write failed");
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fleet_node::store::Labels;
+
+    async fn wait_until(mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_elsewhere_drops_the_finished_forwarder() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(Node::open(dir.path()).unwrap());
+        let (mut conn, mut rx) = test_conn(Arc::clone(&node));
+        let spawn = SpawnAgent {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            attach: true,
+            ..Default::default()
+        };
+        assert!(
+            conn.handle(Request {
+                id: 1,
+                kind: Some(request::Kind::Spawn(Box::new(spawn))),
+            })
+            .await
+        );
+        let id = loop {
+            if let Some(Frame::Event(Event {
+                kind: Some(event::Kind::Exited(e)),
+            })) = rx.recv().await
+            {
+                break e.agent_id;
+            }
+        };
+        wait_until(|| conn.forwarders[&id].is_finished()).await;
+        assert!(lock(&conn.attached).contains(&id));
+
+        // Another connection forgets it (retried until the node has
+        // retired the agent).
+        let other = Some(ConnId(u64::MAX - 1));
+        let n = Arc::clone(&node);
+        wait_until(move || {
+            n.forget(&[id], false, &Labels::new(), other)
+                .unwrap()
+                .forgotten
+                == vec![id]
+        })
+        .await;
+        conn.removed_elsewhere(id).await;
+        assert!(conn.forwarders.is_empty());
+        assert!(!lock(&conn.attached).contains(&id));
+    }
+
+    fn test_conn(node: Arc<Node>) -> (Connection, mpsc::Receiver<Frame>) {
+        let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
+        let conn = Connection {
+            node,
+            id: ConnId(u64::MAX),
+            outbox,
+            forwarders: HashMap::new(),
+            attached: Arc::new(Mutex::new(HashSet::new())),
+            removed_pending: HashSet::new(),
+            log_follower: None,
+        };
+        (conn, rx)
+    }
+
+    /// A stand-in forwarder for `id` that runs until the sender is used.
+    fn running_forwarder(conn: &mut Connection, id: u64) -> tokio::sync::oneshot::Sender<()> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        conn.forwarders.insert(
+            id,
+            tokio::spawn(async move {
+                let _ = done_rx.await;
+            }),
+        );
+        lock(&conn.attached).insert(id);
+        done_tx
+    }
+
+    #[tokio::test]
+    async fn removal_elsewhere_leaves_a_running_forwarder_until_a_later_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut conn, _rx) = test_conn(Arc::new(Node::open(dir.path()).unwrap()));
+        let done = running_forwarder(&mut conn, 7);
+
+        conn.removed_elsewhere(7).await;
+        assert!(conn.forwarders.contains_key(&7), "still delivering");
+        assert!(lock(&conn.attached).contains(&7));
+
+        done.send(()).unwrap();
+        wait_until(|| conn.forwarders[&7].is_finished()).await;
+        conn.removed_elsewhere(8).await;
+        assert!(conn.forwarders.is_empty());
+        assert!(!lock(&conn.attached).contains(&7));
+    }
+
+    #[tokio::test]
+    async fn removal_elsewhere_leaves_a_running_forwarder_until_a_later_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut conn, mut rx) = test_conn(Arc::new(Node::open(dir.path()).unwrap()));
+        let done = running_forwarder(&mut conn, 7);
+
+        conn.removed_elsewhere(7).await;
+        assert!(conn.forwarders.contains_key(&7), "still delivering");
+
+        done.send(()).unwrap();
+        wait_until(|| conn.forwarders[&7].is_finished()).await;
+        assert!(
+            conn.handle(Request {
+                id: 1,
+                kind: Some(request::Kind::List(Default::default())),
+            })
+            .await
+        );
+        assert!(matches!(rx.recv().await, Some(Frame::Response(_))));
+        assert!(conn.forwarders.is_empty());
+        assert!(!lock(&conn.attached).contains(&7));
+    }
+
+    #[tokio::test]
+    async fn forward_removed_hands_other_connections_removals_to_the_loop() {
+        let (tx, removed) = broadcast::channel(8);
+        let (outbox, mut out_rx) = mpsc::channel(OUTBOX_CAPACITY);
+        let (local, mut local_rx) = mpsc::unbounded_channel();
+        let own = ConnId(1);
+        let task = tokio::spawn(forward_removed(removed, outbox, own, local));
+        let removal = |agent_id, origin| Removed {
+            event: AgentRemoved {
+                agent_id,
+                replaced_by: None,
+            },
+            origin,
+        };
+        tx.send(removal(4, Some(own))).unwrap();
+        tx.send(removal(5, Some(ConnId(2)))).unwrap();
+
+        assert_eq!(local_rx.recv().await, Some(5), "own removal skipped");
+        match out_rx.recv().await {
+            Some(Frame::Event(Event {
+                kind: Some(event::Kind::AgentRemoved(e)),
+            })) => assert_eq!(e.agent_id, 5),
+            other => panic!("unexpected {other:?}"),
+        }
+        task.abort();
     }
 }
