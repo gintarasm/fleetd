@@ -305,6 +305,86 @@ fn restart_failure_keeps_old_agent() {
     assert!(removed.try_recv().is_err(), "nothing announced");
 }
 
+/// The files under `dir`, sorted.
+fn entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn restart_whose_spawn_fails_leaves_nothing_and_releases_the_guard() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let program = bin.path().join("agent.sh");
+    let write_program = || {
+        std::fs::write(&program, "#!/bin/sh\necho hi; exit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write_program();
+    let node = Node::open(dir.path()).unwrap();
+    let mut exits = node.exit_events();
+    let mut removed = node.removed_events();
+    let old = node
+        .spawn(SpawnAgent {
+            program: program.to_string_lossy().into_owned(),
+            cwd: work.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    wait_exited(&mut exits, old);
+    std::fs::remove_file(&program).unwrap();
+    let rings = entries(&dir.path().join("scrollback"));
+    let histories = entries(&dir.path().join("history"));
+
+    // The cwd is valid, so the spawn itself fails, inside `start`.
+    let e = node.restart(old, 0, 0, None).unwrap_err();
+    assert_ne!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+    assert_eq!(ids(&node), vec![old], "no new row");
+    assert_eq!(
+        entries(&dir.path().join("scrollback")),
+        rings,
+        "no new ring"
+    );
+    assert_eq!(
+        entries(&dir.path().join("history")),
+        histories,
+        "no new history"
+    );
+    assert!(node.replacements().unwrap().is_empty());
+    assert!(removed.try_recv().is_err(), "nothing announced");
+
+    // The `restarting` guard was released: a second attempt is not refused
+    // as being restarted, and the old agent restarts once it can.
+    let e = node.restart(old, 0, 0, None).unwrap_err();
+    assert_ne!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+    write_program();
+    let new = node.restart(old, 0, 0, None).unwrap();
+    assert!(new.replaced);
+    assert_eq!(ids(&node), vec![new.info.id]);
+}
+
+#[test]
+fn forget_after_a_failed_restart_is_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    let mut exits = node.exit_events();
+    let old = spawn_sh_in(&node, work.path(), "exit 0", &[]);
+    wait_exited(&mut exits, old);
+    drop(work);
+    assert!(node.restart(old, 0, 0, None).is_err());
+    let out = node.forget(&[old], false, &Labels::new(), None).unwrap();
+    assert_eq!(out.forgotten, vec![old]);
+    assert!(out.refused.is_empty());
+}
+
 #[test]
 fn concurrent_restart_creates_one_agent() {
     let dir = tempfile::tempdir().unwrap();
