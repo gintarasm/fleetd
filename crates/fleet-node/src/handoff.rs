@@ -124,14 +124,17 @@ impl HandoffGate {
 /// files. The terminal check keeps a record from naming one of the
 /// daemon's own fds that are open by then (the listener, the lock, the log),
 /// and the `claimed` check from making two owners of one fd (a double
-/// close). `None` for any of those, a negative fd, or a holder socket (not
-/// supported yet).
+/// close). `None` for any of those, fd 0, 1 or 2, or a holder socket (not
+/// supported yet). The standard fds are never an agent's: a successor
+/// started in a terminal (`fleet daemon upgrade` execs it there) has ttys
+/// on them, and an agent owning one would close the daemon's stdio when it
+/// exits.
 pub(crate) fn claim_terminal(
     terminal: Option<Terminal>,
     claimed: &mut HashSet<RawFd>,
 ) -> Option<OwnedFd> {
     let fd: RawFd = match terminal? {
-        Terminal::Fd(fd) if fd >= 0 => fd,
+        Terminal::Fd(fd) if fd > 2 => fd,
         Terminal::Fd(_) | Terminal::HolderSocket(_) => return None,
     };
     // SAFETY: fcntl and isatty on any integer are memory-safe; both fail on
@@ -289,5 +292,42 @@ mod tests {
         drop(claimed_fd);
         // SAFETY: closing the slave we opened.
         unsafe { libc::close(slave) };
+    }
+
+    #[test]
+    fn a_terminal_on_a_standard_fd_is_never_claimed() {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty with valid out-pointers and no name/termios/size.
+        let r = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(r, 0, "openpty");
+        // A tty on stdin, as for a daemon started in a terminal; stdin is
+        // put back afterwards (no test reads it).
+        // SAFETY: dup/dup2 on fds this process has open.
+        let saved = unsafe { libc::dup(0) };
+        assert!(saved >= 0, "dup stdin");
+        assert_eq!(unsafe { libc::dup2(slave, 0) }, 0, "dup2 onto stdin");
+        let mut claimed = HashSet::new();
+        let got = claim_terminal(Some(Terminal::Fd(0)), &mut claimed);
+        // Never closes fd 0, whatever it returned.
+        let claimed_stdin = got.map(std::os::fd::IntoRawFd::into_raw_fd).is_some();
+        // SAFETY: restoring stdin and closing what we opened.
+        unsafe {
+            libc::dup2(saved, 0);
+            libc::close(saved);
+            libc::close(slave);
+            libc::close(master);
+        }
+        assert!(!claimed_stdin, "a terminal on fd 0 was claimed");
+        for fd in 1..=2 {
+            assert!(claim_terminal(Some(Terminal::Fd(fd)), &mut claimed).is_none());
+        }
     }
 }
