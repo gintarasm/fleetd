@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Action, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
     IntoElement, ParentElement, PromptButton, PromptLevel, Render, SharedString,
@@ -29,6 +30,7 @@ use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
 use super::theme::{Theme, Typography, appearance_of};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use crate::core::config::{GuiConfig, save_connection};
+use crate::core::glass::{Backdrop, GlassChoice, glass_tint};
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
@@ -68,13 +70,9 @@ pub fn open_main_window(cx: &mut App) {
         }),
         window_min_size: Some(size(px(640.), px(400.))),
         // The desktop shows through, blurred, under the theme's window
-        // tint; Reduce Transparency keeps the window opaque (read when the
-        // window opens).
-        window_background: if native::reduce_transparency() {
-            WindowBackgroundAppearance::Opaque
-        } else {
-            WindowBackgroundAppearance::Blurred
-        },
+        // tint, or through liquid glass (`[gui] glass`, ADR 0049); Reduce
+        // Transparency keeps the window opaque (read when the window opens).
+        window_background: background_of(backdrop(app.read(cx).config())),
         ..Default::default()
     };
     let state = app.clone();
@@ -84,6 +82,24 @@ pub fn open_main_window(cx: &mut App) {
     }) {
         Ok(handle) => app.update(cx, |a, _| a.window = Some(handle)),
         Err(e) => eprintln!("fleet-gui: cannot open the window: {e}"),
+    }
+}
+
+/// The workspace window's backdrop for `[gui] glass`, this macOS and
+/// Reduce Transparency.
+fn backdrop(config: &GuiConfig) -> Backdrop {
+    Backdrop::resolve(
+        config.glass,
+        native::glass_available(),
+        native::reduce_transparency(),
+    )
+}
+
+fn background_of(backdrop: Backdrop) -> WindowBackgroundAppearance {
+    match backdrop {
+        Backdrop::Opaque => WindowBackgroundAppearance::Opaque,
+        Backdrop::Blur | Backdrop::GlassChrome => WindowBackgroundAppearance::Blurred,
+        Backdrop::GlassWindow => WindowBackgroundAppearance::Transparent,
     }
 }
 
@@ -111,6 +127,7 @@ struct Look {
     opacity: f32,
     blur: f32,
     motion: MotionChoice,
+    glass: GlassChoice,
 }
 
 impl Look {
@@ -120,6 +137,7 @@ impl Look {
             opacity: c.window_opacity,
             blur: c.blur,
             motion: c.reduce_motion,
+            glass: c.glass,
         }
     }
 }
@@ -146,6 +164,8 @@ pub struct Workspace {
     reduce_motion: bool,
     /// The settings the window last applied.
     look: Look,
+    /// What the window draws behind the content (blur, glass, opaque).
+    backdrop: Backdrop,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -174,8 +194,16 @@ impl Workspace {
             this.apply_look(window, cx);
         });
         let config = app.read(cx).config().clone();
-        stronger_blur(window, config.blur);
+        let backdrop = backdrop(&config);
+        if backdrop.blurred() {
+            stronger_blur(window, config.blur);
+        }
         let theme = window_theme(window, &config);
+        native::set_glass(
+            window,
+            backdrop.regions(),
+            Some(glass_tint(&window_tokens(window, &config))),
+        );
         // Coming back to the window is when a fleetd installed meanwhile
         // is worth noticing (one stat, never per frame).
         let activation = cx.observe_window_activation(window, |this, window, cx| {
@@ -216,6 +244,7 @@ impl Workspace {
             window_title: String::new(),
             reduce_motion: config.reduce_motion.resolve(native::reduce_motion()),
             look: Look::of(&config),
+            backdrop,
             _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -229,11 +258,33 @@ impl Workspace {
     /// The theme, blur and motion for the system's settings and ours.
     fn apply_look(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let config = self.app.read(cx).config().clone();
-        stronger_blur(window, config.blur);
+        // An opaque window stays opaque (Reduce Transparency is read when
+        // it opens); otherwise the glass setting applies live.
+        let backdrop = match self.backdrop {
+            Backdrop::Opaque => Backdrop::Opaque,
+            _ => backdrop(&config),
+        };
+        if backdrop != self.backdrop {
+            window.set_background_appearance(background_of(backdrop));
+            self.backdrop = backdrop;
+        }
+        if backdrop.blurred() {
+            stronger_blur(window, config.blur);
+        }
         let theme = window_theme(window, &config);
+        native::set_glass(
+            window,
+            backdrop.regions(),
+            Some(glass_tint(&window_tokens(window, &config))),
+        );
         self.reduce_motion = config.reduce_motion.resolve(native::reduce_motion());
         self.app.update(cx, |a, cx| a.set_theme(theme, cx));
         window.refresh();
+    }
+
+    /// What the window draws behind its content (`[gui] glass`, ADR 0049).
+    pub fn backdrop(&self) -> Backdrop {
+        self.backdrop
     }
 
     /// Motion is reduced (sheets and the toast appear without sliding).
@@ -852,6 +903,28 @@ impl Render for Workspace {
         let bar = render_bar(&bar, &theme, cx);
         super::bench::sidebar_drawn(window);
         let panes = self.render_panes(cx);
+        // Under glass gpui leaves the tint to the glass (ADR 0049).
+        let tint = self.backdrop.tint();
+        // Without glass the root's one fill covers all and nothing is
+        // wrapped (the default frame is unchanged).
+        let (bar, sidebar, panes) = if tint.everywhere() {
+            (
+                bar.into_any_element(),
+                sidebar.into_any_element(),
+                panes.into_any_element(),
+            )
+        } else {
+            let fill = |el: gpui::Div, on: bool| if on { el.bg(theme.window) } else { el };
+            (
+                fill(div().flex_none().child(bar), tint.chrome).into_any_element(),
+                fill(div().flex_none().h_full().child(sidebar), tint.chrome).into_any_element(),
+                fill(
+                    div().flex_1().min_w_0().h_full().flex().child(panes),
+                    tint.content,
+                )
+                .into_any_element(),
+            )
+        };
         let reduce_motion = self.reduce_motion;
         // An error wins over a neutral notice; the notice has no red border.
         let is_error = error.is_some();
@@ -950,7 +1023,7 @@ impl Render for Workspace {
             .relative()
             .flex()
             .flex_col()
-            .bg(theme.window)
+            .when(tint.everywhere(), |s| s.bg(theme.window))
             .text_color(theme.text)
             .on_action(cx.listener(Self::toggle_maximize))
             .on_action(
@@ -988,12 +1061,18 @@ impl Render for Workspace {
     }
 }
 
+/// The tokens for the window's appearance (or the one `[gui] theme`
+/// picks), the tint at `[gui] window_opacity`.
+fn window_tokens(window: &Window, config: &GuiConfig) -> Tokens {
+    let appearance = config.theme.resolve(appearance_of(window.appearance()));
+    Tokens::for_appearance(appearance).with_window_opacity(config.window_opacity)
+}
+
 /// The theme for the window's appearance (or the one `[gui] theme`
 /// picks), its tint at `[gui] window_opacity`, in the user's accent
 /// colour. Reduce Transparency makes it opaque.
 fn window_theme(window: &Window, config: &GuiConfig) -> Theme {
-    let appearance = config.theme.resolve(appearance_of(window.appearance()));
-    let tokens = Tokens::for_appearance(appearance).with_window_opacity(config.window_opacity);
+    let tokens = window_tokens(window, config);
     let theme = if native::reduce_transparency() {
         Theme::from_tokens(&tokens.opaque())
     } else {

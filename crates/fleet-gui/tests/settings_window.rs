@@ -8,6 +8,7 @@ use fleet_gui::app::{
     AppState, SettingsWindow, TextSetting, Theme, Workspace, open_settings, settings_window,
 };
 use fleet_gui::core::config::{GuiConfig, load_config};
+use fleet_gui::core::glass::{Backdrop, GlassChoice};
 use fleet_gui::core::settings::Section;
 use fleet_gui::core::target::Target;
 use fleet_gui::core::theme::Appearance;
@@ -106,6 +107,34 @@ fn window_opacity_tints_the_window(cx: &mut TestAppContext) {
     let after = s.app.read_with(cx, |a, _| a.theme().window.a);
     assert_eq!(config(cx, &s).window_opacity, 0.86);
     assert!(after > before, "{before} -> {after}");
+}
+
+#[gpui::test]
+fn glass_choice_applies_live_where_the_system_has_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let s = setup(cx, dir.path(), GuiConfig::default());
+    let backdrop = |cx: &mut TestAppContext| s.ws.read_with(cx, |w, _| w.backdrop()).unwrap();
+    let before = backdrop(cx);
+    assert!(
+        matches!(before, Backdrop::Blur | Backdrop::Opaque),
+        "off by default: {before:?}"
+    );
+    click(cx, &s, "glass-Sidebar and bar");
+    let c = config(cx, &s);
+    if c.glass == GlassChoice::Chrome {
+        // macOS 26 without Reduce Transparency: the control is live.
+        assert_eq!(backdrop(cx), Backdrop::GlassChrome);
+        assert_eq!(load_config(dir.path()).unwrap().glass, GlassChoice::Chrome);
+        click(cx, &s, "glass-Window");
+        assert_eq!(backdrop(cx), Backdrop::GlassWindow);
+        click(cx, &s, "glass-Off");
+        assert_eq!(backdrop(cx), Backdrop::Blur);
+        assert_eq!(load_config(dir.path()).unwrap().glass, GlassChoice::Off);
+    } else {
+        // No glass here, or Reduce Transparency: the control is inert.
+        assert_eq!(c.glass, GlassChoice::Off);
+        assert_eq!(backdrop(cx), before);
+    }
 }
 
 #[gpui::test]

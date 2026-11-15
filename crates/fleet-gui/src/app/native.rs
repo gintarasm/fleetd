@@ -1,20 +1,24 @@
 //! AppKit (objc2) calls for what gpui 0.2.2 does not offer: dragging the
-//! window by our own titlebar, the strength of the window's blur, the
-//! system accent colour, the app's appearance and the accessibility
-//! display settings. Main thread only; elsewhere, or without the event
+//! window by our own titlebar, the strength of the window's blur, liquid
+//! glass behind the content (macOS 26), the system accent colour, the
+//! app's appearance and the accessibility display settings. Main thread only; elsewhere, or without the event
 //! they need, they do nothing.
 
 use gpui::Window;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{ClassType, MainThreadMarker, msg_send};
+use objc2::runtime::{AnyClass, AnyObject};
+use objc2::{ClassType, MainThreadMarker, Message, msg_send};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSColor,
-    NSColorSpace, NSEventType, NSView, NSVisualEffectView, NSWorkspace,
+    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSAutoresizingMaskOptions, NSColor, NSColorSpace, NSEventType, NSGlassEffectView,
+    NSGlassEffectViewStyle, NSUserInterfaceItemIdentification, NSView, NSVisualEffectView,
+    NSWindowOrderingMode, NSWorkspace,
 };
-use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSString};
+use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
+use crate::core::glass::GlassRegion;
 use crate::core::settings::ThemeChoice;
+use crate::core::theme::Rgba;
 
 /// Lets the window server move the window with the mouse, from the left
 /// mouse-down being handled (a press on the unified bar). The window
@@ -81,6 +85,126 @@ pub fn reduce_transparency() -> bool {
 pub fn reduce_motion() -> bool {
     MainThreadMarker::new().is_some()
         && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+/// This macOS has liquid glass (`NSGlassEffectView`, macOS 26 and later).
+/// Asked of the runtime, not the OS version, so a beta or a back-port
+/// counts and a missing class can never be messaged.
+pub fn glass_available() -> bool {
+    AnyClass::get(c"NSGlassEffectView").is_some()
+}
+
+/// Puts one glass view per region behind gpui's view, tinted `tint`, and
+/// removes ours that are not listed (an empty list removes them all).
+/// Existing views are kept and retinted, so this is cheap to call again on
+/// an appearance change. The views follow window resizes by their
+/// autoresizing masks; the regions' frames come from the fixed chrome
+/// metrics, so nothing moves them per frame. Returns how many are in
+/// place: 0 without glass (macOS < 26), off the main thread, or without a
+/// window.
+pub fn set_glass(window: &Window, regions: &[GlassRegion], tint: Option<Rgba>) -> usize {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return 0;
+    };
+    let Some((content, gpui_view)) = content_views(window) else {
+        return 0;
+    };
+    let ours = |id: &str| id.starts_with("fleet.glass.");
+    // Drop the glass panes no longer wanted.
+    for sub in content.subviews() {
+        if let Some(id) = view_id(&sub)
+            && ours(&id)
+            && !regions.iter().any(|r| r.id() == id)
+        {
+            sub.removeFromSuperview();
+        }
+    }
+    if regions.is_empty() || !glass_available() {
+        return 0;
+    }
+    let tint = tint.map(|c| {
+        let f = |v: u8| f64::from(v) / 255.0;
+        NSColor::colorWithSRGBRed_green_blue_alpha(f(c.r), f(c.g), f(c.b), f64::from(c.a))
+    });
+    let bounds = content.bounds();
+    let flipped = content.isFlipped();
+    let mut placed = 0;
+    // Back to front: each goes just under gpui's view, so the later ones
+    // end up on top.
+    for region in regions {
+        let existing = content
+            .subviews()
+            .iter()
+            .find(|v| view_id(v).as_deref() == Some(region.id()));
+        let view: Retained<NSView> = match existing {
+            Some(v) => v,
+            None => {
+                let glass = NSGlassEffectView::new(mtm);
+                glass.setStyle(NSGlassEffectViewStyle::Regular);
+                glass.setCornerRadius(0.0);
+                glass.setIdentifier(Some(&NSString::from_str(region.id())));
+                let view: Retained<NSView> = Retained::into_super(glass);
+                // gpui's view is a subview of `content`: just under it.
+                content.addSubview_positioned_relativeTo(
+                    &view,
+                    NSWindowOrderingMode::Below,
+                    Some(&gpui_view),
+                );
+                view
+            }
+        };
+        let f = region.frame(bounds.size.width as f32, bounds.size.height as f32);
+        let y = if flipped {
+            f64::from(f.y)
+        } else {
+            bounds.size.height - f64::from(f.y + f.h)
+        };
+        view.setFrame(NSRect::new(
+            NSPoint::new(f64::from(f.x), y),
+            NSSize::new(f64::from(f.w), f64::from(f.h)),
+        ));
+        let (grow_w, grow_h) = region.grows();
+        let mut mask = NSAutoresizingMaskOptions::empty();
+        mask |= if grow_w {
+            NSAutoresizingMaskOptions::ViewWidthSizable
+        } else {
+            NSAutoresizingMaskOptions::ViewMaxXMargin
+        };
+        // Keep the distance to the top: in an unflipped view that is the
+        // margin below that stretches.
+        mask |= if grow_h {
+            NSAutoresizingMaskOptions::ViewHeightSizable
+        } else if flipped {
+            NSAutoresizingMaskOptions::ViewMaxYMargin
+        } else {
+            NSAutoresizingMaskOptions::ViewMinYMargin
+        };
+        view.setAutoresizingMask(mask);
+        if let Some(glass) = view.downcast_ref::<NSGlassEffectView>() {
+            glass.setTintColor(tint.as_deref());
+        }
+        placed += 1;
+    }
+    placed
+}
+
+/// The window's content view and gpui's view inside it.
+fn content_views(window: &Window) -> Option<(Retained<NSView>, Retained<NSView>)> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return None;
+    };
+    // SAFETY: gpui's AppKit handle points at its live view, and the
+    // callers run on the main thread.
+    let view: &NSView = unsafe { h.ns_view.cast::<NSView>().as_ref() };
+    let content = view.window()?.contentView()?;
+    Some((content, view.retain()))
+}
+
+fn view_id(view: &NSView) -> Option<String> {
+    view.identifier().map(|s| s.to_string())
 }
 
 /// Sets the blur radius, in points, of the window's blurred backdrop.
