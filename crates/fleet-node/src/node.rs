@@ -2145,6 +2145,7 @@ impl Node {
             exit_code: None,
             created_unix_ms,
             labels: new.labels,
+            exited_unix_ms: None,
         };
         Ok((info, attached))
     }
@@ -2751,6 +2752,7 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
         exit_code: rec.exit_code,
         created_unix_ms: rec.created_unix_ms,
         labels: rec.labels,
+        exited_unix_ms: rec.exited_unix_ms,
     }
 }
 

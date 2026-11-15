@@ -16,6 +16,7 @@ use super::sidebar_view::{TabMark, program_name};
 use super::theme::Theme;
 use super::workspace::Workspace;
 use crate::core::config::GuiConfig;
+use crate::core::ended::run_time;
 use crate::core::layout::{Axis, Dir, Layout};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
@@ -808,6 +809,7 @@ impl AppState {
                 reconnect_in,
                 focused: pane == self.focused,
                 maximized: self.maximized == Some(pane),
+                run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));
@@ -1050,6 +1052,31 @@ impl AppState {
         self.session.forget(vec![agent_id]);
     }
 
+    /// The summary bar's Remove: forgets the agent `pane` shows if it
+    /// exited or is lost; otherwise does nothing. The pane empties when the
+    /// node announces the removal.
+    pub fn remove_in_pane(&self, pane: PaneId, cx: &App) {
+        if let Some(agent) = self.ended_agent(pane, cx) {
+            self.forget(agent);
+        }
+    }
+
+    /// The agent `pane` shows, if it exited or is lost.
+    fn ended_agent(&self, pane: PaneId, cx: &App) -> Option<u64> {
+        let view = self.panes.get(&pane)?;
+        let (state, shown) = {
+            let m = lock(view.read(cx).model_handle());
+            (m.state(), m.agent_id())
+        };
+        match state {
+            // The final screen on show is that agent's.
+            PaneState::Exited(_) => shown,
+            // The attach failed: the agent is the one the layout names.
+            PaneState::Lost => self.layout.agent(pane).or(shown),
+            _ => None,
+        }
+    }
+
     pub fn clear_exited(&self) {
         self.session.clear_exited();
     }
@@ -1098,21 +1125,10 @@ impl AppState {
     /// size, if it exited or is lost; otherwise does nothing.
     pub fn restart_focused(&mut self, cx: &mut Context<Self>) {
         let pane = self.focused;
-        let Some(view) = self.panes.get(&pane) else {
+        let Some(agent) = self.ended_agent(pane, cx) else {
             return;
         };
-        let (state, shown) = {
-            let m = lock(view.read(cx).model_handle());
-            (m.state(), m.agent_id())
-        };
-        let agent = match state {
-            // The final screen on show is that agent's.
-            PaneState::Exited(_) => shown,
-            // The attach failed: the agent is the one the layout names.
-            PaneState::Lost => self.layout.agent(pane).or(shown),
-            _ => None,
-        };
-        let Some(agent) = agent else {
+        let Some(view) = self.panes.get(&pane) else {
             return;
         };
         let (cols, rows) = view.read(cx).grid().unwrap_or((80, 24));

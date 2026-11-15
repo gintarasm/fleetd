@@ -680,6 +680,7 @@ impl Workspace {
             PaneEvent::ToggleMaximize => self.toggle_maximize(&ToggleMaximize, window, cx),
             PaneEvent::Close => self.close_pane(&ClosePane, window, cx),
             PaneEvent::Restart => self.restart_pane(&RestartPane, window, cx),
+            PaneEvent::Remove => self.app.read(cx).remove_in_pane(pane, cx),
             PaneEvent::ContextMenu { on_grid } => self.open_pane_menu(pane, on_grid, cx),
         }
     }
@@ -967,12 +968,13 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use fleet_proto::{AgentInfo, AgentState, AttachOk};
     use fleet_term::Palette;
     use gpui::{
-        AppContext, Entity, Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent,
-        TestAppContext, TouchPhase, VisualTestContext, point,
+        AppContext, ClipboardItem, Entity, Modifiers, MouseButton, Point, ScrollDelta,
+        ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, point,
     };
 
     use super::Workspace;
@@ -2233,6 +2235,44 @@ mod tests {
         s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
         s.cx.run_until_parked();
         assert_eq!(shown(&mut s, PaneId(1)), Some(9));
+    }
+
+    #[gpui::test]
+    fn ended_pane_summary_copies_its_last_output_and_removes_its_agent(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        fake.model(PaneId(1))
+            .lock()
+            .unwrap()
+            .on_output(b"$ make\r\nbuild failed   \r\n");
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        // Running: no summary.
+        assert!(!drawn(&mut s, "pane-1-ended"));
+        assert!(!drawn(&mut s, "pane-1-remove"));
+
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        let mut exited = ended(5, "/w", 1_000, AgentState::Exited);
+        exited.info.exited_unix_ms = Some(193_000);
+        agents(&mut s, &fake, vec![exited]);
+        assert!(drawn(&mut s, "pane-1-ended"));
+        // The bar is told how long the agent ran.
+        let run_time = s.app.read_with(s.cx, |a, cx| {
+            a.pane_view(PaneId(1)).unwrap().read(cx).chrome.run_time
+        });
+        assert_eq!(run_time, Some(Duration::from_secs(192)));
+
+        s.cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+        click(&mut s, "pane-1-copy-output");
+        let clip = s.cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(clip.as_deref(), Some("$ make\nbuild failed"));
+
+        click(&mut s, "pane-1-remove");
+        assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![5])));
     }
 
     /// Pane 1 shows agent 5, exited, and cmd-r restarts it in place.

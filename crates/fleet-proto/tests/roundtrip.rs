@@ -77,6 +77,7 @@ fn info() -> AgentInfo {
         exit_code: None,
         created_unix_ms: 1,
         labels: labels(),
+        exited_unix_ms: Some(2),
     }
 }
 
