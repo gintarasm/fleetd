@@ -159,7 +159,7 @@ fn no_binary_restarts_onto_the_daemons_own_path_as_rebuilt() {
     fs::rename(&next, &own).unwrap();
     let rebuilt = fs::metadata(&own).unwrap().ino();
     // macOS scans a new executable on its first run, which under load can
-    // outlast the daemon's 2 s check: run it once first.
+    // outlast the daemon's 5 s check: run it once first.
     let warm = Command::new(&own).arg("--handoff-check").output().unwrap();
     assert!(warm.status.success());
 

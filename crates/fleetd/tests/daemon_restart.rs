@@ -5,7 +5,8 @@
 //! The tests' daemon is a debug build, so its test hooks
 //! (`FLEETD_TEST_RESTART_DELAY_MS`, `FLEETD_TEST_CORRUPT_HANDOFF`,
 //! `FLEETD_TEST_SHORT_HANDOFF`, `FLEETD_TEST_PANIC_AFTER_FREEZE`,
-//! `FLEETD_TEST_PANIC_OPENING_HANDOFF`) work.
+//! `FLEETD_TEST_PANIC_DESCRIBING`, `FLEETD_TEST_PANIC_OPENING_HANDOFF`)
+//! work.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -668,16 +669,26 @@ fn corrupt_record_falls_back() {
 
 #[test]
 fn panic_after_freeze_thaws_and_keeps_serving() {
+    panic_in_restart_thaws_and_keeps_serving("FLEETD_TEST_PANIC_AFTER_FREEZE");
+}
+
+#[test]
+fn panic_while_freezing_thaws_and_keeps_serving() {
+    // Inside the node's freeze, while it saves each agent's screen.
+    panic_in_restart_thaws_and_keeps_serving("FLEETD_TEST_PANIC_DESCRIBING");
+}
+
+fn panic_in_restart_thaws_and_keeps_serving(hook: &str) {
     const N: u32 = 8_000;
-    let mut daemon = Daemon::start_with(&[("FLEETD_TEST_PANIC_AFTER_FREEZE", "1")]);
+    let mut daemon = Daemon::start_with(&[(hook, "1")]);
     let (mut c, hello) = daemon.connect();
     let shell = c.sh(SHELL);
     let writer = c.sh(&numbered_writer(N));
     c.wait_screen(shell, "ready", |l| l == "ready");
     c.wait_screen(writer, "output", past_200);
 
-    // The restart panics once the agents are frozen: answered with an
-    // Error, everything undone.
+    // The restart panics with the agents frozen: answered with an Error,
+    // everything undone.
     let id = c.restart_daemon(fleetd());
     let e = error_message(c.response(id));
     assert!(e.contains("internal error"), "{e}");
@@ -777,7 +788,7 @@ fn no_binary_named_restarts_onto_the_daemons_own_path_rebuilt() {
     let rebuilt = fs::metadata(&own).unwrap().ino();
     assert_ne!(rebuilt, started_from);
     // macOS scans a new executable on its first run, which under load can
-    // outlast the 2 s check: run it once first.
+    // outlast the 5 s check: run it once first.
     warm_up(&own);
 
     let id = c.restart_daemon_onto_itself();

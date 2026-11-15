@@ -31,7 +31,7 @@ use crate::handoff;
 use crate::server::{RESTART_FLUSH, RestartReply, RestartRequest, Restarts};
 
 /// Bound on the new binary's `--handoff-check`.
-pub const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on stopping requests and freezing the node for a restart.
 pub const FREEZE_DEADLINE: Duration = Duration::from_secs(3);
 

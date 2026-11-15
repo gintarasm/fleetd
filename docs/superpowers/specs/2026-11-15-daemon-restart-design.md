@@ -59,7 +59,7 @@ The user chose 1 now, with the code prepared for 3.
 ### Pre-flight check (before anything irreversible)
 
 1. Resolve `binary` to an absolute path; it must be an executable file.
-2. Run `<binary> --handoff-check` with a short timeout (2 s). It prints the handoff-format versions it can read, one line, and exits 0. Anything else — not executable, non-zero, timeout, no common version — refuses the restart with an `Error` naming the reason. Nothing has changed; the daemon carries on.
+2. Run `<binary> --handoff-check` with a short timeout (5 s). It prints the handoff-format versions it can read, one line, and exits 0. Anything else — not executable, non-zero, timeout, no common version — refuses the restart with an `Error` naming the reason. Nothing has changed; the daemon carries on.
 3. Refuse if a restart is already in progress, or if an agent spawn or agent restart (M2c) is mid-flight (wait for those to settle, bounded, then refuse).
 
 ### Freezing the node at a clean boundary

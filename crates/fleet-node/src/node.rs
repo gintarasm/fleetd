@@ -1350,6 +1350,36 @@ fn labels_match(labels: &Labels, selector: &Labels) -> bool {
     selector.iter().all(|(k, v)| labels.get(k) == Some(v))
 }
 
+/// Runs `f` when dropped, on a return or an unwind, unless disarmed.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+/// Test hook (debug builds): with `FLEETD_TEST_PANIC_DESCRIBING` set,
+/// describing the frozen agents for a handoff panics.
+fn test_panic_describing() {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("FLEETD_TEST_PANIC_DESCRIBING").is_some() {
+        panic!("test hook FLEETD_TEST_PANIC_DESCRIBING");
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -2459,26 +2489,30 @@ impl Node {
     /// daemon run.
     pub fn prepare_handoff(&self, deadline: Instant) -> io::Result<Vec<HandoffAgent>> {
         self.handoff.begin(deadline)?;
+        // Reopens the gate on an error or a panic; disarmed on success.
+        let gate = OnDrop::new(|| self.handoff.end());
         let agents = self.freeze_for_handoff(deadline);
         match &agents {
-            Ok(agents) => info!(agents = agents.len(), "handoff prepared"),
-            Err(e) => {
-                warn!(error = %e, "preparing the handoff failed; serving on");
-                self.handoff.end();
+            Ok(agents) => {
+                info!(agents = agents.len(), "handoff prepared");
+                gate.disarm();
             }
+            Err(e) => warn!(error = %e, "preparing the handoff failed; serving on"),
         }
         agents
     }
 
-    /// Freezes the host and describes its agents; thaws on failure.
+    /// Freezes the host and describes its agents; thaws on an error or a
+    /// panic.
     fn freeze_for_handoff(&self, deadline: Instant) -> io::Result<Vec<HandoffAgent>> {
         // A failed freeze thaws itself, or was not ours to thaw (busy).
         let frozen = self.host.freeze(deadline)?;
+        let thaw = OnDrop::new(|| self.host.thaw());
         let described = self
             .wait_for_exiting(&frozen, deadline)
             .and_then(|()| self.describe_frozen(frozen));
-        if described.is_err() {
-            self.host.thaw();
+        if described.is_ok() {
+            thaw.disarm();
         }
         described
     }
@@ -2520,6 +2554,7 @@ impl Node {
             .iter()
             .map(|(&id, live)| (live.host_id, (id, live.pipeline.clone())))
             .collect();
+        test_panic_describing();
         frozen
             .into_iter()
             .map(|agent| {

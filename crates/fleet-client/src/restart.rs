@@ -17,10 +17,10 @@ pub const RESTART_WAIT: Duration = Duration::from_secs(10);
 
 /// How long a client that does not block on the request (the GUI) waits
 /// for the old daemon's answer to `RestartDaemon` before it gives up with
-/// [`did_not_come_back`]: fleetd's check of the new binary (2 s) and its
+/// [`did_not_come_back`]: fleetd's check of the new binary (5 s) and its
 /// freeze (3 s) bound the answer, plus a margin. [`RESTART_WAIT`] starts
 /// only once the answer is in.
-pub const RESTART_ANSWER_WAIT: Duration = Duration::from_secs(6);
+pub const RESTART_ANSWER_WAIT: Duration = Duration::from_secs(9);
 
 /// What an old daemon says to a request it does not know, and what a client
 /// says instead.

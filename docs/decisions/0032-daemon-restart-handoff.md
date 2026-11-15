@@ -39,7 +39,7 @@ The freeze runs under a 3 s deadline; every step is undoable, so a miss or failu
 
 ### Pre-flight, refusals and failure
 
-Before anything irreversible: `binary` resolves to an absolute executable file; `<binary> --handoff-check` (2 s timeout, output read with a bounded wait so a grandchild holding stdout cannot hang it) prints `handoff N` for each version it reads, and one must match; no restart is running; no spawn or agent restart is mid-flight. Each refusal leaves the old daemon serving, agents untouched.
+Before anything irreversible: `binary` resolves to an absolute executable file; `<binary> --handoff-check` (5 s timeout, since macOS scans a freshly built binary on its first run; output read with a bounded wait so a grandchild holding stdout cannot hang it) prints `handoff N` for each version it reads, and one must match; no restart is running; no spawn or agent restart is mid-flight. Each refusal leaves the old daemon serving, agents untouched.
 
 If `execve` fails after the answer (the binary changed after the check), the daemon thaws and records the failure in its restore summary (`restart_error`, same `instance`), so the client that already got `RestartingDaemon` learns the reason on reconnecting.
 
@@ -51,11 +51,11 @@ If the record is unusable or restore fails, the daemon logs it, signals the reco
 
 The pids in `FLEETD_HANDOFF_PIDS` are the safety net for everything else. Once the node has opened from the record, every listed pid that is still a child and not a kept agent's is ended, as a record that lists fewer agents leaves them to no one. If the start fails before the node has opened (an error or a panic while opening it, a `serve` error before it, the runtime failing to build), every listed child is ended (SIGTERM, SIGKILL after the shutdown grace, reaped), the agents still running in the store are marked lost and the process exits. Only children of the process are signalled, so a stray variable cannot kill arbitrary process groups.
 
-A panic in the old daemon's restart after the freeze is undone like any failure: a guard thaws the node and removes the record on the way out, and the requester gets an `Error` ("internal error (…)").
+A panic in the old daemon's restart, during the freeze (while the node saves each agent's screen) or after it, is undone like any failure: guards thaw the node, reopen the handoff gate and remove any record on the way out, and the requester gets an `Error` ("internal error (…)").
 
 ### Telling the outcome
 
-One decision, `restart_outcome` in `fleet-client`, is shared by the CLI and the GUI, so both print identical words and agree on success. Success needs positive proof: a new instance whose summary names the old instance as predecessor, nothing failed or fell back, and exactly the announced number of agents kept. Missing summary, another predecessor or too few kept is a partial result (`fleetd restarted: K kept, M could not be restored and were ended (ids …)`, exit 1; "(ids unknown)" when the summary lists none). The same instance with a `restart_error` is `fleetd restart failed: <reason>; the old fleetd is still running`; the same instance without one is still waiting. The wait is bounded at 10 s from `RestartingDaemon`. The GUI, which does not block on the request, also bounds the answer itself at 6 s (the 2 s check plus the 3 s freeze, plus a margin); either timeout reads "fleetd did not come back within 10 s".
+One decision, `restart_outcome` in `fleet-client`, is shared by the CLI and the GUI, so both print identical words and agree on success. Success needs positive proof: a new instance whose summary names the old instance as predecessor, nothing failed or fell back, and exactly the announced number of agents kept. Missing summary, another predecessor or too few kept is a partial result (`fleetd restarted: K kept, M could not be restored and were ended (ids …)`, exit 1; "(ids unknown)" when the summary lists none). The same instance with a `restart_error` is `fleetd restart failed: <reason>; the old fleetd is still running`; the same instance without one is still waiting. The wait is bounded at 10 s from `RestartingDaemon`. The GUI, which does not block on the request, also bounds the answer itself at 9 s (the 5 s check plus the 3 s freeze, plus a margin); either timeout reads "fleetd did not come back within 10 s".
 
 ### Clients
 
