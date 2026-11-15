@@ -20,7 +20,7 @@ use super::controls::appear;
 use super::keymap::{
     ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
     FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart, RestartPane,
-    SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
@@ -40,6 +40,7 @@ use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::target::Target;
 use crate::core::theme::Tokens;
 use crate::core::titlebar::{Link, bar_title, window_title};
+use crate::core::zoom::Zoom;
 
 /// Opens the workspace window, or brings the open one to the front.
 pub fn open_main_window(cx: &mut App) {
@@ -660,6 +661,10 @@ impl Workspace {
     }
 
     /// ⌘R: restarts the focused pane's agent in place if it ended.
+    fn zoom(&mut self, zoom: Zoom, cx: &mut Context<Self>) {
+        self.app.update(cx, |a, cx| a.zoom(zoom, cx));
+    }
+
     fn restart_pane(&mut self, _: &RestartPane, _: &mut Window, cx: &mut Context<Self>) {
         if self.modal() {
             return;
@@ -972,6 +977,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(Zoom::In, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(Zoom::Out, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(Zoom::Reset, cx)))
             .child(bar)
             .child(
                 div()

@@ -24,3 +24,4 @@ pub mod text_edit;
 pub mod theme;
 pub mod titlebar;
 pub mod truncate;
+pub mod zoom;
