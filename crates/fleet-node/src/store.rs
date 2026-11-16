@@ -6,9 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
 
-/// v6 and v7 were taken by M3 branches (spec "Waves"); identity took 8, the
-/// mailbox 9 (M3-E, renumbered at merge), leases 10 (ADR 0077).
+/// Identity took 8 (spec "Waves"); the mailbox (M3-E) 9, leases 10 (ADR 0077).
 const SCHEMA_VERSION: i64 = 10;
+
+mod mailbox;
+use mailbox::MAILBOX_DDL;
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -231,8 +233,17 @@ impl Store {
                  COMMIT;"
             ))?;
         }
+        if version < 9 {
+            // v9: mailboxes (ADR 0076). The DDL must match `create_latest`'s.
+            self.conn.execute_batch(&format!(
+                "BEGIN;
+                 {MAILBOX_DDL}
+                 PRAGMA user_version = 9;
+                 COMMIT;"
+            ))?;
+        }
         if version < 10 {
-            // v10: leases (ADR 0077; v9 is the mailbox's, M3-E). The DDL
+            // v10: leases (ADR 0077). The DDL
             // must match `create_latest`'s.
             self.conn.execute_batch(&format!(
                 "BEGIN;
@@ -270,6 +281,7 @@ impl Store {
                  new_id INTEGER NOT NULL
              );
              {AGENT_TOKENS_DDL}
+             {MAILBOX_DDL}
              {LEASES_DDL}
              PRAGMA user_version = 10;
              COMMIT;"
@@ -444,6 +456,7 @@ impl Store {
                 "DELETE FROM agent_replacements WHERE new_id = ?1",
                 (id as i64,),
             )?;
+            self.drop_mailbox_mark(id)?;
         }
         tx.commit()?;
         Ok(n == 1)
@@ -453,6 +466,7 @@ impl Store {
     /// that pointed at `old` to `new` (chains collapse), in one transaction.
     pub fn replace_agent(&self, old: u64, new: u64) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        self.move_mailbox(old, new)?;
         self.conn
             .execute("DELETE FROM agents WHERE id = ?1", (old as i64,))?;
         self.conn.execute(
@@ -677,7 +691,8 @@ impl Store {
     }
 
     /// [`Store::mark_running_as_lost`], sparing `keep`: the agents a previous
-    /// daemon handed over, still running. One transaction.
+    /// daemon handed over, still running. Each lost agent reports it (a
+    /// `lost` message to its parent or the user, ADR 0076). One transaction.
     pub fn mark_running_as_lost_except(&self, keep: &[u64]) -> rusqlite::Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let running: Vec<u64> = {
@@ -697,6 +712,7 @@ impl Store {
             )?;
             self.conn
                 .execute("DELETE FROM agent_tokens WHERE agent_id = ?1", (id as i64,))?;
+            self.report_lost(id)?;
         }
         tx.commit()?;
         Ok(lost)
@@ -707,7 +723,7 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn new_agent(n: i64) -> NewAgent {
+    pub(super) fn new_agent(n: i64) -> NewAgent {
         NewAgent {
             program: "claude".into(),
             args: vec!["--flag".into(), format!("a b\"{n}")],
@@ -771,7 +787,7 @@ mod tests {
         let (_d, p, s) = open_tmp();
         drop(s);
         let c = Connection::open(&p).unwrap();
-        c.execute_batch("DROP TABLE leases; PRAGMA user_version = 8;")
+        c.execute_batch("DROP TABLE leases; DROP TABLE messages; DROP TABLE inbox_marks; PRAGMA user_version = 8;")
             .unwrap();
         drop(c);
         let s = Store::open(&p).unwrap();
@@ -856,6 +872,8 @@ mod tests {
         conn.execute_batch(
             "DROP TABLE agent_tokens;
              DROP TABLE leases;
+             DROP TABLE messages;
+             DROP TABLE inbox_marks;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              ALTER TABLE agents DROP COLUMN priority;
              PRAGMA user_version = 3;",
@@ -868,7 +886,7 @@ mod tests {
         assert_eq!((rec.program.as_str(), rec.priority), ("claude", 0));
     }
 
-    fn open_tmp() -> (tempfile::TempDir, std::path::PathBuf, Store) {
+    pub(super) fn open_tmp() -> (tempfile::TempDir, std::path::PathBuf, Store) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let s = Store::open(&path).unwrap();
@@ -1131,6 +1149,8 @@ mod tests {
             "agent_labels",
             "agent_replacements",
             "agent_tokens",
+            "messages",
+            "inbox_marks",
             "sqlite_sequence",
         ] {
             for pragma in ["table_info", "foreign_key_list", "index_list"] {
@@ -1169,6 +1189,8 @@ mod tests {
             "agent_labels",
             "agent_replacements",
             "agent_tokens",
+            "messages",
+            "inbox_marks",
         ] {
             let sql: String = conn
                 .query_row(
@@ -1294,6 +1316,8 @@ mod tests {
         conn.execute_batch(
             "DROP TABLE agent_tokens;
              DROP TABLE leases;
+             DROP TABLE messages;
+             DROP TABLE inbox_marks;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              UPDATE agents SET state = 'exited', exit_code = 2;
              PRAGMA user_version = 4;",

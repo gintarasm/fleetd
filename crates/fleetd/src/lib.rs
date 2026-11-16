@@ -8,6 +8,7 @@ mod scope;
 mod server;
 pub mod stdio;
 pub mod stop_signal;
+mod wait;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};

@@ -215,6 +215,13 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
         Kind::Restart(r) => vec![r.agent_id],
         // With `exited_only`, the node keeps to a's descendants.
         Kind::Forget(r) => r.ids.clone(),
+        // The node checks the recipients (D(a), a's parent, the user) and
+        // keeps a broadcast to D(a) (ADR 0076).
+        Kind::SendMessage(_) => return None,
+        // The caller's own mailbox.
+        Kind::ReadInbox(_) => return None,
+        // Named agents must be in D(a); none means D(a).
+        Kind::Wait(r) => r.agent_ids.clone(),
     };
     for id in targets {
         if !scope.sees(id).await {
