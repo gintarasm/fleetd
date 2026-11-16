@@ -8,7 +8,7 @@
 //! *reported* (`fleet report`, `AgentInfo.reported`) wins over it where
 //! both exist.
 
-use crate::{AgentInfo, AgentState};
+use crate::{AgentInfo, AgentState, Reported, ReportedState};
 
 /// The label key New terminal sets. Not a `fleet.` key: those are the
 /// core's (ADR 0025), and the core never interprets labels.
@@ -57,6 +57,43 @@ impl AgentStatus {
     pub fn ended(self) -> bool {
         matches!(self, AgentStatus::Done | AgentStatus::Failed)
     }
+}
+
+impl ReportedState {
+    /// The word `fleet report` takes and `fleet ls` / `fleet tree` print.
+    pub fn name(self) -> &'static str {
+        match self {
+            ReportedState::Unspecified => "unknown",
+            ReportedState::ReportedWorking => "working",
+            ReportedState::ReportedWaiting => "waiting",
+            ReportedState::ReportedDone => "done",
+            ReportedState::ReportedError => "error",
+        }
+    }
+
+    /// The state a [`ReportedState::name`] names (not "unknown").
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            ReportedState::ReportedWorking,
+            ReportedState::ReportedWaiting,
+            ReportedState::ReportedDone,
+            ReportedState::ReportedError,
+        ]
+        .into_iter()
+        .find(|s| s.name() == name)
+    }
+}
+
+/// The agent's own status report, while it counts: the agent is running
+/// and not a shell. An ended agent speaks through its exit (done or
+/// failed), not through what it last said (ADR 0075).
+pub fn live_report(info: &AgentInfo) -> Option<&Reported> {
+    if info.state() != AgentState::Running || is_shell(info) {
+        return None;
+    }
+    info.reported
+        .as_ref()
+        .filter(|r| r.state() != ReportedState::Unspecified)
 }
 
 /// A plain login shell from New terminal: no status.
@@ -229,6 +266,35 @@ mod tests {
             st(&info(AgentState::Lost, None), "", None, false),
             Some(AgentStatus::Failed)
         );
+    }
+
+    #[test]
+    fn reported_states_have_names_both_ways() {
+        for n in ["working", "waiting", "done", "error"] {
+            assert_eq!(ReportedState::from_name(n).unwrap().name(), n);
+        }
+        assert_eq!(ReportedState::from_name("busy"), None);
+        assert_eq!(ReportedState::from_name("unknown"), None);
+    }
+
+    #[test]
+    fn a_report_counts_while_the_agent_runs_and_is_not_a_shell() {
+        let rep = Reported {
+            state: ReportedState::ReportedWaiting.into(),
+            message: "m".into(),
+            at_unix_ms: 5,
+        };
+        let mut i = info(AgentState::Running, None);
+        assert_eq!(live_report(&i), None);
+        i.reported = Some(rep.clone());
+        assert_eq!(live_report(&i), Some(&rep));
+        i.labels.insert("kind".into(), "shell".into());
+        assert_eq!(live_report(&i), None);
+        i.labels.clear();
+        i.set_state(AgentState::Exited);
+        assert_eq!(live_report(&i), None);
+        i.set_state(AgentState::Lost);
+        assert_eq!(live_report(&i), None);
     }
 
     #[test]
