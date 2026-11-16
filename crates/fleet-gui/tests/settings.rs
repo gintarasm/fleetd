@@ -27,7 +27,7 @@ fn defaults_follow_the_system_and_keep_todays_look() {
     assert_eq!(c.blur, 40.0);
     assert_eq!(c.window_opacity, 0.84);
     assert!(c.confirm_kill);
-    assert!(c.notifications);
+    assert!(!c.notifications, "off unless asked for (ADR 0042)");
     assert_eq!(c.default_dir, "");
     assert_eq!(c.glass, GlassChoice::Off, "glass stays off until decided");
 }
@@ -104,7 +104,7 @@ fn a_change_reports_its_key_only_when_it_changes_something() {
         Some("option_as_meta")
     );
     assert_eq!(
-        Change::Notifications(false).apply(&mut c),
+        Change::Notifications(true).apply(&mut c),
         Some("notifications")
     );
     assert_eq!(

@@ -157,9 +157,9 @@ fn switches_toggle_their_settings(cx: &mut TestAppContext) {
     click(cx, &s, "switch-notifications");
     click(cx, &s, "switch-option-as-meta");
     let c = config(cx, &s);
-    assert!(!c.confirm_kill && !c.notifications && !c.option_as_meta);
+    assert!(!c.confirm_kill && c.notifications && !c.option_as_meta);
     let saved = load_config(dir.path()).unwrap();
-    assert!(!saved.confirm_kill && !saved.notifications && !saved.option_as_meta);
+    assert!(!saved.confirm_kill && saved.notifications && !saved.option_as_meta);
     click(cx, &s, "switch-confirm-kill");
     assert!(config(cx, &s).confirm_kill);
 }
