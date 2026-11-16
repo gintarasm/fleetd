@@ -62,6 +62,9 @@ struct RowSnapshot {
     selected: Option<(u16, u16)>,
     /// The hovered link's columns, `from..to`.
     link: Option<(u16, u16)>,
+    /// Find matches, `from..to`, and whether each is the current one
+    /// (looked up, not searched: ADR 0053).
+    found: Vec<(u16, u16, bool)>,
 }
 
 /// What a frame draws, copied out under one model lock.
@@ -112,10 +115,18 @@ impl TerminalElement {
                     .filter(|&(l, _, _)| l == line)
                     .map(|(_, from, to)| (from.min(cols), to.min(cols)))
                     .filter(|(from, to)| from < to);
+                let mut found = Vec::new();
+                model.find_matches(line, &mut found);
+                found.retain_mut(|(from, to, _)| {
+                    *from = (*from).min(cols);
+                    *to = (*to).min(cols);
+                    from < to
+                });
                 RowSnapshot {
                     cells,
                     selected,
                     link,
+                    found,
                 }
             })
             .collect();
@@ -490,6 +501,14 @@ impl Element for TerminalElement {
                         Bounds::new(at, size(width, LINK_UNDERLINE)),
                         self.theme.accent,
                     ));
+                }
+                for &(from, to, current) in &row.found {
+                    let fill_color = if current {
+                        self.theme.find_current
+                    } else {
+                        self.theme.find_match
+                    };
+                    window.paint_quad(fill(cell_bounds(origin, m, from, to - from), fill_color));
                 }
                 if let Some((from, to)) = row.selected {
                     window.paint_quad(fill(

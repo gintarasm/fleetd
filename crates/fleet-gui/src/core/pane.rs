@@ -10,6 +10,7 @@ use std::ops::Range;
 use fleet_proto::{AttachOk, HistoryPage};
 use fleet_term::{Cell, HistoryEvent, Palette, Terminal, parse_history_line};
 
+use super::find::{FindStatus, Needle, Search, Step};
 use super::scrollback::{Cap, Scrollback};
 use super::selection::{self, LINE_END, LineRef, SelPoint, SelUnit, Selection};
 
@@ -58,6 +59,8 @@ pub struct PaneModel {
     selection: Option<Selection>,
     /// How much history stays loaded.
     history_cap: Cap,
+    /// The find bar's search, while it is open.
+    find: Option<Search>,
 }
 
 impl PaneModel {
@@ -74,6 +77,7 @@ impl PaneModel {
             unseen_lines: 0,
             selection: None,
             history_cap: Cap::default(),
+            find: None,
         }
     }
 
@@ -106,6 +110,9 @@ impl PaneModel {
         self.scroll_offset = 0;
         self.unseen_lines = 0;
         self.selection = None;
+        if let Some(f) = &mut self.find {
+            f.restart(&self.scrollback);
+        }
     }
 
     /// Feeds agent output to the grid and moves what scrolled off into
@@ -164,15 +171,17 @@ impl PaneModel {
 
     /// `(generation, before_line)` of the next `ReadHistory` to send, once:
     /// when the view's top is within [`PREFETCH_LINES`] of the oldest loaded
-    /// line, older history exists, no request is in flight and the loaded
-    /// history is not at its cap.
+    /// line (or an open find has searched down to it), older history
+    /// exists, no request is in flight and the loaded history is not at its
+    /// cap.
     pub fn next_page_request(&mut self) -> Option<(u64, u64)> {
         let sb = &self.scrollback;
         if self.page_in_flight || sb.fully_loaded() || sb.is_full() {
             return None;
         }
         let top = sb.end_line() - self.scroll_offset;
-        if top - sb.first_line() > PREFETCH_LINES {
+        let finding = self.find.as_ref().is_some_and(|f| f.at_oldest(sb));
+        if top - sb.first_line() > PREFETCH_LINES && !finding {
             return None;
         }
         self.page_in_flight = true;
@@ -383,9 +392,120 @@ impl PaneModel {
         (from < to).then_some(from..to)
     }
 
+    /// Opens find (or changes its query): searches the loaded history and
+    /// the grid for `query`, from the newest line, in [`PaneModel::find_step`]s.
+    pub fn find_open(&mut self, query: &str, case_sensitive: bool) {
+        let needle = Needle::new(query, case_sensitive);
+        if self
+            .find
+            .as_ref()
+            .is_some_and(|f| f.needle() == needle.as_ref())
+        {
+            return;
+        }
+        self.find = Some(Search::new(needle, &self.scrollback));
+    }
+
+    pub fn find_close(&mut self) {
+        self.find = None;
+    }
+
+    /// Find is open and has lines left to scan.
+    pub fn find_pending(&self) -> bool {
+        self.find
+            .as_ref()
+            .is_some_and(|f| !f.done(&self.scrollback))
+    }
+
+    /// Scans up to `budget` more lines for the open find. The first match
+    /// picked (the newest at or above the view's bottom) is scrolled into
+    /// view.
+    pub fn find_step(&mut self, budget: usize) -> Step {
+        let (_, bottom) = self.view_lines();
+        let Some(f) = &mut self.find else {
+            return Step::default();
+        };
+        let before = f.current();
+        let step = f.step(&self.scrollback, &self.term, budget, bottom);
+        if let Some(m) = f.current().filter(|&m| Some(m) != before) {
+            self.reveal(m.line);
+        }
+        step
+    }
+
+    /// Goes to the next match up (`up`) or down, wrapping, and scrolls it
+    /// into view; `false` if there is none.
+    pub fn find_next(&mut self, up: bool) -> bool {
+        let (top, bottom) = self.view_lines();
+        let Some(f) = &mut self.find else {
+            return false;
+        };
+        // Matches on a grid that changed since the last step.
+        f.step(&self.scrollback, &self.term, 0, bottom);
+        match f.advance(up, top, bottom) {
+            Some(m) => {
+                self.reveal(m.line);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The find bar's match count and place; `None` while find is closed.
+    pub fn find_status(&self) -> Option<FindStatus> {
+        let f = self.find.as_ref()?;
+        Some(FindStatus {
+            index: f.current_index().map(|i| i + 1),
+            count: f.count(),
+            searching: !f.done(&self.scrollback),
+        })
+    }
+
+    /// Replaces `out` with the matches on `line`: columns `start..end` and
+    /// whether it is the current match.
+    pub fn find_matches(&self, line: LineRef, out: &mut Vec<(u16, u16, bool)>) {
+        out.clear();
+        if let Some(f) = &self.find {
+            let n = match line {
+                LineRef::History(abs) => abs,
+                LineRef::Grid(row) => self.scrollback.end_line() + u64::from(row),
+            };
+            f.on_line(n, out);
+        }
+    }
+
+    /// The first and last line the view shows, numbered as the search
+    /// numbers them (grid row `r` is `end_line + r`).
+    fn view_lines(&self) -> (u64, u64) {
+        let top = self.scrollback.end_line() - self.scroll_offset;
+        let rows = u64::from(self.term.size().1.max(1));
+        (top, top + rows - 1)
+    }
+
+    /// Scrolls so that `line` (numbered as in [`PaneModel::view_lines`]) is
+    /// in view, near the middle, unless it already is.
+    fn reveal(&mut self, line: u64) {
+        let (top, bottom) = self.view_lines();
+        if (top..=bottom).contains(&line) {
+            return;
+        }
+        let end = self.scrollback.end_line();
+        self.scroll_offset = if line >= end {
+            0
+        } else {
+            let half = u64::from(self.term.size().1) / 2;
+            end.saturating_sub(line.saturating_sub(half))
+                .min(self.scrollback.len())
+        };
+        self.unseen_lines = self.unseen_lines.min(self.scroll_offset);
+    }
+
     /// After the grid changed: history events into the scrollback, the view
     /// pinned, a selection on the grid dropped, observer replies discarded.
     fn grid_changed(&mut self) {
+        if let Some(f) = &mut self.find {
+            f.grid_changed();
+        }
         for event in self.term.drain_history() {
             match event {
                 HistoryEvent::Line(line) => {
@@ -856,5 +976,171 @@ mod tests {
         pane.on_resized(10, 2);
         assert_eq!(history_texts(&pane), ["1"]);
         assert_eq!(pane.scrollback().first_line(), 40);
+    }
+
+    fn find_all(pane: &mut PaneModel, query: &str, case: bool) {
+        pane.find_open(query, case);
+        while pane.find_step(1000).more {}
+    }
+
+    fn found_on(pane: &PaneModel, line: LineRef) -> Vec<(u16, u16, bool)> {
+        let mut out = Vec::new();
+        pane.find_matches(line, &mut out);
+        out
+    }
+
+    #[test]
+    fn find_matches_history_and_grid_and_starts_on_the_newest() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 2, &["error one", "fine", "an error"], 10));
+        pane.on_output(b"Error three");
+        find_all(&mut pane, "error", false);
+        let status = pane.find_status().unwrap();
+        assert_eq!(
+            (status.index, status.count, status.searching),
+            (Some(3), 3, false)
+        );
+        assert_eq!(found_on(&pane, LineRef::History(10)), [(0, 5, false)]);
+        assert_eq!(found_on(&pane, LineRef::History(11)), []);
+        assert_eq!(found_on(&pane, LineRef::History(12)), [(3, 8, false)]);
+        assert_eq!(found_on(&pane, LineRef::Grid(0)), [(0, 5, true)]);
+        // Case sensitive: only the lower-case ones.
+        find_all(&mut pane, "error", true);
+        assert_eq!(pane.find_status().unwrap().count, 2);
+        assert_eq!(found_on(&pane, LineRef::Grid(0)), []);
+        // An empty query finds nothing.
+        find_all(&mut pane, "", false);
+        let status = pane.find_status().unwrap();
+        assert_eq!((status.index, status.count), (None, 0));
+    }
+
+    #[test]
+    fn find_next_goes_up_and_wraps_previous_goes_down() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 2, &["x 1", "x 2", "y", "x 3"], 0));
+        find_all(&mut pane, "x", false);
+        let index = |p: &PaneModel| p.find_status().unwrap().index;
+        assert_eq!(index(&pane), Some(3));
+        assert!(pane.find_next(true));
+        assert_eq!(index(&pane), Some(2));
+        assert!(pane.find_next(true));
+        assert!(pane.find_next(true));
+        assert_eq!(index(&pane), Some(3));
+        assert!(pane.find_next(false));
+        assert_eq!(index(&pane), Some(1));
+        assert_eq!(found_on(&pane, LineRef::History(0)), [(0, 1, true)]);
+    }
+
+    #[test]
+    fn the_current_match_is_scrolled_into_view() {
+        let mut pane = pane();
+        let mut tail: Vec<String> = (0..50).map(|i| format!("line {i}")).collect();
+        tail[10] = "needle".into();
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        pane.on_attached(&attach_ok(20, 3, &tail, 0));
+        assert_eq!(pane.scroll_offset(), 0);
+        find_all(&mut pane, "needle", false);
+        let mut rows = Vec::new();
+        pane.view_rows(3, &mut rows);
+        assert!(rows.contains(&ViewRow::History(10)), "{rows:?}");
+        // Already in view: going to it again does not scroll.
+        let offset = pane.scroll_offset();
+        assert!(pane.find_next(true));
+        assert_eq!(pane.scroll_offset(), offset);
+        // A match on the grid brings the view back down.
+        pane.on_output(b"needle");
+        while pane.find_step(1000).more {}
+        assert!(pane.find_next(false));
+        assert_eq!(pane.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn find_scans_in_bounded_steps() {
+        let mut pane = pane();
+        let tail: Vec<String> = (0..1000).map(|i| format!("hit {i}")).collect();
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        pane.on_attached(&attach_ok(20, 2, &tail, 0));
+        pane.find_open("hit", false);
+        let step = pane.find_step(100);
+        assert!(step.more && step.changed);
+        let status = pane.find_status().unwrap();
+        assert!(status.searching);
+        assert!(status.count < 100, "{}", status.count);
+        // The newest is picked once it is certain.
+        assert_eq!(status.index, Some(status.count));
+        let mut steps = 1;
+        while pane.find_step(100).more {
+            steps += 1;
+        }
+        assert!(steps >= 10, "{steps}");
+        let status = pane.find_status().unwrap();
+        assert_eq!(
+            (status.count, status.index, status.searching),
+            (1000, Some(1000), false)
+        );
+    }
+
+    #[test]
+    fn find_follows_new_output_and_keeps_the_current_match_as_it_scrolls() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 2, &["old hit"], 0));
+        pane.on_output(b"new hit");
+        find_all(&mut pane, "hit", false);
+        assert_eq!(pane.find_status().unwrap().index, Some(2));
+        // The grid row with the current match scrolls into history.
+        pane.on_output(b"\r\nmore\r\nlast hit");
+        // Between output and the next step the old grid matches move with
+        // their text.
+        assert_eq!(found_on(&pane, LineRef::History(1)), [(4, 7, true)]);
+        while pane.find_step(1000).more {}
+        let status = pane.find_status().unwrap();
+        assert_eq!((status.index, status.count), (Some(2), 3));
+        assert_eq!(found_on(&pane, LineRef::History(1)), [(4, 7, true)]);
+        assert_eq!(found_on(&pane, LineRef::Grid(1)), [(5, 8, false)]);
+    }
+
+    #[test]
+    fn clear_and_reattach_restart_the_search() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 2, &["hit", "hit"], 0));
+        find_all(&mut pane, "hit", false);
+        assert_eq!(pane.find_status().unwrap().count, 2);
+        pane.on_output(b"\x1b[3J");
+        while pane.find_step(1000).more {}
+        assert_eq!(pane.find_status().unwrap().count, 0);
+        pane.on_attached(&attach_ok(20, 2, &["hit", "hit", "hit"], 5));
+        while pane.find_step(1000).more {}
+        assert_eq!(pane.find_status().unwrap().count, 3);
+    }
+
+    #[test]
+    fn find_pages_in_older_history_and_close_stops_it() {
+        let mut pane = pane();
+        let tail: Vec<String> = (0..500).map(|i| format!("l{i}")).collect();
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        let mut ok = attach_ok(20, 2, &tail, 1000);
+        ok.history_first_line = 0;
+        pane.on_attached(&ok);
+        // The view is far from the oldest line: no page yet.
+        assert_eq!(pane.next_page_request(), None);
+        pane.find_open("zzz", false);
+        assert_eq!(pane.next_page_request(), None);
+        while pane.find_step(1000).more {}
+        // The search reached the oldest loaded line: it wants older ones.
+        assert_eq!(pane.next_page_request(), Some((0, 1000)));
+        let page = HistoryPage {
+            agent_id: 1,
+            first_line: 999,
+            lines: vec![b"zzz".to_vec().into()],
+        };
+        pane.on_page(&page, 0);
+        assert!(pane.find_step(1000).changed);
+        assert_eq!(pane.find_status().unwrap().count, 1);
+        assert_eq!(pane.next_page_request(), Some((0, 999)));
+        pane.cancel_page_request();
+        pane.scroll_to_bottom();
+        pane.find_close();
+        assert_eq!(pane.find_status(), None);
+        assert_eq!(pane.next_page_request(), None);
     }
 }

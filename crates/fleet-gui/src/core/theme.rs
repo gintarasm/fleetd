@@ -109,6 +109,9 @@ pub struct Tokens {
     pub selection: Rgba,
     /// Behind the IME's marked text.
     pub marked: Rgba,
+    /// Over find matches, and over the current one.
+    pub find_match: Rgba,
+    pub find_current: Rgba,
     pub danger: Rgba,
     pub success: Rgba,
     pub shadow: Rgba,
@@ -206,6 +209,8 @@ impl Tokens {
             accent: rgb(0x0a84ff),
             selection: rgba(0x3f8cf0, 0.35),
             marked: rgb(0x3a3d44),
+            find_match: rgba(0xffd60a, 0.28),
+            find_current: rgba(0xff9f0a, 0.6),
             danger: rgb(0xff6961),
             success: rgb(0x32d74b),
             shadow: rgba(0x000000, 0.45),
@@ -231,6 +236,8 @@ impl Tokens {
             accent: rgb(0x007aff),
             selection: rgba(0x007aff, 0.22),
             marked: rgb(0xdde4ee),
+            find_match: rgba(0xffcc00, 0.35),
+            find_current: rgba(0xff9500, 0.55),
             danger: rgb(0xd70015),
             success: rgb(0x23873c),
             shadow: rgba(0x000000, 0.18),

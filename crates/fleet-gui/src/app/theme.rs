@@ -32,6 +32,9 @@ pub struct Theme {
     pub selection: Hsla,
     /// Background of the IME's marked (uncommitted) text.
     pub marked: Hsla,
+    /// Translucent fills over find matches and the current one.
+    pub find_match: Hsla,
+    pub find_current: Hsla,
     pub danger: Hsla,
     pub success: Hsla,
     pub shadow: Hsla,
@@ -60,6 +63,8 @@ impl Theme {
             accent: hsla(t.accent),
             selection: hsla(t.selection),
             marked: hsla(t.marked),
+            find_match: hsla(t.find_match),
+            find_current: hsla(t.find_current),
             danger: hsla(t.danger),
             success: hsla(t.success),
             shadow: hsla(t.shadow),

@@ -3,6 +3,7 @@
 pub mod backoff;
 pub mod config;
 pub mod ended;
+pub mod find;
 pub mod fuzzy;
 pub mod icons;
 pub mod keys;

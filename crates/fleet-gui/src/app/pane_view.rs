@@ -7,23 +7,25 @@ use std::time::{Duration, Instant};
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Styled,
-    Subscription, Task, UTF16Selection, Window, div, point, px, size,
+    AnyWindowHandle, AppContext, Bounds, BoxShadow, ClipboardItem, Context, Entity, EventEmitter,
+    FocusHandle, Font, InteractiveElement, IntoElement, KeyDownEvent, Modifiers,
+    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement,
+    Styled, Subscription, Task, UTF16Selection, Window, div, point, px, size,
 };
 
 use super::controls;
 use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
-use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
+use super::keymap::{Copy, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
 use super::native;
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
+use super::text_field::TextField;
 use super::theme::{Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::find::status_label;
 use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
@@ -38,6 +40,13 @@ use crate::core::style::{self, radius, space, text};
 
 /// At most this many lines are scrolled (or reported) per wheel event.
 const MAX_WHEEL_LINES: f32 = 100.0;
+
+/// History lines a find step scans, off the UI thread, holding the pane's
+/// model lock (about a millisecond; ADR 0053).
+const FIND_STEP_LINES: usize = 2000;
+
+/// Width of the find bar's text field.
+const FIND_FIELD_WIDTH: f32 = 180.0;
 
 /// Where the pane's input goes: the [`Session`], or a recording fake in
 /// tests.
@@ -271,6 +280,19 @@ pub struct PaneView {
     /// Runs a command that opens a file, and the one to run when that
     /// cannot start (replaced in tests).
     pub(crate) open_file: Arc<dyn Fn(Vec<String>, Vec<String>)>,
+    /// The find bar, while open.
+    find: Option<FindBar>,
+    /// The last query, brought back when find opens again.
+    find_query: String,
+    find_case: bool,
+    /// The search running off the UI thread, while lines are left.
+    find_task: Option<Task<()>>,
+}
+
+/// The find bar's field and its subscription.
+struct FindBar {
+    field: Entity<TextField>,
+    _changes: Subscription,
 }
 
 /// Runs `argv` detached; when it cannot start (an editor not on the app's
@@ -327,7 +349,128 @@ impl PaneView {
             editor: config.editor.clone(),
             hover: None,
             open_file: Arc::new(spawn_opener),
+            find: None,
+            find_query: String::new(),
+            find_case: false,
+            find_task: None,
         }
+    }
+
+    /// ⌘F: opens the find bar (or focuses it) with the last query
+    /// selected.
+    fn open_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let query = self.find_query.clone();
+            let field = cx.new(|cx| TextField::new(query, "Find", cx));
+            let changes = cx.observe(&field, |v, field, cx| {
+                let text = field.read(cx).text();
+                if text != v.find_query {
+                    v.find_query = text.to_owned();
+                    v.search(cx);
+                }
+            });
+            self.find = Some(FindBar {
+                field,
+                _changes: changes,
+            });
+            self.search(cx);
+        }
+        if let Some(bar) = &self.find {
+            bar.field.update(cx, |f, cx| f.select_all_text(cx));
+            window.focus(&bar.field.read(cx).focus_handle().clone());
+        }
+        cx.notify();
+    }
+
+    /// Starts searching for the find bar's query.
+    fn search(&mut self, cx: &mut Context<Self>) {
+        self.model().find_open(&self.find_query, self.find_case);
+        self.find_task = None;
+        self.continue_search(cx);
+        cx.notify();
+    }
+
+    /// Scans what is left to scan in steps on the background executor, each
+    /// under the model lock, redrawing as matches come in. Nothing here
+    /// runs while drawing.
+    fn continue_search(&mut self, cx: &mut Context<Self>) {
+        if self.find_task.is_some() || !self.model().find_pending() {
+            return;
+        }
+        let model = Arc::clone(&self.model);
+        self.find_task = Some(cx.spawn(async move |view, cx| {
+            loop {
+                let m = Arc::clone(&model);
+                let step = cx
+                    .background_executor()
+                    .spawn(async move { lock(&m).find_step(FIND_STEP_LINES) })
+                    .await;
+                let go_on = view.update(cx, |v, cx| {
+                    if step.changed {
+                        cx.notify();
+                    }
+                    if !step.more {
+                        v.find_task = None;
+                        // At the oldest loaded line: page in older history.
+                        v.sink.check_paging(v.pane);
+                    }
+                    step.more
+                });
+                if !matches!(go_on, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The next match up (Enter, ⌘G) or down (⇧Enter, ⌘⇧G).
+    fn step_find(&mut self, up: bool, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            return;
+        }
+        if self.model().find_next(up) {
+            self.sink.check_paging(self.pane);
+            cx.notify();
+        }
+    }
+
+    fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(true, cx);
+    }
+
+    fn find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(false, cx);
+    }
+
+    fn toggle_find_case(&mut self, cx: &mut Context<Self>) {
+        self.find_case = !self.find_case;
+        self.search(cx);
+    }
+
+    /// Esc: closes the find bar; the keys go back to the terminal.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        self.find_task = None;
+        self.model().find_close();
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn find_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let m = &ev.keystroke.modifiers;
+        match ev.keystroke.key.as_str() {
+            "enter" if !m.platform => self.step_find(!m.shift, cx),
+            "escape" => self.close_find(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// The find bar's count, while it is open.
+    pub(crate) fn find_label(&self) -> Option<String> {
+        self.find.as_ref()?;
+        let status = self.model().find_status()?;
+        Some(status_label(status, !self.find_query.is_empty()))
     }
 
     /// The link underlined under the pointer: its line and columns.
@@ -567,9 +710,10 @@ impl PaneView {
         }
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // While composing, the IME owns the keys.
-        if self.marked.is_some() {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // While composing, the IME owns the keys; the find field's keys
+        // are its own.
+        if self.marked.is_some() || !self.focus.is_focused(window) {
             return;
         }
         let Some(key) = to_key(&ev.keystroke) else {
@@ -915,6 +1059,10 @@ fn sel_point(model: &PaneModel, (col, row): (u16, u16)) -> SelPoint {
 impl Render for PaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_activation(window, cx);
+        // New output while find is open: scan it (off the UI thread).
+        if self.find.is_some() {
+            self.continue_search(cx);
+        }
         let theme = theme(cx);
         let focused = window.is_window_active() && self.focus.is_focused(window);
         let (state, title, observing) = {
@@ -1047,11 +1195,81 @@ impl Render for PaneView {
             .mb(px(space::SM - space::XXS))
             .overflow_hidden()
             .child(element);
+        let find_bar = self.find.as_ref().map(|bar| {
+            let number = chrome.number;
+            let label = self.find_label().unwrap_or_default();
+            let case_on = self.find_case;
+            let step = |id: &'static str, icon: Icon, up: bool| {
+                controls::icon_button(id, icon, &theme, true)
+                    .debug_selector(move || format!("pane-{number}-{id}"))
+                    .on_click(cx.listener(move |v, _, _, cx| v.step_find(up, cx)))
+            };
+            div()
+                .id("find")
+                .debug_selector(move || format!("pane-{number}-find"))
+                .occlude()
+                .on_key_down(cx.listener(Self::find_key_down))
+                .absolute()
+                .top(px(space::XS))
+                .right(px(space::XS))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::XS))
+                .p(px(space::XS))
+                .rounded(px(radius::MD))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.raised)
+                .shadow_md()
+                .type_style(text::CALLOUT)
+                .child(div().w(px(FIND_FIELD_WIDTH)).child(bar.field.clone()))
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(space::XL * 3.0))
+                        .text_color(theme.secondary)
+                        .whitespace_nowrap()
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .id("find-case")
+                        .debug_selector(move || format!("pane-{number}-find-case"))
+                        .flex_none()
+                        .px(px(space::XS))
+                        .rounded(px(radius::SM))
+                        .bg(if case_on {
+                            theme.selected
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .text_color(if case_on { theme.text } else { theme.tertiary })
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(theme.hover))
+                        .child("Aa")
+                        .on_click(cx.listener(|v, _, _, cx| v.toggle_find_case(cx))),
+                )
+                .child(step("find-up", Icon::ChevronUp, true))
+                .child(step("find-down", Icon::ChevronDown, false))
+                .child(
+                    controls::icon_button("find-close", Icon::Close, &theme, true)
+                        .debug_selector(move || format!("pane-{number}-find-close"))
+                        .on_click(cx.listener(|v, _, window, cx| v.close_find(window, cx))),
+                )
+        });
+        let find_open = find_bar.is_some();
         if let Some(text) = banner(chrome, state) {
+            // Below the find bar when that is open.
+            let top = if find_open {
+                space::XS * 4.0 + style::chrome::CONTROL_HEIGHT + space::SM
+            } else {
+                space::XS
+            };
             grid = grid.child(
                 div()
                     .absolute()
-                    .top(px(space::XS))
+                    .top(px(top))
                     .right(px(space::XS))
                     .flex()
                     .flex_row()
@@ -1082,6 +1300,7 @@ impl Render for PaneView {
                     .child(text),
             );
         }
+        grid = grid.children(find_bar);
         div()
             .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
@@ -1093,6 +1312,9 @@ impl Render for PaneView {
             }))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
             .size_full()
             .flex()
             .flex_col()
@@ -1241,8 +1463,8 @@ mod tests {
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::core::config::GuiConfig;
-    use crate::core::pane::PaneModel;
     use crate::core::pane::PaneState;
+    use crate::core::pane::{PaneModel, ViewRow};
     use crate::core::selection::{LineRef, SelPoint};
     use crate::core::session::PaneId;
     use fleet_proto::AttachOk;
@@ -1901,6 +2123,138 @@ mod tests {
         cx.run_until_parked();
         let marked = view.read_with(cx, |v, _| v.marked.clone());
         assert_eq!(marked.as_deref(), Some("に"));
+    }
+
+    /// A live 80×24 pane whose history has `needle` on lines 10 and 40.
+    fn model_with_needles() -> PaneModel {
+        let mut model = blank_model();
+        model.on_attached(&AttachOk {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            history_tail: (0..50)
+                .map(|i| match i {
+                    10 | 40 => format!("a Needle {i}"),
+                    _ => format!("h{i}"),
+                })
+                .map(|s| s.into_bytes().into())
+                .collect(),
+            ..Default::default()
+        });
+        model.on_output(b"\x1b[24;1H");
+        model
+    }
+
+    fn find_status(
+        view: &Entity<PaneView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<crate::core::find::FindStatus> {
+        view.read_with(cx, |v, _| v.model().find_status())
+    }
+
+    fn shows_line(view: &Entity<PaneView>, cx: &mut VisualTestContext, line: u64) -> bool {
+        view.read_with(cx, |v, _| {
+            let mut rows = Vec::new();
+            v.model().view_rows(24, &mut rows);
+            rows.contains(&ViewRow::History(line))
+        })
+    }
+
+    #[gpui::test]
+    fn cmd_f_finds_in_history_and_steps_through_matches(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_needles());
+        sink.take();
+        cx.simulate_keystrokes("cmd-f");
+        assert!(cx.debug_bounds("pane-0-find").is_some());
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        // The query went to the find field, not to the agent.
+        assert!(sink.take().is_empty());
+        let status = find_status(&view, cx).unwrap();
+        assert_eq!((status.index, status.count), (Some(2), 2));
+        assert!(shows_line(&view, cx, 40));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.find_label()).as_deref(),
+            Some("2 of 2")
+        );
+
+        // Enter goes up to the older match, Shift-Enter back down.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        assert!(shows_line(&view, cx, 10));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        cx.simulate_keystrokes("cmd-g");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        cx.simulate_keystrokes("cmd-shift-g");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        assert!(sink.take().is_empty());
+
+        // Case sensitive: "needle" is not "Needle".
+        let case = cx.debug_bounds("pane-0-find-case").unwrap().center();
+        cx.simulate_click(case, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.find_label()).as_deref(),
+            Some("No matches")
+        );
+        cx.simulate_click(case, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 2);
+
+        // Esc closes it and gives the keys back to the agent.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(find_status(&view, cx), None);
+        assert_eq!(view.read_with(cx, |v, _| v.find_label()), None);
+        assert!(sink.take().is_empty());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sink.take(), vec![b"\r".to_vec()]);
+
+        // ⌘F again brings the last query back, selected.
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 2);
+        cx.simulate_input("h4");
+        cx.run_until_parked();
+        // h4, h40..h49 minus the needle on 40.
+        assert_eq!(find_status(&view, cx).unwrap().count, 10);
+    }
+
+    #[gpui::test]
+    fn find_bar_buttons_step_and_close(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_needles());
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, id: &'static str| {
+            let at = cx.debug_bounds(id).unwrap().center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(cx, "pane-0-find-up");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        click(cx, "pane-0-find-down");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        click(cx, "pane-0-find-close");
+        assert_eq!(find_status(&view, cx), None);
+        // The keys go back to the terminal.
+        let focused = cx.update(|window, cx| view.read(cx).focus_handle().is_focused(window));
+        assert!(focused);
+    }
+
+    #[gpui::test]
+    fn find_follows_output_while_open(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_needles());
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        let model = view.read_with(cx, |v, _| Arc::clone(v.model_handle()));
+        model.lock().unwrap().on_output(b"\r\nneedle again");
+        // The session notifies the view of output.
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 3);
     }
 
     #[test]
