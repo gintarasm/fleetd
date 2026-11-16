@@ -41,6 +41,10 @@ use crate::core::zoom::{FontZoom, Zoom};
 /// Saved state is written once it has been still this long.
 pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// A blocking job reading an agent's output as plain text (see
+/// [`SessionApi::read_output`]).
+pub type OutputJob = Box<dyn FnOnce() -> Result<String, String> + Send>;
+
 /// What the workspace needs from the session: [`Session`], or a recording
 /// fake in tests.
 pub trait SessionApi: InputSink {
@@ -66,6 +70,11 @@ pub trait SessionApi: InputSink {
         rows: u16,
     ) -> Result<(), String>;
     fn forget(&self, ids: Vec<u64>);
+    /// A job reading the agent's whole output (fleetd's history, then the
+    /// screen) as plain text; it blocks, so it runs off the UI thread.
+    fn read_output(&self, _agent_id: u64) -> OutputJob {
+        Box::new(|| Err("not connected to a fleetd".into()))
+    }
     /// Sets an agent's name (ADR 0052).
     fn rename(&self, agent_id: u64, name: String);
     /// Sets, then removes, an agent's labels (Edit Labels, ADR 0087).
@@ -132,6 +141,10 @@ impl SessionApi for Session {
 
     fn forget(&self, ids: Vec<u64>) {
         Session::forget(self, ids);
+    }
+
+    fn read_output(&self, agent_id: u64) -> OutputJob {
+        Box::new(Session::read_output(self, agent_id))
     }
 
     fn rename(&self, agent_id: u64, name: String) {
@@ -1514,6 +1527,24 @@ impl AppState {
         self.session.set_labels(agent_id, set, remove);
     }
 
+    /// A job reading `agent_id`'s output as plain text (ADR 0086).
+    pub(super) fn read_output(&self, agent_id: u64) -> OutputJob {
+        self.session.read_output(agent_id)
+    }
+
+    /// Forgets these agents (fleetd refuses running ones).
+    pub(super) fn forget_all(&self, ids: Vec<u64>) {
+        if !ids.is_empty() {
+            self.session.forget(ids);
+        }
+    }
+
+    /// Shows `text` in the neutral toast, until dismissed.
+    pub(super) fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notice = Some(text);
+        cx.notify();
+    }
+
     /// The summary bar's Remove: forgets the agent `pane` shows if it
     /// exited or is lost; otherwise does nothing. The pane empties when the
     /// node announces the removal.
@@ -1592,6 +1623,12 @@ impl AppState {
     /// while one of its descendants runs (ADR 0074).
     pub fn ended_count(&self) -> usize {
         removable_ended(&self.agents).len()
+    }
+
+    /// The ids of the exited or lost agents Clear exited removes: not an
+    /// ended parent while one of its descendants runs (ADR 0074).
+    pub fn ended_ids(&self) -> Vec<u64> {
+        removable_ended(&self.agents)
     }
 
     /// Restarts the agent the focused pane shows, in that pane at its

@@ -58,6 +58,9 @@ actions!(
         NextAgent,
         PreviousAgent,
         ToggleGraph,
+        SaveOutput,
+        OpenOutput,
+        CopyLastOutput,
     ]
 );
 
@@ -142,6 +145,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         // Kills the focused pane's agent (asking first); ⌘W only detaches.
         KeyBinding::new("cmd-shift-w", KillPane, Some(WORKSPACE_CONTEXT)),
+        // Saves the focused pane's agent's output (ADR 0086).
+        KeyBinding::new("cmd-shift-s", SaveOutput, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
         // Also from the pane's find field, inside the terminal's context.

@@ -16,6 +16,7 @@ mod kill_sheet;
 mod labels_sheet;
 mod native;
 mod new_agent;
+mod output;
 mod palette;
 mod pane_drag;
 mod pane_view;
