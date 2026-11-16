@@ -115,13 +115,17 @@ fn the_session_and_the_token_identify_an_agent() {
         Ok(Caller::User)
     );
     assert_eq!(node.resolve_caller(None, None), Ok(Caller::User));
-    // A made-up token is refused, not taken for the user.
-    assert!(node.resolve_caller(None, Some("00")).is_err());
+    // An unknown token (another daemon's, an exited agent's) is no token.
+    assert_eq!(node.resolve_caller(None, Some("00")), Ok(Caller::User));
+    assert_eq!(
+        node.resolve_caller(Some(pid_a), Some("00")),
+        Ok(Caller::Agent(a))
+    );
 
     // Exit revokes the token, and the session no longer names A.
     node.kill(a).unwrap();
     wait_exit(&node, a);
-    assert!(node.resolve_caller(None, Some(&tok_a)).is_err());
+    assert_eq!(node.resolve_caller(None, Some(&tok_a)), Ok(Caller::User));
     assert_eq!(node.resolve_caller(Some(pid_a), None), Ok(Caller::User));
     node.shutdown();
 }

@@ -4,6 +4,7 @@
 pub mod handoff;
 pub mod logging;
 mod restart;
+mod scope;
 mod server;
 pub mod stdio;
 pub mod stop_signal;
@@ -340,7 +341,10 @@ impl Daemon {
                 (node, restore)
             }
         };
-        let node = Arc::new(node.with_agent_nice(agent_nice_setting()));
+        let node = Arc::new(
+            node.with_agent_nice(agent_nice_setting())
+                .with_quotas(scope::read_quotas(&state_dir)),
+        );
         let identity = handoff::Identity::current();
         let instance = identity.instance;
         // What a restart with no binary named restarts onto.

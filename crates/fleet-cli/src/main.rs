@@ -440,7 +440,10 @@ fn run(cli: Cli) -> Result<u8> {
         ));
     }
     let sock = state_dir(&cli).join("fleetd.sock");
-    let mut client = Connection::unix(&sock, "fleet")?;
+    // The token identifies an agent's helper that left its session (ADR
+    // 0072); inside the session fleetd knows the agent without it.
+    let token = fleet_client::agent_token_from_env();
+    let mut client = Connection::unix_as(&sock, "fleet", token.as_deref())?;
     match cli.command {
         Command::Spawn {
             cols,
@@ -631,7 +634,8 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("fleet: {e}");
-            ExitCode::from(1)
+            // Refused by an agent's scope or a quota (ADR 0072).
+            ExitCode::from(if e.is_forbidden() { 3 } else { 1 })
         }
     }
 }

@@ -1905,8 +1905,8 @@ impl Node {
     /// Who a connection is (ADR 0072), from its peer's session id and the
     /// token its `Hello` carried: the running agent whose pid is the
     /// session, else the running agent the token belongs to, else the user.
-    /// `Err` (the handshake is refused) when the two name different agents,
-    /// or the token is no running agent's.
+    /// `Err` (the handshake is refused) when the two name different agents.
+    /// A token that is no running agent's is ignored.
     ///
     /// A root shell (`kind=shell` without a parent: the user's own
     /// terminal, ADR 0071) is the user: its session and its token mean the
@@ -1921,11 +1921,11 @@ impl Node {
             .filter(|&id| !self.is_root_shell(id));
         let by_token = match token {
             None => None,
-            Some(t) => match lock(&self.store).token_agent(&token::digest(t)) {
-                Ok(Some(id)) => Some(id),
-                Ok(None) => return Err("unknown or revoked agent token".into()),
-                Err(e) => return Err(format!("checking the agent token failed: {e}")),
-            },
+            // An unknown token is no token: one from another daemon (a
+            // `--state-dir` of its own) or from an agent that has exited.
+            Some(t) => lock(&self.store)
+                .token_agent(&token::digest(t))
+                .map_err(|e| format!("checking the agent token failed: {e}"))?,
         };
         let id = match (by_session, by_token) {
             (Some(a), Some(b)) if a != b => {
@@ -2509,6 +2509,39 @@ impl Node {
             out.forgotten.push(id);
         }
         Ok(out)
+    }
+
+    /// [`Node::forget`] by `caller`: an agent's `exited_only` forgets only
+    /// its own exited descendants. (Explicit ids are checked against its
+    /// scope by the caller of this.)
+    pub fn forget_by(
+        &self,
+        caller: Caller,
+        ids: &[u64],
+        exited_only: bool,
+        selector: &Labels,
+        origin: Option<ConnId>,
+    ) -> Result<ForgetOutcome, ForgetError> {
+        let Caller::Agent(a) = caller else {
+            return self.forget(ids, exited_only, selector, origin);
+        };
+        if !exited_only {
+            return self.forget(ids, false, selector, origin);
+        }
+        if !ids.is_empty() {
+            return self.forget(ids, true, selector, origin);
+        }
+        let mine = self.tree()?.descendants(a);
+        let targets: Vec<u64> = self
+            .list_matching(selector)?
+            .into_iter()
+            .filter(|i| mine.contains(&i.id) && i.state != fleet_proto::AgentState::Running as i32)
+            .map(|i| i.id)
+            .collect();
+        if targets.is_empty() {
+            return Ok(ForgetOutcome::default());
+        }
+        self.forget(&targets, false, &Labels::new(), origin)
     }
 
     /// Drops everything the node keeps of a removed agent besides its row:
