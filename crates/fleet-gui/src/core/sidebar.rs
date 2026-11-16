@@ -4,7 +4,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use fleet_proto::AgentState;
+use fleet_client::names::{NAME_LABEL, name_of};
+use fleet_proto::{AgentInfo, AgentState};
 
 use super::session::AgentRow;
 use super::status::AgentStatus;
@@ -35,6 +36,31 @@ pub fn program_name(program: &str) -> String {
     Path::new(program)
         .file_name()
         .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// The agent's main text (ADR 0052): its name, else its program.
+pub fn display_name(info: &AgentInfo) -> String {
+    name_of(info).map_or_else(|| program_name(&info.program), str::to_owned)
+}
+
+/// The agent's secondary text: `program · id`.
+pub fn program_and_id(info: &AgentInfo) -> String {
+    format!("{} · {}", program_name(&info.program), info.id)
+}
+
+/// The labels a row shows as chips, by key: all but the name, `project`
+/// (the group title) and the core's `fleet.*`.
+pub fn label_chips(info: &AgentInfo) -> Vec<(String, String)> {
+    let mut chips: Vec<(String, String)> = info
+        .labels
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() != NAME_LABEL && k.as_str() != "project" && !k.starts_with("fleet.")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    chips.sort();
+    chips
 }
 
 fn title_of(row: &AgentRow, home: &Path) -> String {
@@ -130,7 +156,9 @@ impl Filter {
 
 /// Whether every word of `query` (ignoring case) is in the row's `name`
 /// (as the row shows it), its program, its cwd (as stored or with `~`),
-/// or a label (`key=value`). An empty query matches everything.
+/// or a label (`key=value`), or is its id. An empty query matches
+/// everything. The one match the sidebar filter, the command palette and
+/// the agent switcher share (ADR 0052).
 pub fn query_matches(query: &str, row: &AgentRow, name: &str, home: &Path) -> bool {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     if words.is_empty() {
@@ -144,9 +172,10 @@ pub fn query_matches(query: &str, row: &AgentRow, name: &str, home: &Path) -> bo
     ];
     hay.extend(row.info.labels.iter().map(|(k, v)| format!("{k}={v}")));
     let hay: Vec<String> = hay.iter().map(|h| h.to_lowercase()).collect();
+    let id = row.info.id.to_string();
     words
         .iter()
-        .all(|w| hay.iter().any(|h| h.contains(w.as_str())))
+        .all(|w| *w == id || hay.iter().any(|h| h.contains(w.as_str())))
 }
 
 /// A sidebar section: its agents that pass the filter, or none drawn
@@ -257,6 +286,62 @@ mod tests {
         let g = group_agents(&rows, home);
         let ids: Vec<u64> = g[0].agents.iter().map(|r| r.info.id).collect();
         assert_eq!(ids, vec![3, 2, 1, 4]);
+    }
+
+    fn info_with(labels: &[(&str, &str)]) -> AgentInfo {
+        AgentInfo {
+            id: 7,
+            program: "/usr/bin/claude".into(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn display_name_is_the_name_else_the_program() {
+        let named = info_with(&[("name", "lto-falcon")]);
+        assert_eq!(display_name(&named), "lto-falcon");
+        assert_eq!(display_name(&info_with(&[])), "claude");
+        assert_eq!(display_name(&info_with(&[("name", "")])), "claude");
+        assert_eq!(program_and_id(&named), "claude · 7");
+    }
+
+    #[test]
+    fn chips_hide_the_name_project_and_core_labels() {
+        let info = info_with(&[
+            ("name", "x"),
+            ("project", "fleetd"),
+            ("fleet.parent", "3"),
+            ("role", "reviewer"),
+            ("kind", "shell"),
+        ]);
+        assert_eq!(
+            label_chips(&info),
+            [
+                ("kind".to_owned(), "shell".to_owned()),
+                ("role".to_owned(), "reviewer".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_uses_names_labels_program_and_id() {
+        let mut r = row(7, "/w", None, AgentState::Running, 1);
+        r.info = AgentInfo {
+            cwd: "/w".into(),
+            ..info_with(&[("name", "LTO-falcon"), ("role", "reviewer")])
+        };
+        let home = Path::new("/h");
+        let name = display_name(&r.info);
+        for q in ["", "falcon", "lto", "reviewer", "role=rev", "claude", "7"] {
+            assert!(query_matches(q, &r, &name, home), "{q}");
+        }
+        for q in ["otter", "role=coder", "77"] {
+            assert!(!query_matches(q, &r, &name, home), "{q}");
+        }
     }
 
     fn labelled(mut r: AgentRow, k: &str, v: &str) -> AgentRow {

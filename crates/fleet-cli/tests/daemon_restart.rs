@@ -125,7 +125,7 @@ fn restart_keeps_the_running_agent() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let ls = text(&fleet(d.dir.path(), &["ls"]).stdout);
     let row: Vec<_> = ls.lines().nth(1).unwrap().split_whitespace().collect();
-    assert_eq!(&row[..2], [id, "running"], "{ls}");
+    assert_eq!([row[0], row[2]], [id, "running"], "{ls}");
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn no_binary_restarts_onto_the_daemons_own_path_as_rebuilt() {
     assert_eq!(running_ino(d.dir.path()), rebuilt);
     let ls = text(&fleet(d.dir.path(), &["ls"]).stdout);
     let row: Vec<_> = ls.lines().nth(1).unwrap().split_whitespace().collect();
-    assert_eq!(&row[..2], [id.trim(), "running"], "{ls}");
+    assert_eq!([row[0], row[2]], [id.trim(), "running"], "{ls}");
 }
 
 /// The inode of the binary the daemon on `dir` reports it runs.

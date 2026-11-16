@@ -18,6 +18,7 @@ mod palette;
 mod pane_drag;
 mod pane_view;
 mod picker_view;
+mod rename;
 mod resident;
 mod settings_window;
 mod sidebar_view;

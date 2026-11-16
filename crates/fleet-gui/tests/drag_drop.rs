@@ -57,6 +57,7 @@ impl SessionApi for OneAgent {
     }
     fn forget(&self, _: Vec<u64>) {}
     fn clear_exited(&self) {}
+    fn rename(&self, _: u64, _: String) {}
     fn replaced(&self) -> HashMap<u64, u64> {
         HashMap::new()
     }

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fleet_client::names::name_of;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Action, Animation, AnimationExt, App, AppContext, Bounds, Context, Div, Entity, EntityId,
@@ -33,6 +34,7 @@ use super::palette::{command_action, command_shortcut};
 use super::pane_drag::PaneDrag;
 use super::pane_view::{PaneEvent, PaneView};
 use super::picker_view::{PickerEvent, PickerView};
+use super::rename::{RenameEvent, RenameSheet};
 use super::sidebar_view::{SidebarData, TabMark, program_name, render_sidebar, tab_title};
 use super::split_chooser::{ChooserEvent, SplitChooserView};
 use super::split_dividers::SplitDrag;
@@ -54,7 +56,9 @@ use crate::core::picker::Recents;
 use crate::core::session::PaneId;
 use crate::core::settings::{MotionChoice, ThemeChoice};
 use crate::core::shortcuts::Section;
-use crate::core::sidebar::{Filter, SidebarGroup, StatusFilter, ended, sidebar_groups};
+use crate::core::sidebar::{
+    Filter, SidebarGroup, StatusFilter, ended, program_and_id, sidebar_groups,
+};
 use crate::core::spawn::SpawnRequest;
 use crate::core::split_chooser::{choice_rows, off_screen_agents};
 use crate::core::style::{chrome, motion, radius, space, text};
@@ -176,6 +180,8 @@ impl Look {
 pub struct Workspace {
     app: Entity<AppState>,
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
+    /// The Rename sheet (ADR 0052).
+    rename: Option<(Entity<RenameSheet>, Subscription)>,
     /// The question before a kill (issue #27).
     kill: Option<(Entity<KillSheet>, Subscription)>,
     /// The command palette (⌘P) and what its rows stand for.
@@ -244,6 +250,7 @@ impl Workspace {
                 // The choosers' pane ids name panes of the old layout.
                 this.choosers.clear();
                 if this.sheet.take().is_some()
+                    | this.rename.take().is_some()
                     | this.kill.take().is_some()
                     | this.palette.take().is_some()
                     | this.switcher.take().is_some()
@@ -313,6 +320,7 @@ impl Workspace {
             app,
             _ticker: ticker,
             sheet: None,
+            rename: None,
             kill: None,
             palette: None,
             palette_recents: Recents::default(),
@@ -405,6 +413,10 @@ impl Workspace {
         self.sheet.as_ref().map(|(s, _)| s)
     }
 
+    pub fn rename_sheet(&self) -> Option<&Entity<RenameSheet>> {
+        self.rename.as_ref().map(|(s, _)| s)
+    }
+
     /// The command palette, while it is open.
     pub fn palette(&self) -> Option<&Entity<PickerView>> {
         self.palette.as_ref().map(|(p, _, _)| p)
@@ -434,6 +446,7 @@ impl Workspace {
     /// A sheet is open over the panes.
     fn modal(&self) -> bool {
         self.sheet.is_some()
+            || self.rename.is_some()
             || self.kill.is_some()
             || self.connect.is_some()
             || self.shortcuts.is_some()
@@ -480,6 +493,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.sheet = None;
+        self.rename = None;
         self.kill = None;
         self.palette = None;
         self.switcher = None;
@@ -966,6 +980,7 @@ impl Workspace {
         }
         match item {
             RowMenuItem::OpenSplit => self.open_menu_split(agent_id, window, cx),
+            RowMenuItem::Rename => self.open_rename(agent_id, window, cx),
             RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
             RowMenuItem::Restart => self.restart(&Restart { agent_id }, window, cx),
             RowMenuItem::Remove => self.remove(&Remove { agent_id }, window, cx),
@@ -984,6 +999,7 @@ impl Workspace {
                 can_split: app.layout().panes().len() < MAX_PANES,
                 maximized: app.maximized == Some(pane),
                 restartable: view.is_some_and(|v| v.restartable()),
+                has_agent: app.layout().agent(pane).is_some(),
                 killable: app
                     .layout()
                     .agent(pane)
@@ -1033,6 +1049,7 @@ impl Workspace {
             PaneMenuItem::SplitDown => PaneEvent::SplitDown,
             PaneMenuItem::Maximize | PaneMenuItem::Restore => PaneEvent::ToggleMaximize,
             PaneMenuItem::Restart => PaneEvent::Restart,
+            PaneMenuItem::Rename => PaneEvent::Rename,
             PaneMenuItem::Kill => PaneEvent::Kill,
             PaneMenuItem::Close => PaneEvent::Close,
         };
@@ -1051,9 +1068,10 @@ impl Workspace {
         let dirs = app.dir_choices();
         let target = app.target.clone();
         let command = app.config.default_command.clone();
+        let taken = app.live_names();
         let default_dir = app.config.default_dir.clone();
         let sheet = cx.new(|cx| {
-            let s = NewAgentSheet::new(&command, dirs, &target, cx);
+            let s = NewAgentSheet::new(&command, dirs, &target, taken, cx);
             // Settings › Agents: a default folder beats the recent one.
             if !default_dir.is_empty() {
                 s.dir.update(cx, |f, cx| f.set_text(default_dir, cx));
@@ -1063,6 +1081,46 @@ impl Workspace {
         let sub = cx.subscribe_in(&sheet, window, Self::sheet_event);
         sheet.read(cx).focus(window, cx);
         self.sheet = Some((sheet, sub));
+        cx.notify();
+    }
+
+    /// Opens the Rename sheet for an agent (a double-click on its name, or
+    /// Rename… in a menu).
+    pub fn open_rename(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let Some(info) = self
+            .app
+            .read(cx)
+            .agents
+            .iter()
+            .find(|r| r.info.id == agent_id)
+            .map(|r| r.info.clone())
+        else {
+            return;
+        };
+        let name = name_of(&info).unwrap_or_default().to_owned();
+        let what = program_and_id(&info);
+        let sheet = cx.new(|cx| RenameSheet::new(agent_id, name, what, cx));
+        let sub = cx.subscribe_in(&sheet, window, Self::rename_event);
+        sheet.read(cx).focus(window, cx);
+        self.rename = Some((sheet, sub));
+        cx.notify();
+    }
+
+    fn rename_event(
+        &mut self,
+        _sheet: &Entity<RenameSheet>,
+        event: &RenameEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let RenameEvent::Rename { agent_id, name } = event {
+            self.app.read(cx).rename(*agent_id, name.clone());
+        }
+        self.rename = None;
+        self.focus_current(window, cx);
         cx.notify();
     }
 
@@ -1475,6 +1533,11 @@ impl Workspace {
             PaneEvent::ToggleMaximize => self.toggle_maximize(&ToggleMaximize, window, cx),
             PaneEvent::Close => self.close_pane(&ClosePane, window, cx),
             PaneEvent::Restart => self.restart_pane(&RestartPane, window, cx),
+            PaneEvent::Rename => {
+                if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
+                    self.open_rename(agent_id, window, cx);
+                }
+            }
             PaneEvent::Kill => self.kill_in_pane(pane, window, cx),
             PaneEvent::Remove => self.app.read(cx).remove_in_pane(pane, cx),
             PaneEvent::ContextMenu { on_grid } => self.open_pane_menu(pane, on_grid, cx),
@@ -1948,6 +2011,28 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
+        let rename = self.rename.as_ref().map(|(sheet, _)| {
+            deferred(
+                div()
+                    .id("rename-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt(px(chrome::BAR_HEIGHT + space::SM))
+                    .child(sheet_drag_strip("rename-drag-strip"))
+                    .child(appear(
+                        div().child(sheet.clone()),
+                        "rename-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
         let sheet = self.sheet.as_ref().map(|(sheet, _)| {
             // The backdrop takes every click and wheel event over the panes.
             deferred(
@@ -2040,6 +2125,7 @@ impl Render for Workspace {
             .children(palette)
             .children(switcher)
             .children(sheet)
+            .children(rename)
             .children(
                 self.kill
                     .as_ref()
@@ -2189,8 +2275,10 @@ mod tests {
     use super::{Workspace, now_ms};
     use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
     use crate::app::keymap::{FocusPane1, Kill, RemoveExited, SplitRight, bind_keys};
+    use crate::app::new_agent::NewAgentSheet;
     use crate::app::pane_view::InputSink;
     use crate::app::sidebar_view::TabMark;
+    use crate::app::text_field::TextField;
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
     use crate::core::feedback;
@@ -2217,6 +2305,7 @@ mod tests {
             size: (u16, u16),
         },
         Forget(Vec<u64>),
+        Rename(u64, String),
         ClearExited,
         Spawn {
             req: SpawnRequest,
@@ -2331,6 +2420,13 @@ mod tests {
 
         fn forget(&self, ids: Vec<u64>) {
             self.calls.lock().unwrap().push(Call::Forget(ids));
+        }
+
+        fn rename(&self, agent_id: u64, name: String) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::Rename(agent_id, name));
         }
 
         fn clear_exited(&self) {
@@ -2897,13 +2993,15 @@ mod tests {
         assert_eq!(dir_text, "/r1");
         assert!(can_choose);
 
+        let name = sheet.read_with(s.cx, |sh, cx| sh.name.read(cx).text().to_owned());
+        assert!(name.starts_with("brief-"), "{name}");
         s.cx.simulate_keystrokes("enter");
         assert!(fake.calls().contains(&Call::Spawn {
             req: SpawnRequest {
                 program: "claude".into(),
                 args: vec!["--append-system-prompt".into(), "be brief".into()],
                 cwd: "/r1".into(),
-                labels: Default::default(),
+                labels: HashMap::from([("name".into(), name)]),
             },
             size: s.app.read_with(s.cx, |a, cx| {
                 a.pane_view(PaneId(1)).unwrap().read(cx).grid().unwrap()
@@ -2919,6 +3017,9 @@ mod tests {
         s.cx.simulate_input("sh -c 'echo hi'");
         let dir_field = sheet.read_with(s.cx, |sh, _| sh.dir.clone());
         dir_field.update(s.cx, |f, cx| f.set_text("/tmp".into(), cx));
+        s.cx.run_until_parked();
+        let name = sheet.read_with(s.cx, |sh, cx| sh.name.read(cx).text().to_owned());
+        assert!(name.starts_with("echo-"), "{name}");
         s.cx.simulate_keystrokes("enter");
 
         let size = s.app.read_with(s.cx, |a, cx| {
@@ -2929,7 +3030,7 @@ mod tests {
                 program: "sh".into(),
                 args: vec!["-c".into(), "echo hi".into()],
                 cwd: "/tmp".into(),
-                labels: Default::default(),
+                labels: HashMap::from([("name".into(), name)]),
             },
             size,
             pane: PaneId(1),
@@ -3005,6 +3106,221 @@ mod tests {
             .app
             .read_with(s.cx, |a, _| (a.focused(), a.layout().agent(PaneId(1))));
         assert_eq!((focused, shown), (PaneId(2), Some(9)));
+    }
+
+    fn sheet_text(
+        s: &mut Setup<'_>,
+        field: impl Fn(&NewAgentSheet) -> Entity<TextField>,
+    ) -> String {
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
+        let field = sheet.read_with(s.cx, |sh, _| field(sh));
+        field.read_with(s.cx, |f, _| f.text().to_owned())
+    }
+
+    fn set_sheet_text(
+        s: &mut Setup<'_>,
+        field: impl Fn(&NewAgentSheet) -> Entity<TextField>,
+        text: &str,
+    ) {
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
+        let field = sheet.read_with(s.cx, |sh, _| field(sh));
+        let text = text.to_owned();
+        field.update(s.cx, |f, cx| f.set_text(text, cx));
+        s.cx.run_until_parked();
+    }
+
+    fn last_spawn(fake: &Fake) -> SpawnRequest {
+        fake.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Spawn { req, .. } => Some(req),
+                _ => None,
+            })
+            .next_back()
+            .expect("a spawn")
+    }
+
+    /// The Name field follows the command and directory until the user
+    /// edits it; the generated name avoids live agents' names; labels
+    /// are `k=v` pairs.
+    #[gpui::test]
+    fn new_agent_name_follows_the_command_until_edited(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        s.cx.simulate_keystrokes("cmd-n");
+        let name = |sh: &NewAgentSheet| sh.name.clone();
+        let command = |sh: &NewAgentSheet| sh.command.clone();
+        set_sheet_text(&mut s, |sh| sh.dir.clone(), "/w/fleetd");
+        set_sheet_text(&mut s, command, "claude");
+        assert!(sheet_text(&mut s, name).starts_with("fleetd-"));
+        set_sheet_text(&mut s, command, "claude 'fix the SIGTERM race'");
+        let generated = sheet_text(&mut s, name);
+        assert!(generated.starts_with("sigterm-"), "{generated}");
+        // Typed by the user: it stays.
+        set_sheet_text(&mut s, name, "my-agent");
+        set_sheet_text(&mut s, command, "claude 'tune LTO'");
+        assert_eq!(sheet_text(&mut s, name), "my-agent");
+        set_sheet_text(&mut s, |sh| sh.labels.clone(), "role=reviewer, team=core");
+        s.cx.simulate_keystrokes("enter");
+        let req = last_spawn(&fake);
+        assert_eq!(req.args, ["tune LTO"]);
+        assert_eq!(
+            req.labels,
+            HashMap::from([
+                ("name".to_owned(), "my-agent".to_owned()),
+                ("role".to_owned(), "reviewer".to_owned()),
+                ("team".to_owned(), "core".to_owned()),
+            ])
+        );
+
+        // A live agent has the name the command would get: another one.
+        let mut taken = row(1, "/w/fleetd", 1);
+        taken.info.labels.insert("name".into(), generated.clone());
+        agents(&mut s, &fake, vec![taken]);
+        s.cx.simulate_keystrokes("cmd-n");
+        set_sheet_text(&mut s, |sh| sh.dir.clone(), "/w/fleetd");
+        set_sheet_text(&mut s, command, "claude 'fix the SIGTERM race'");
+        let other = sheet_text(&mut s, name);
+        assert!(
+            other.starts_with("sigterm-") && other != generated,
+            "{other}"
+        );
+        // Bad labels or names keep the sheet open with the error.
+        set_sheet_text(&mut s, |sh| sh.labels.clone(), "role");
+        s.cx.simulate_keystrokes("enter");
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
+        assert!(sheet.read_with(s.cx, |sh, _| sh.error.clone()).is_some());
+        set_sheet_text(&mut s, |sh| sh.labels.clone(), "");
+        set_sheet_text(&mut s, name, "12");
+        s.cx.simulate_keystrokes("enter");
+        assert!(s.ws.read_with(s.cx, |w, _| w.sheet().is_some()));
+    }
+
+    fn named(id: u64, name: &str, labels: &[(&str, &str)]) -> AgentRow {
+        let mut r = row(id, "/w", id as i64);
+        r.info.labels.insert("name".into(), name.into());
+        for (k, v) in labels {
+            r.info.labels.insert((*k).into(), (*v).into());
+        }
+        r
+    }
+
+    /// Rows show their labels as chips (not the name, project or
+    /// `fleet.*`), and the pane header the name with `program · id`.
+    #[gpui::test]
+    fn rows_and_headers_show_names_and_chips(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let labels = [
+            ("role", "reviewer"),
+            ("project", "p"),
+            ("fleet.parent", "2"),
+        ];
+        agents(
+            &mut s,
+            &fake,
+            vec![named(1, "lto-falcon", &labels), row(2, "/w", 2)],
+        );
+        assert!(s.cx.debug_bounds("tab-1-name").is_some());
+        assert!(s.cx.debug_bounds("tab-1-detail").is_some());
+        assert!(s.cx.debug_bounds("tab-1-chip-role").is_some());
+        for hidden in [
+            "tab-1-chip-name",
+            "tab-1-chip-project",
+            "tab-1-chip-fleet.parent",
+        ] {
+            assert!(s.cx.debug_bounds(hidden).is_none(), "{hidden}");
+        }
+        assert!(s.cx.debug_bounds("tab-2-chip-role").is_none());
+        click(&mut s, "tab-1");
+        attach_model(&fake, PaneId(1), 1);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        let chrome = s.app.read_with(s.cx, |a, cx| {
+            a.pane_view(PaneId(1)).unwrap().read(cx).chrome.clone()
+        });
+        assert_eq!(chrome.name.as_deref(), Some("lto-falcon"));
+        assert_eq!(chrome.agent, Some(1));
+        assert!(s.cx.debug_bounds("pane-1-name").is_some());
+        assert!(s.cx.debug_bounds("pane-1-detail").is_some());
+    }
+
+    fn double_click(s: &mut Setup<'_>, selector: &'static str) {
+        let at = center(s, selector);
+        for click_count in [1, 2] {
+            s.cx.simulate_event(gpui::MouseDownEvent {
+                position: at,
+                button: MouseButton::Left,
+                modifiers: Modifiers::none(),
+                click_count,
+                first_mouse: false,
+            });
+            s.cx.simulate_event(gpui::MouseUpEvent {
+                position: at,
+                button: MouseButton::Left,
+                modifiers: Modifiers::none(),
+                click_count,
+            });
+        }
+        s.cx.run_until_parked();
+    }
+
+    fn rename_to(s: &mut Setup<'_>, name: &str) {
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.rename_sheet().cloned())
+                .expect("rename sheet open");
+        let field = sheet.read_with(s.cx, |sh, _| sh.name.clone());
+        let name = name.to_owned();
+        field.update(s.cx, |f, cx| f.set_text(name, cx));
+        s.cx.simulate_keystrokes("enter");
+    }
+
+    /// Rename: a double-click on the name in the row or the header, or
+    /// Rename… in the row and pane menus.
+    #[gpui::test]
+    fn rename_from_row_header_and_menus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![named(3, "old-name", &[])]);
+        double_click(&mut s, "tab-3-name");
+        let sheet = s.ws.read_with(s.cx, |w, _| w.rename_sheet().cloned());
+        let text = sheet
+            .expect("rename sheet open")
+            .read_with(s.cx, |sh, cx| sh.name.read(cx).text().to_owned());
+        assert_eq!(text, "old-name");
+        rename_to(&mut s, "  new-name ");
+        assert!(fake.calls().contains(&Call::Rename(3, "new-name".into())));
+        assert!(s.ws.read_with(s.cx, |w, _| w.rename_sheet().is_none()));
+
+        // A bad name keeps the sheet open; Escape cancels.
+        pick_row(&mut s, 3, RowMenuItem::Rename);
+        rename_to(&mut s, "123");
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.rename_sheet().cloned())
+                .unwrap();
+        assert!(sheet.read_with(s.cx, |sh, _| sh.error.clone()).is_some());
+        s.cx.simulate_keystrokes("escape");
+        assert!(s.ws.read_with(s.cx, |w, _| w.rename_sheet().is_none()));
+
+        // The header: shown in pane 1.
+        attach_model(&fake, PaneId(1), 3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        double_click(&mut s, "pane-1-name");
+        rename_to(&mut s, "from-header");
+        assert!(
+            fake.calls()
+                .contains(&Call::Rename(3, "from-header".into()))
+        );
+        s.ws.update_in(s.cx, |ws, window, cx| {
+            let epoch = ws.epoch;
+            ws.pane_menu_pick(PaneId(1), PaneMenuItem::Rename, epoch, window, cx);
+        });
+        rename_to(&mut s, "from-menu");
+        assert!(fake.calls().contains(&Call::Rename(3, "from-menu".into())));
     }
 
     fn spawn_via_sheet(s: &mut Setup<'_>, dir: &str) {
@@ -3747,13 +4063,18 @@ mod tests {
         );
         assert_eq!(
             row_items(&mut s, 7),
-            [RowMenuItem::OpenSplit, RowMenuItem::Kill]
+            [
+                RowMenuItem::OpenSplit,
+                RowMenuItem::Rename,
+                RowMenuItem::Kill
+            ]
         );
         for id in [8, 6] {
             assert_eq!(
                 row_items(&mut s, id),
                 [
                     RowMenuItem::OpenSplit,
+                    RowMenuItem::Rename,
                     RowMenuItem::Restart,
                     RowMenuItem::Remove
                 ]
@@ -3780,7 +4101,10 @@ mod tests {
         assert_eq!(shown(&mut s, pane), Some(7));
         // With four panes the menu no longer offers it.
         s.cx.simulate_keystrokes("cmd-d cmd-d");
-        assert_eq!(row_items(&mut s, 7), [RowMenuItem::Kill]);
+        assert_eq!(
+            row_items(&mut s, 7),
+            [RowMenuItem::Rename, RowMenuItem::Kill]
+        );
     }
 
     #[gpui::test]

@@ -1,11 +1,13 @@
 //! The New agent sheet: a directory (typed, picked from the recent ones,
-//! or chosen with the native folder picker for a local daemon) and a
-//! command, prefilled from `[gui] default_command`.
+//! or chosen with the native folder picker for a local daemon), a
+//! command, prefilled from `[gui] default_command`, a name (generated from
+//! the command until edited, ADR 0052) and optional labels.
 
+use fleet_client::names::NAME_LABEL;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, ParentElement, PathPromptOptions, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 
 use super::controls::{
@@ -17,20 +19,12 @@ use crate::core::session::AgentRow;
 use crate::core::style::{space, text};
 use crate::core::target::Target;
 
-pub use crate::core::spawn::SpawnRequest;
+use crate::core::spawn::{NameDraft, parse_label_list};
+pub use crate::core::spawn::{SpawnRequest, parse_command};
 
 pub enum SheetEvent {
     Spawn(SpawnRequest),
     Cancel,
-}
-
-/// Splits a command line with shell quoting rules into program and args.
-pub fn parse_command(line: &str) -> Result<(String, Vec<String>), String> {
-    let mut words = shell_words::split(line)
-        .map_err(|e| format!("cannot parse the command: {e}"))?
-        .into_iter();
-    let program = words.next().ok_or("enter a command")?;
-    Ok((program, words.collect()))
 }
 
 /// The sheet's directory list: the recent directories for the target,
@@ -67,32 +61,68 @@ pub fn dir_hint(target: &Target) -> Option<String> {
 pub struct NewAgentSheet {
     pub(crate) dir: Entity<TextField>,
     pub(crate) command: Entity<TextField>,
+    pub(crate) name: Entity<TextField>,
+    pub(crate) labels: Entity<TextField>,
+    /// The Name field's generated text, until the user edits it.
+    pub(crate) draft: NameDraft,
     pub(crate) dirs: Vec<String>,
     /// The native folder picker is offered (local daemon only).
     pub(crate) can_choose: bool,
     /// [`dir_hint`] for the target.
     pub(crate) hint: Option<String>,
     pub(crate) error: Option<String>,
+    _observers: [Subscription; 3],
 }
 
 impl EventEmitter<SheetEvent> for NewAgentSheet {}
 
 impl NewAgentSheet {
+    /// `taken`: the live agents' names, which the generated name avoids.
     pub fn new(
         default_command: &[String],
         dirs: Vec<String>,
         target: &Target,
+        taken: Vec<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let first = dirs.first().cloned().unwrap_or_default();
         let command = shell_words::join(default_command);
+        let draft = NameDraft::new(&command, &first, taken);
+        let generated = draft.generated().to_owned();
+        let dir = cx.new(|cx| TextField::new(first, "Directory on the fleetd host", cx));
+        let command = cx.new(|cx| TextField::new(command, "Command", cx));
+        let name = cx.new(|cx| TextField::new(generated, "Name", cx));
+        let labels = cx.new(|cx| TextField::new(String::new(), "key=value, key=value", cx));
+        // A field notifies on every edit (and caret blink): each observer
+        // only acts on a text that changed.
+        let observers = [
+            cx.observe(&command, |this, _, cx| this.inputs_changed(cx)),
+            cx.observe(&dir, |this, _, cx| this.inputs_changed(cx)),
+            cx.observe(&name, |this, name, cx| {
+                this.draft.field_changed(name.read(cx).text());
+            }),
+        ];
         NewAgentSheet {
-            dir: cx.new(|cx| TextField::new(first, "Directory on the fleetd host", cx)),
-            command: cx.new(|cx| TextField::new(command, "Command", cx)),
+            dir,
+            command,
+            name,
+            labels,
+            draft,
             dirs,
             can_choose: *target == Target::Local,
             hint: dir_hint(target),
             error: None,
+            _observers: observers,
+        }
+    }
+
+    /// The command or directory changed: the Name field follows, until
+    /// the user edits it.
+    fn inputs_changed(&mut self, cx: &mut Context<Self>) {
+        let command = self.command.read(cx).text().to_owned();
+        let cwd = self.dir.read(cx).text().trim().to_owned();
+        if let Some(name) = self.draft.inputs_changed(&command, &cwd) {
+            self.name.update(cx, |f, cx| f.set_text(name, cx));
         }
     }
 
@@ -109,15 +139,22 @@ impl NewAgentSheet {
             cx.notify();
             return;
         }
-        match parse_command(self.command.read(cx).text()) {
-            Ok((program, args)) => {
+        let request = || -> Result<SpawnRequest, String> {
+            let (program, args) = parse_command(self.command.read(cx).text())?;
+            let mut labels = parse_label_list(self.labels.read(cx).text())?;
+            let name = self.draft.name(self.name.read(cx).text())?;
+            labels.insert(NAME_LABEL.to_owned(), name);
+            Ok(SpawnRequest {
+                program,
+                args,
+                cwd: cwd.clone(),
+                labels,
+            })
+        };
+        match request() {
+            Ok(req) => {
                 self.error = None;
-                cx.emit(SheetEvent::Spawn(SpawnRequest {
-                    program,
-                    args,
-                    cwd,
-                    labels: Default::default(),
-                }));
+                cx.emit(SheetEvent::Spawn(req));
             }
             Err(e) => {
                 self.error = Some(e);
@@ -229,6 +266,30 @@ impl Render for NewAgentSheet {
                     .child(field_label("Command", &theme))
                     .child(self.command.clone()),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(space::SM))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .gap(px(space::SM - space::XXS))
+                            .child(field_label("Name", &theme))
+                            .child(self.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .gap(px(space::SM - space::XXS))
+                            .child(field_label("Labels", &theme))
+                            .child(self.labels.clone()),
+                    ),
+            )
             .children(self.error.clone().map(|e| error_text(e, &theme)))
             .child(
                 div()
@@ -251,7 +312,7 @@ impl Render for NewAgentSheet {
 
 #[cfg(test)]
 mod tests {
-    use super::{dir_choices, dir_hint, parse_command};
+    use super::{dir_choices, dir_hint};
     use crate::core::session::AgentRow;
     use crate::core::target::Target;
     use fleet_proto::AgentInfo;
@@ -278,20 +339,6 @@ mod tests {
             dir_hint(&remote).as_deref(),
             Some("paths on box; ~ is not expanded")
         );
-    }
-
-    #[test]
-    fn command_uses_shell_quoting() {
-        assert_eq!(
-            parse_command("sh -c 'echo \"hi there\"'"),
-            Ok((
-                "sh".to_owned(),
-                vec!["-c".to_owned(), "echo \"hi there\"".to_owned()]
-            ))
-        );
-        assert_eq!(parse_command("claude"), Ok(("claude".to_owned(), vec![])));
-        assert!(parse_command("   ").is_err());
-        assert!(parse_command("echo 'open").is_err());
     }
 
     #[test]

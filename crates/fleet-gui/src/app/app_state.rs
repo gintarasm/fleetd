@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use fleet_client::names::{live_names, name_of};
 use fleet_term::Palette;
 use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle};
 
@@ -63,6 +64,8 @@ pub trait SessionApi: InputSink {
         rows: u16,
     ) -> Result<(), String>;
     fn forget(&self, ids: Vec<u64>);
+    /// Sets an agent's name (ADR 0052).
+    fn rename(&self, agent_id: u64, name: String);
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
@@ -125,6 +128,10 @@ impl SessionApi for Session {
 
     fn forget(&self, ids: Vec<u64>) {
         Session::forget(self, ids);
+    }
+
+    fn rename(&self, agent_id: u64, name: String) {
+        Session::rename(self, agent_id, name);
     }
 
     fn clear_exited(&self) {
@@ -206,6 +213,7 @@ impl SessionApi for NoSession {
     }
 
     fn forget(&self, _ids: Vec<u64>) {}
+    fn rename(&self, _agent_id: u64, _name: String) {}
     fn clear_exited(&self) {}
 
     fn replaced(&self) -> HashMap<u64, u64> {
@@ -989,6 +997,7 @@ impl AppState {
                     (None, None) => None,
                 },
                 cwd: row.map(|r| tilde(&r.info.cwd, &self.home)),
+                name: row.and_then(|r| name_of(&r.info)).map(str::to_owned),
                 link_dir: row
                     .filter(|_| self.target == Target::Local)
                     .map(|r| r.info.cwd.clone()),
@@ -1366,7 +1375,8 @@ impl AppState {
     /// New terminal's request: a login shell in `cwd`.
     pub(super) fn terminal_request(&self, cwd: String) -> SpawnRequest {
         let shell = std::env::var("SHELL").ok();
-        new_terminal(&self.target, shell.as_deref(), cwd)
+        let infos: Vec<_> = self.agents.iter().map(|r| r.info.clone()).collect();
+        new_terminal(&self.target, shell.as_deref(), cwd, &live_names(&infos))
     }
 
     /// Where something started next to `pane` runs: its agent's folder,
@@ -1431,6 +1441,10 @@ impl AppState {
 
     pub fn forget(&self, agent_id: u64) {
         self.session.forget(vec![agent_id]);
+    }
+
+    pub fn rename(&self, agent_id: u64, name: String) {
+        self.session.rename(agent_id, name);
     }
 
     /// The summary bar's Remove: forgets the agent `pane` shows if it
@@ -1702,6 +1716,12 @@ impl AppState {
         self.notice = None;
         self.error_is_connection = false;
         cx.notify();
+    }
+
+    /// The live agents' names, which a generated name avoids.
+    pub(super) fn live_names(&self) -> Vec<String> {
+        let infos: Vec<_> = self.agents.iter().map(|r| r.info.clone()).collect();
+        live_names(&infos).into_iter().map(str::to_owned).collect()
     }
 }
 

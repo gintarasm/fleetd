@@ -30,17 +30,19 @@ fn the_folder_is_the_focused_agents_then_the_last_used_then_home() {
 
 #[test]
 fn a_local_terminal_is_a_login_shell_labelled_kind_shell() {
-    let req = new_terminal(&Target::Local, Some("/bin/bash"), "/work".into());
+    let req = new_terminal(&Target::Local, Some("/bin/bash"), "/work".into(), &[]);
     assert_eq!(req.program, "/bin/bash");
     assert_eq!(req.args, ["-l"]);
     assert_eq!(req.cwd, "/work");
-    assert_eq!(req.labels.len(), 1);
+    assert_eq!(req.labels.len(), 2);
     assert_eq!(req.labels[KIND_LABEL], SHELL_KIND);
+    // Named as a shell (ADR 0052).
+    assert!(req.labels["name"].starts_with("shell-"), "{req:?}");
     assert_eq!((KIND_LABEL, SHELL_KIND), ("kind", "shell"));
     // Not a reserved key (ADR 0025).
     assert!(!KIND_LABEL.starts_with("fleet."));
 
-    let req = new_terminal(&Target::Local, None, "/work".into());
+    let req = new_terminal(&Target::Local, None, "/work".into(), &[]);
     assert_eq!(
         (req.program.as_str(), req.args),
         ("/bin/zsh", vec!["-l".to_owned()])
@@ -54,7 +56,7 @@ fn a_remote_terminal_runs_the_remote_shell() {
     let remote = Target::Ssh {
         dest: "me@box".into(),
     };
-    let req = new_terminal(&remote, Some("/bin/bash"), String::new());
+    let req = new_terminal(&remote, Some("/bin/bash"), String::new(), &[]);
     assert_eq!(req.program, "/bin/sh");
     assert_eq!(req.args, ["-c", "exec \"${SHELL:-/bin/zsh}\" -l"]);
     assert_eq!(req.cwd, "");

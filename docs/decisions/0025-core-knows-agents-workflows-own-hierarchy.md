@@ -3,6 +3,9 @@
 **Status:** accepted · 2026-11-13 (user decisions, from a design review of 0009)
 
 **Supersedes:** [0009](0009-domain-model.md).
+
+**Amended by:** [0052](0052-agent-names.md) — the `name` label is grant-safe: an agent's spawner (another agent included) may set it, and a child never inherits it.
+
 **Amends:**
 - [0007](0007-plugin-system.md): new plugin kind `workflow`;
 - [0010](0010-storage-and-layout.md): worktree layout and archive cleanup move to the git-worktree workflow;

@@ -7,15 +7,17 @@
 
 use std::collections::{HashMap, HashSet};
 
+use fleet_client::names::name_of;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Action, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
+    Action, AppContext, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    div, px,
 };
 
 use super::agent_mark::{MARK_SLOT, agent_mark};
-use super::controls;
+use super::controls::{self, Tooltip};
 use super::keymap::{Kill, Remove, Restart};
 use super::status_dot::status_dot;
 use super::tail_text::{head_text, tail_text};
@@ -28,7 +30,7 @@ use crate::core::row_preview::{preview_line, row_meta};
 use crate::core::session::AgentRow;
 use crate::core::sidebar::ended;
 pub use crate::core::sidebar::program_name;
-use crate::core::sidebar::{SidebarGroup, StatusFilter};
+use crate::core::sidebar::{SidebarGroup, StatusFilter, label_chips, program_and_id};
 use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
@@ -77,9 +79,12 @@ pub struct SidebarData<'a> {
     pub focus: FocusHandle,
 }
 
-/// A tab's title: the agent's OSC title if a pane knows it, else the
-/// program.
+/// A tab's title: the agent's name (ADR 0052), else its OSC title if a
+/// pane knows it, else the program.
 pub fn tab_title(row: &AgentRow, titles: &HashMap<u64, String>) -> String {
+    if let Some(name) = name_of(&row.info) {
+        return name.to_owned();
+    }
     titles
         .get(&row.info.id)
         .filter(|t| !t.trim().is_empty())
@@ -296,6 +301,8 @@ fn render_tab(
         .child(mark_el)
         .child(
             div()
+                .id(("agent-name", id))
+                .debug_selector(move || format!("tab-{id}-name"))
                 .flex_1()
                 .min_w_0()
                 .truncate()
@@ -303,7 +310,15 @@ fn render_tab(
                 .when(mark == TabMark::Focused, |s| {
                     s.font_weight(gpui::FontWeight::MEDIUM)
                 })
-                .child(SharedString::from(tab_title(row, data.titles))),
+                .child(SharedString::from(tab_title(row, data.titles)))
+                // A double-click renames; the row's click still shows it.
+                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                    if ev.click_count() == 2 {
+                        this.open_rename(id, window, cx);
+                        // Not also the row's click, which would focus a pane.
+                        cx.stop_propagation();
+                    }
+                })),
         )
         .child({
             let shown = meta.text.clone();
@@ -332,19 +347,43 @@ fn render_tab(
         });
     let line2 = div()
         .flex()
+        .flex_row()
+        .gap(px(space::XS))
         // Under the title: past the agent's mark and the status.
-        .pl(px(MARK_SLOT + space::SM - space::XXS + space::LG))
+        .pl(px(ROW_INDENT))
         .type_style(text::SUBHEADLINE)
-        .text_color(if running {
-            theme.secondary
-        } else {
-            theme.tertiary
-        })
-        .debug_selector({
-            let shown = preview.clone();
-            move || format!("preview-{id}-{shown}")
-        })
-        .child(head_text(preview));
+        .child(
+            div()
+                .debug_selector(move || format!("tab-{id}-detail"))
+                .flex_none()
+                .text_color(theme.tertiary)
+                .child(SharedString::from(program_and_id(&row.info))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(if running {
+                    theme.secondary
+                } else {
+                    theme.tertiary
+                })
+                .debug_selector({
+                    let shown = preview.clone();
+                    move || format!("preview-{id}-{shown}")
+                })
+                .child(head_text(preview)),
+        );
+    let chips = label_chips(&row.info);
+    let line3 = (!chips.is_empty()).then(|| {
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(space::XXS))
+            .pl(px(ROW_INDENT))
+            .children(chips.into_iter().map(|(k, v)| chip(id, k, v, theme)))
+    });
     let bar = div()
         .absolute()
         .left_0()
@@ -378,6 +417,7 @@ fn render_tab(
         .child(bar)
         .child(line1)
         .child(line2)
+        .children(line3)
         .on_click(cx.listener(move |this, _, window, cx| {
             // A drag that ends on its own row is not a click.
             if this.pane_drag.is_click() {
@@ -395,6 +435,35 @@ fn render_tab(
             cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
 }
+
+/// A label chip: the value, with `key=value` as its tooltip.
+fn chip(id: u64, key: String, value: String, theme: &Theme) -> impl IntoElement + use<> {
+    let tip = SharedString::from(format!("{key}={value}"));
+    let tip_theme = *theme;
+    let selector = format!("tab-{id}-chip-{key}");
+    div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .px(px(space::XS))
+        .rounded(px(radius::SM))
+        .bg(theme.hover)
+        .type_style(text::CAPTION)
+        .text_color(theme.secondary)
+        .max_w(px(chrome::SIDEBAR_WIDTH / 2.0))
+        .truncate()
+        .child(SharedString::from(value))
+        .tooltip(move |_, cx| {
+            cx.new(|_| Tooltip {
+                text: tip.clone(),
+                theme: tip_theme,
+            })
+            .into()
+        })
+}
+
+/// Where a row's second and third lines start: under the title, past
+/// the agent's mark and the status.
+const ROW_INDENT: f32 = MARK_SLOT + space::SM - space::XXS + space::LG;
 
 /// A row's hover group (its agent buttons show on hover).
 const ROW_GROUP: &str = "agent-row";
