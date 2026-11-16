@@ -5,6 +5,7 @@ use fleet_gui::core::config::{load_config, save_confirm_kill};
 use fleet_gui::core::icons::Icon;
 use fleet_gui::core::kill::{AgentButtons, KillFlow, agent_buttons, kill_flow, kill_question};
 use fleet_gui::core::menus::{MenuEntry, PaneMenuItem, PaneMenuState, pane_menu};
+use fleet_gui::core::status::Subject;
 
 #[test]
 fn a_running_agent_offers_stop_an_ended_one_restart_and_remove() {
@@ -18,18 +19,35 @@ fn a_running_agent_offers_stop_an_ended_one_restart_and_remove() {
 #[test]
 fn the_question_names_the_agent_its_program_and_directory() {
     assert_eq!(
-        kill_question(7, Some("claude"), Some("~/fleetd")),
+        kill_question(Subject::Agent, 7, Some("claude"), Some("~/fleetd")),
         "Kill agent 7 (claude, ~/fleetd)?"
     );
     assert_eq!(
-        kill_question(7, Some("claude"), None),
+        kill_question(Subject::Agent, 7, Some("claude"), None),
         "Kill agent 7 (claude)?"
     );
     assert_eq!(
-        kill_question(7, Some("claude"), Some("")),
+        kill_question(Subject::Agent, 7, Some("claude"), Some("")),
         "Kill agent 7 (claude)?"
     );
-    assert_eq!(kill_question(9, None, None), "Kill agent 9?");
+    assert_eq!(
+        kill_question(Subject::Agent, 9, None, None),
+        "Kill agent 9?"
+    );
+}
+
+/// A shell from New terminal is never called an agent (ADR 0071).
+#[test]
+fn a_shell_is_asked_about_as_a_shell() {
+    assert_eq!(
+        kill_question(Subject::Shell, 4, Some("zsh"), Some("~/src")),
+        "Kill shell 4 (zsh, ~/src)?"
+    );
+    assert_eq!(PaneMenuItem::Kill.title(Subject::Shell), "Kill Shell…");
+    assert_eq!(PaneMenuItem::Rename.title(Subject::Shell), "Rename Shell…");
+    assert_eq!(PaneMenuItem::Restart.title(Subject::Shell), "Restart Shell");
+    // Items that are not about what the pane shows keep their title.
+    assert_eq!(PaneMenuItem::Close.title(Subject::Shell), "Close Pane");
 }
 
 #[test]
@@ -89,7 +107,7 @@ fn the_pane_menu_offers_kill_agent_with_cmd_shift_w_for_a_running_agent() {
         ..Default::default()
     };
     assert!(!items(ended).contains(&PaneMenuItem::Kill));
-    assert_eq!(PaneMenuItem::Kill.title(), "Kill Agent…");
+    assert_eq!(PaneMenuItem::Kill.title(Subject::Agent), "Kill Agent…");
     let key = PaneMenuItem::Kill.shortcut().unwrap();
     assert_eq!((key.key, key.shift), ("w", true));
 }

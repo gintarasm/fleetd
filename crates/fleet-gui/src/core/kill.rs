@@ -2,6 +2,8 @@
 //! (issue #27): what the agent's buttons offer, and the question asked
 //! first unless `[gui] confirm_kill` is off.
 
+use super::status::Subject;
+
 /// The agent buttons of a pane header or a sidebar row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentButtons {
@@ -23,19 +25,25 @@ pub fn agent_buttons(has_agent: bool, ended: bool) -> AgentButtons {
     }
 }
 
-/// The confirmation's question: "Kill agent 7 (claude, ~/fleetd)?". The
-/// program and directory are left out when unknown (an agent the list
-/// does not carry yet).
-pub fn kill_question(agent_id: u64, program: Option<&str>, cwd: Option<&str>) -> String {
+/// The confirmation's question: "Kill agent 7 (claude, ~/fleetd)?", or
+/// "Kill shell 4 (zsh, ~/src)?" for a shell. The program and directory
+/// are left out when unknown (an agent the list does not carry yet).
+pub fn kill_question(
+    subject: Subject,
+    agent_id: u64,
+    program: Option<&str>,
+    cwd: Option<&str>,
+) -> String {
+    let noun = subject.noun();
     let parts: Vec<&str> = [program, cwd]
         .into_iter()
         .flatten()
         .filter(|s| !s.trim().is_empty())
         .collect();
     if parts.is_empty() {
-        format!("Kill agent {agent_id}?")
+        format!("Kill {noun} {agent_id}?")
     } else {
-        format!("Kill agent {agent_id} ({})?", parts.join(", "))
+        format!("Kill {noun} {agent_id} ({})?", parts.join(", "))
     }
 }
 

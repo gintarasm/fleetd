@@ -486,3 +486,62 @@ fn restart_does_not_restore_env() {
     assert!(screen.contains("secret=[]"), "{screen:?}");
     assert!(!screen.contains("s3cr3tv4lue"), "{screen:?}");
 }
+
+/// Polls until `id` has an exit code, or `within` passes.
+fn exited_within(node: &Node, id: u64, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if node.exit_code(id).is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// An interactive shell (New terminal) ignores SIGTERM; kill still ends
+/// it, at once, as closing a terminal window would (SIGHUP).
+#[test]
+fn kill_ends_an_interactive_shell_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    let id = node
+        .spawn(SpawnAgent {
+            program: "/bin/sh".into(),
+            args: vec!["-i".into()],
+            cols: 80,
+            rows: 24,
+            env: [("PS1".to_owned(), "ready> ".to_owned())].into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    wait_screen(&node, id, "ready>");
+    node.kill(id).unwrap();
+    assert!(
+        exited_within(&node, id, fleet_node::node::KILL_GRACE / 2),
+        "the shell outlived the hangup"
+    );
+}
+
+/// An agent that ignores both SIGHUP and SIGTERM is SIGKILLed once
+/// [`KILL_GRACE`] has passed.
+#[test]
+fn kill_escalates_to_sigkill_after_the_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    let id = spawn_sh(
+        &node,
+        "trap '' HUP TERM; echo ready; while :; do sleep 1; done",
+    );
+    wait_screen(&node, id, "ready");
+    node.kill(id).unwrap();
+    assert!(
+        !exited_within(&node, id, Duration::from_millis(300)),
+        "it ignores HUP and TERM, so only the escalation ends it"
+    );
+    assert!(
+        exited_within(&node, id, fleet_node::node::KILL_GRACE * 3),
+        "never SIGKILLed"
+    );
+}

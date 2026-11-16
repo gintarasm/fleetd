@@ -11,6 +11,7 @@ use gpui::{
 use super::controls::{ButtonKind, button, error_text, field_label, sheet_card, sheet_title};
 use super::text_field::TextField;
 use super::theme::{Typography, current as theme};
+use crate::core::status::Subject;
 use crate::core::style::{space, text};
 
 pub enum RenameEvent {
@@ -22,6 +23,8 @@ pub struct RenameSheet {
     pub(crate) agent_id: u64,
     /// What the agent is, under the title (`claude · 4`).
     what: String,
+    /// "Rename agent" or "Rename shell" (ADR 0071).
+    subject: Subject,
     pub(crate) name: Entity<TextField>,
     pub(crate) error: Option<String>,
 }
@@ -29,10 +32,17 @@ pub struct RenameSheet {
 impl EventEmitter<RenameEvent> for RenameSheet {}
 
 impl RenameSheet {
-    pub fn new(agent_id: u64, name: String, what: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        agent_id: u64,
+        name: String,
+        what: String,
+        subject: Subject,
+        cx: &mut Context<Self>,
+    ) -> Self {
         RenameSheet {
             agent_id,
             what,
+            subject,
             name: cx.new(|cx| TextField::new(name, "Name", cx)),
             error: None,
         }
@@ -82,7 +92,10 @@ impl Render for RenameSheet {
             .on_key_down(cx.listener(Self::key_down))
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(sheet_title("Rename agent"))
+            .child(sheet_title(match self.subject {
+                Subject::Agent => "Rename agent",
+                Subject::Shell => "Rename shell",
+            }))
             .child(
                 div()
                     .flex()

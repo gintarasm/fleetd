@@ -1269,6 +1269,9 @@ impl ActivityHub {
 
 /// How long [`Node::shutdown`] lets agents exit after SIGTERM.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long [`Node::kill`] lets an agent exit after SIGHUP and SIGTERM
+/// before it SIGKILLs the process group (ADR 0071).
+pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// How long [`Node::shutdown`] waits for agents after SIGKILL.
 const KILL_WAIT: Duration = Duration::from_millis(500);
 
@@ -2435,12 +2438,38 @@ impl Node {
         Ok(())
     }
 
-    /// Sends SIGTERM to the agent's process group; a no-op once it exited.
+    /// Sends SIGHUP and SIGTERM to the agent's process group, then SIGKILL
+    /// if it is still running after [`KILL_GRACE`] (ADR 0071); a no-op once
+    /// it exited.
     pub fn kill(&self, id: u64) -> io::Result<()> {
         match self.live(id) {
             Ok(live) => {
-                info!(agent = id, signal = "SIGTERM", "agent killed");
-                self.host.kill(live.host_id)
+                info!(agent = id, signal = "SIGHUP+SIGTERM", "agent killed");
+                self.host.kill(live.host_id)?;
+                let host = Arc::clone(&self.host);
+                let host_id = live.host_id;
+                // `force_kill` is a no-op once the agent has exited (its pid
+                // may be reused by then), so the escalation never misfires.
+                let escalate = move || {
+                    std::thread::sleep(KILL_GRACE);
+                    if host.stats(host_id).is_some_and(|s| s.exit_code.is_none()) {
+                        info!(
+                            agent = id,
+                            signal = "SIGKILL",
+                            "agent outlived the kill grace"
+                        );
+                        if let Err(e) = host.force_kill(host_id) {
+                            warn!(agent = id, error = %e, "cannot SIGKILL agent");
+                        }
+                    }
+                };
+                if let Err(e) = std::thread::Builder::new()
+                    .name("fleet-kill-grace".into())
+                    .spawn(escalate)
+                {
+                    warn!(agent = id, error = %e, "cannot start the kill escalation");
+                }
+                Ok(())
             }
             Err(_) if self.exit_code(id).is_some() => Ok(()),
             Err(e) => Err(e),
