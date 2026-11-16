@@ -105,10 +105,10 @@ fn reports(
     let deadline = Instant::now() + wait;
     let mut out = Vec::new();
     while let Ok(f) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        if let Frame::Event(e) = f {
-            if let Some(event::Kind::Reported(r)) = e.kind {
-                out.push(r);
-            }
+        if let Frame::Event(e) = f
+            && let Some(event::Kind::Reported(r)) = e.kind
+        {
+            out.push(r);
         }
     }
     out
@@ -153,7 +153,7 @@ fn only_an_agent_reports_and_its_ancestors_and_the_user_hear_it() {
     assert!(!err.is_forbidden(), "{err}");
 
     for (who, rx) in [("user", &user_events), ("parent", &parent_events)] {
-        let got = reports(rx, Duration::from_secs(5).min(Duration::from_millis(1500)));
+        let got = reports(rx, Duration::from_millis(1500));
         assert_eq!(got.len(), 1, "{who}: {got:?}");
         assert_eq!(got[0].agent_id, c);
         let r = got[0].reported.as_ref().unwrap();
