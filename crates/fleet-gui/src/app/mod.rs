@@ -15,6 +15,7 @@ mod pane_view;
 mod picker_view;
 mod resident;
 mod sidebar_view;
+mod split_dividers;
 mod status_item;
 mod tail_text;
 mod terminal_element;

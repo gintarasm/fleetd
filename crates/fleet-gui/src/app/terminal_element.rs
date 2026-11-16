@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use fleet_term::{Cell, CursorShape, CursorView};
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, DispatchPhase, Element, ElementId, ElementInputHandler,
-    Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior,
-    Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollWheelEvent, SharedString, StrikethroughStyle, Style, TextRun,
-    UnderlineStyle, Window, fill, outline, point, px, relative, size,
+    App, BorderStyle, Bounds, ContentMask, CursorStyle, DispatchPhase, Element, ElementId,
+    ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hitbox,
+    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, SharedString,
+    StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, outline, point, px, relative,
+    size,
 };
 
 use super::bench;
@@ -22,6 +23,9 @@ use crate::core::session::PaneId;
 
 /// Cursor bar thickness (beam width, underline height).
 const CURSOR_BAR: Pixels = px(2.0);
+
+/// Thickness of a hovered link's underline.
+const LINK_UNDERLINE: Pixels = px(1.0);
 
 pub struct TerminalElement {
     pub(crate) view: Entity<PaneView>,
@@ -37,6 +41,8 @@ pub struct TerminalElement {
     /// Draw the cursor at all (not in an empty pane or after the agent exited).
     pub(crate) show_cursor: bool,
     pub(crate) marked: Option<String>,
+    /// The link under the pointer while ⌘ is held: underlined.
+    pub(crate) link: Option<(LineRef, u16, u16)>,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +56,8 @@ struct RowSnapshot {
     cells: Vec<Cell>,
     /// The selected columns, `from..to`.
     selected: Option<(u16, u16)>,
+    /// The hovered link's columns, `from..to`.
+    link: Option<(u16, u16)>,
 }
 
 /// What a frame draws, copied out under one model lock.
@@ -92,7 +100,16 @@ impl TerminalElement {
                     .selected_cols(line)
                     .map(|r| (r.start.min(cols), r.end.min(cols)))
                     .filter(|(from, to)| from < to);
-                RowSnapshot { cells, selected }
+                let link = self
+                    .link
+                    .filter(|&(l, _, _)| l == line)
+                    .map(|(_, from, to)| (from.min(cols), to.min(cols)))
+                    .filter(|(from, to)| from < to);
+                RowSnapshot {
+                    cells,
+                    selected,
+                    link,
+                }
             })
             .collect();
         let cursor = term.cursor_view();
@@ -434,6 +451,9 @@ impl Element for TerminalElement {
             cx,
         );
         self.listen_to_mouse(hitbox.clone(), window);
+        if self.link.is_some() {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
         // The lock is held only for the copy; shaping happens after.
         let snap = self.snapshot();
         if bench::watches(self.pane) {
@@ -450,6 +470,17 @@ impl Element for TerminalElement {
                     .filter(|c| usize::from(c.row) == i)
                     .map(|c| c.col);
                 self.paint_row(row, origin, m, block_col, window, cx);
+                if let Some((from, to)) = row.link {
+                    let at = point(
+                        origin.x + m.cell_w * f32::from(from),
+                        origin.y + m.line_h - LINK_UNDERLINE,
+                    );
+                    let width = m.cell_w * f32::from(to - from);
+                    window.paint_quad(fill(
+                        Bounds::new(at, size(width, LINK_UNDERLINE)),
+                        self.theme.accent,
+                    ));
+                }
                 if let Some((from, to)) = row.selected {
                     window.paint_quad(fill(
                         cell_bounds(origin, m, from, to - from),

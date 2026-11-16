@@ -28,6 +28,7 @@ use super::palette::{command_action, command_shortcut};
 use super::pane_view::{PaneEvent, PaneView};
 use super::picker_view::{PickerEvent, PickerView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
+use super::split_dividers::SplitDrag;
 use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use crate::core::config::save_connection;
@@ -145,6 +146,8 @@ pub struct Workspace {
     window_title: String,
     /// Reduce Motion is on (read at launch and on appearance changes).
     reduce_motion: bool,
+    /// A split divider being dragged.
+    split_drag: SplitDrag,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -218,6 +221,7 @@ impl Workspace {
             drawn: Vec::new(),
             window_title: String::new(),
             reduce_motion: native::reduce_motion(),
+            split_drag: SplitDrag::default(),
             _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -911,7 +915,7 @@ impl Workspace {
 
     /// The pane cards, [`chrome::PANE_GAP`] apart and from the edges;
     /// only the maximized one when a pane is maximized (the others stay
-    /// attached).
+    /// attached); then the split dividers' strips over the gaps.
     fn render_panes(&mut self, cx: &App) -> impl IntoElement + use<> {
         let app = self.app.read(cx);
         let rects = match app.maximized {
@@ -927,6 +931,10 @@ impl Workspace {
             None => app.layout.rects(1.0, 1.0),
         };
         self.drawn = rects.iter().map(|(p, _)| *p).collect();
+        let dividers = match app.maximized {
+            Some(_) => Vec::new(),
+            None => self.split_drag.render(&app.layout, &self.app),
+        };
         let children: Vec<_> = rects
             .into_iter()
             .filter_map(|(pane, r)| {
@@ -948,7 +956,8 @@ impl Workspace {
             div()
                 .absolute()
                 .inset(px(chrome::PANE_GAP / 2.0))
-                .children(children),
+                .children(children)
+                .children(dividers),
         )
     }
 
@@ -1884,6 +1893,39 @@ mod tests {
             a.pane_view(PaneId(2)).unwrap().read(cx).chrome.clone()
         });
         assert!(chrome.has_agent && !chrome.starting);
+    }
+
+    #[gpui::test]
+    fn file_links_resolve_in_a_local_agents_directory_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        s.cx.run_until_parked();
+        let chrome = |s: &mut Setup<'_>| {
+            s.app.read_with(s.cx, |a, cx| {
+                let c = a.pane_view(PaneId(1)).unwrap().read(cx).chrome.clone();
+                (c.cwd, c.link_dir)
+            })
+        };
+        assert_eq!(chrome(&mut s), (Some("/w".into()), Some("/w".into())));
+
+        // On another machine the agent's paths are not here.
+        let other = Arc::new(Fake::default());
+        let session: Arc<dyn SessionApi> = other.clone();
+        let (_tx, rx) = async_channel::unbounded();
+        let target = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        *other.agents.lock().unwrap() = vec![row(5, "/w", 1)];
+        s.app
+            .update(s.cx, |a, cx| a.replace_session(session, rx, target, cx));
+        click(&mut s, "tab-5");
+        attach_model(&other, PaneId(1), 5);
+        s.cx.run_until_parked();
+        assert_eq!(chrome(&mut s), (Some("/w".into()), None));
     }
 
     #[gpui::test]

@@ -7,6 +7,7 @@ pub mod icons;
 pub mod keys;
 pub mod launch;
 pub mod layout;
+pub mod links;
 pub mod menus;
 pub mod mouse;
 pub mod palette;
