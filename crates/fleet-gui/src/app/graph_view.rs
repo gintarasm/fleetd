@@ -59,6 +59,9 @@ pub enum GraphEvent {
     Open(u64),
     /// Esc: back to the panes.
     Close,
+    /// Reply… on a card with a question: the Answer sheet, in the graph
+    /// (ADR 0078).
+    Answer(u64),
 }
 
 pub struct GraphView {
@@ -497,13 +500,57 @@ impl GraphView {
                 .text_color(theme.secondary)
                 .child(SharedString::from(format!("{} · {}", c.program, c.project)))
         });
-        let activity = (!compact && !c.activity.is_empty()).then(|| {
+        let asked = c.question.is_some();
+        let activity = (!compact && !asked && !c.activity.is_empty()).then(|| {
             div()
                 .truncate()
                 .text_size(cap)
                 .line_height(cap_lh)
                 .text_color(theme.tertiary)
                 .child(SharedString::from(c.activity))
+        });
+        // The open question in place of the last line, and Reply… opening
+        // the Answer sheet (ADR 0078): the card's size is fixed, so the
+        // choices are in the sheet.
+        let question = (!compact).then(|| c.question.clone()).flatten().map(|q| {
+            let shown = q.clone();
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(size(space::XS))
+                .child(
+                    div()
+                        .debug_selector(move || format!("graph-question-{id}-{shown}"))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(cap)
+                        .line_height(cap_lh)
+                        .text_color(theme.warning)
+                        .child(SharedString::from(q)),
+                )
+                .child(
+                    div()
+                        .id(("graph-reply", id))
+                        .debug_selector(move || format!("graph-reply-{id}"))
+                        .flex_none()
+                        .px(size(space::XS))
+                        .rounded(size(radius::SM))
+                        .bg(theme.accent)
+                        .text_size(cap)
+                        .line_height(cap_lh)
+                        .text_color(gpui::white())
+                        .cursor_pointer()
+                        .child("Reply…")
+                        // Not the card's click, which opens the agent.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected = Some(id);
+                            cx.emit(GraphEvent::Answer(id));
+                            cx.stop_propagation();
+                        })),
+                )
         });
         let hidden = c.hidden.map(|h| {
             div()
@@ -550,6 +597,7 @@ impl GraphView {
             .child(name_row)
             .children(meta)
             .children(activity)
+            .children(question)
             .children(hidden)
             .into_any_element()
     }

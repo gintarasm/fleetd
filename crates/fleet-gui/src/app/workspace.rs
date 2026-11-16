@@ -16,6 +16,7 @@ use gpui::{
     relative, size,
 };
 
+use super::answer_sheet::{AnswerEvent, AnswerSheet};
 use super::app_state::AppState;
 use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
 use super::context_menu::{self, MenuLine};
@@ -62,6 +63,7 @@ use crate::core::menus::{
 use crate::core::palette::{Entry, PaletteState, palette_items, remove_exited_prompt};
 use crate::core::picker::Recents;
 use crate::core::presets::{Prefill, preset_request};
+use crate::core::question::open_question;
 use crate::core::session::PaneId;
 use crate::core::settings::{MotionChoice, ThemeChoice};
 use crate::core::shortcuts::Section;
@@ -194,6 +196,8 @@ pub struct Workspace {
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
     /// The Rename sheet (ADR 0052).
     rename: Option<(Entity<RenameSheet>, Subscription)>,
+    /// The Answer sheet (ADR 0078).
+    answer: Option<(Entity<AnswerSheet>, Subscription)>,
     /// The Edit Labels sheet (ADR 0087).
     labels: Option<(Entity<LabelsSheet>, Subscription)>,
     /// The question before a kill (issue #27).
@@ -280,6 +284,7 @@ impl Workspace {
                 this.row_selection = RowSelection::default();
                 if this.sheet.take().is_some()
                     | this.rename.take().is_some()
+                    | this.answer.take().is_some()
                     | this.labels.take().is_some()
                     | this.kill.take().is_some()
                     | this.send.take().is_some()
@@ -354,6 +359,7 @@ impl Workspace {
             _ticker: ticker,
             sheet: None,
             rename: None,
+            answer: None,
             labels: None,
             kill: None,
             send: None,
@@ -427,6 +433,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if !self.graph_shown {
+            return;
+        }
+        // Answering stays in the graph.
+        if let GraphEvent::Answer(id) = *event {
+            self.open_answer(id, window, cx);
             return;
         }
         self.graph_shown = false;
@@ -532,6 +543,7 @@ impl Workspace {
     fn modal(&self) -> bool {
         self.sheet.is_some()
             || self.rename.is_some()
+            || self.answer.is_some()
             || self.labels.is_some()
             || self.kill.is_some()
             || self.send.is_some()
@@ -591,6 +603,7 @@ impl Workspace {
     ) {
         self.sheet = None;
         self.rename = None;
+        self.answer = None;
         self.labels = None;
         self.kill = None;
         self.send = None;
@@ -1334,6 +1347,73 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens the Answer sheet for an agent's open question (Reply… on its
+    /// row, header or graph card, ADR 0078).
+    pub fn open_answer(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let Some(info) = self
+            .app
+            .read(cx)
+            .agents
+            .iter()
+            .find(|r| r.info.id == agent_id)
+            .map(|r| r.info.clone())
+        else {
+            return;
+        };
+        let Some(question) = open_question(&info) else {
+            return;
+        };
+        let what = format!(
+            "{} · {}",
+            name_of(&info).unwrap_or(&info.program),
+            program_and_id(&info)
+        );
+        let sheet = cx.new(|cx| AnswerSheet::new(agent_id, what, question, cx));
+        let sub = cx.subscribe_in(&sheet, window, Self::answer_event);
+        sheet.read(cx).focus(window, cx);
+        self.answer = Some((sheet, sub));
+        cx.notify();
+    }
+
+    pub fn answer_sheet(&self) -> Option<&Entity<AnswerSheet>> {
+        self.answer.as_ref().map(|(s, _)| s)
+    }
+
+    fn answer_event(
+        &mut self,
+        _sheet: &Entity<AnswerSheet>,
+        event: &AnswerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let AnswerEvent::Send {
+            agent_id,
+            question,
+            text,
+        } = event
+        {
+            self.app.read(cx).answer(*agent_id, *question, text.clone());
+        }
+        self.answer = None;
+        self.focus_current(window, cx);
+        cx.notify();
+    }
+
+    /// A click on a choice button: answers question `question` of
+    /// `agent_id` with it (ADR 0078).
+    pub fn answer_with(
+        &mut self,
+        agent_id: u64,
+        question: u64,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.app.read(cx).answer(agent_id, question, text);
+    }
+
     /// Opens the Edit Labels sheet for an agent (Edit Labels… in the row
     /// and pane menus).
     pub fn open_labels(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -2029,6 +2109,27 @@ impl Workspace {
                     self.open_rename(agent_id, window, cx);
                 }
             }
+            PaneEvent::Answer => {
+                if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
+                    self.open_answer(agent_id, window, cx);
+                }
+            }
+            PaneEvent::Choose(i) => {
+                if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
+                    let q = self
+                        .app
+                        .read(cx)
+                        .agents
+                        .iter()
+                        .find(|r| r.info.id == agent_id)
+                        .and_then(|r| open_question(&r.info));
+                    if let Some(q) = q
+                        && let Some(choice) = q.choices.get(i)
+                    {
+                        self.answer_with(agent_id, q.id, choice.clone(), cx);
+                    }
+                }
+            }
             PaneEvent::EditLabels => {
                 if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
                     self.open_labels(agent_id, window, cx);
@@ -2550,6 +2651,28 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
+        let answer = self.answer.as_ref().map(|(sheet, _)| {
+            deferred(
+                div()
+                    .id("answer-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt(px(chrome::BAR_HEIGHT + space::SM))
+                    .child(sheet_drag_strip("answer-drag-strip"))
+                    .child(appear(
+                        div().child(sheet.clone()),
+                        "answer-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
         let labels = self.labels.as_ref().map(|(sheet, _)| {
             deferred(
                 div()
@@ -2685,6 +2808,7 @@ impl Render for Workspace {
             .children(switcher)
             .children(sheet)
             .children(rename)
+            .children(answer)
             .children(labels)
             .children(
                 self.kill
@@ -2923,6 +3047,8 @@ mod tests {
         SetLabels(u64, Vec<(String, String)>, Vec<String>),
         /// Typed into an agent (Send to Agents…).
         Send(u64, Vec<u8>),
+        /// An answer to an agent's open question: agent, question id, text.
+        Answer(u64, u64, String),
         ClearExited,
         Spawn {
             req: SpawnRequest,
@@ -3060,6 +3186,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(Call::SetLabels(agent_id, set, remove));
+        }
+
+        fn answer(&self, agent_id: u64, question: u64, text: String) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::Answer(agent_id, question, text));
         }
 
         fn clear_exited(&self) {
@@ -4031,6 +4164,84 @@ mod tests {
         let name = name.to_owned();
         field.update(s.cx, |f, cx| f.set_text(name, cx));
         s.cx.simulate_keystrokes("enter");
+    }
+
+    fn asking(id: u64, question_id: u64) -> AgentRow {
+        let mut r = row(id, "/w", id as i64);
+        r.info.reported = Some(fleet_proto::Reported {
+            state: fleet_proto::ReportedState::ReportedWaiting.into(),
+            message: String::new(),
+            at_unix_ms: 1,
+            question: Some(fleet_proto::Question {
+                id: question_id,
+                text: "Which branch?".into(),
+                choices: vec!["main".into(), "dev".into()],
+            }),
+        });
+        r
+    }
+
+    /// A question (ADR 0078): choices answer from the row and from the
+    /// pane header, Reply… opens the sheet for free text, and a question
+    /// that is closed (or an ended agent's) shows nothing.
+    #[gpui::test]
+    fn a_question_is_answered_from_the_row_the_header_and_the_sheet(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![asking(3, 9), row(4, "/w", 4)]);
+        assert!(s.cx.debug_bounds("row-question-3-Which branch?").is_some());
+        assert!(s.cx.debug_bounds("row-reply-4").is_none());
+        click(&mut s, "row-choice-3-dev");
+        assert!(fake.calls().contains(&Call::Answer(3, 9, "dev".into())));
+        // Not also the row's click: no pane took the agent.
+        assert!(s.ws.read_with(s.cx, |w, _| w.answer_sheet().is_none()));
+
+        // Reply…: the sheet with the text field.
+        click(&mut s, "row-reply-3");
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.answer_sheet().cloned())
+                .expect("answer sheet open");
+        // Nothing typed: refused, still open.
+        s.cx.simulate_keystrokes("enter");
+        assert!(sheet.read_with(s.cx, |sh, _| sh.error.clone()).is_some());
+        let field = sheet.read_with(s.cx, |sh, _| sh.reply.clone());
+        field.update(s.cx, |f, cx| f.set_text("something else".into(), cx));
+        s.cx.simulate_keystrokes("enter");
+        assert!(
+            fake.calls()
+                .contains(&Call::Answer(3, 9, "something else".into()))
+        );
+        assert!(s.ws.read_with(s.cx, |w, _| w.answer_sheet().is_none()));
+
+        // A choice in the sheet; Escape cancels.
+        click(&mut s, "row-reply-3");
+        s.cx.simulate_keystrokes("escape");
+        assert!(s.ws.read_with(s.cx, |w, _| w.answer_sheet().is_none()));
+
+        // The pane header strip.
+        attach_model(&fake, PaneId(1), 3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        click(&mut s, "pane-choice-3-main");
+        assert!(fake.calls().contains(&Call::Answer(3, 9, "main".into())));
+    }
+
+    /// A question that was answered (the agent reported on) or whose agent
+    /// ended shows nothing.
+    #[gpui::test]
+    fn a_closed_question_shows_nothing(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![asking(3, 9), asking(4, 10)]);
+        assert!(s.cx.debug_bounds("row-reply-3").is_some());
+        assert!(s.cx.debug_bounds("row-reply-4").is_some());
+        let mut gone = asking(3, 9);
+        gone.info.set_state(AgentState::Exited);
+        agents(&mut s, &fake, vec![gone, row(4, "/w", 4)]);
+        assert!(s.cx.debug_bounds("row-reply-3").is_none());
+        assert!(s.cx.debug_bounds("row-reply-4").is_none());
     }
 
     /// Rename: a double-click on the name in the row or the header, or

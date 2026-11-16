@@ -257,6 +257,7 @@ mod tests {
             state: state.into(),
             message: "m".into(),
             at_unix_ms: 1,
+            question: None,
         });
         r
     }

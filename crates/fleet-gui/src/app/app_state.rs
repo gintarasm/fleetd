@@ -26,6 +26,7 @@ use crate::core::git;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::presets::{Preset, detect_presets, usable};
+use crate::core::question::open_question;
 use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::settings::{Change, save_changes};
@@ -89,6 +90,8 @@ pub trait SessionApi: InputSink {
     /// Types `data` into an agent, shown in a pane or not (Send to
     /// Agents…, ADR 0083).
     fn send_input(&self, _agent_id: u64, _data: Vec<u8>) {}
+    /// Answers an agent's open question (ADR 0078).
+    fn answer(&self, _agent_id: u64, _question: u64, _text: String) {}
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
@@ -163,6 +166,10 @@ impl SessionApi for Session {
 
     fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
         Session::set_labels(self, agent_id, set, remove);
+    }
+
+    fn answer(&self, agent_id: u64, question: u64, text: String) {
+        Session::answer(self, agent_id, question, text);
     }
 
     fn send_input(&self, agent_id: u64, data: Vec<u8>) {
@@ -1109,6 +1116,7 @@ impl AppState {
                 local: self.target == Target::Local,
                 no_agents,
                 run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
+                question: row.and_then(|r| open_question(&r.info)),
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));
@@ -1586,6 +1594,11 @@ impl AppState {
 
     pub fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
         self.session.set_labels(agent_id, set, remove);
+    }
+
+    /// Answers `agent_id`'s open question (ADR 0078).
+    pub fn answer(&self, agent_id: u64, question: u64, text: String) {
+        self.session.answer(agent_id, question, text);
     }
 
     /// A job reading `agent_id`'s output as plain text (ADR 0086).

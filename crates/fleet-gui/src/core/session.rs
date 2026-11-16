@@ -406,6 +406,12 @@ enum ControlCmd {
     },
     /// Types into an agent (Send to Agents…, ADR 0083).
     Input(u64, Vec<u8>),
+    /// Answers an agent's open question (ADR 0078); `question` names it.
+    Answer {
+        agent_id: u64,
+        question: u64,
+        text: String,
+    },
     ClearExited,
     RestartDaemon(String),
     Stop,
@@ -628,6 +634,18 @@ impl Session {
             set,
             remove,
             verb: "edit labels",
+        });
+    }
+
+    /// Answers `agent_id`'s open question `question` as the user (ADR
+    /// 0078). fleetd then closes it and tells every view with an
+    /// `AgentReported` event; a refusal (the question was closed first) is
+    /// shown as an error.
+    pub fn answer(&self, agent_id: u64, question: u64, text: String) {
+        self.control(ControlCmd::Answer {
+            agent_id,
+            question,
+            text,
         });
     }
 
@@ -1214,6 +1232,18 @@ fn control_writer(
                 };
                 send_tracked(&mut sender, verb, request::Kind::SetLabels(set));
                 list(&mut sender, &mut next_list);
+            }
+            Some(ControlCmd::Answer {
+                agent_id,
+                question,
+                text,
+            }) => {
+                let answer = fleet_proto::AnswerQuestion {
+                    agent_id,
+                    text,
+                    question_id: Some(question),
+                };
+                send_tracked(&mut sender, "answer", request::Kind::Answer(answer));
             }
             Some(ControlCmd::Input(agent_id, data)) => {
                 let input = SendInput { agent_id, data };

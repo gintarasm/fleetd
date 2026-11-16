@@ -26,6 +26,7 @@ use super::keymap::{
     ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAll, TERMINAL_CONTEXT, to_key,
 };
 use super::native;
+use super::question_view::{Click, question_block};
 use super::status_dot::status_dot;
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
@@ -45,6 +46,7 @@ use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
 use crate::core::pane::{PaneModel, PaneState, ViewRow, ViewScroll};
+use crate::core::question::OpenQuestion;
 use crate::core::scroll_feedback::{
     Fade, HIT_WIDTH, INSET, Thumb, Wake, end_jumps_to_bottom, offset_for_thumb, thumb,
 };
@@ -206,6 +208,9 @@ pub struct PaneChrome {
     /// here mean the same to it, so files can be dropped and images
     /// pasted (ADR 0081).
     pub local: bool,
+    /// The agent's open question, shown in a strip under the header (ADR
+    /// 0078).
+    pub question: Option<OpenQuestion>,
 }
 
 /// The focus ring's colour at full strength: the agent's colour, else the
@@ -325,6 +330,10 @@ pub enum PaneEvent {
     Restart,
     /// A double-click on the name: rename the pane's agent.
     Rename,
+    /// Reply… on the question strip: the Answer sheet (ADR 0078).
+    Answer,
+    /// A choice button on the question strip: answer with choice `n`.
+    Choose(usize),
     /// Edit Labels… in the pane's menu.
     EditLabels,
     /// The menu's Duplicate Agent…: the New agent sheet, prefilled with
@@ -1515,6 +1524,22 @@ impl Render for PaneView {
                     })
                 }))
         });
+        // The agent's open question, between the header and the screen (ADR
+        // 0078).
+        let question = chrome.question.as_ref().zip(chrome.agent).map(|(q, id)| {
+            question_block(
+                "pane",
+                id,
+                q,
+                &theme,
+                |i| -> Click {
+                    Box::new(cx.listener(move |_, _, _, cx| cx.emit(PaneEvent::Choose(i))))
+                },
+                Box::new(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Answer))),
+            )
+            .flex_none()
+            .m(px(space::XS))
+        });
         let header = div()
             .id("pane-header")
             .group(PANE_HEADER_GROUP)
@@ -1882,6 +1907,7 @@ impl Render for PaneView {
             .bg(theme.card)
             .relative()
             .child(header)
+            .children(question)
             .child(grid)
             .children(self.flash.as_ref().map(|(n, _)| {
                 let ring = div()
