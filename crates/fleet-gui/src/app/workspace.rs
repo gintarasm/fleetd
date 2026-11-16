@@ -754,6 +754,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
         let theme = self.app.read(cx).theme;
+        let agent_emoji = self.app.read(cx).config.agent_emoji;
         let (rows, home, error, notice, titles, marks, update, statuses, bells) = {
             let app = self.app.read(cx);
             (
@@ -778,6 +779,7 @@ impl Render for Workspace {
             statuses: &statuses,
             bells: &bells,
             reduce_motion: self.reduce_motion,
+            agent_emoji,
         };
         let sidebar = render_sidebar(&data, &theme, cx);
         let ended_rows = rows.iter().filter(|r| ended(r)).count();
@@ -1741,6 +1743,66 @@ mod tests {
         s.app.update(s.cx, |a, cx| a.set_window_active(true, cx));
         s.cx.run_until_parked();
         assert_eq!(marked(&mut s), (false, Some(AgentStatus::Idle), 0));
+    }
+
+    /// Issue #33: each agent's colour, from its id, marks its row and its
+    /// pane header; shells get one too.
+    #[gpui::test]
+    fn rows_and_pane_headers_carry_the_agent_colour(cx: &mut TestAppContext) {
+        use crate::core::identity::agent_colour;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let mut shell = row(2, "/w", 2);
+        shell.info.labels.insert("kind".into(), "shell".into());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), shell]);
+        s.app.update(s.cx, |a, cx| a.show_agent(1, cx));
+        s.cx.run_until_parked();
+        let (one, two) = (agent_colour(1).name, agent_colour(2).name);
+        assert_ne!(one, two);
+        assert!(
+            s.cx.debug_bounds(leak(format!("identity-1-{one}")))
+                .is_some()
+        );
+        assert!(
+            s.cx.debug_bounds(leak(format!("identity-2-{two}")))
+                .is_some()
+        );
+        assert!(
+            s.cx.debug_bounds(leak(format!("pane-1-identity-{one}")))
+                .is_some()
+        );
+        assert!(s.cx.debug_bounds("identity-1-emoji").is_none());
+        assert!(s.cx.debug_bounds("pane-1-identity-emoji").is_none());
+    }
+
+    /// `[gui] agent_emoji` puts the agent's emoji in place of the swatch
+    /// and the header icon.
+    #[gpui::test]
+    fn agent_emoji_replaces_the_swatch(cx: &mut TestAppContext) {
+        use crate::core::identity::agent_colour;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let config = GuiConfig {
+            agent_emoji: true,
+            ..GuiConfig::default()
+        };
+        let mut s = setup_with(cx, &fake, dir.path(), config);
+        agents(&mut s, &fake, vec![row(1, "/w", 1)]);
+        s.app.update(s.cx, |a, cx| a.show_agent(1, cx));
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("identity-1-emoji").is_some());
+        assert!(s.cx.debug_bounds("pane-1-identity-emoji").is_some());
+        let one = agent_colour(1).name;
+        assert!(
+            s.cx.debug_bounds(leak(format!("identity-1-{one}")))
+                .is_none()
+        );
+    }
+
+    /// `debug_bounds` takes a `&'static str`.
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
     }
 
     #[gpui::test]

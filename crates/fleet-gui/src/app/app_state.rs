@@ -915,6 +915,8 @@ impl AppState {
                 focused: pane == self.focused,
                 maximized: self.maximized == Some(pane),
                 status: agent.and_then(|id| self.statuses.get(&id).copied()),
+                agent,
+                agent_emoji: self.config.agent_emoji,
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));
