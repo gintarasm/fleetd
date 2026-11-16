@@ -39,6 +39,10 @@ pub enum RowMenuItem {
     Duplicate,
     SaveOutput,
     OpenOutput,
+    /// Send to Agents… with this agent checked (ADR 0083).
+    SendTo,
+    /// Send to Agents… with the sidebar's selection checked.
+    SendToSelected,
     Kill,
     Restart,
     Remove,
@@ -54,6 +58,8 @@ impl RowMenuItem {
             RowMenuItem::Duplicate => "Duplicate…",
             RowMenuItem::SaveOutput => "Save Output…",
             RowMenuItem::OpenOutput => "Open Output in Editor",
+            RowMenuItem::SendTo => "Send to Agent…",
+            RowMenuItem::SendToSelected => "Send to Selected…",
             // It asks first.
             RowMenuItem::Kill => "Kill…",
             RowMenuItem::Restart => "Restart",
@@ -62,11 +68,13 @@ impl RowMenuItem {
     }
 }
 
-/// A row's menu: Open in New Split (while a pane can be added), Rename…
-/// Edit Labels… and Duplicate…, Save Output… and Open Output in Editor (ADR 0086),
-/// then Kill for a running agent, or Restart and Remove for one that
-/// exited or is lost.
-pub fn row_menu(can_split: bool, ended: bool) -> Vec<MenuEntry<RowMenuItem>> {
+/// A row's menu: Open in New Split (while a pane can be added), Rename…,
+/// Edit Labels… and Duplicate…; for a running agent Send to Agent… (Send
+/// to Selected… when the row is in a selection of several,
+/// `in_selection`, ADR 0083), then Save Output… and Open Output in Editor
+/// (ADR 0086); then Kill for a running agent, or Restart and Remove for
+/// one that exited or is lost.
+pub fn row_menu(can_split: bool, ended: bool, in_selection: bool) -> Vec<MenuEntry<RowMenuItem>> {
     let mut out = Vec::new();
     if can_split {
         out.push(MenuEntry::Item(RowMenuItem::OpenSplit));
@@ -76,6 +84,13 @@ pub fn row_menu(can_split: bool, ended: bool) -> Vec<MenuEntry<RowMenuItem>> {
     out.push(MenuEntry::Item(RowMenuItem::EditLabels));
     out.push(MenuEntry::Item(RowMenuItem::Duplicate));
     out.push(MenuEntry::Separator);
+    if !ended {
+        out.push(MenuEntry::Item(if in_selection {
+            RowMenuItem::SendToSelected
+        } else {
+            RowMenuItem::SendTo
+        }));
+    }
     out.push(MenuEntry::Item(RowMenuItem::SaveOutput));
     out.push(MenuEntry::Item(RowMenuItem::OpenOutput));
     out.push(MenuEntry::Separator);
@@ -293,19 +308,20 @@ mod tests {
     #[test]
     fn row_menu_offers_kill_or_restart_and_remove() {
         assert_eq!(
-            items(&row_menu(true, false)),
+            items(&row_menu(true, false, false)),
             [
                 R::OpenSplit,
                 R::Rename,
                 R::EditLabels,
                 R::Duplicate,
+                R::SendTo,
                 R::SaveOutput,
                 R::OpenOutput,
                 R::Kill
             ]
         );
         assert_eq!(
-            items(&row_menu(true, true)),
+            items(&row_menu(true, true, false)),
             [
                 R::OpenSplit,
                 R::Rename,
@@ -318,18 +334,27 @@ mod tests {
             ]
         );
         assert_eq!(
-            items(&row_menu(false, false)),
+            items(&row_menu(false, false, false)),
             [
                 R::Rename,
                 R::EditLabels,
                 R::Duplicate,
+                R::SendTo,
                 R::SaveOutput,
                 R::OpenOutput,
                 R::Kill
             ]
         );
+        assert_eq!(items(&row_menu(false, false, true))[3], R::SendToSelected);
+        // An ended row is never typed into, selected or not.
+        assert!(
+            !items(&row_menu(false, true, true))
+                .iter()
+                .any(|i| matches!(i, R::SendTo | R::SendToSelected))
+        );
         assert_eq!(R::SaveOutput.title(), "Save Output…");
-        assert_eq!(row_menu(false, true)[0], MenuEntry::Item(R::Rename));
+        assert_eq!(R::SendToSelected.title(), "Send to Selected…");
+        assert_eq!(row_menu(false, true, false)[0], MenuEntry::Item(R::Rename));
         assert_eq!(R::Kill.title(), "Kill…");
         assert_eq!(R::Rename.title(), "Rename…");
         assert_eq!(R::EditLabels.title(), "Edit Labels…");
@@ -442,9 +467,10 @@ mod tests {
                     .collect(),
             );
         }
-        for (split, ended) in [(true, true), (true, false), (false, true), (false, false)] {
+        for bits in 0..8u8 {
+            let (split, ended, sel) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
             check(
-                row_menu(split, ended)
+                row_menu(split, ended, sel)
                     .iter()
                     .map(|e| *e == MenuEntry::Separator)
                     .collect(),

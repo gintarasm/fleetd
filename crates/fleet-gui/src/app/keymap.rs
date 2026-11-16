@@ -67,6 +67,8 @@ actions!(
         ScrollToTop,
         ScrollToBottom,
         ClearScrollback,
+        // ⇧⌘M: type into one or many agents (ADR 0083).
+        SendToAgents,
     ]
 );
 
@@ -127,6 +129,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-shift-f", FocusFilter, None),
         KeyBinding::new("cmd-p", CommandPalette, None),
+        KeyBinding::new("cmd-shift-m", SendToAgents, None),
         KeyBinding::new("ctrl-tab", NextAgent, None),
         KeyBinding::new("ctrl-shift-tab", PreviousAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),

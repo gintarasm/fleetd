@@ -73,6 +73,8 @@ pub enum Command {
     ClearScrollback,
     RemoveExited,
     ToggleGraph,
+    /// Send to Agents… (ADR 0083).
+    SendToAgents,
     ShowShortcuts,
     OpenSettings,
     SwitchFleetd,
@@ -95,6 +97,8 @@ pub struct PaletteState {
     pub restartable: bool,
     /// Text is selected in the focused pane (Copy).
     pub has_selection: bool,
+    /// Some agent is running (Send to Agents…).
+    pub any_running: bool,
 }
 
 impl Command {
@@ -156,6 +160,7 @@ impl Command {
         Command::ClearScrollback,
         Command::RemoveExited,
         Command::ToggleGraph,
+        Command::SendToAgents,
         Command::ShowShortcuts,
         Command::OpenSettings,
         Command::SwitchFleetd,
@@ -214,6 +219,7 @@ impl Command {
             Command::ClearScrollback => "Clear Scrollback",
             Command::RemoveExited => "Remove Exited Agents…",
             Command::ToggleGraph => "Show or Hide the Agent Graph",
+            Command::SendToAgents => "Send to Agents…",
             Command::ShowShortcuts => "Keyboard Shortcuts",
             Command::OpenSettings => "Settings…",
             Command::SwitchFleetd => "Switch fleetd…",
@@ -259,6 +265,7 @@ impl Command {
             Command::SelectAll => "copy text",
             Command::ClearScrollback => "erase history buffer",
             Command::RemoveExited => "clear forget rm lost",
+            Command::SendToAgents => "broadcast message type input fleet send",
             Command::ShowShortcuts => "cheat sheet keys help",
             Command::OpenSettings => "preferences config",
             Command::SwitchFleetd => "connect target",
@@ -299,6 +306,7 @@ impl Command {
             Command::KillPane | Command::Paste => s.running,
             Command::RestartPane | Command::RemovePane => s.restartable,
             Command::Copy => s.has_selection,
+            Command::SendToAgents => s.any_running,
             Command::NewTab => s.tabs < MAX_TABS,
             Command::CloseTab | Command::NextTab | Command::PrevTab => s.tabs > 1,
             Command::SelectTab(n) => s.tabs > 1 && n <= s.tabs,
@@ -569,6 +577,7 @@ mod tests {
             running: true,
             restartable: true,
             has_selection: true,
+            any_running: true,
         }
     }
 
@@ -689,6 +698,17 @@ mod tests {
         assert!(listed.contains(&Command::RestartPane));
         assert!(listed.contains(&Command::RemovePane));
         assert!(!listed.contains(&Command::KillPane));
+    }
+
+    #[test]
+    fn send_to_agents_needs_a_running_agent() {
+        assert!(shown(&everything()).contains(&Command::SendToAgents));
+        let none = PaletteState {
+            any_running: false,
+            ..everything()
+        };
+        assert!(!shown(&none).contains(&Command::SendToAgents));
+        assert_eq!(Command::SendToAgents.title(), "Send to Agents…");
     }
 
     #[test]

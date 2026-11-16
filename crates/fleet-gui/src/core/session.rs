@@ -19,7 +19,8 @@ use fleet_client::{
 };
 use fleet_proto::{
     AgentInfo, AgentState, BinaryIdentity, ForgetAgents, Frame, HelloOk, KillAgent, ListAgents,
-    Response, RestartAgent, RestartDaemon, SetLabels, SpawnAgent, event, request, response,
+    Response, RestartAgent, RestartDaemon, SendInput, SetLabels, SpawnAgent, event, request,
+    response,
 };
 use fleet_term::Palette;
 
@@ -403,6 +404,8 @@ enum ControlCmd {
         remove: Vec<String>,
         verb: &'static str,
     },
+    /// Types into an agent (Send to Agents…, ADR 0083).
+    Input(u64, Vec<u8>),
     ClearExited,
     RestartDaemon(String),
     Stop,
@@ -626,6 +629,13 @@ impl Session {
             remove,
             verb: "edit labels",
         });
+    }
+
+    /// Types `data` into an agent on the control connection, as `fleet
+    /// send` does (Send to Agents…, ADR 0083); a refusal is shown as an
+    /// error.
+    pub fn send_input(&self, agent_id: u64, data: Vec<u8>) {
+        self.control(ControlCmd::Input(agent_id, data));
     }
 
     /// Forgets these exited agents (running ones are refused by fleetd).
@@ -1197,6 +1207,10 @@ fn control_writer(
                 };
                 send_tracked(&mut sender, verb, request::Kind::SetLabels(set));
                 list(&mut sender, &mut next_list);
+            }
+            Some(ControlCmd::Input(agent_id, data)) => {
+                let input = SendInput { agent_id, data };
+                send_tracked(&mut sender, "send", request::Kind::Input(input));
             }
             Some(ControlCmd::RestartDaemon(binary)) => {
                 send_tracked(

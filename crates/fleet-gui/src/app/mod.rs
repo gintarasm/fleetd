@@ -23,6 +23,7 @@ mod pane_view;
 mod picker_view;
 mod rename;
 mod resident;
+mod send_sheet;
 mod settings_window;
 mod sidebar_view;
 mod split_chooser;
@@ -100,6 +101,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                 items: vec![
                     MenuItem::action("Settings…", keymap::OpenSettings),
                     MenuItem::action("Command Palette…", keymap::CommandPalette),
+                    MenuItem::action("Send to Agents…", keymap::SendToAgents),
                     MenuItem::separator(),
                     MenuItem::action("Remove Exited Agents…", keymap::RemoveExited),
                     MenuItem::separator(),
