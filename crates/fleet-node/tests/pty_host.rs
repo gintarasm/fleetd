@@ -11,6 +11,7 @@ fn sh(script: &str) -> CommandSpec {
         env: vec![],
         cols: 80,
         rows: 24,
+        nice: 0,
     }
 }
 

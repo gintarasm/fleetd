@@ -3,8 +3,9 @@
 //! [`status_menu`] each time it opens; a pick goes into a channel that a
 //! foreground gpui task hands to [`super::resident::handle`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{App, Global};
 use objc2::rc::Retained;
@@ -13,13 +14,15 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff, NSControlStateValueOn,
+    NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSSize, NSString, ns_string};
 
 use super::app_state::AppState;
 use super::resident;
+use crate::core::status::badge_label;
 use crate::core::status_menu::{StatusEntry, StatusMenuState, status_menu};
 
 /// The 18 pt template mark at 2x (rendered from `fleetd-mark.svg`).
@@ -91,6 +94,13 @@ impl MenuTarget {
                 _ => {
                     let item = menu_item(mtm, entry.title(), Some(self));
                     item.setTag(i as isize);
+                    if let StatusEntry::Notifications(on) = entry {
+                        item.setState(if *on {
+                            NSControlStateValueOn
+                        } else {
+                            NSControlStateValueOff
+                        });
+                    }
                     item
                 }
             };
@@ -145,9 +155,35 @@ pub fn install_status_item(cx: &mut App) {
         return;
     };
     let state = Rc::new(RefCell::new(resident::menu_state(app.read(cx))));
+    let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     let shared = state.clone();
+    let observed = item.clone();
+    // The needs-you count, last shown (ADR 0042).
+    let shown_count = Cell::new(0usize);
     cx.observe(&app, move |app, cx| {
-        *shared.borrow_mut() = resident::menu_state(app.read(cx));
+        let a = app.read(cx);
+        *shared.borrow_mut() = resident::menu_state(a);
+        let count = a.needs_you_count();
+        if shown_count.replace(count) != count {
+            show_count(&observed, mtm, count);
+        }
+    })
+    .detach();
+    // Statuses age (working turns quiet) with no event: while no window's
+    // ticker does it, this one does.
+    let ticking = app.downgrade();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let alive = ticking.update(cx, |a, cx| {
+                if a.window.is_none() {
+                    a.refresh_status(cx);
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+        }
     })
     .detach();
 
@@ -172,7 +208,6 @@ pub fn install_status_item(cx: &mut App) {
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
     menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-    let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
     if let Some(button) = item.button(mtm) {
         let image = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(ICON));
         if let Some(image) = image {
@@ -188,6 +223,16 @@ pub fn install_status_item(cx: &mut App) {
         _menu: menu,
         _target: target,
     });
+}
+
+/// The needs-you count as the status item's title beside the mark, and
+/// as the Dock badge (none at 0).
+fn show_count(item: &NSStatusItem, mtm: MainThreadMarker, count: usize) {
+    let label = badge_label(count);
+    if let Some(button) = item.button(mtm) {
+        button.setTitle(&NSString::from_str(label.as_deref().unwrap_or("")));
+    }
+    super::attention::set_dock_badge(label.as_deref());
 }
 
 /// `Accessory` (no Dock icon, no app menu) while no window is open,

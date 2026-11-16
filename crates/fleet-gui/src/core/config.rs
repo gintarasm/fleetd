@@ -72,10 +72,14 @@ pub struct GuiConfig {
     pub reduce_motion: MotionChoice,
     /// Kill asks first.
     pub confirm_kill: bool,
-    /// The GUI may post notifications (read by the notification work, #32).
+    /// macOS notifications when an agent needs you or ends while the
+    /// window is not focused (ADR 0042). Off unless asked for.
     pub notifications: bool,
     /// The New agent sheet's directory; empty: the most recent one.
     pub default_dir: String,
+    /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
+    /// blank means `$VISUAL`, then `$EDITOR` (ADR 0046).
+    pub editor: String,
 }
 
 impl Default for GuiConfig {
@@ -91,8 +95,9 @@ impl Default for GuiConfig {
             window_opacity: DEFAULT_OPACITY,
             reduce_motion: MotionChoice::System,
             confirm_kill: true,
-            notifications: true,
+            notifications: false,
             default_dir: String::new(),
+            editor: String::new(),
         }
     }
 }
@@ -137,6 +142,23 @@ pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
     save_gui_values(
         state_dir,
         vec![("connection", toml_edit::Value::from(target.to_string()))],
+    )
+}
+
+/// Sets `[gui] confirm_kill`, leaving comments and every other key as they
+/// were.
+pub fn save_confirm_kill(state_dir: &Path, confirm: bool) -> io::Result<()> {
+    save_gui_values(
+        state_dir,
+        vec![("confirm_kill", toml_edit::Value::from(confirm))],
+    )
+}
+
+/// Sets `[gui] notifications`, leaving comments and every other key as they were.
+pub fn save_notifications(state_dir: &Path, on: bool) -> io::Result<()> {
+    save_gui_values(
+        state_dir,
+        vec![("notifications", toml_edit::Value::from(on))],
     )
 }
 
@@ -217,7 +239,16 @@ mod tests {
         assert_eq!(c.font_family, "SF Mono");
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
+        assert!(!c.notifications);
         assert_eq!(c.connection, None);
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
+    fn config_reads_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\neditor = \"zed\"\n");
+        assert_eq!(load_config(dir.path()).unwrap().editor, "zed");
     }
 
     #[test]
@@ -286,5 +317,19 @@ mod tests {
         let c = load_config(dir.path()).unwrap();
         assert_eq!(c.font_size, 15.0);
         assert_eq!(c.connection, Some(Target::Local));
+    }
+
+    #[test]
+    fn save_notifications_round_trips_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\nfont_size = 15 # big\n");
+        save_notifications(dir.path(), true).unwrap();
+        let c = load_config(dir.path()).unwrap();
+        assert!(c.notifications);
+        assert_eq!(c.font_size, 15.0);
+        save_notifications(dir.path(), false).unwrap();
+        assert!(!load_config(dir.path()).unwrap().notifications);
+        let out = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(out.contains("font_size = 15 # big"), "{out}");
     }
 }

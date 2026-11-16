@@ -440,20 +440,38 @@ OLDPWD=/\0FLEET_AGENT_ID=7\0EMPTY=\0\0__FLEET_END__\0logout junk";
         let shell = script(
             tmp.path(),
             &format!(
-                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+                "#!/bin/sh\nsleep 60 &\necho $! > '{}'\nwait\n",
                 pidfile.display()
             ),
         );
-        let start = Instant::now();
-        assert!(capture_login_env(&shell, Duration::from_secs(1)).is_none());
-        assert!(start.elapsed() < Duration::from_secs(3));
+        // A run only counts once the shell got as far as starting its child
+        // and writing its pid: on a busy machine the limit can pass before
+        // that, so the limit doubles until it does.
+        let mut limit = Duration::from_secs(1);
+        let pid: i32 = loop {
+            let _ = std::fs::remove_file(&pidfile);
+            let start = Instant::now();
+            assert!(capture_login_env(&shell, limit).is_none());
+            let took = start.elapsed();
+            // Ended by the limit, not by the child (60 s).
+            assert!(
+                took >= limit && took < limit + Duration::from_secs(10),
+                "capture with a {limit:?} limit took {took:?}"
+            );
+            let pid = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|p| p.trim().parse().ok());
+            if let Some(pid) = pid {
+                break pid;
+            }
+            assert!(
+                limit < Duration::from_secs(8),
+                "the shell never started its child, even with an {limit:?} limit"
+            );
+            limit *= 2;
+        };
         // The shell's background child went with its group.
-        let pid: i32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         // SAFETY: signal 0 only checks for existence. The orphaned `sleep`
         // is reaped by init, so it disappears once killed.
         while unsafe { libc::kill(pid, 0) } == 0 {

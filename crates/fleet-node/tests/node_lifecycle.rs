@@ -150,6 +150,7 @@ fn insert_running_row(state_dir: &std::path::Path) -> u64 {
             created_unix_ms: 1,
             scrollback_path: String::new(),
             labels: Labels::new(),
+            priority: 0,
         })
         .unwrap()
 }
