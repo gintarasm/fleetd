@@ -51,7 +51,7 @@ use crate::core::glass::{Backdrop, GlassChoice, glass_tint};
 use crate::core::kill::{KillFlow, kill_flow};
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
-    MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
+    MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, group_menu, pane_menu, row_menu,
 };
 use crate::core::palette::{Entry, PaletteState, palette_items, remove_exited_prompt};
 use crate::core::picker::Recents;
@@ -59,7 +59,8 @@ use crate::core::session::PaneId;
 use crate::core::settings::{MotionChoice, ThemeChoice};
 use crate::core::shortcuts::Section;
 use crate::core::sidebar::{
-    Filter, SidebarGroup, StatusFilter, ended, program_and_id, sidebar_groups,
+    Filter, GroupBy, SidebarGroup, StatusFilter, ended, group_agents_by, narrow_groups,
+    program_and_id,
 };
 use crate::core::sidebar_tree::removable_ended;
 use crate::core::spawn::SpawnRequest;
@@ -884,8 +885,8 @@ impl Workspace {
             status: self.status_filter,
         };
         let titles = &app.titles;
-        sidebar_groups(
-            &app.agents,
+        narrow_groups(
+            group_agents_by(&app.agents, &app.home, app.group_by()),
             &app.home,
             &filter,
             &|r| tab_title(r, titles),
@@ -989,6 +990,33 @@ impl Workspace {
         self.app.update(cx, |a, cx| a.toggle_group(title, cx));
     }
 
+    /// Groups the sidebar `by` folder or repository (ADR 0085).
+    pub(crate) fn set_group_by(&mut self, by: GroupBy, cx: &mut Context<Self>) {
+        self.app.update(cx, |a, cx| a.set_group_by(by, cx));
+    }
+
+    /// A group header's native menu (at the right-click being handled):
+    /// group by folder or by repository.
+    pub(super) fn open_group_menu(&mut self, cx: &mut Context<Self>) {
+        let items = group_menu(self.app.read(cx).group_by());
+        let lines = items
+            .iter()
+            .map(|&(by, checked)| {
+                Some(MenuLine {
+                    title: by.title().to_owned(),
+                    enabled: true,
+                    shortcut: None,
+                    checked,
+                })
+            })
+            .collect();
+        context_menu::show(lines, cx, move |index, cx| {
+            if let Some(&(by, _)) = items.get(index) {
+                with_workspace(cx, |ws, _, cx| ws.set_group_by(by, cx));
+            }
+        });
+    }
+
     /// The `input` bench's panes: `agent` in the focused pane (returned)
     /// and each of `extra` in a new split; the focus returns to the first.
     pub(super) fn bench_open(
@@ -1015,6 +1043,7 @@ impl Workspace {
             title: item.title().to_owned(),
             enabled: true,
             shortcut: None,
+            checked: false,
         });
         let epoch = self.epoch;
         context_menu::show(lines, cx, move |index, cx| {
@@ -1083,6 +1112,7 @@ impl Workspace {
             title: item.title(subject),
             enabled,
             shortcut: item.shortcut(),
+            checked: false,
         });
         let epoch = self.epoch;
         context_menu::show(lines, cx, move |index, cx| {
@@ -5165,6 +5195,62 @@ mod tests {
             s.app
                 .read_with(s.cx, |a, _| a.collapsed_groups().is_empty())
         );
+    }
+
+    fn in_repo(mut r: AgentRow, repo: &str, worktree: &str, branch: &str) -> AgentRow {
+        r.info.git = Some(fleet_proto::GitInfo {
+            repo: repo.into(),
+            worktree: worktree.into(),
+            branch: branch.into(),
+            detached: false,
+        });
+        r
+    }
+
+    /// ADR 0085: the row and the pane header show the git checkout; the
+    /// sidebar groups by repository on request, remembered; the filter
+    /// matches the branch.
+    #[gpui::test]
+    fn rows_show_the_branch_and_group_by_repository(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                in_repo(row(1, "/src/fleetd", 1), "fleetd", "", "main"),
+                in_repo(row(2, "/wt/issue-97", 2), "fleetd", "issue-97", "feat/git"),
+                row(3, "/notes", 3),
+            ],
+        );
+        assert!(drawn(&mut s, "tab-1-git-fleetd · main"));
+        assert!(drawn(&mut s, "tab-2-git-issue-97 · feat/git"));
+        // Not in a checkout: program and id, as before.
+        assert!(drawn(&mut s, "tab-3-detail"));
+        assert_eq!(
+            groups_drawn(&mut s),
+            ["/notes", "/src/fleetd", "/wt/issue-97"]
+        );
+
+        s.app.update(s.cx, |a, cx| a.show_agent(2, cx));
+        assert!(drawn(&mut s, "pane-1-git-fleetd (issue-97) · feat/git"));
+
+        s.ws.update(s.cx, |ws, cx| {
+            ws.set_group_by(crate::core::sidebar::GroupBy::Repo, cx)
+        });
+        assert_eq!(groups_drawn(&mut s), ["/notes", "fleetd"]);
+        assert_eq!(tabs_drawn(&mut s), [3, 2, 1]);
+        s.cx.executor().advance_clock(SAVE_DEBOUNCE);
+        s.cx.run_until_parked();
+        assert_eq!(
+            GuiState::load(dir.path()).sidebar_group_by,
+            crate::core::sidebar::GroupBy::Repo
+        );
+
+        s.cx.simulate_keystrokes("cmd-shift-f");
+        s.cx.simulate_input("feat/git");
+        assert_eq!(tabs_drawn(&mut s), [2]);
     }
 
     fn exited(id: u64, code: i32) -> AgentRow {

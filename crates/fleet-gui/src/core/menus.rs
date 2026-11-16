@@ -1,5 +1,8 @@
-//! The context menus: a sidebar row's and a pane's. What they offer and
-//! what they are called; the shell shows them as native menus.
+//! The context menus: a sidebar row's, a sidebar group header's and a
+//! pane's. What they offer and what they are called; the shell shows them
+//! as native menus.
+
+use super::sidebar::GroupBy;
 
 use super::status::Subject;
 
@@ -68,6 +71,15 @@ pub fn row_menu(can_split: bool, ended: bool) -> Vec<MenuEntry<RowMenuItem>> {
         out.push(MenuEntry::Item(RowMenuItem::Kill));
     }
     out
+}
+
+/// A sidebar group header's menu (ADR 0085): what the sidebar groups
+/// by, the current choice checked.
+pub fn group_menu(current: GroupBy) -> Vec<(GroupBy, bool)> {
+    GroupBy::ALL
+        .into_iter()
+        .map(|by| (by, by == current))
+        .collect()
 }
 
 /// An item of a pane's menu (right-click on its header, or on the grid
@@ -181,8 +193,21 @@ pub fn pane_menu(s: PaneMenuState) -> Vec<MenuEntry<(PaneMenuItem, bool)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuEntry, PaneMenuItem as P, PaneMenuState, RowMenuItem as R, pane_menu, row_menu,
+        GroupBy, MenuEntry, PaneMenuItem as P, PaneMenuState, RowMenuItem as R, group_menu,
+        pane_menu, row_menu,
     };
+
+    #[test]
+    fn the_group_menu_checks_the_current_grouping() {
+        assert_eq!(
+            group_menu(GroupBy::Repo),
+            [(GroupBy::Folder, false), (GroupBy::Repo, true)]
+        );
+        assert_eq!(
+            GroupBy::ALL.map(GroupBy::title),
+            ["Group by Folder", "Group by Repository"]
+        );
+    }
 
     fn items<T: Copy>(m: &[MenuEntry<T>]) -> Vec<T> {
         m.iter()
