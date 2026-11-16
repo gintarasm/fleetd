@@ -18,14 +18,17 @@ use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, swit
 use super::context_menu::{self, MenuLine};
 use super::controls::appear;
 use super::keymap::{
-    ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
-    FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart, RestartPane,
-    SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    ClosePane, CommandPalette, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
+    FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart,
+    RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
+use super::palette::{command_action, command_shortcut};
 use super::pane_view::{PaneEvent, PaneView};
+use super::picker_view::{PickerEvent, PickerView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
+use super::split_dividers::SplitDrag;
 use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use crate::core::config::save_connection;
@@ -33,8 +36,11 @@ use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
 };
+use crate::core::palette::{Command, Entry, palette_items};
+use crate::core::picker::Recents;
 use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
+use crate::core::spawn::SpawnRequest;
 use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::target::Target;
 use crate::core::titlebar::{Link, bar_title, window_title};
@@ -108,6 +114,10 @@ fn blur_within(window: &mut Window, frames: u32) {
 pub struct Workspace {
     app: Entity<AppState>,
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
+    /// The command palette (⌘P) and what its rows stand for.
+    palette: Option<(Entity<PickerView>, Vec<Entry>, Subscription)>,
+    /// The palette's recent picks, most recent first.
+    palette_recents: Recents,
     /// The connect sheet, over everything else.
     connect: Option<(Entity<ConnectSheet>, [Subscription; 2])>,
     /// The [`AppState::session_epoch`] last seen; a change closes the
@@ -123,6 +133,8 @@ pub struct Workspace {
     window_title: String,
     /// Reduce Motion is on (read at launch and on appearance changes).
     reduce_motion: bool,
+    /// A split divider being dragged.
+    split_drag: SplitDrag,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -135,7 +147,7 @@ impl Workspace {
             let epoch = app.read(cx).session_epoch();
             if epoch != this.epoch {
                 this.epoch = epoch;
-                if this.sheet.take().is_some() {
+                if this.sheet.take().is_some() | this.palette.take().is_some() {
                     this.focus_current(window, cx);
                 }
             }
@@ -183,12 +195,15 @@ impl Workspace {
             app,
             _ticker: ticker,
             sheet: None,
+            palette: None,
+            palette_recents: Recents::default(),
             connect: None,
             epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
             window_title: String::new(),
             reduce_motion: native::reduce_motion(),
+            split_drag: SplitDrag::default(),
             _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -208,6 +223,11 @@ impl Workspace {
         self.sheet.as_ref().map(|(s, _)| s)
     }
 
+    /// The command palette, while it is open.
+    pub fn palette(&self) -> Option<&Entity<PickerView>> {
+        self.palette.as_ref().map(|(p, _, _)| p)
+    }
+
     pub fn connect_sheet(&self) -> Option<&Entity<ConnectSheet>> {
         self.connect.as_ref().map(|(s, _)| s)
     }
@@ -221,7 +241,7 @@ impl Workspace {
 
     /// A sheet is open over the panes.
     fn modal(&self) -> bool {
-        self.sheet.is_some() || self.connect.is_some()
+        self.sheet.is_some() || self.connect.is_some() || self.palette.is_some()
     }
 
     /// Opens the connect sheet (or brings it up), showing `reason`.
@@ -232,6 +252,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.sheet = None;
+        self.palette = None;
         if let Some((sheet, _)) = &self.connect {
             let sheet = sheet.clone();
             sheet.update(cx, |s, cx| {
@@ -563,6 +584,94 @@ impl Workspace {
         cx.notify();
     }
 
+    /// ⌘P: opens the command palette (actions, agents, recent folders),
+    /// or closes it if open. Not over a sheet.
+    pub fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            self.focus_current(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.modal() {
+            return;
+        }
+        let app = self.app.read(cx);
+        let (entries, items): (Vec<Entry>, Vec<_>) = palette_items(
+            |c| command_shortcut(c, window),
+            &app.agents,
+            &app.dir_choices(),
+            &app.home,
+        )
+        .into_iter()
+        .unzip();
+        let recents = self.palette_recents.clone();
+        let palette =
+            cx.new(|cx| PickerView::new(items, recents, "Search actions, agents and folders", cx));
+        let sub = cx.subscribe_in(&palette, window, Self::palette_event);
+        palette.read(cx).focus(window, cx);
+        self.palette = Some((palette, entries, sub));
+        cx.notify();
+    }
+
+    fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette(window, cx);
+    }
+
+    /// A palette pick: an action is performed, an agent shown in the
+    /// focused pane, a folder gets the default command.
+    fn palette_event(
+        &mut self,
+        _palette: &Entity<PickerView>,
+        event: &PickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, entries, _)) = self.palette.take() else {
+            return;
+        };
+        self.focus_current(window, cx);
+        cx.notify();
+        let PickerEvent::Pick(key) = event else {
+            return;
+        };
+        let Some(entry) = entries.into_iter().find(|e| e.key() == *key) else {
+            return;
+        };
+        self.palette_recents.touch(key);
+        match entry {
+            Entry::Command(Command::ClearExited) => self.clear_exited(cx),
+            Entry::Command(c) => {
+                if let Some(action) = command_action(c) {
+                    window.dispatch_action(action, cx);
+                }
+            }
+            Entry::Agent(id) => self.show_agent(id, window, cx),
+            Entry::Folder(dir) => self.spawn_default_in(dir, window, cx),
+        }
+    }
+
+    /// A new agent running `[gui] default_command` in `dir`, in the
+    /// focused pane.
+    fn spawn_default_in(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let command = self.app.read(cx).config.default_command.clone();
+        let result = match command.split_first() {
+            Some((program, args)) => {
+                let req = SpawnRequest {
+                    program: program.clone(),
+                    args: args.to_vec(),
+                    cwd: dir,
+                    labels: Default::default(),
+                };
+                self.app.update(cx, |a, cx| a.spawn(req, cx))
+            }
+            None => Err("set [gui] default_command to start an agent from a folder".to_owned()),
+        };
+        if let Err(e) = result {
+            self.app.update(cx, |a, cx| a.show_error(e, cx));
+        }
+        self.focus_current(window, cx);
+    }
+
     /// Asks before killing: only Kill kills.
     fn kill(&mut self, action: &Kill, window: &mut Window, cx: &mut Context<Self>) {
         let agent_id = action.agent_id;
@@ -694,7 +803,7 @@ impl Workspace {
 
     /// The pane cards, [`chrome::PANE_GAP`] apart and from the edges;
     /// only the maximized one when a pane is maximized (the others stay
-    /// attached).
+    /// attached); then the split dividers' strips over the gaps.
     fn render_panes(&mut self, cx: &App) -> impl IntoElement + use<> {
         let app = self.app.read(cx);
         let rects = match app.maximized {
@@ -710,6 +819,10 @@ impl Workspace {
             None => app.layout.rects(1.0, 1.0),
         };
         self.drawn = rects.iter().map(|(p, _)| *p).collect();
+        let dividers = match app.maximized {
+            Some(_) => Vec::new(),
+            None => self.split_drag.render(&app.layout, &self.app),
+        };
         let children: Vec<_> = rects
             .into_iter()
             .filter_map(|(pane, r)| {
@@ -731,7 +844,8 @@ impl Workspace {
             div()
                 .absolute()
                 .inset(px(chrome::PANE_GAP / 2.0))
-                .children(children),
+                .children(children)
+                .children(dividers),
         )
     }
 
@@ -863,6 +977,36 @@ impl Render for Workspace {
                 )
                 .with_priority(3)
             });
+        let palette = self.palette.as_ref().map(|(palette, _, _)| {
+            // A click beside it closes it, never reaching the panes.
+            deferred(
+                div()
+                    .id("palette-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt(px(chrome::BAR_HEIGHT + space::XL))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.palette.is_some() {
+                                this.toggle_palette(window, cx);
+                            }
+                        }),
+                    )
+                    .child(appear(
+                        div().child(palette.clone()),
+                        "palette-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
         let sheet = self.sheet.as_ref().map(|(sheet, _)| {
             // The backdrop takes every click and wheel event over the panes.
             deferred(
@@ -916,6 +1060,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
+            .on_action(cx.listener(Self::command_palette))
             .child(bar)
             .child(
                 div()
@@ -927,6 +1072,7 @@ impl Render for Workspace {
                     .child(panes),
             )
             .children(toast)
+            .children(palette)
             .children(sheet)
             .children(connect)
     }
@@ -1597,6 +1743,39 @@ mod tests {
             a.pane_view(PaneId(2)).unwrap().read(cx).chrome.clone()
         });
         assert!(chrome.has_agent && !chrome.starting);
+    }
+
+    #[gpui::test]
+    fn file_links_resolve_in_a_local_agents_directory_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        s.cx.run_until_parked();
+        let chrome = |s: &mut Setup<'_>| {
+            s.app.read_with(s.cx, |a, cx| {
+                let c = a.pane_view(PaneId(1)).unwrap().read(cx).chrome.clone();
+                (c.cwd, c.link_dir)
+            })
+        };
+        assert_eq!(chrome(&mut s), (Some("/w".into()), Some("/w".into())));
+
+        // On another machine the agent's paths are not here.
+        let other = Arc::new(Fake::default());
+        let session: Arc<dyn SessionApi> = other.clone();
+        let (_tx, rx) = async_channel::unbounded();
+        let target = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        *other.agents.lock().unwrap() = vec![row(5, "/w", 1)];
+        s.app
+            .update(s.cx, |a, cx| a.replace_session(session, rx, target, cx));
+        click(&mut s, "tab-5");
+        attach_model(&other, PaneId(1), 5);
+        s.cx.run_until_parked();
+        assert_eq!(chrome(&mut s), (Some("/w".into()), None));
     }
 
     #[gpui::test]

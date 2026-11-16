@@ -61,6 +61,9 @@ pub struct GuiConfig {
     pub font_family: String,
     pub font_size: f32,
     pub option_as_meta: bool,
+    /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
+    /// blank means `$VISUAL`, then `$EDITOR` (ADR 0046).
+    pub editor: String,
 }
 
 impl Default for GuiConfig {
@@ -71,6 +74,7 @@ impl Default for GuiConfig {
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
             option_as_meta: true,
+            editor: String::new(),
         }
     }
 }
@@ -174,6 +178,14 @@ mod tests {
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
         assert_eq!(c.connection, None);
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
+    fn config_reads_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\neditor = \"zed\"\n");
+        assert_eq!(load_config(dir.path()).unwrap().editor, "zed");
     }
 
     #[test]
