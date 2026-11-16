@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
@@ -239,7 +239,9 @@ const FAKE_IGNORE_TERM: &str = "FLEETD_TEST_FAKE_IGNORE_TERM";
 /// a daemon from before `RestartDaemon` on that state dir: it takes the
 /// lock, binds the socket, handshakes (naming no binary) and answers
 /// `ListAgents` with no agents and everything else with "empty request". On
-/// SIGTERM it removes the socket and exits, or ignores the signal.
+/// SIGTERM it removes the socket and exits, or (with
+/// `FLEETD_TEST_FAKE_IGNORE_TERM`) keeps running and writes when the signal
+/// arrived to `TERM_FILE`.
 #[test]
 fn fake_old_daemon_process() {
     let Some(dir) = std::env::var_os(FAKE_DIR) else {
@@ -260,7 +262,7 @@ fn fake_old_daemon_process() {
         libc::signal(
             libc::SIGTERM,
             if std::env::var_os(FAKE_IGNORE_TERM).is_some() {
-                libc::SIG_IGN
+                on_term_ignored as extern "C" fn(libc::c_int) as libc::sighandler_t
             } else {
                 on_term as extern "C" fn(libc::c_int) as libc::sighandler_t
             },
@@ -271,7 +273,16 @@ fn fake_old_daemon_process() {
             std::thread::spawn(move || serve_old(s));
         }
     });
+    let mut term_written = false;
     while !TERMINATED.load(Ordering::SeqCst) {
+        let at = TERM_AT_NS.load(Ordering::SeqCst);
+        if at != 0 && !term_written {
+            // Written whole, then renamed, so the test never reads half of it.
+            let tmp = dir.join(format!("{TERM_FILE}.tmp"));
+            fs::write(&tmp, at.to_string()).unwrap();
+            fs::rename(&tmp, dir.join(TERM_FILE)).unwrap();
+            term_written = true;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     let _ = fs::remove_file(&sock);
@@ -282,6 +293,32 @@ static TERMINATED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_term(_: libc::c_int) {
     TERMINATED.store(true, Ordering::SeqCst);
+}
+
+/// When the ignored SIGTERM first arrived, as `monotonic_ns`; 0 if not yet.
+static TERM_AT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The file in the state dir where the fake writes `TERM_AT_NS`.
+const TERM_FILE: &str = "fake-term-at-ns";
+
+extern "C" fn on_term_ignored(_: libc::c_int) {
+    // `clock_gettime` is async-signal-safe.
+    let _ = TERM_AT_NS.compare_exchange(0, monotonic_ns(), Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// The machine-wide monotonic clock, so the fake's and the test's readings
+/// compare.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: writes into `ts`, which outlives the call.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) },
+        0
+    );
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 fn serve_old(mut s: UnixStream) {
@@ -389,14 +426,63 @@ fn too_old_daemon_without_force_stop_is_left_running() {
 
 #[test]
 fn force_stop_that_does_not_stop_says_so() {
+    // fleet-cli's `STOP_WAIT`: how long fleetd waits after SIGTERM.
+    const STOP_WAIT: Duration = Duration::from_secs(5);
     let mut old = FakeOld::start(true);
     ensure_fleet_built();
+    // Only the wait after SIGTERM is timed against `STOP_WAIT`: starting
+    // fleetd, exec'ing fleet, the handshake and lsof before it take seconds
+    // on a loaded machine. The run as a whole only has to end.
     let started = Instant::now();
-    let out = fleetd(old.dir.path(), &["--force-stop"], None);
-    assert!(started.elapsed() < Duration::from_secs(8));
-    assert_eq!(out.status.code(), Some(1));
+    let mut cmd = Command::new(FLEETD);
+    cmd.env("FLEETD_LOGIN_ENV", "off")
+        .env_remove("FLEETD_TEST_UPGRADE_ANSWER")
+        .arg("--state-dir")
+        .arg(old.dir.path())
+        .arg("--force-stop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut new = cmd.spawn().expect("run fleetd");
+    let status = loop {
+        if let Some(status) = new.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = new.kill();
+            let _ = new.wait();
+            let mut err = String::new();
+            let _ = new.stderr.take().unwrap().read_to_string(&mut err);
+            panic!("fleetd --force-stop did not exit within 60s; stderr: {err}");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let exited_ns = monotonic_ns();
+    let mut err = String::new();
+    new.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert_eq!(status.code(), Some(1), "{err}");
+    // It waited for the old one before giving up.
+    assert!(
+        started.elapsed() >= STOP_WAIT,
+        "fleetd gave up after {:?}, before its {STOP_WAIT:?} stop wait",
+        started.elapsed()
+    );
+    // And gave up soon after the wait, counted from the signal.
+    let term_file = old.dir.path().join(TERM_FILE);
+    wait_for("the fake to record SIGTERM", 10, || term_file.exists());
+    let term_ns: u64 = fs::read_to_string(&term_file).unwrap().parse().unwrap();
+    let waited = Duration::from_nanos(exited_ns.saturating_sub(term_ns));
+    // The fake may note the signal a little after fleetd sent it (and
+    // started its clock), so the lower bound from the signal has slack.
+    assert!(
+        waited > STOP_WAIT / 2,
+        "fleetd exited {waited:?} after SIGTERM, before its {STOP_WAIT:?} stop wait"
+    );
+    assert!(
+        waited < STOP_WAIT + Duration::from_secs(10),
+        "fleetd exited {waited:?} after SIGTERM, expected about {STOP_WAIT:?}"
+    );
     let pid = old.child.id();
-    let err = text(&out.stderr);
     assert!(
         err.ends_with(&format!(
             "the old fleetd (pid {pid}) did not stop; stop it with kill -9 {pid} and run fleetd again\n"
