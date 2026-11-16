@@ -35,6 +35,7 @@ actions!(
         Find,
         FindNext,
         FindPrevious,
+        CommandPalette,
     ]
 );
 
@@ -81,6 +82,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-4", FocusPane4, None),
         KeyBinding::new("cmd-n", NewAgent, None),
         KeyBinding::new("cmd-t", NewTerminal, None),
+        KeyBinding::new("cmd-p", CommandPalette, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
