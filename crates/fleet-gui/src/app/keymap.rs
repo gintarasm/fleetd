@@ -33,6 +33,8 @@ actions!(
         Undo,
         Redo,
         CommandPalette,
+        NextAgent,
+        PreviousAgent,
     ]
 );
 
@@ -80,6 +82,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-n", NewAgent, None),
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-p", CommandPalette, None),
+        KeyBinding::new("ctrl-tab", NextAgent, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
