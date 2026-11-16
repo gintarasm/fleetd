@@ -200,9 +200,11 @@ Sends SIGTERM to the agent's process group. There is no SIGKILL follow-up yet, s
 fleet restart 1             # same program, args, cwd and labels, new id; the old agent is removed
 fleet restart 1 --attach    # and attach to the new one
 fleet rm 1 2                # forget exited or lost agents: list entry, history, scrollback
-fleet rm --exited           # forget every exited or lost agent
-fleet rm --exited --selector project=fleetd
+fleet rm --exited           # forget every exited or lost agent; prints the removed ids
+fleet rm --exited --label project=fleetd --label role=coder
 ```
+
+- `fleet rm --exited` never touches a running agent; `--label k=v` (repeatable, as in `fleet ls`) keeps only agents with every pair. In the GUI, **Remove Exited Agents…** (⌘P or the fleet menu) does the same after asking, with the count.
 
 - Only exited or lost agents can be restarted or removed; running ones are refused. `fleet rm` exits non-zero if any id was refused.
 - The environment given at spawn is not stored, so a restarted agent gets the daemon's base environment, not the original `--env`.

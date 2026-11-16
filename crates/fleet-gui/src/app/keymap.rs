@@ -45,6 +45,7 @@ actions!(
         FindNext,
         FindPrevious,
         CommandPalette,
+        RemoveExited,
         NextAgent,
         PreviousAgent,
     ]

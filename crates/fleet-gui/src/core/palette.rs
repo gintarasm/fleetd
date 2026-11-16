@@ -29,7 +29,7 @@ pub enum Command {
     FocusPane2,
     FocusPane3,
     FocusPane4,
-    ClearExited,
+    RemoveExited,
     SwitchFleetd,
     InstallSkill,
     Quit,
@@ -53,7 +53,7 @@ impl Command {
         Command::FocusPane2,
         Command::FocusPane3,
         Command::FocusPane4,
-        Command::ClearExited,
+        Command::RemoveExited,
         Command::SwitchFleetd,
         Command::InstallSkill,
         Command::Quit,
@@ -76,7 +76,7 @@ impl Command {
             Command::FocusPane2 => "Focus Pane 2",
             Command::FocusPane3 => "Focus Pane 3",
             Command::FocusPane4 => "Focus Pane 4",
-            Command::ClearExited => "Clear Exited Agents",
+            Command::RemoveExited => "Remove Exited Agents…",
             Command::SwitchFleetd => "Switch fleetd…",
             Command::InstallSkill => "Install Agent Skill",
             Command::Quit => "Quit fleet",
@@ -91,7 +91,7 @@ impl Command {
             Command::SplitRight | Command::SplitDown => "pane",
             Command::ClosePane => "detach",
             Command::ToggleMaximize => "zoom",
-            Command::ClearExited => "remove forget",
+            Command::RemoveExited => "clear forget rm lost",
             Command::SwitchFleetd => "connect target",
             _ => "",
         }
@@ -239,9 +239,32 @@ pub fn shortcut_text(mods: Mods, key: &str) -> String {
     s
 }
 
+/// The question Remove Exited Agents asks, naming how many go; `None`
+/// when none has ended (nothing is asked or removed).
+pub fn remove_exited_prompt(ended: usize) -> Option<String> {
+    match ended {
+        0 => None,
+        1 => Some("Remove 1 exited agent?".to_owned()),
+        n => Some(format!("Remove {n} exited agents?")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_exited_prompt_names_the_count() {
+        assert_eq!(remove_exited_prompt(0), None);
+        assert_eq!(
+            remove_exited_prompt(1).as_deref(),
+            Some("Remove 1 exited agent?")
+        );
+        assert_eq!(
+            remove_exited_prompt(3).as_deref(),
+            Some("Remove 3 exited agents?")
+        );
+    }
     use crate::core::picker::{Picker, Recents};
     use fleet_proto::AgentInfo;
 

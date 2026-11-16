@@ -97,6 +97,8 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Settings…", keymap::OpenSettings),
                     MenuItem::action("Command Palette…", keymap::CommandPalette),
                     MenuItem::separator(),
+                    MenuItem::action("Remove Exited Agents…", keymap::RemoveExited),
+                    MenuItem::separator(),
                     MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),
                     MenuItem::action("Install agent skill", keymap::InstallSkill),
                     MenuItem::separator(),

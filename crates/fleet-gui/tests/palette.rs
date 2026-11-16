@@ -202,7 +202,7 @@ fn cmd_p_lists_actions_with_shortcuts_and_esc_closes(cx: &mut TestAppContext) {
         s.shortcut("Maximize or Restore Pane").as_deref(),
         Some("⇧⌘↩")
     );
-    assert_eq!(s.shortcut("Clear Exited Agents"), None);
+    assert_eq!(s.shortcut("Remove Exited Agents…"), None);
     s.keys("escape");
     assert!(!s.palette_open());
     assert!(s.pane_focused());
