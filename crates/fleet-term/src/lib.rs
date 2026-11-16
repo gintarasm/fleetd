@@ -48,6 +48,7 @@ use recorder::Recorder;
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -112,6 +113,8 @@ struct ClientState {
 struct Replies {
     buf: Arc<Mutex<Vec<u8>>>,
     title: Arc<Mutex<Option<String>>>,
+    /// A BEL arrived since [`Terminal::take_bell`] last looked.
+    bell: Arc<AtomicBool>,
     client: Option<Arc<ClientState>>,
 }
 
@@ -162,6 +165,7 @@ impl EventListener for Replies {
             Event::ResetTitle => {
                 *self.title.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
+            Event::Bell => self.bell.store(true, Ordering::Relaxed),
             _ => {}
         }
     }
@@ -291,6 +295,11 @@ impl Terminal {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Whether a BEL arrived since the last call (clears it).
+    pub fn take_bell(&self) -> bool {
+        self.replies.bell.swap(false, Ordering::Relaxed)
     }
 
     /// Feeds raw PTY output through the VT parser.
@@ -869,6 +878,18 @@ mod tests {
         let mut cells = vec![Cell::default()];
         parse_history_line(b"a\x1b[2Kb\x1b]0;t\x07c", &mut cells);
         assert_eq!(cells_text(&cells), "abc");
+    }
+
+    #[test]
+    fn take_bell_reports_a_bel_once() {
+        let mut t = Terminal::new(80, 24);
+        assert!(!t.take_bell());
+        t.feed(b"done\x07");
+        assert!(t.take_bell());
+        assert!(!t.take_bell());
+        // BEL ending an OSC string is a terminator, not a bell.
+        t.feed(b"\x1b]2;title\x07");
+        assert!(!t.take_bell());
     }
 
     #[test]

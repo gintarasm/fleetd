@@ -217,12 +217,17 @@ impl Workspace {
         // Coming back to the window is when a fleetd installed meanwhile
         // is worth noticing (one stat, never per frame).
         let activation = cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
-                this.app.update(cx, |a, cx| a.refresh_update_available(cx));
-            }
+            let active = window.is_window_active();
+            this.app.update(cx, |a, cx| {
+                a.set_window_active(active, cx);
+                if active {
+                    a.refresh_update_available(cx);
+                }
+            });
         });
         app.update(cx, |a, cx| {
             a.set_theme(theme, cx);
+            a.set_window_active(window.is_window_active(), cx);
             // The list is often in before the window: draw it at once.
             a.sync_agents();
         });
@@ -1126,7 +1131,7 @@ impl Render for Workspace {
             self.agent_mru.observe(app.layout.agent(app.focused()));
         }
         let theme = self.app.read(cx).theme;
-        let (rows, home, error, notice, titles, marks, update) = {
+        let (rows, home, error, notice, titles, marks, update, statuses, bells) = {
             let app = self.app.read(cx);
             (
                 app.agents.clone(),
@@ -1136,6 +1141,8 @@ impl Render for Workspace {
                 app.titles.clone(),
                 app.tab_marks(),
                 app.update_button(),
+                app.statuses.clone(),
+                app.bells.clone(),
             )
         };
         let mark = move |id: u64| marks.get(&id).copied().unwrap_or(TabMark::None);
@@ -1145,6 +1152,9 @@ impl Render for Workspace {
             now_ms: now_ms(),
             titles: &titles,
             mark: &mark,
+            statuses: &statuses,
+            bells: &bells,
+            reduce_motion: self.reduce_motion,
         };
         let sidebar = render_sidebar(&data, &theme, cx);
         let ended_rows = rows.iter().filter(|r| ended(r)).count();
@@ -2489,6 +2499,72 @@ mod tests {
         let shown = s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
         assert_eq!(shown.as_deref(), Some("spawn failed: no such directory"));
         assert!(s.cx.debug_bounds("error-toast").is_some());
+    }
+
+    /// Issue #32: a bell where you are not looking flashes the pane, marks
+    /// the row and counts as needs you until the pane is seen; shells get
+    /// no status dot.
+    #[gpui::test]
+    fn a_bell_marks_the_agent_until_its_pane_is_seen(cx: &mut TestAppContext) {
+        use crate::core::status::AgentStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let mut shell = row(2, "/w", 2);
+        shell.info.labels.insert("kind".into(), "shell".into());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), shell]);
+        s.app.update(s.cx, |a, cx| a.show_agent(1, cx));
+        fake.model(PaneId(1))
+            .lock()
+            .unwrap()
+            .on_attached(&AttachOk {
+                agent_id: 1,
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            });
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("status-1-Idle").is_some());
+        assert!(s.cx.debug_bounds("pane-1-status-Idle").is_some());
+        assert!(s.cx.debug_bounds("status-2-Idle").is_none());
+
+        let ring = |s: &mut Setup<'_>| {
+            s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+            fake.model(PaneId(1)).lock().unwrap().on_output(b"ding\x07");
+            s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+            s.cx.run_until_parked();
+        };
+        let flashing = |s: &mut Setup<'_>| {
+            s.app.read_with(s.cx, |a, cx| {
+                a.pane_view(PaneId(1)).unwrap().read(cx).flashing()
+            })
+        };
+        let marked = |s: &mut Setup<'_>| {
+            s.app.read_with(s.cx, |a, _| {
+                (
+                    a.bells.contains(&1),
+                    a.statuses.get(&1).copied(),
+                    a.needs_you_count(),
+                )
+            })
+        };
+
+        // Looking at it: the pane flashes, nothing is marked.
+        ring(&mut s);
+        assert!(flashing(&mut s));
+        assert_eq!(marked(&mut s), (false, Some(AgentStatus::Idle), 0));
+
+        // Away from the window: marked, and it needs you.
+        s.app.update(s.cx, |a, cx| a.set_window_active(false, cx));
+        ring(&mut s);
+        assert_eq!(marked(&mut s), (true, Some(AgentStatus::NeedsYou), 1));
+        assert!(s.cx.debug_bounds("status-1-Needs you").is_some());
+        assert!(s.cx.debug_bounds("pane-1-status-Needs you").is_some());
+
+        // Back at the window, with its pane focused: seen.
+        s.app.update(s.cx, |a, cx| a.set_window_active(true, cx));
+        s.cx.run_until_parked();
+        assert_eq!(marked(&mut s), (false, Some(AgentStatus::Idle), 0));
     }
 
     #[gpui::test]

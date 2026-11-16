@@ -125,6 +125,11 @@ impl PaneModel {
         self.grid_changed();
     }
 
+    /// Whether the agent rang the bell (BEL) since the last call; clears it.
+    pub fn take_bell(&mut self) -> bool {
+        self.term.take_bell()
+    }
+
     /// The agent's grid was resized.
     pub fn on_resized(&mut self, cols: u16, rows: u16) {
         self.term.resize(cols, rows);
@@ -618,6 +623,16 @@ mod tests {
             history_generation: 0,
             primary: true,
         }
+    }
+
+    #[test]
+    fn take_bell_reports_a_bel_in_the_output_once() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 5, &[], 0));
+        assert!(!pane.take_bell());
+        pane.on_output(b"waiting\x07");
+        assert!(pane.take_bell());
+        assert!(!pane.take_bell());
     }
 
     fn history_texts(pane: &PaneModel) -> Vec<String> {

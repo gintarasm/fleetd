@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use fleet_term::CursorShape;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyWindowHandle, AppContext, Bounds, BoxShadow, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, Font, InteractiveElement, IntoElement, KeyDownEvent, Modifiers,
-    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement,
-    Styled, Subscription, Task, UTF16Selection, Window, div, point, px, size,
+    Animation, AnimationExt, AnyWindowHandle, AppContext, Bounds, BoxShadow, ClipboardItem,
+    Context, Entity, EventEmitter, FocusHandle, Font, InteractiveElement, IntoElement,
+    KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size,
+    StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection, Window, div, point, px,
+    size,
 };
 
 use super::controls::{self, ButtonKind};
@@ -21,6 +22,7 @@ use super::fonts::terminal_font;
 use super::icons;
 use super::keymap::{Copy, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
 use super::native;
+use super::status_dot::status_dot;
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
 use super::text_field::TextField;
@@ -39,6 +41,7 @@ use crate::core::scroll_feedback::{
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
 use crate::core::shortcuts::{EmptyPane, HINT, empty_pane};
+use crate::core::status::AgentStatus;
 use crate::core::style::{self, radius, space, text};
 
 /// At most this many lines are scrolled (or reported) per wheel event.
@@ -169,6 +172,8 @@ pub struct PaneChrome {
     pub focused: bool,
     /// The pane fills the window (its button offers Restore).
     pub maximized: bool,
+    /// The agent's status (ADR 0042); none for a shell or no agent.
+    pub status: Option<AgentStatus>,
     /// The agent list arrived and is empty: an empty pane welcomes.
     pub no_agents: bool,
     /// How long the ended agent ran, if known (the summary bar).
@@ -293,6 +298,10 @@ pub struct PaneView {
     /// The window whose activation the cursor follows, and that
     /// subscription (renewed when the view moves to a new window).
     activation: Option<(AnyWindowHandle, Subscription)>,
+    /// The bell flash being drawn (its number, so each restarts the fade),
+    /// and the task that ends it.
+    flash: Option<(u32, Task<()>)>,
+    flashes: u32,
     /// `[gui] editor`, for ⌘-clicked files.
     pub(crate) editor: String,
     /// The link under the pointer while ⌘ is held: its line and columns.
@@ -337,6 +346,9 @@ fn spawn_opener(argv: Vec<String>, fallback: Vec<String>) {
     }
 }
 
+/// How long the bell flash lasts.
+const FLASH_MS: u64 = 600;
+
 impl PaneView {
     pub fn new(
         pane: PaneId,
@@ -366,6 +378,8 @@ impl PaneView {
             fade_timer: None,
             reduce_motion: native::reduce_motion,
             activation: None,
+            flash: None,
+            flashes: 0,
             editor: config.editor.clone(),
             hover: None,
             open_file: Arc::new(spawn_opener),
@@ -374,6 +388,28 @@ impl PaneView {
             find_case: false,
             find_task: None,
         }
+    }
+
+    /// The agent rang the bell: the card's border flashes (fading out,
+    /// or shown and then removed under Reduce Motion).
+    pub fn flash(&mut self, cx: &mut Context<Self>) {
+        self.flashes = self.flashes.wrapping_add(1);
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FLASH_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.flash = None;
+                cx.notify();
+            });
+        });
+        self.flash = Some((self.flashes, task));
+        cx.notify();
+    }
+
+    /// A bell flash is being drawn.
+    pub fn flashing(&self) -> bool {
+        self.flash.is_some()
     }
 
     /// ⌘F: opens the find bar (or focuses it) with the last query
@@ -1179,6 +1215,11 @@ impl Render for PaneView {
             } else {
                 theme.tertiary
             }))
+            .children(chrome.status.map(|s| {
+                let number = chrome.number;
+                status_dot(s, &theme, unix_ms(), (self.reduce_motion)())
+                    .debug_selector(move || format!("pane-{number}-status-{}", s.label()))
+            }))
             .child(
                 div()
                     .flex()
@@ -1402,10 +1443,35 @@ impl Render for PaneView {
                 theme.border
             })
             .bg(theme.card)
+            .relative()
             .child(header)
             .child(grid)
+            .children(self.flash.as_ref().map(|(n, _)| {
+                let ring = div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(radius::LG))
+                    .border_2()
+                    .border_color(theme.warning);
+                if (self.reduce_motion)() {
+                    ring.into_any_element()
+                } else {
+                    ring.with_animation(
+                        ("bell-flash", *n),
+                        Animation::new(Duration::from_millis(FLASH_MS)),
+                        |el, t| el.opacity(1.0 - t),
+                    )
+                    .into_any_element()
+                }
+            }))
             .children(ended_bar(self, state, &theme, cx))
     }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn utf16_len(s: &str) -> usize {

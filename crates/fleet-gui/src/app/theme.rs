@@ -37,6 +37,7 @@ pub struct Theme {
     pub find_current: Hsla,
     pub danger: Hsla,
     pub success: Hsla,
+    pub warning: Hsla,
     pub shadow: Hsla,
 }
 
@@ -67,6 +68,7 @@ impl Theme {
             find_current: hsla(t.find_current),
             danger: hsla(t.danger),
             success: hsla(t.success),
+            warning: hsla(t.warning),
             shadow: hsla(t.shadow),
         }
     }
