@@ -442,3 +442,34 @@ fn a_report_reaches_the_parent_and_wakes_a_named_wait() {
         "{seen:?}"
     );
 }
+
+#[test]
+fn message_edges_list_agent_to_agent_messages_without_bodies() {
+    let f = Family::new();
+    let c1 = Caller::Agent(f.c1);
+    f.node.send_message(c1, &to(&[f.g], "secret body")).unwrap();
+    f.node.send_message(c1, &to(&[f.r], "to r")).unwrap();
+    // To the user, and from the user: not between two cards.
+    f.node
+        .send_message(
+            c1,
+            &SendMessage {
+                body: "to the user".into(),
+                to_user: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    f.node
+        .send_message(Caller::User, &to(&[f.c1], "from the user"))
+        .unwrap();
+    let all = f.node.message_edges(0, 0).unwrap().edges;
+    let pairs: Vec<_> = all.iter().map(|e| (e.sender, e.recipient)).collect();
+    assert_eq!(pairs, [(f.c1, f.g), (f.c1, f.r)]);
+    assert!(all[0].id < all[1].id);
+    // The newest one only; and nothing from the future.
+    let newest = f.node.message_edges(0, 1).unwrap().edges;
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].recipient, f.r);
+    assert!(f.node.message_edges(i64::MAX, 0).unwrap().edges.is_empty());
+}

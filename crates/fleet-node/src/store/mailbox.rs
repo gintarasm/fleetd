@@ -117,6 +117,34 @@ impl Store {
         rows.collect()
     }
 
+    /// Who wrote to whom: the newest `limit` messages of kind `message`,
+    /// `question` or `answer` with an agent as sender and as recipient,
+    /// created at or after `since_ms`, oldest first. No bodies (ADR 0089).
+    pub fn message_edges(
+        &self,
+        since_ms: i64,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(u64, u64, u64, MessageKind, i64)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, sender, recipient, kind, created_ms FROM (
+                 SELECT id, sender, recipient, kind, created_ms FROM messages
+                 WHERE sender IS NOT NULL AND recipient IS NOT NULL
+                   AND kind IN ('message','question','answer') AND created_ms >= ?1
+                 ORDER BY id DESC LIMIT ?2) ORDER BY id",
+        )?;
+        let rows = stmt.query_map((since_ms, limit as i64), |r| {
+            let kind: String = r.get(3)?;
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+                MessageKind::parse(&kind).unwrap_or(MessageKind::Message),
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
     /// How far `mailbox` has been read: the last cursor its owner read.
     pub fn read_mark(&self, mailbox: Mailbox) -> rusqlite::Result<u64> {
         Ok(self
