@@ -855,6 +855,11 @@ impl PaneView {
     }
 
     /// Some text is selected (the context menu's Copy).
+    /// The agent asked for bracketed paste (Send to Agents…, ADR 0083).
+    pub fn bracketed_paste(&self) -> bool {
+        self.model().terminal().modes().bracketed_paste
+    }
+
     pub fn has_selection(&self) -> bool {
         self.model().has_selection()
     }

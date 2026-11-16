@@ -13,8 +13,9 @@ use super::keymap::{
     FocusPane3, FocusPane4, FocusRight, FocusUp, InstallSkill, KillPane, NewAgent, NewTab,
     NewTerminal, NextAgent, NextTab, OpenOutput, OpenSettings, Paste, PrevTab, PreviousAgent, Quit,
     RemoveExited, RemovePane, RenamePane, ReopenClosedPane, RestartPane, SaveOutput,
-    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAll, SelectTab, ShowShortcuts,
-    SplitDown, SplitRight, SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn, ZoomOut, ZoomReset,
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAll, SelectTab, SendToAgents,
+    ShowShortcuts, SplitDown, SplitRight, SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 use crate::core::palette::{Command, Mods, shortcut_text};
 
@@ -80,6 +81,7 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::ZoomReset => Box::new(ZoomReset),
         Command::RemoveExited => Box::new(RemoveExited),
         Command::ToggleGraph => Box::new(ToggleGraph),
+        Command::SendToAgents => Box::new(SendToAgents),
         Command::ShowShortcuts => Box::new(ShowShortcuts),
         Command::OpenSettings => Box::new(OpenSettings),
         Command::ScrollPageUp => Box::new(ScrollPageUp),

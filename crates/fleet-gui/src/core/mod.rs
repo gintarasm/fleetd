@@ -1,6 +1,7 @@
 //! Platform-neutral GUI logic: no gpui, no AppKit.
 
 pub mod backoff;
+pub mod broadcast;
 pub mod config;
 pub mod drag_drop;
 pub mod ended;

@@ -159,6 +159,24 @@ pub fn list_well(id: &'static str, max_height: f32, theme: &Theme) -> Stateful<D
         .overflow_y_scroll()
 }
 
+/// A checkbox's box: accent-filled with a check when `checked`.
+pub fn check_box(checked: bool, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(14.))
+        .rounded(px(radius::SM))
+        .border_1()
+        .border_color(if checked { theme.accent } else { theme.border })
+        .when(checked, |b| {
+            b.bg(theme.accent)
+                .child(icons::sized(Icon::Check, 11.0).text_color(gpui::white()))
+        })
+        .when(!checked, |b| b.bg(theme.field))
+}
+
 /// Error text in a sheet.
 pub fn error_text(message: impl IntoElement, theme: &Theme) -> Div {
     div()

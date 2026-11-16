@@ -2,7 +2,10 @@
 //! [`core::picker::Picker`](crate::core::picker::Picker). ↑/↓ (or ⌃P/⌃N)
 //! move the selection, Enter or a click picks, Esc dismisses. The
 //! command palette is one; the agent switcher is another, without the
-//! query field ([`PickerView::list`]).
+//! query field ([`PickerView::list`]); the Send sheet's agent list is a
+//! third, with a checkbox on each row ([`PickerView::multi`]).
+
+use std::collections::HashSet;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -12,6 +15,7 @@ use gpui::{
     Window, div, px,
 };
 
+use super::controls::check_box;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::picker::{Picker, PickerItem, Ranked, Recents, hit_ranges};
@@ -19,6 +23,8 @@ use crate::core::style::{radius, space, text};
 
 /// The list's height before it scrolls.
 const LIST_MAX_HEIGHT: f32 = 360.0;
+/// The checkbox list's height before it scrolls (inside a sheet).
+const MULTI_LIST_MAX_HEIGHT: f32 = 220.0;
 /// The picker's width.
 pub const PICKER_WIDTH: f32 = 560.0;
 
@@ -35,6 +41,9 @@ pub struct PickerView {
     empty_text: SharedString,
     /// The query field is drawn and has the keyboard; else the list has.
     show_query: bool,
+    /// A list of checkboxes, inside a sheet: the keys checked. A pick
+    /// asks the owner to toggle one ([`PickerView::set_checked`]).
+    checked: Option<HashSet<String>>,
     focus: FocusHandle,
     _query_changed: Subscription,
 }
@@ -64,6 +73,7 @@ impl PickerView {
             scroll: ScrollHandle::new(),
             empty_text: "No matches".into(),
             show_query: true,
+            checked: None,
             focus: cx.focus_handle(),
             _query_changed: sub,
         }
@@ -76,6 +86,31 @@ impl PickerView {
             show_query: false,
             ..PickerView::new(items, recents, "", cx)
         }
+    }
+
+    /// A list with a checkbox on each row, drawn flat inside a sheet:
+    /// Enter or a click picks (the owner toggles the row's box).
+    pub fn multi(
+        items: Vec<PickerItem>,
+        placeholder: &str,
+        checked: HashSet<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        PickerView {
+            checked: Some(checked),
+            ..PickerView::new(items, Recents::default(), placeholder, cx)
+        }
+    }
+
+    /// The rows checked ([`PickerView::multi`]).
+    pub fn set_checked(&mut self, keys: HashSet<String>, cx: &mut Context<Self>) {
+        self.checked = Some(keys);
+        cx.notify();
+    }
+
+    /// The query field's text.
+    pub fn query_field(&self) -> &Entity<TextField> {
+        &self.query
     }
 
     /// Focus goes to the query field (or the list, without one).
@@ -158,11 +193,16 @@ impl PickerView {
             (t.text, t.secondary)
         };
         let theme = *t;
+        let check = self
+            .checked
+            .as_ref()
+            .map(|keys| check_box(keys.contains(&item.key), t));
         let line = div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(space::SM))
+            .children(check)
             .child(
                 div()
                     .flex_none()
@@ -243,27 +283,36 @@ impl Render for PickerView {
                 .id("picker-list")
                 .flex()
                 .flex_col()
-                .max_h(px(LIST_MAX_HEIGHT))
+                .max_h(px(if self.checked.is_some() {
+                    MULTI_LIST_MAX_HEIGHT
+                } else {
+                    LIST_MAX_HEIGHT
+                }))
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
                 .children(rows)
         };
-        div()
+        let card = div()
             .id("picker")
             .debug_selector(|| "picker".to_owned())
-            .w(px(PICKER_WIDTH))
-            // Narrower inside a small pane (the split chooser's list).
-            .max_w_full()
             .flex()
             .flex_col()
-            .gap(px(space::XS))
-            .p(px(space::SM))
-            .rounded(px(radius::LG + 2.0))
-            .border_1()
-            .border_color(t.border)
-            .bg(t.raised)
-            .shadow_lg()
-            .text_color(t.text)
+            .gap(px(space::XS));
+        let card = if self.checked.is_some() {
+            // Inside a sheet: no card of its own.
+            card.w_full()
+        } else {
+            card.w(px(PICKER_WIDTH))
+                // Narrower inside a small pane (the split chooser's list).
+                .max_w_full()
+                .p(px(space::SM))
+                .rounded(px(radius::LG + 2.0))
+                .border_1()
+                .border_color(t.border)
+                .bg(t.raised)
+                .shadow_lg()
+        };
+        card.text_color(t.text)
             .type_style(text::BODY)
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::key_down))

@@ -1,7 +1,8 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
 //! directory. (New agent and Clear exited live in the unified bar.)
-//! A click shows the agent in the focused pane; a right-click opens the
-//! row's native menu (`core::menus::row_menu`). Above the tabs, a filter
+//! A click shows the agent in the focused pane; ⌘-click and ⇧-click pick
+//! rows for Send to Selected… (ADR 0083); a right-click opens the row's
+//! native menu (`core::menus::row_menu`). Above the tabs, a filter
 //! field and status filters; a click on a group's header collapses it
 //! (issue #40, ADR 0060), and a right-click offers grouping by folder or
 //! by git repository (ADR 0085). A row's second line shows its git
@@ -81,6 +82,8 @@ pub struct SidebarData<'a> {
     pub status_filter: StatusFilter,
     /// The tabs' focus: a key typed while it has it goes to the filter.
     pub focus: FocusHandle,
+    /// The rows picked with ⌘-click and ⇧-click (ADR 0083).
+    pub selected: &'a [u64],
 }
 
 /// A tab's title: the agent's name (ADR 0052), else its OSC title if a
@@ -301,6 +304,7 @@ fn render_tab(
     let meta = row_meta(row, data.now_ms);
     let preview = preview_line(&row.last_line);
     let rang = data.bells.contains(&id);
+    let picked = data.selected.contains(&id);
     let buttons: Vec<RowButton> = match agent_buttons(true, ended(row)) {
         AgentButtons::None => Vec::new(),
         AgentButtons::Stop => vec![("stop", Icon::Stop, Box::new(Kill { agent_id: id }))],
@@ -474,16 +478,19 @@ fn render_tab(
         .when(rang && mark != TabMark::Focused, |s| {
             s.bg(theme.warning.opacity(0.14))
         })
+        // Picked for Send to Selected…: an accent tint over the rest.
+        .when(picked, |s| s.bg(theme.accent.opacity(0.22)))
         .hover(|s| s.bg(theme.hover))
         .active(|s| s.bg(theme.pressed))
         .child(bar)
         .child(line1)
         .child(line2)
         .children(line3)
-        .on_click(cx.listener(move |this, _, window, cx| {
+        .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
             // A drag that ends on its own row is not a click.
             if this.pane_drag.is_click() {
-                this.show_agent(id, window, cx);
+                let m = ev.modifiers();
+                this.row_click(id, m.platform, m.shift, window, cx);
             }
         }))
         .on_mouse_down(

@@ -16,6 +16,7 @@ use super::pane_view::{InputSink, PaneChrome, PaneView};
 use super::sidebar_view::{TabMark, program_name};
 use super::theme::Theme;
 use super::workspace::Workspace;
+use crate::core::broadcast::{RETURN, RETURN_DELAY_MS, SendPlan, encode_text};
 use crate::core::config::{GuiConfig, load_config};
 use crate::core::drag_drop::DropAction;
 use crate::core::ended::run_time;
@@ -82,6 +83,9 @@ pub trait SessionApi: InputSink {
     fn rename(&self, agent_id: u64, name: String);
     /// Sets, then removes, an agent's labels (Edit Labels, ADR 0087).
     fn set_labels(&self, _agent_id: u64, _set: HashMap<String, String>, _remove: Vec<String>) {}
+    /// Types `data` into an agent, shown in a pane or not (Send to
+    /// Agents…, ADR 0083).
+    fn send_input(&self, _agent_id: u64, _data: Vec<u8>) {}
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
@@ -156,6 +160,10 @@ impl SessionApi for Session {
 
     fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
         Session::set_labels(self, agent_id, set, remove);
+    }
+
+    fn send_input(&self, agent_id: u64, data: Vec<u8>) {
+        Session::send_input(self, agent_id, data);
     }
 
     fn clear_exited(&self) {
@@ -1581,6 +1589,55 @@ impl AppState {
     pub(super) fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
         self.notice = Some(text);
         cx.notify();
+    }
+
+    /// Types `data` into an agent (Send to Agents…, ADR 0083).
+    pub fn send_input(&self, agent_id: u64, data: Vec<u8>) {
+        self.session.send_input(agent_id, data);
+    }
+
+    /// Send to Agents… (ADR 0083): types the plan's text into each
+    /// target, as `fleet send` does (a bracketed paste for several lines
+    /// where a pane says the agent wants one), then the Return,
+    /// [`RETURN_DELAY_MS`] later if there was text.
+    pub fn send_text(&mut self, plan: &SendPlan, cx: &mut Context<Self>) {
+        if !plan.text.is_empty() {
+            for &id in &plan.targets {
+                let bracketed = self.bracketed_paste(id, cx).unwrap_or(false);
+                self.send_input(id, encode_text(&plan.text, bracketed));
+            }
+        }
+        if !plan.press_return {
+            return;
+        }
+        let targets = plan.targets.clone();
+        if !plan.return_delayed() {
+            for id in targets {
+                self.send_input(id, RETURN.to_vec());
+            }
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(RETURN_DELAY_MS))
+                .await;
+            let _ = this.update(cx, |a, _| {
+                for id in targets {
+                    a.send_input(id, RETURN.to_vec());
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Whether a pane showing `agent_id` (in any tab) has bracketed paste
+    /// on; `None` when no pane shows it.
+    pub fn bracketed_paste(&self, agent_id: u64, cx: &App) -> Option<bool> {
+        self.panes
+            .iter()
+            .filter(|(pane, _)| self.tabs.agent(**pane) == Some(agent_id))
+            .map(|(_, view)| view.read(cx).bracketed_paste())
+            .reduce(|a, b| a || b)
     }
 
     /// The summary bar's Remove: forgets the agent `pane` shows if it
