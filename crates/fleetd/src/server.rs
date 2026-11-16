@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
+use fleet_node::lease::now_ms;
 use fleet_node::node::{ActivityReceiver, ConnId, Node, Removed, StreamItem, Subscription};
 use fleet_node::scope::Caller;
 use fleet_proto::{
@@ -40,6 +41,8 @@ use crate::handoff::Identity;
 use crate::logging;
 use crate::scope;
 use crate::wait;
+
+pub(crate) mod lease;
 
 /// Concurrent connections served; more are rejected.
 const MAX_CONNECTIONS: usize = 64;
@@ -502,6 +505,12 @@ struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Leases tied to this connection go with it, and its queued asks
+        // (ADR 0077). A restart does not reach here for the other
+        // connections: `exec` ends them without destructors.
+        if let Err(e) = self.node.leases().conn_closed(self.id, now_ms()) {
+            warn!(conn = self.id.0, error = %e, "releasing a closed connection's leases failed");
+        }
         for task in self.forwarders.values() {
             task.abort();
         }
@@ -630,6 +639,11 @@ impl Connection {
             }
             Some(request::Kind::Restart(r)) => return self.restart(req.id, r).await,
             Some(request::Kind::Forget(f)) => return self.forget(req.id, *f).await,
+            Some(request::Kind::AcquireLease(a)) => return self.acquire_lease(req.id, *a).await,
+            Some(request::Kind::ReleaseLease(r)) => {
+                return self.release_lease(req.id, r.name).await;
+            }
+            Some(request::Kind::ListLeases(_)) => return self.list_leases(req.id).await,
             Some(request::Kind::RestartDaemon(_)) => unreachable!("handled above"),
             // Boxed: kept out of every request's future.
             Some(request::Kind::SendMessage(m)) => {

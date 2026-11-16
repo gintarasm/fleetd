@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
 
-/// Identity took 8 (spec "Waves"); the mailbox (M3-E) takes 9.
-const SCHEMA_VERSION: i64 = 9;
+/// Identity took 8 (spec "Waves"); the mailbox (M3-E) 9, leases 10 (ADR 0077).
+const SCHEMA_VERSION: i64 = 10;
 
 mod mailbox;
 use mailbox::MAILBOX_DDL;
@@ -55,6 +55,29 @@ pub struct AgentRecord {
 pub struct Store {
     conn: Connection,
 }
+
+/// A held lease (ADR 0077, spec §4). `holder` is the agent holding it
+/// (`None`: the user); `holder_conn` is set when the lease is tied to a
+/// connection (the `fleet lease … -- cmd` form) and is then the holder's
+/// *key*, which a client that reconnects after a daemon restart presents to
+/// reclaim it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRow {
+    pub name: String,
+    pub holder: Option<u64>,
+    pub holder_conn: Option<i64>,
+    pub acquired_ms: i64,
+    pub expires_ms: Option<i64>,
+}
+
+/// The `leases` table (ADR 0077).
+const LEASES_DDL: &str = "CREATE TABLE leases (
+                 name TEXT PRIMARY KEY,
+                 holder INTEGER,
+                 holder_conn INTEGER,
+                 acquired_ms INTEGER NOT NULL,
+                 expires_ms INTEGER
+        );";
 
 /// An agent's token digest (ADR 0072): only while it runs.
 const AGENT_TOKENS_DDL: &str = "CREATE TABLE agent_tokens (
@@ -219,10 +242,20 @@ impl Store {
                  COMMIT;"
             ))?;
         }
+        if version < 10 {
+            // v10: leases (ADR 0077). The DDL
+            // must match `create_latest`'s.
+            self.conn.execute_batch(&format!(
+                "BEGIN;
+                 {LEASES_DDL}
+                 PRAGMA user_version = 10;
+                 COMMIT;"
+            ))?;
+        }
         Ok(())
     }
 
-    /// The latest schema for a new DB; the same tables the v1 -> ... -> v9
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v10
     /// migrations produce.
     fn create_latest(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(&format!(
@@ -249,7 +282,8 @@ impl Store {
              );
              {AGENT_TOKENS_DDL}
              {MAILBOX_DDL}
-             PRAGMA user_version = 9;
+             {LEASES_DDL}
+             PRAGMA user_version = 10;
              COMMIT;"
         ))
     }
@@ -495,6 +529,57 @@ impl Store {
             .optional()
     }
 
+    /// Stores `row`, replacing a lease of the same name.
+    pub fn put_lease(&self, row: &LeaseRow) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO leases (name, holder, holder_conn, acquired_ms, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                &row.name,
+                row.holder.map(|h| h as i64),
+                row.holder_conn,
+                row.acquired_ms,
+                row.expires_ms,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the lease `name`; whether there was one.
+    pub fn delete_lease(&self, name: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM leases WHERE name = ?1", (name,))?
+            > 0)
+    }
+
+    /// Every lease, by name.
+    pub fn leases(&self) -> rusqlite::Result<Vec<LeaseRow>> {
+        let mut q = self.conn.prepare(
+            "SELECT name, holder, holder_conn, acquired_ms, expires_ms FROM leases ORDER BY name",
+        )?;
+        q.query_map((), |r| {
+            Ok(LeaseRow {
+                name: r.get(0)?,
+                holder: r.get::<_, Option<i64>>(1)?.map(|h| h as u64),
+                holder_conn: r.get(2)?,
+                acquired_ms: r.get(3)?,
+                expires_ms: r.get(4)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// Deletes the leases held by an agent that is not running (it ended
+    /// while no daemon watched, or its row is gone); how many.
+    pub fn delete_leases_of_ended_agents(&self) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM leases WHERE holder IS NOT NULL
+             AND holder NOT IN (SELECT id FROM agents WHERE state = 'running')",
+            (),
+        )
+    }
+
     /// running -> exited, recording the exit time, and revokes its token.
     /// Errors if the agent is unknown or not running.
     pub fn set_exited(&self, id: u64, code: i32) -> rusqlite::Result<()> {
@@ -651,8 +736,63 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v9() {
-        assert_eq!(SCHEMA_VERSION, 9);
+    fn schema_is_v10() {
+        assert_eq!(SCHEMA_VERSION, 10);
+    }
+
+    fn lease(name: &str, holder: Option<u64>) -> LeaseRow {
+        LeaseRow {
+            name: name.into(),
+            holder,
+            holder_conn: None,
+            acquired_ms: 5,
+            expires_ms: Some(9),
+        }
+    }
+
+    #[test]
+    fn leases_round_trip_and_replace() {
+        let (_d, _p, s) = open_tmp();
+        assert!(s.leases().unwrap().is_empty());
+        let mut a = lease("perf-wall", None);
+        a.holder_conn = Some(77);
+        s.put_lease(&a).unwrap();
+        s.put_lease(&lease("b", Some(3))).unwrap();
+        assert_eq!(s.leases().unwrap(), vec![lease("b", Some(3)), a.clone()]);
+        let mut a2 = a.clone();
+        a2.expires_ms = None;
+        s.put_lease(&a2).unwrap();
+        assert_eq!(s.leases().unwrap()[1], a2);
+        assert!(s.delete_lease("b").unwrap());
+        assert!(!s.delete_lease("b").unwrap());
+    }
+
+    #[test]
+    fn leases_of_ended_agents_are_deleted_and_the_users_kept() {
+        let (_d, _p, s) = open_tmp();
+        let live = s.insert_agent(&new_agent(1)).unwrap();
+        let ended = s.insert_agent(&new_agent(2)).unwrap();
+        s.set_exited(ended, 0).unwrap();
+        s.put_lease(&lease("user", None)).unwrap();
+        s.put_lease(&lease("live", Some(live))).unwrap();
+        s.put_lease(&lease("ended", Some(ended))).unwrap();
+        s.put_lease(&lease("gone", Some(999))).unwrap();
+        assert_eq!(s.delete_leases_of_ended_agents().unwrap(), 2);
+        let names: Vec<_> = s.leases().unwrap().into_iter().map(|l| l.name).collect();
+        assert_eq!(names, ["live", "user"]);
+    }
+
+    #[test]
+    fn v8_database_migrates_to_v10_with_leases() {
+        let (_d, p, s) = open_tmp();
+        drop(s);
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch("DROP TABLE leases; DROP TABLE messages; DROP TABLE inbox_marks; PRAGMA user_version = 8;")
+            .unwrap();
+        drop(c);
+        let s = Store::open(&p).unwrap();
+        assert_eq!(user_version(&p), SCHEMA_VERSION);
+        s.put_lease(&lease("x", None)).unwrap();
     }
 
     #[test]
@@ -731,6 +871,7 @@ mod tests {
         let conn = Connection::open(&p).unwrap();
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE leases;
              DROP TABLE messages;
              DROP TABLE inbox_marks;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
@@ -1174,6 +1315,7 @@ mod tests {
         // Back to the v4 shape: no exit time column.
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE leases;
              DROP TABLE messages;
              DROP TABLE inbox_marks;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;

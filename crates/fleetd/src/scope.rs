@@ -199,6 +199,9 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
         Kind::List(_) => return None,
         // Only drops this connection's own subscription.
         Kind::Detach(_) => return None,
+        // Leases are open to any caller (ADR 0034, 0077): any name, no
+        // descendants check. The node answers a release by a non-holder.
+        Kind::AcquireLease(_) | Kind::ReleaseLease(_) | Kind::ListLeases(_) => return None,
         Kind::SetLabels(_) => return Some(forbidden("agents cannot change labels")),
         Kind::ReadLogs(_) | Kind::StopLogs(_) => {
             return Some(forbidden("agents cannot read fleetd's log"));

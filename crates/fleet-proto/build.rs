@@ -11,6 +11,8 @@ fn main() {
         // initialised on every decode (see the `frame_decode` benchmark).
         .boxed(".fleet.v1.Request.kind.spawn")
         .boxed(".fleet.v1.Request.kind.forget")
+        .boxed(".fleet.v1.Request.kind.acquire_lease")
+        .boxed(".fleet.v1.Response.kind.lease_granted")
         .boxed(".fleet.v1.Request.kind.send_message")
         .boxed(".fleet.v1.Request.kind.wait")
         .boxed(".fleet.v1.Response.kind.spawned")
