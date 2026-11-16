@@ -14,6 +14,7 @@ mod kill_sheet;
 mod native;
 mod new_agent;
 mod palette;
+mod pane_drag;
 mod pane_view;
 mod picker_view;
 mod resident;

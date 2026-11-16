@@ -9,8 +9,8 @@ use std::path::Path;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Action, Context, Div, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, div, px,
+    Action, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::controls;
@@ -270,7 +270,18 @@ fn render_tab(
         .child(bar)
         .child(line1)
         .child(line2)
-        .on_click(cx.listener(move |this, _, window, cx| this.show_agent(id, window, cx)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            // A drag that ends on its own row is not a click.
+            if this.pane_drag.is_click() {
+                this.show_agent(id, window, cx);
+            }
+        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, ev: &MouseDownEvent, _, _| {
+                this.pane_drag.press_agent(id, ev.position);
+            }),
+        )
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),

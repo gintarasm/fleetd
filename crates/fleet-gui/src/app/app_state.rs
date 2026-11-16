@@ -16,6 +16,7 @@ use super::sidebar_view::{TabMark, program_name};
 use super::theme::Theme;
 use super::workspace::Workspace;
 use crate::core::config::{GuiConfig, load_config};
+use crate::core::drag_drop::DropAction;
 use crate::core::ended::run_time;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
@@ -1134,13 +1135,57 @@ impl AppState {
 
     /// Splits the focused pane to the right and shows `agent_id` there.
     pub fn open_in_new_split(&mut self, agent_id: u64, cx: &mut Context<Self>) -> Option<PaneId> {
-        let new = self.layout.split(self.focused, Axis::Horizontal)?;
+        self.open_beside(self.focused, Dir::Right, agent_id, cx)
+    }
+
+    /// Splits `pane`, the new pane on its `dir` side showing `agent_id`
+    /// and focused. `None` at [`MAX_PANES`] or for an unknown pane.
+    fn open_beside(
+        &mut self,
+        pane: PaneId,
+        dir: Dir,
+        agent_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
+        let new = self.layout.split_toward(pane, dir)?;
         self.maximized = None;
         self.layout.set_agent(new, Some(agent_id));
         self.open(new, Some(agent_id), cx);
         self.focused = new;
         self.layout_changed(cx);
         Some(new)
+    }
+
+    /// Carries out a drag and drop (ADR 0059). The pane the agent or the
+    /// pane lands in gets the focus, and is returned; `None` if nothing
+    /// changed (a pane or split gone meanwhile, or no room for a pane).
+    pub fn drop_on(&mut self, action: DropAction, cx: &mut Context<Self>) -> Option<PaneId> {
+        match action {
+            DropAction::Show { pane, agent } => {
+                if !self.panes.contains_key(&pane) {
+                    return None;
+                }
+                self.set_focused(pane, cx);
+                self.show_agent(agent, cx);
+                Some(pane)
+            }
+            DropAction::SplitShow { pane, dir, agent } => self.open_beside(pane, dir, agent, cx),
+            DropAction::Swap { pane, with } => {
+                self.layout.swap(pane, with).then(|| self.moved(pane, cx))
+            }
+            DropAction::Move { pane, target, dir } => self
+                .layout
+                .move_pane(pane, target, dir)
+                .then(|| self.moved(pane, cx)),
+        }
+    }
+
+    /// `pane` moved in the layout: it gets the focus, in the split view.
+    fn moved(&mut self, pane: PaneId, cx: &mut Context<Self>) -> PaneId {
+        self.maximized = None;
+        self.focused = pane;
+        self.layout_changed(cx);
+        pane
     }
 
     /// Spawns into the focused pane at its size. The directory becomes a

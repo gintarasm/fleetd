@@ -7,10 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Action, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
-    IntoElement, ModifiersChangedEvent, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px, relative,
-    size,
+    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px,
+    relative, size,
 };
 
 use super::app_state::AppState;
@@ -27,6 +27,7 @@ use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::palette::{command_action, command_shortcut};
+use super::pane_drag::PaneDrag;
 use super::pane_view::{PaneEvent, PaneView};
 use super::picker_view::{PickerEvent, PickerView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
@@ -36,6 +37,7 @@ use super::theme::{Theme, Typography, appearance_of};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use super::{controls, keymap};
 use crate::core::config::{GuiConfig, save_confirm_kill, save_connection};
+use crate::core::drag_drop::DropTarget;
 use crate::core::kill::{KillFlow, kill_flow};
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
@@ -188,6 +190,8 @@ pub struct Workspace {
     look: Look,
     /// A split divider being dragged.
     split_drag: SplitDrag,
+    /// A sidebar row or a pane header being dragged (ADR 0059).
+    pub(super) pane_drag: PaneDrag,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -278,6 +282,7 @@ impl Workspace {
             reduce_motion: config.reduce_motion.resolve(native::reduce_motion()),
             look: Look::of(&config),
             split_drag: SplitDrag::default(),
+            pane_drag: PaneDrag::default(),
             _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -304,6 +309,11 @@ impl Workspace {
     }
 
     /// The panes the last frame drew (one while maximized).
+    /// Where the agent or pane being dragged would drop now (ADR 0059).
+    pub fn drop_target(&self) -> Option<DropTarget> {
+        self.pane_drag.target()
+    }
+
     pub fn drawn_panes(&self) -> &[PaneId] {
         &self.drawn
     }
@@ -1208,13 +1218,23 @@ impl Workspace {
             Some(_) => Vec::new(),
             None => self.split_drag.render(&app.layout, &self.app),
         };
+        let dragging = self.pane_drag.render(
+            rects.clone(),
+            app.layout.panes().len() < MAX_PANES,
+            &self.app,
+            &app.theme,
+        );
         let children: Vec<_> = rects
             .into_iter()
             .filter_map(|(pane, r)| {
                 let view = app.pane_view(pane)?.clone();
+                let drag = self.pane_drag.clone();
                 Some(
                     div()
                         .debug_selector(move || format!("pane-card-{}", pane.0))
+                        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, _| {
+                            drag.press_card(pane, ev.position);
+                        })
                         .absolute()
                         .left(relative(r.x))
                         .top(relative(r.y))
@@ -1230,7 +1250,8 @@ impl Workspace {
                 .absolute()
                 .inset(px(chrome::PANE_GAP / 2.0))
                 .children(children)
-                .children(dividers),
+                .children(dividers)
+                .children(dragging),
         )
     }
 
@@ -1468,6 +1489,13 @@ impl Render for Workspace {
             .flex_col()
             .bg(theme.window)
             .text_color(theme.text)
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                // Esc ends a drag before it reaches the focused pane.
+                if ev.keystroke.key == "escape" && this.pane_drag.cancel() {
+                    cx.stop_propagation();
+                    window.refresh();
+                }
+            }))
             .on_action(cx.listener(Self::toggle_maximize))
             .on_action(
                 cx.listener(|this, _: &SplitRight, w, cx| this.split(Axis::Horizontal, w, cx)),
