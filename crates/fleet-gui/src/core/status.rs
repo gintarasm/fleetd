@@ -11,50 +11,8 @@ use std::collections::{HashMap, HashSet};
 use fleet_proto::{AgentInfo, AgentState};
 
 use super::session::AgentRow;
-use super::spawn::{KIND_LABEL, SHELL_KIND};
 
-/// Output this recent means the agent is working. Agent CLIs redraw a
-/// spinner while they work, so a few quiet seconds mean they stopped.
-pub const QUIET_MS: i64 = 3_000;
-
-/// One agent's status.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AgentStatus {
-    /// Output in the last [`QUIET_MS`].
-    Working,
-    /// Quiet and its last line looks like a prompt, or it rang the bell.
-    NeedsYou,
-    /// Running, quiet, and nothing says it waits for input (or no output
-    /// seen yet).
-    Idle,
-    /// Exited 0.
-    Done,
-    /// Exited non-zero (or with no code), or lost.
-    Failed,
-}
-
-impl AgentStatus {
-    /// For tooltips and menus.
-    pub fn label(self) -> &'static str {
-        match self {
-            AgentStatus::Working => "Working",
-            AgentStatus::NeedsYou => "Needs you",
-            AgentStatus::Idle => "Idle",
-            AgentStatus::Done => "Done",
-            AgentStatus::Failed => "Failed",
-        }
-    }
-
-    /// The agent ended (done or failed).
-    pub fn ended(self) -> bool {
-        matches!(self, AgentStatus::Done | AgentStatus::Failed)
-    }
-}
-
-/// A plain login shell from New terminal: no status.
-pub fn is_shell(info: &AgentInfo) -> bool {
-    info.labels.get(KIND_LABEL).map(String::as_str) == Some(SHELL_KIND)
-}
+pub use fleet_proto::status::{AgentStatus, QUIET_MS, is_shell, looks_like_prompt};
 
 /// What a row or pane shows, as the GUI names it to the user: a shell
 /// from New terminal is never called an agent (ADR 0071), though the node
@@ -95,62 +53,14 @@ impl Subject {
 /// The status of `row` at `now_ms`; `rang` is an unseen bell from a pane
 /// showing it. `None` for a shell, or a state the GUI does not know.
 pub fn agent_status(row: &AgentRow, rang: bool, now_ms: i64) -> Option<AgentStatus> {
-    if is_shell(&row.info) {
-        return None;
-    }
-    match row.info.state() {
-        AgentState::Exited => Some(match row.info.exit_code {
-            Some(0) => AgentStatus::Done,
-            _ => AgentStatus::Failed,
-        }),
-        AgentState::Lost => Some(AgentStatus::Failed),
-        AgentState::Unspecified => None,
-        AgentState::Running => Some(if rang {
-            AgentStatus::NeedsYou
-        } else {
-            match row.last_output_unix_ms {
-                Some(at) if now_ms - at < QUIET_MS => AgentStatus::Working,
-                Some(_) if looks_like_prompt(&row.last_line) => AgentStatus::NeedsYou,
-                _ => AgentStatus::Idle,
-            }
-        }),
-    }
-}
-
-/// Footer hints agent TUIs show while they wait for you (lowercase).
-const PROMPT_HINTS: [&str; 9] = [
-    "(y/n)",
-    "[y/n]",
-    "(yes/no)",
-    "for shortcuts",
-    "shift+tab to cycle",
-    "esc to cancel",
-    "enter to confirm",
-    "enter to select",
-    "press enter",
-];
-
-/// Characters a prompt line ends with.
-const PROMPT_ENDS: [char; 9] = ['?', '>', '❯', '›', '»', ':', '$', '#', '%'];
-
-/// Whether an agent's last non-blank line looks like it waits for input:
-/// it ends like a prompt (`?`, `>`, `❯`, `:`, `$` …), carries a TUI's
-/// waiting hint ("? for shortcuts", "(y/n)", "esc to cancel" …), or is a
-/// box-drawing rule (the bottom of a TUI's input box).
-pub fn looks_like_prompt(line: &str) -> bool {
-    let line = line.trim();
-    let Some(last) = line.chars().next_back() else {
-        return false;
-    };
-    if PROMPT_ENDS.contains(&last) {
-        return true;
-    }
-    let lower = line.to_lowercase();
-    if PROMPT_HINTS.iter().any(|h| lower.contains(h)) {
-        return true;
-    }
-    line.chars()
-        .all(|c| ('\u{2500}'..='\u{257f}').contains(&c) || c == ' ')
+    fleet_proto::status::inferred_status(
+        &row.info,
+        &row.last_line,
+        row.last_output_unix_ms,
+        rang,
+        now_ms,
+        QUIET_MS,
+    )
 }
 
 /// Every non-shell agent's status; `bells` are agents with an unseen bell.

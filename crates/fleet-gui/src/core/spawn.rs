@@ -8,12 +8,7 @@ use fleet_client::names::{NAME_LABEL, check_name, default_name};
 
 use super::target::Target;
 
-/// The label key New terminal sets. Not a `fleet.` key: those are the
-/// core's (ADR 0025), and the core never interprets labels.
-pub const KIND_LABEL: &str = "kind";
-/// [`KIND_LABEL`]'s value for a plain shell, so the sidebar can style it
-/// and status detection can skip it.
-pub const SHELL_KIND: &str = "shell";
+pub use fleet_proto::status::{KIND_LABEL, SHELL_KIND};
 /// The shell when `$SHELL` is unset or empty.
 pub const DEFAULT_SHELL: &str = "/bin/zsh";
 
