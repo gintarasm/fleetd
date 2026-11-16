@@ -1609,6 +1609,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn file_links_resolve_in_a_local_agents_directory_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        s.cx.run_until_parked();
+        let chrome = |s: &mut Setup<'_>| {
+            s.app.read_with(s.cx, |a, cx| {
+                let c = a.pane_view(PaneId(1)).unwrap().read(cx).chrome.clone();
+                (c.cwd, c.link_dir)
+            })
+        };
+        assert_eq!(chrome(&mut s), (Some("/w".into()), Some("/w".into())));
+
+        // On another machine the agent's paths are not here.
+        let other = Arc::new(Fake::default());
+        let session: Arc<dyn SessionApi> = other.clone();
+        let (_tx, rx) = async_channel::unbounded();
+        let target = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        *other.agents.lock().unwrap() = vec![row(5, "/w", 1)];
+        s.app
+            .update(s.cx, |a, cx| a.replace_session(session, rx, target, cx));
+        click(&mut s, "tab-5");
+        attach_model(&other, PaneId(1), 5);
+        s.cx.run_until_parked();
+        assert_eq!(chrome(&mut s), (Some("/w".into()), None));
+    }
+
+    #[gpui::test]
     fn requested_attach_is_not_reverted_by_the_old_agent(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(Fake::default());

@@ -805,6 +805,9 @@ impl AppState {
                     (None, None) => None,
                 },
                 cwd: row.map(|r| tilde(&r.info.cwd, &self.home)),
+                link_dir: row
+                    .filter(|_| self.target == Target::Local)
+                    .map(|r| r.info.cwd.clone()),
                 starting: self.starting.contains(&pane),
                 reconnect_in,
                 focused: pane == self.focused,
