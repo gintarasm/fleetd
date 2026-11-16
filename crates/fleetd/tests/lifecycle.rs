@@ -541,3 +541,38 @@ fn login_env_switch_off_skips_capture() {
     );
     assert_eq!(got, "unset:daemon\n");
 }
+
+/// fleetd with `FLEETD_AGENT_NICE=value` (ADR 0066).
+fn spawn_with_agent_nice(dir: &Path, value: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_fleetd"))
+        .env(NO_LOGIN_ENV.0, NO_LOGIN_ENV.1)
+        .env("FLEETD_AGENT_NICE", value)
+        .arg("--state-dir")
+        .arg(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fleetd")
+}
+
+/// This process's nice value, which fleetd inherits.
+fn own_nice() -> i32 {
+    // SAFETY: no memory effects; cannot fail for the calling process.
+    unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+}
+
+#[test]
+fn agent_nice_setting_lowers_agents() {
+    for (value, lowered_by) in [("4", 4), ("off", 0), ("bogus", 0)] {
+        let dir = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let _d = Reaper(spawn_with_agent_nice(dir.path(), value));
+        wait_ready(dir.path());
+        let got = agent_output(dir.path(), work.path(), "ps -o nice= -p $$ > out");
+        assert_eq!(
+            got.trim().parse::<i32>().unwrap(),
+            (own_nice() + lowered_by).min(19),
+            "FLEETD_AGENT_NICE={value}"
+        );
+    }
+}
