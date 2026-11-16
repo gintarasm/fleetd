@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -26,6 +26,9 @@ pub struct NewAgent {
     pub created_unix_ms: i64,
     pub scrollback_path: String,
     pub labels: Labels,
+    /// The `AgentPriority` it was spawned with (ADR 0066), as its proto
+    /// value.
+    pub priority: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +42,7 @@ pub struct AgentRecord {
     pub created_unix_ms: i64,
     pub scrollback_path: String,
     pub labels: Labels,
+    pub priority: i32,
 }
 
 pub struct Store {
@@ -69,7 +73,7 @@ fn conversion_err(col: usize, e: Box<dyn std::error::Error + Send + Sync>) -> ru
 }
 
 const AGENT_COLUMNS: &str = "SELECT id, program, args_json, cwd, state, exit_code, \
-     created_unix_ms, scrollback_path FROM agents";
+     created_unix_ms, scrollback_path, priority FROM agents";
 
 /// Decodes an `AGENT_COLUMNS` row, taking its labels out of `labels`.
 fn decode_agent(
@@ -90,12 +94,13 @@ fn decode_agent(
         created_unix_ms: r.get(6)?,
         scrollback_path: r.get(7)?,
         labels: labels.remove(&id).unwrap_or_default(),
+        priority: r.get(8)?,
     })
 }
 
 impl Store {
     /// Opens (creating with mode 0600 if new) the DB, enables WAL and
-    /// migrates to schema v3. Fails on a DB written by a newer schema.
+    /// migrates to schema v4. Fails on a DB written by a newer schema.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if !path.exists() {
             use std::os::unix::fs::OpenOptionsExt;
@@ -133,10 +138,10 @@ impl Store {
             ));
         }
         if version == 0 {
-            // A new DB gets the v3 schema at once: replaying v1 -> v2 -> v3
+            // A new DB gets the v4 schema at once: replaying v1 -> v2 -> v3
             // (a table rebuild) leaves ~1 MB of SQLite heap behind, which
             // shows in the daemon's idle RSS.
-            return self.create_v3();
+            return self.create_v4();
         }
         // An existing DB is at v1 or later here (v1 created the `agents`
         // table); it migrates in place.
@@ -156,12 +161,22 @@ impl Store {
         if version < 3 {
             self.migrate_to_v3()?;
         }
+        if version < 4 {
+            // v4: the agent's CPU priority (ADR 0066). The column DDL must
+            // match `create_v4`'s (the schema-equality test compares them).
+            self.conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE agents ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 4;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
-    /// The v3 schema for a new DB; the same tables the v1 -> v2 -> v3
+    /// The v4 schema for a new DB; the same tables the v1 -> ... -> v4
     /// migrations produce.
-    fn create_v3(&self) -> rusqlite::Result<()> {
+    fn create_v4(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "BEGIN;
              CREATE TABLE agents (
@@ -172,7 +187,7 @@ impl Store {
                  state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
                  exit_code INTEGER,
                  created_unix_ms INTEGER NOT NULL,
-                 scrollback_path TEXT NOT NULL
+                 scrollback_path TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE agent_labels (
                  agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -184,7 +199,7 @@ impl Store {
                  old_id INTEGER PRIMARY KEY,
                  new_id INTEGER NOT NULL
              );
-             PRAGMA user_version = 3;
+             PRAGMA user_version = 4;
              COMMIT;",
         )
     }
@@ -202,7 +217,8 @@ impl Store {
     }
 
     /// The `agents_v3` and `agent_replacements` DDL here must stay in sync
-    /// with `create_v3` (the schema-equality test compares the two).
+    /// with `create_v4` before its v4 column (the schema-equality test
+    /// compares the two).
     fn rebuild_agents_v3(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch("BEGIN")?;
         let run = || -> rusqlite::Result<()> {
@@ -261,14 +277,15 @@ impl Store {
         let args_json = serde_json::to_string(&rec.args)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         self.conn.execute(
-            "INSERT INTO agents (program, args_json, cwd, state, created_unix_ms, scrollback_path)
-             VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+            "INSERT INTO agents (program, args_json, cwd, state, created_unix_ms, scrollback_path, priority)
+             VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)",
             (
                 &rec.program,
                 args_json,
                 &rec.cwd,
                 rec.created_unix_ms,
                 &rec.scrollback_path,
+                rec.priority,
             ),
         )?;
         let id = self.conn.last_insert_rowid() as u64;
@@ -546,7 +563,60 @@ mod tests {
             created_unix_ms: 1_000 + n,
             scrollback_path: format!("/sb/{n}.log"),
             labels: Labels::new(),
+            priority: 0,
         }
+    }
+
+    #[test]
+    fn schema_is_v4() {
+        assert_eq!(SCHEMA_VERSION, 4);
+    }
+
+    #[test]
+    fn priority_is_stored_with_the_agent() {
+        let (_d, _p, s) = open_tmp();
+        let a = s
+            .insert_agent(&NewAgent {
+                priority: 1,
+                ..new_agent(1)
+            })
+            .unwrap();
+        let (b, _) = s
+            .insert_agent_with_scrollback(
+                &NewAgent {
+                    priority: 2,
+                    ..new_agent(2)
+                },
+                |id| format!("/sb/{id}"),
+            )
+            .unwrap();
+        let c = s.insert_agent(&new_agent(3)).unwrap();
+        assert_eq!(s.agent(a).unwrap().unwrap().priority, 1);
+        assert_eq!(s.agent(b).unwrap().unwrap().priority, 2);
+        assert_eq!(s.agent(c).unwrap().unwrap().priority, 0);
+        let listed: HashMap<u64, i32> = s
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.priority))
+            .collect();
+        assert_eq!(listed, HashMap::from([(a, 1), (b, 2), (c, 0)]));
+    }
+
+    #[test]
+    fn v3_database_migrates_to_v4_with_default_priority() {
+        let (_d, p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        drop(s);
+        // Back to v3: what a v3 store left behind.
+        let conn = Connection::open(&p).unwrap();
+        conn.execute_batch("ALTER TABLE agents DROP COLUMN priority; PRAGMA user_version = 3;")
+            .unwrap();
+        drop(conn);
+        let s = Store::open(&p).unwrap();
+        assert_eq!(user_version(&p), 4);
+        let rec = s.agent(a).unwrap().unwrap();
+        assert_eq!((rec.program.as_str(), rec.priority), ("claude", 0));
     }
 
     fn open_tmp() -> (tempfile::TempDir, std::path::PathBuf, Store) {
@@ -646,7 +716,7 @@ mod tests {
         let (_d, p, s) = open_tmp();
         drop(s);
         let _s = Store::open(&p).unwrap();
-        assert_eq!(user_version(&p), 3);
+        assert_eq!(user_version(&p), SCHEMA_VERSION);
     }
 
     #[test]
@@ -655,7 +725,7 @@ mod tests {
         drop(s);
         Connection::open(&p)
             .unwrap()
-            .pragma_update(None, "user_version", 4)
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         assert!(Store::open(&p).is_err());
     }
@@ -767,7 +837,7 @@ mod tests {
         drop(conn);
 
         let s = Store::open(&p).unwrap();
-        assert_eq!(user_version(&p), 3);
+        assert_eq!(user_version(&p), SCHEMA_VERSION);
         let l = s.list_agents().unwrap();
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].program, "claude");
@@ -843,16 +913,18 @@ mod tests {
                 )
                 .unwrap();
             let sql = sql.replace(['"', '\''], "").replace("agents_v3", "agents");
+            // ALTER TABLE ADD COLUMN splices `, <column>` in before the `)`.
             let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let sql = sql.replace(" ,", ",").replace(" )", ")");
             out.push(format!("{table} sql {sql}"));
         }
         out
     }
 
     #[test]
-    fn new_database_is_created_at_v3_like_a_migrated_one() {
+    fn new_database_is_created_at_v4_like_a_migrated_one() {
         let (_d, fresh, s) = open_tmp();
-        assert_eq!(user_version(&fresh), 3);
+        assert_eq!(user_version(&fresh), SCHEMA_VERSION);
         let a = s.insert_agent(&new_agent(1)).unwrap();
         s.set_exited(a, 0).unwrap();
         assert!(s.forget_agent(a).unwrap());
@@ -928,7 +1000,7 @@ mod tests {
         drop(conn);
 
         let s = Store::open(&p).unwrap();
-        assert_eq!(user_version(&p), 3);
+        assert_eq!(user_version(&p), SCHEMA_VERSION);
         assert_eq!(
             s.agent(7).unwrap().unwrap().labels,
             labels(&[("project", "x")])

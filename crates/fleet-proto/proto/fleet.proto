@@ -99,6 +99,17 @@ message SpawnAgent {
   // Labels (ADR 0025): at most 64, keys 1-64 bytes, values up to 256 bytes;
   // keys starting with `fleet.` are reserved.
   map<string, string> labels = 8;
+  // CPU priority (ADR 0066); kept by RestartAgent.
+  AgentPriority priority = 9;
+}
+
+enum AgentPriority {
+  // The node's setting (`FLEETD_AGENT_NICE`; off by default).
+  AGENT_PRIORITY_DEFAULT = 0;
+  // Never lowered, whatever the node's setting.
+  AGENT_PRIORITY_NORMAL = 1;
+  // Lowered by the node's setting, or by 10 when it is off.
+  AGENT_PRIORITY_LOW = 2;
 }
 
 // Only agents whose labels contain every selector pair; empty means all.
