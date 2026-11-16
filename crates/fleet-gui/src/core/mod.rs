@@ -36,6 +36,7 @@ pub mod status;
 pub mod status_menu;
 pub mod style;
 pub mod switcher;
+pub mod tabs;
 pub mod target;
 pub mod text_edit;
 pub mod theme;

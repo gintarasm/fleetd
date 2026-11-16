@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::layout::SavedLayout;
+use super::layout::{Layout, SavedLayout};
+use super::tabs::{SavedTabs, Tabs};
 use super::target::Target;
 
 pub const MAX_RECENT_TARGETS: usize = 10;
@@ -31,6 +32,11 @@ pub struct GuiState {
     /// Keyed by target string. Entries that do not parse (old or unknown shape) are dropped.
     #[serde(deserialize_with = "lenient_layouts")]
     pub layouts: BTreeMap<String, SavedLayout>,
+    /// Keyed by target string: the workspace tabs (ADR 0061). Where
+    /// present it wins over `layouts`, which keeps the shown tab's layout
+    /// for older builds. Entries that do not parse are dropped.
+    #[serde(deserialize_with = "lenient_tabs")]
+    pub tabs: BTreeMap<String, SavedTabs>,
     /// Keyed by target string: the titles of the sidebar groups shown
     /// collapsed (issue #40).
     pub collapsed_groups: BTreeMap<String, BTreeSet<String>>,
@@ -48,6 +54,14 @@ fn lenient_layouts<'de, D: Deserializer<'de>>(
     Ok(raw
         .into_iter()
         .filter_map(|(k, v)| v.try_into().ok().map(|l| (k, l)))
+        .collect())
+}
+
+fn lenient_tabs<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, SavedTabs>, D::Error> {
+    let raw = BTreeMap::<String, toml::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(k, v)| v.try_into().ok().map(|t| (k, t)))
         .collect())
 }
 
@@ -71,6 +85,25 @@ impl GuiState {
             eprintln!("fleet-gui: ignoring corrupt {}: {e}", path.display());
             GuiState::default()
         })
+    }
+
+    /// `target`'s saved tabs; else one tab with its layout saved before
+    /// tabs; else one empty pane.
+    pub fn saved_tabs(&self, target: &Target) -> Tabs {
+        let key = target.to_string();
+        match (self.tabs.get(&key), self.layouts.get(&key)) {
+            (Some(t), _) => Tabs::from_saved(t),
+            (None, Some(l)) => Tabs::from_layout(Layout::from_saved(l)),
+            (None, None) => Tabs::single(),
+        }
+    }
+
+    /// Records `tabs` for `target`, and the shown tab's layout as the
+    /// target's single layout (what older builds read).
+    pub fn set_tabs(&mut self, target: &Target, tabs: &Tabs) {
+        let key = target.to_string();
+        self.layouts.insert(key.clone(), tabs.layout().to_saved());
+        self.tabs.insert(key, tabs.to_saved());
     }
 
     /// Atomic (temp file + rename), mode 0600.
@@ -118,6 +151,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::core::layout::Layout;
+    use crate::core::session::PaneId;
 
     #[test]
     fn state_roundtrip_is_0600_and_atomic() {
@@ -177,6 +212,51 @@ mod tests {
         let s = GuiState::load(dir.path());
         assert_eq!(s.recent_targets, [Target::Local]);
         assert!(s.layouts.is_empty());
+    }
+
+    #[test]
+    fn tabs_roundtrip_and_a_bad_entry_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tabs = Tabs::single();
+        tabs.new_tab();
+        let mut s = GuiState::default();
+        s.tabs.insert("local".into(), tabs.to_saved());
+        s.save(dir.path()).unwrap();
+        assert_eq!(GuiState::load(dir.path()), s);
+
+        let text = std::fs::read_to_string(dir.path().join("gui-state.toml")).unwrap();
+        std::fs::write(
+            dir.path().join("gui-state.toml"),
+            format!("{text}\n[tabs.\"me@box\"]\ntabs = 3\n"),
+        )
+        .unwrap();
+        let back = GuiState::load(dir.path());
+        assert_eq!(back.tabs.len(), 1);
+        assert_eq!(back.tabs["local"], tabs.to_saved());
+    }
+
+    #[test]
+    fn saved_tabs_win_over_an_older_single_layout() {
+        let mut s = GuiState::default();
+        let mut old = Layout::single();
+        old.set_agent(PaneId(1), Some(4));
+        s.layouts.insert("local".into(), old.to_saved());
+        // Only the old layout: one tab with it.
+        let t = s.saved_tabs(&Target::Local);
+        assert_eq!((t.len(), t.layout().agent(PaneId(1))), (1, Some(4)));
+        // Tabs saved too: they are used.
+        let mut tabs = Tabs::single();
+        tabs.new_tab();
+        s.tabs.insert("local".into(), tabs.to_saved());
+        assert_eq!(s.saved_tabs(&Target::Local), tabs);
+        // Recording keeps the shown tab as the single layout.
+        tabs.select(0);
+        s.set_tabs(&Target::Local, &tabs);
+        assert_eq!(s.layouts["local"], tabs.layout().to_saved());
+        assert_eq!(s.tabs["local"], tabs.to_saved());
+        // Nothing saved: one empty pane.
+        let ssh = Target::Ssh { dest: "b".into() };
+        assert_eq!(s.saved_tabs(&ssh), Tabs::single());
     }
 
     #[test]
