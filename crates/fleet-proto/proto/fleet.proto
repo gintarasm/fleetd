@@ -1,7 +1,13 @@
 syntax = "proto3";
 package fleet.v1;
 
-message Hello { uint32 protocol_version = 1; string client = 2; }
+message Hello {
+  uint32 protocol_version = 1;
+  string client = 2;
+  // The caller's `FLEET_AGENT_TOKEN` (ADR 0072), when it has one; empty
+  // otherwise. The CLI sends it, the GUI never does.
+  string agent_token = 40;
+}
 message HelloOk {
   uint32 protocol_version = 1;
   string server = 2;
@@ -83,6 +89,7 @@ message Event {
     LogLine log_line = 5;
     AgentResized agent_resized = 6;
     AgentRemoved agent_removed = 7;
+    SpawnRefused spawn_refused = 40;
   }
 }
 
@@ -223,3 +230,7 @@ message ReadLogs { uint32 tail = 1; bool follow = 2; }
 message StopLogs {}
 message LogLines { repeated string lines = 1; }
 message LogLine { string line = 1; }
+
+// An agent's spawn was refused by a quota (spec §1): `parent` is the agent
+// that asked, `reason` the refusal's text (after "forbidden: ").
+message SpawnRefused { uint64 parent = 1; string reason = 2; }

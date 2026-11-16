@@ -370,6 +370,7 @@ fn hello(version: u32) -> Frame {
     Frame::Hello(Hello {
         protocol_version: version,
         client: "protocol-test".into(),
+        ..Default::default()
     })
 }
 

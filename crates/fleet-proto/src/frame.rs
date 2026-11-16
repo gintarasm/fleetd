@@ -211,6 +211,7 @@ mod tests {
             Frame::Hello(Hello {
                 protocol_version: 1,
                 client: "cli".into(),
+                ..Default::default()
             }),
             Frame::HelloOk(HelloOk {
                 protocol_version: 1,

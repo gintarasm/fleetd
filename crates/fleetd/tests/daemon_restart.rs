@@ -148,6 +148,7 @@ impl Client {
         c.try_send(Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client: "restart-test".into(),
+            ..Default::default()
         }))
         .ok()?;
         match c.read_frame() {

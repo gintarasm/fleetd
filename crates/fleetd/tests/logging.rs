@@ -102,6 +102,7 @@ impl Client {
         c.send(Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client: "logging-test".into(),
+            ..Default::default()
         }));
         match c.next_frame(TIMEOUT) {
             Some(Frame::HelloOk(_)) => c,

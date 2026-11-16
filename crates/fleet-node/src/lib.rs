@@ -5,8 +5,10 @@ pub mod host;
 pub mod node;
 pub mod priority;
 pub mod pty;
+pub mod scope;
 pub mod scrollback;
 pub mod store;
+pub mod token;
 pub mod term {
     pub use fleet_term::*;
 }

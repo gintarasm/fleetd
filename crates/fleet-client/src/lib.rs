@@ -66,6 +66,34 @@ impl From<io::Error> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The `Hello` a client named `client_name` sends, without an agent token.
+fn hello(client_name: &str) -> Hello {
+    Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client: client_name.into(),
+        ..Default::default()
+    }
+}
+
+/// `$FLEET_AGENT_TOKEN`, when set and not empty: the token fleetd gave the
+/// agent this process runs in (or was started by).
+pub fn agent_token_from_env() -> Option<String> {
+    std::env::var(fleet_proto::AGENT_TOKEN_ENV)
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+impl Error {
+    /// Whether the server refused the request by scope or quota (ADR
+    /// 0072): its message starts `forbidden:`. The CLI exits 3 for it.
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, Error::Server(m) if m.starts_with(FORBIDDEN_PREFIX))
+    }
+}
+
+/// How a refusal's message starts.
+pub const FORBIDDEN_PREFIX: &str = "forbidden:";
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -174,7 +202,7 @@ impl Connection {
         write: Box<dyn Write + Send>,
         client_name: &str,
     ) -> Result<Connection> {
-        Self::over_within(read, write, client_name, HANDSHAKE_TIMEOUT, || {})
+        Self::over_within(read, write, hello(client_name), HANDSHAKE_TIMEOUT, || {})
     }
 
     /// Runs the handshake on its own thread, so a peer that never answers
@@ -183,16 +211,15 @@ impl Connection {
     fn over_within(
         read: Box<dyn Read + Send>,
         write: Box<dyn Write + Send>,
-        client_name: &str,
+        hello: Hello,
         timeout: Duration,
         on_timeout: impl FnOnce(),
     ) -> Result<Connection> {
         let (tx, rx) = mpsc::channel();
-        let name = client_name.to_owned();
         thread::Builder::new()
             .name("fleet-handshake".into())
             .spawn(move || {
-                let _ = tx.send(Self::handshake(read, write, &name));
+                let _ = tx.send(Self::handshake(read, write, hello));
             })?;
         match rx.recv_timeout(timeout) {
             Ok(r) => r,
@@ -209,7 +236,7 @@ impl Connection {
     fn handshake(
         read: Box<dyn Read + Send>,
         write: Box<dyn Write + Send>,
-        client_name: &str,
+        hello: Hello,
     ) -> Result<Connection> {
         let mut conn = Connection {
             reader: FrameReader {
@@ -225,13 +252,7 @@ impl Connection {
         };
         let mut out = BytesMut::new();
         FrameCodec::new()
-            .encode(
-                Frame::Hello(Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                    client: client_name.into(),
-                }),
-                &mut out,
-            )
+            .encode(Frame::Hello(hello), &mut out)
             .map_err(|e| Error::Protocol(e.to_string()))?;
         conn.sender.stream.write_all(&out)?;
         conn.sender.stream.flush()?;
@@ -253,12 +274,30 @@ impl Connection {
         Self::unix_with_timeout(path, client_name, HANDSHAKE_TIMEOUT)
     }
 
+    /// [`Connection::unix`], sending `agent_token` in the `Hello` (ADR
+    /// 0072): the CLI passes [`agent_token_from_env`]. fleetd identifies the
+    /// caller by its session first, so the token only matters for a process
+    /// that left its agent's session.
+    pub fn unix_as(
+        path: &Path,
+        client_name: &str,
+        agent_token: Option<&str>,
+    ) -> Result<Connection> {
+        let mut hello = hello(client_name);
+        hello.agent_token = agent_token.unwrap_or_default().to_owned();
+        Self::unix_hello(path, hello, HANDSHAKE_TIMEOUT)
+    }
+
     /// Like [`Connection::unix`] with a caller-chosen handshake timeout.
     pub fn unix_with_timeout(
         path: &Path,
         client_name: &str,
         timeout: Duration,
     ) -> Result<Connection> {
+        Self::unix_hello(path, hello(client_name), timeout)
+    }
+
+    fn unix_hello(path: &Path, hello: Hello, timeout: Duration) -> Result<Connection> {
         let stream = match UnixStream::connect(path) {
             Ok(s) => s,
             Err(e)
@@ -276,7 +315,7 @@ impl Connection {
         let mut conn = Self::over_within(
             Box::new(stream.try_clone()?),
             Box::new(stream),
-            client_name,
+            hello,
             timeout,
             move || {
                 let _ = closer.shutdown(Shutdown::Both);
@@ -313,7 +352,7 @@ impl Connection {
         let r = Self::over_within(
             Box::new(stdout),
             Box::new(stdin),
-            client_name,
+            hello(client_name),
             timeout,
             move || {
                 // Ends the child, and with it the handshake thread's read.
@@ -440,7 +479,7 @@ mod tests {
             Connection::over_within(
                 Box::new(client.try_clone().unwrap()),
                 Box::new(client),
-                "t",
+                hello("t"),
                 SHORT,
                 move || {
                     let _ = closer.shutdown(Shutdown::Both);

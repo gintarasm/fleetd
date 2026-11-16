@@ -20,3 +20,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Version of the handoff record; a successor refuses a record it cannot read.
 pub const HANDOFF_VERSION: u32 = 1;
+
+/// The environment variable holding an agent's token (ADR 0072): set by the
+/// node in every agent's environment, sent by the CLI in `Hello`.
+pub const AGENT_TOKEN_ENV: &str = "FLEET_AGENT_TOKEN";
