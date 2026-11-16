@@ -109,6 +109,9 @@ pub struct Tokens {
     pub selection: Rgba,
     /// Behind the IME's marked text.
     pub marked: Rgba,
+    /// Over find matches, and over the current one.
+    pub find_match: Rgba,
+    pub find_current: Rgba,
     pub danger: Rgba,
     pub success: Rgba,
     /// An agent that needs you (the system orange, accessible variant).
@@ -147,19 +150,19 @@ pub const LIGHT_PALETTE: Palette = Palette {
     ansi: [
         (0x24, 0x29, 0x2e),
         (0xc8, 0x28, 0x29),
-        (0x3a, 0x86, 0x2c),
-        (0x9a, 0x6a, 0x00),
+        (0x2f, 0x7d, 0x24),
+        (0x8a, 0x5f, 0x00),
         (0x20, 0x5e, 0xc4),
         (0x8e, 0x3c, 0xa8),
-        (0x10, 0x80, 0x8c),
+        (0x0c, 0x72, 0x7d),
         (0xbc, 0xbc, 0xbc),
         (0x6a, 0x73, 0x7d),
-        (0xe0, 0x40, 0x40),
-        (0x4c, 0xa0, 0x3c),
-        (0xb8, 0x84, 0x10),
-        (0x3a, 0x78, 0xe0),
-        (0xa8, 0x54, 0xc4),
-        (0x20, 0x9a, 0xa6),
+        (0xd0, 0x38, 0x38),
+        (0x3e, 0x83, 0x31),
+        (0x94, 0x69, 0x0c),
+        (0x37, 0x72, 0xd5),
+        (0xa4, 0x52, 0xbf),
+        (0x1b, 0x80, 0x8a),
         (0xe8, 0xe8, 0xe8),
     ],
 };
@@ -169,6 +172,27 @@ impl Tokens {
         match appearance {
             Appearance::Dark => Tokens::dark(),
             Appearance::Light => Tokens::light(),
+        }
+    }
+
+    /// These tokens with the window tint at `[gui] window_opacity` `a`
+    /// (kept within the range text stays readable in). The setting scales
+    /// each theme's own transparency: at the default the tint is the
+    /// theme's (0.84 dark, 0.94 light), at 1 it is opaque. Light's text
+    /// needs at least its own tint for WCAG AA (#47), so there the setting
+    /// only ever makes the window more opaque.
+    pub fn with_window_opacity(self, a: f32) -> Tokens {
+        use super::settings::{DEFAULT_OPACITY, OPACITY_MAX, OPACITY_MIN};
+        let a = a.clamp(OPACITY_MIN, OPACITY_MAX);
+        let scale = (1.0 - self.window.a) / (1.0 - DEFAULT_OPACITY);
+        let scaled = 1.0 - (1.0 - a) * scale;
+        let a = match self.appearance {
+            Appearance::Light => scaled.max(self.window.a),
+            Appearance::Dark => scaled,
+        };
+        Tokens {
+            window: Rgba { a, ..self.window },
+            ..self
         }
     }
 
@@ -208,6 +232,8 @@ impl Tokens {
             accent: rgb(0x0a84ff),
             selection: rgba(0x3f8cf0, 0.35),
             marked: rgb(0x3a3d44),
+            find_match: rgba(0xffd60a, 0.28),
+            find_current: rgba(0xff9f0a, 0.6),
             danger: rgb(0xff6961),
             success: rgb(0x32d74b),
             warning: rgb(0xffb340),
@@ -219,7 +245,7 @@ impl Tokens {
         Tokens {
             appearance: Appearance::Light,
             palette: LIGHT_PALETTE,
-            window: rgba(0xeeeeee, 0.84),
+            window: rgba(0xf0f0f2, 0.94),
             card: Rgba::from_palette(LIGHT_PALETTE.bg, 0.98),
             raised: rgba(0xffffff, 0.98),
             field: rgba(0xffffff, 0.85),
@@ -229,16 +255,91 @@ impl Tokens {
             border: rgba(0x000000, 0.12),
             separator: rgba(0x000000, 0.08),
             text: rgb(0x1d1d1f),
-            secondary: rgb(0x5f5f66),
-            tertiary: rgb(0x8e8e94),
+            secondary: rgb(0x48484e),
+            tertiary: rgb(0x5a5a5e),
             accent: rgb(0x007aff),
-            selection: rgba(0x3a78e0, 0.28),
+            selection: rgba(0x007aff, 0.22),
             marked: rgb(0xdde4ee),
+            find_match: rgba(0xffcc00, 0.35),
+            find_current: rgba(0xff9500, 0.55),
             danger: rgb(0xd70015),
-            success: rgb(0x248a3d),
+            success: rgb(0x23873c),
             warning: rgb(0xc93400),
             shadow: rgba(0x000000, 0.18),
         }
+        .with_accent(rgb(0x007aff))
+    }
+
+    /// These tokens in the user's accent colour: the accent, and the
+    /// selection tint in its hue at the selection's own alpha.
+    pub fn with_accent(self, accent: Rgba) -> Tokens {
+        let accent = self.legible_accent(accent);
+        Tokens {
+            accent,
+            selection: Rgba {
+                a: self.selection.a,
+                ..accent
+            },
+            ..self
+        }
+    }
+
+    /// `accent` darkened, keeping its hue, just enough to read as text
+    /// (WCAG AA, 4.5:1) on every light surface: the bar's buttons are
+    /// labelled in it and the white label of a primary button sits on it.
+    /// The system's light accents (blue, yellow, pink...) are too pale on
+    /// a light grey. Dark mode keeps the accent as it is.
+    pub fn legible_accent(&self, accent: Rgba) -> Rgba {
+        if self.appearance == Appearance::Dark {
+            return accent;
+        }
+        let surfaces = self.light_text_surfaces();
+        let reads = |c: Rgba| surfaces.iter().all(|&s| contrast(c, s) >= 4.5);
+        let scaled = |k: f32| {
+            let s = |v: u8| (f32::from(v) * k).round() as u8;
+            Rgba {
+                r: s(accent.r),
+                g: s(accent.g),
+                b: s(accent.b),
+                a: 1.0,
+            }
+        };
+        let solid = Rgba { a: 1.0, ..accent };
+        if reads(solid) {
+            return solid;
+        }
+        // The largest scale that reads (black always does).
+        let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+        for _ in 0..24 {
+            let mid = (lo + hi) / 2.0;
+            if reads(scaled(mid)) {
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+        scaled(lo)
+    }
+
+    /// Every opaque colour text is drawn on in light, over a white and a
+    /// black desktop: the window tint bare, hovered and selected (the
+    /// sidebar's rows), the cards, the sheets and their fields.
+    fn light_text_surfaces(&self) -> Vec<Rgba> {
+        [rgb(0xffffff), rgb(0x000000)]
+            .into_iter()
+            .flat_map(|desktop| {
+                let w = self.window.over(desktop);
+                let raised = self.raised.over(w);
+                [
+                    w,
+                    self.hover.over(w),
+                    self.selected.over(w),
+                    self.card.over(w),
+                    raised,
+                    self.field.over(raised),
+                ]
+            })
+            .collect()
     }
 }
 
@@ -285,6 +386,153 @@ mod tests {
         assert!(contrast(t.danger, t.raised.over(t.window.over(BLACK))) >= 3.0);
     }
 
+    /// The light window's surfaces text sits on, over either desktop:
+    /// the bare tint, and a sidebar row hovered or selected on it.
+    fn light_window_surfaces(t: &Tokens) -> Vec<Rgba> {
+        backdrops(t.window)
+            .into_iter()
+            .flat_map(|w| [w, t.hover.over(w), t.selected.over(w)])
+            .collect()
+    }
+
+    /// Cards, sheets and the field wells on sheets, over either desktop.
+    fn light_raised_surfaces(t: &Tokens) -> Vec<Rgba> {
+        backdrops(t.window)
+            .into_iter()
+            .flat_map(|w| {
+                let raised = t.raised.over(w);
+                [t.card.over(w), raised, t.field.over(raised)]
+            })
+            .collect()
+    }
+
+    fn min_contrast(fg: Rgba, surfaces: &[Rgba]) -> f64 {
+        surfaces
+            .iter()
+            .map(|&s| contrast(fg, s))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// WCAG AA for text (4.5:1) everywhere in light, and 3:1 for marks
+    /// and outlines that carry meaning (status dots, the focus ring).
+    fn check_light_aa(t: &Tokens) {
+        let window = light_window_surfaces(t);
+        let raised = light_raised_surfaces(t);
+        let all: Vec<Rgba> = window.iter().chain(&raised).copied().collect();
+        for (name, fg) in [
+            ("text", t.text),
+            ("secondary", t.secondary),
+            ("tertiary", t.tertiary),
+        ] {
+            let c = min_contrast(fg, &all);
+            assert!(c >= 4.5, "light {name} text {c:.2}");
+        }
+        // Each level stays a step apart from the next.
+        assert!(t.secondary.luminance() > t.text.luminance() * 1.5);
+        assert!(t.tertiary.luminance() > t.secondary.luminance() * 1.2);
+        // The accent labels the bar's buttons and draws the focus ring.
+        let c = min_contrast(t.accent, &all);
+        assert!(c >= 4.5, "light accent text {c:.2}");
+        let c = contrast(WHITE, t.accent);
+        assert!(c >= 4.5, "white on a light primary button {c:.2}");
+        // Errors are written on sheets; danger outlines the toast.
+        let c = min_contrast(t.danger, &raised);
+        assert!(c >= 4.5, "light danger text {c:.2}");
+        let c = min_contrast(t.danger, &window);
+        assert!(c >= 3.0, "light danger outline {c:.2}");
+        let c = min_contrast(t.success, &window);
+        assert!(c >= 3.0, "light running dot {c:.2}");
+    }
+
+    #[test]
+    fn light_text_meets_wcag_aa_on_every_surface() {
+        check_light_aa(&Tokens::light());
+        check_light_aa(&Tokens::light().opaque());
+    }
+
+    #[test]
+    fn light_terminal_colours_meet_wcag_aa() {
+        let t = Tokens::light();
+        let cards: Vec<Rgba> = backdrops(t.window)
+            .into_iter()
+            .map(|w| t.card.over(w))
+            .collect();
+        let p = t.palette;
+        let fg = Rgba::from_palette(p.fg, 1.0);
+        assert!(min_contrast(fg, &cards) >= 7.0);
+        // 7 and 15 (white, bright white) are background colours on a
+        // light terminal, as in Terminal.app's light profiles; every
+        // other colour is text.
+        for i in (0..16).filter(|&i| i != 7 && i != 15) {
+            let c = min_contrast(Rgba::from_palette(p.ansi[i], 1.0), &cards);
+            assert!(c >= 4.5, "light ansi {i} {c:.2}");
+        }
+        // Black text on a white background stays readable.
+        let white = Rgba::from_palette(p.ansi[7], 1.0);
+        assert!(contrast(Rgba::from_palette(p.ansi[0], 1.0), white) >= 4.5);
+        // Selected text: the foreground stays AAA, colours stay visible.
+        for card in cards {
+            let sel = t.selection.over(card);
+            // Still visibly a selection.
+            assert!(contrast(sel, card) >= 1.3, "light selection {sel:?}");
+            let c = contrast(fg, sel);
+            assert!(c >= 7.0, "light selected text {c:.2}");
+            for i in (0..16).filter(|&i| i != 7 && i != 15) {
+                let c = contrast(Rgba::from_palette(p.ansi[i], 1.0), sel);
+                assert!(c >= 3.0, "light selected ansi {i} {c:.2}");
+            }
+        }
+    }
+
+    #[test]
+    fn light_accent_is_darkened_until_it_reads_as_text() {
+        let t = Tokens::light();
+        let all: Vec<Rgba> = light_window_surfaces(&t)
+            .into_iter()
+            .chain(light_raised_surfaces(&t))
+            .collect();
+        // The system's yellow and blue: too light as text on light grey.
+        for user in [rgb(0xffc600), rgb(0x007aff), rgb(0xf74f9e)] {
+            let accent = t.legible_accent(user);
+            let c = min_contrast(accent, &all);
+            assert!(c >= 4.5, "{user:?} -> {accent:?} {c:.2}");
+            // As little as needed: a step lighter would fail.
+            let lighter = Rgba {
+                r: accent.r.saturating_add(3),
+                g: accent.g.saturating_add(3),
+                b: accent.b.saturating_add(3),
+                a: 1.0,
+            };
+            assert!(min_contrast(lighter, &all) < 4.6, "{user:?} -> {accent:?}");
+            // Same hue: the channels keep their order.
+            let order = |c: Rgba| {
+                let mut v = [(c.r, 0), (c.g, 1), (c.b, 2)];
+                v.sort();
+                v.map(|(_, i)| i)
+            };
+            assert_eq!(order(accent), order(user), "{user:?} -> {accent:?}");
+        }
+        // Dark enough already: kept.
+        assert_eq!(t.legible_accent(rgb(0x1e40af)), rgb(0x1e40af));
+        // Dark mode keeps the user's accent as it is.
+        assert_eq!(Tokens::dark().legible_accent(rgb(0xffc600)), rgb(0xffc600));
+    }
+
+    #[test]
+    fn with_accent_sets_the_accent_and_tints_the_selection() {
+        let t = Tokens::light().with_accent(rgb(0xffc600));
+        assert_eq!(t.accent, Tokens::light().legible_accent(rgb(0xffc600)));
+        assert_eq!((t.selection.r, t.selection.g, t.selection.b), {
+            let a = t.accent;
+            (a.r, a.g, a.b)
+        });
+        assert_eq!(t.selection.a, Tokens::light().selection.a);
+        check_light_aa(&t);
+        let d = Tokens::dark().with_accent(rgb(0xff0000));
+        assert_eq!(d.accent, rgb(0xff0000));
+        assert_eq!(d.selection.a, Tokens::dark().selection.a);
+    }
+
     #[test]
     fn text_is_readable_over_any_desktop() {
         check(&Tokens::dark());
@@ -315,6 +563,31 @@ mod tests {
             // Only the surfaces change.
             assert_eq!(o.text, t.text);
             assert_eq!(o.palette, t.palette);
+        }
+    }
+
+    #[test]
+    fn text_stays_readable_across_the_window_opacity_range() {
+        use crate::core::settings::{DEFAULT_OPACITY, OPACITY_MAX, OPACITY_MIN};
+        for t in [Tokens::dark(), Tokens::light()] {
+            for a in [OPACITY_MIN, DEFAULT_OPACITY, OPACITY_MAX] {
+                check(&t.with_window_opacity(a));
+            }
+            assert_eq!(t.with_window_opacity(DEFAULT_OPACITY), t);
+            assert_eq!(t.with_window_opacity(OPACITY_MAX).window.a, 1.0);
+            assert_eq!(
+                t.with_window_opacity(0.1),
+                t.with_window_opacity(OPACITY_MIN)
+            );
+        }
+        // Dark follows the setting as is.
+        assert_eq!(
+            Tokens::dark().with_window_opacity(OPACITY_MIN).window.a,
+            OPACITY_MIN
+        );
+        // Light keeps WCAG AA over the whole range (#47).
+        for a in [OPACITY_MIN, DEFAULT_OPACITY, OPACITY_MAX] {
+            check_light_aa(&Tokens::light().with_window_opacity(a));
         }
     }
 
