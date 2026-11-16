@@ -8,10 +8,10 @@ use std::time::Duration;
 use fleet_term::CursorShape;
 use gpui::{
     AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, UTF16Selection, Window, div,
-    point, px, size,
+    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    UTF16Selection, Window, div, point, px, size,
 };
 
 use super::controls;
@@ -25,6 +25,7 @@ use super::theme::{Typography, current as theme};
 use crate::core::config::GuiConfig;
 use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
+use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
 use crate::core::pane::{PaneModel, PaneState, ViewRow};
 use crate::core::selection::{LineRef, SelPoint};
@@ -137,6 +138,9 @@ pub struct PaneChrome {
     pub program: Option<String>,
     /// The agent's directory, with `~`.
     pub cwd: Option<String>,
+    /// The agent's directory when it is on this machine: file paths in the
+    /// pane resolve against it and become links (ADR 0046).
+    pub link_dir: Option<String>,
     /// A spawn into this pane is on its way.
     pub starting: bool,
     /// When the control connection retries, while it is down.
@@ -242,6 +246,35 @@ pub struct PaneView {
     /// The window whose activation the cursor follows, and that
     /// subscription (renewed when the view moves to a new window).
     activation: Option<(AnyWindowHandle, Subscription)>,
+    /// `[gui] editor`, for ⌘-clicked files.
+    pub(crate) editor: String,
+    /// The link under the pointer while ⌘ is held: its line and columns.
+    hover: Option<(LineRef, u16, u16)>,
+    /// Runs a command that opens a file, and the one to run when that
+    /// cannot start (replaced in tests).
+    pub(crate) open_file: Arc<dyn Fn(Vec<String>, Vec<String>)>,
+}
+
+/// Runs `argv` detached; when it cannot start (an editor not on the app's
+/// `PATH`), opens the file in the default text editor instead.
+fn spawn_opener(argv: Vec<String>, fallback: Vec<String>) {
+    let run = |argv: &[String]| {
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    let child = run(&argv).or_else(|_| run(&fallback));
+    match child {
+        // Reaped off the UI thread.
+        Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+        Err(e) => eprintln!(
+            "fleet-gui: cannot open {}: {e}",
+            fallback.last().map_or("", String::as_str)
+        ),
+    }
 }
 
 impl PaneView {
@@ -268,6 +301,90 @@ impl PaneView {
             wheel_lines: 0.0,
             pill: None,
             activation: None,
+            editor: config.editor.clone(),
+            hover: None,
+            open_file: Arc::new(spawn_opener),
+        }
+    }
+
+    /// The link underlined under the pointer: its line and columns.
+    #[cfg(test)]
+    pub(crate) fn hovered_link(&self) -> Option<(LineRef, u16, u16)> {
+        self.hover
+    }
+
+    /// The link under `pos`, if any, on the line it is on.
+    fn link_under(&self, pos: Point<Pixels>) -> Option<(LineRef, Link)> {
+        let l = self.layout?;
+        let model = self.model();
+        let term = model.terminal();
+        let (cols, rows) = term.size();
+        let grid = Bounds::new(
+            l.origin,
+            size(l.cell_w * f32::from(cols), l.line_h * f32::from(rows)),
+        );
+        if !grid.contains(&pos) {
+            return None;
+        }
+        let (col, row) = point_to_cell(pos, grid, l.cell_w, l.line_h, cols, rows);
+        let mut cells = Vec::with_capacity(usize::from(cols));
+        let (line, osc8) = match model.view_row(row) {
+            ViewRow::History(abs) => {
+                model.history_cells(abs, &mut cells);
+                (LineRef::History(abs), None)
+            }
+            ViewRow::Grid(r) => {
+                term.row_cells(r, &mut cells);
+                (LineRef::Grid(r), term.hyperlink_at(r, col))
+            }
+        };
+        let osc8 = osc8.as_ref().map(|(uri, start, end)| Osc8 {
+            uri,
+            start: *start,
+            end: *end,
+        });
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let is_file = |p: &std::path::Path| p.is_file();
+        let files = self.chrome.link_dir.as_deref().map(|cwd| Files {
+            cwd: std::path::Path::new(cwd),
+            home: home.as_deref(),
+            is_file: &is_file,
+        });
+        link_at(&cells, col, osc8, files.as_ref()).map(|link| (line, link))
+    }
+
+    /// Underlines the link under `pos` while ⌘ is held and no drag is on.
+    fn update_hover(&mut self, pos: Point<Pixels>, m: Modifiers, cx: &mut Context<Self>) {
+        let hover = (m.platform && self.drag.is_none())
+            .then(|| self.link_under(pos))
+            .flatten()
+            .map(|(line, l)| (line, l.start, l.end));
+        if hover != self.hover {
+            self.hover = hover;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn modifiers_changed(
+        &mut self,
+        m: Modifiers,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_hover(pos, m, cx);
+    }
+
+    /// Opens a link: URLs through the system, files in the editor.
+    fn open_link(&self, target: LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Url(url) => cx.open_url(&url),
+            LinkTarget::File { path, line, col } => {
+                let visual = std::env::var("VISUAL").ok();
+                let env_editor = std::env::var("EDITOR").ok();
+                let editor = pick_editor(&self.editor, visual.as_deref(), env_editor.as_deref());
+                let argv = editor_command(editor.as_deref(), &path, line, col);
+                (self.open_file)(argv, editor_command(None, &path, None, None));
+            }
         }
     }
 
@@ -395,6 +512,15 @@ impl PaneView {
         let Some(button) = to_button(ev.button) else {
             return;
         };
+        // ⌘-click on a link opens it, even when the agent reports the mouse.
+        let link = (button == MouseButton::Left && ev.modifiers.platform)
+            .then(|| self.link_under(ev.position))
+            .flatten();
+        if let Some((_, link)) = link {
+            self.drag = None;
+            self.open_link(link.target, cx);
+            return;
+        }
         let mut model = lock(&self.model);
         let Some(at) = cell_at(self.layout, &model, ev.position) else {
             return;
@@ -442,6 +568,7 @@ impl PaneView {
         cx: &mut Context<Self>,
     ) {
         let Some(drag) = self.drag else {
+            self.update_hover(ev.position, ev.modifiers, cx);
             return;
         };
         let pressed = ev.pressed_button.and_then(to_button);
@@ -637,6 +764,7 @@ impl Render for PaneView {
             focused,
             show_cursor: draws_cursor(&self.chrome, state),
             marked: self.marked.clone(),
+            link: self.hover,
         };
         let chrome = &self.chrome;
         let (title_text, path) = header_parts(chrome, title.as_deref());
@@ -784,6 +912,11 @@ impl Render for PaneView {
             .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
+            // Keyboard focus path only: ⌘ pressed over an unfocused pane shows
+            // its link on the next pointer move.
+            .on_modifiers_changed(cx.listener(|v, ev: &ModifiersChangedEvent, window, cx| {
+                v.modifiers_changed(ev.modifiers, window.mouse_position(), cx);
+            }))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .size_full()
@@ -1164,6 +1297,118 @@ mod tests {
                 b"\x1b[<0;5;1m".to_vec()
             ]
         );
+    }
+
+    fn hovered(view: &Entity<PaneView>, cx: &mut VisualTestContext) -> Option<(LineRef, u16, u16)> {
+        view.read_with(cx, |v, _| v.hovered_link())
+    }
+
+    /// Records the commands the view would run to open files.
+    fn record_opens(
+        view: &Entity<PaneView>,
+        cx: &mut VisualTestContext,
+    ) -> Arc<Mutex<Vec<Vec<String>>>> {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&opened);
+        view.update(cx, |v, _| {
+            v.open_file = Arc::new(move |argv, _| sink.lock().unwrap().push(argv));
+        });
+        opened
+    }
+
+    #[gpui::test]
+    fn cmd_hover_underlines_a_url_and_cmd_click_opens_it(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"PR https://a.io/p/1 ok");
+        let (view, _sink, cx) = pane(cx, model);
+        let at = cell(&view, cx, 6, 0);
+
+        // Without Command: no link, and a click opens nothing.
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        assert_eq!(hovered(&view, cx), None);
+        cx.simulate_click(at, Modifiers::none());
+        assert_eq!(cx.opened_url(), None);
+
+        cx.simulate_mouse_move(at, None, Modifiers::command());
+        assert_eq!(hovered(&view, cx), Some((LineRef::Grid(0), 3, 19)));
+        // Off the link.
+        let p = cell(&view, cx, 20, 0);
+        cx.simulate_mouse_move(p, None, Modifiers::command());
+        assert_eq!(hovered(&view, cx), None);
+
+        cx.simulate_click(at, Modifiers::command());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://a.io/p/1"));
+        // The click does not start a selection.
+        assert_eq!(selected(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn pressing_and_releasing_cmd_over_a_link_toggles_the_underline(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"https://a.io");
+        let (view, _sink, cx) = pane(cx, model);
+        let p = cell(&view, cx, 2, 0);
+        cx.simulate_mouse_move(p, None, Modifiers::none());
+        cx.simulate_modifiers_change(Modifiers::command());
+        assert_eq!(hovered(&view, cx), Some((LineRef::Grid(0), 0, 12)));
+        cx.simulate_modifiers_change(Modifiers::none());
+        assert_eq!(hovered(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn cmd_click_wins_over_mouse_reporting(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"\x1b[?1000h\x1b[?1006hhttps://a.io");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        let p = cell(&view, cx, 2, 0);
+        cx.simulate_click(p, Modifiers::command());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://a.io"));
+        assert!(sink.take().is_empty());
+    }
+
+    #[gpui::test]
+    fn an_osc8_link_opens_its_uri(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"see \x1b]8;;https://a.io/pr/9\x1b\\the PR\x1b]8;;\x1b\\.");
+        let (view, _sink, cx) = pane(cx, model);
+        let at = cell(&view, cx, 5, 0);
+        cx.simulate_mouse_move(at, None, Modifiers::command());
+        assert_eq!(hovered(&view, cx), Some((LineRef::Grid(0), 4, 10)));
+        cx.simulate_click(at, Modifiers::command());
+        assert_eq!(cx.opened_url().as_deref(), Some("https://a.io/pr/9"));
+    }
+
+    #[gpui::test]
+    fn cmd_click_opens_an_existing_file_of_a_local_agent_in_the_editor(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        let mut model = blank_model();
+        model.on_output(b"--> src/main.rs:10:5 and src/gone.rs:1");
+        let (view, _sink, cx) = pane(cx, model);
+        let opened = record_opens(&view, cx);
+        let at = cell(&view, cx, 6, 0);
+
+        // A remote agent (no local directory): no file links.
+        cx.simulate_mouse_move(at, None, Modifiers::command());
+        assert_eq!(hovered(&view, cx), None);
+
+        let cwd = dir.path().to_string_lossy().into_owned();
+        view.update(cx, |v, _| {
+            v.chrome.link_dir = Some(cwd.clone());
+            v.editor = "zed".to_owned();
+        });
+        cx.simulate_mouse_move(at, None, Modifiers::command());
+        assert_eq!(hovered(&view, cx), Some((LineRef::Grid(0), 4, 20)));
+        cx.simulate_click(at, Modifiers::command());
+        let file = format!("{cwd}/src/main.rs:10:5");
+        assert_eq!(*opened.lock().unwrap(), vec![vec!["zed".to_owned(), file]]);
+
+        // A path that does not exist is no link.
+        let p = cell(&view, cx, 28, 0);
+        cx.simulate_mouse_move(p, None, Modifiers::command());
+        assert_eq!(hovered(&view, cx), None);
     }
 
     #[gpui::test]
