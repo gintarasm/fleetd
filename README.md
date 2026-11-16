@@ -200,9 +200,11 @@ Sends SIGTERM to the agent's process group. There is no SIGKILL follow-up yet, s
 fleet restart 1             # same program, args, cwd and labels, new id; the old agent is removed
 fleet restart 1 --attach    # and attach to the new one
 fleet rm 1 2                # forget exited or lost agents: list entry, history, scrollback
-fleet rm --exited           # forget every exited or lost agent
-fleet rm --exited --selector project=fleetd
+fleet rm --exited           # forget every exited or lost agent; prints the removed ids
+fleet rm --exited --label project=fleetd --label role=coder
 ```
+
+- `fleet rm --exited` never touches a running agent; `--label k=v` (repeatable, as in `fleet ls`) keeps only agents with every pair. In the GUI, **Remove Exited Agents…** (⌘P or the fleet menu) does the same after asking, with the count.
 
 - Only exited or lost agents can be restarted or removed; running ones are refused. `fleet rm` exits non-zero if any id was refused.
 - The environment given at spawn is not stored, so a restarted agent gets the daemon's base environment, not the original `--env`.
@@ -279,13 +281,14 @@ Not yet verified by hand: connecting to a remote host over ssh, the "Start fleet
 
 ### Layout and keys
 
-- **Sidebar:** one vertical tab per agent (status dot, title, time since start, last line), grouped by project label or working directory. Right-click a tab for Kill or Open in new split.
-- **Panes:** rounded cards, up to 4 splits, each with header buttons: split right, split down, maximize, close. Close only detaches; only Kill kills.
+- **Sidebar:** one vertical tab per agent (status dot, title, time since start, last line), grouped by project label or working directory. Right-click a tab for Kill or Open in new split. Hovering a tab shows Stop for a running agent, Restart and Remove for an exited or lost one.
+- **Panes:** rounded cards, up to 4 splits, each with header buttons: Stop (the circled square; Restart and Remove once the agent ended; always on the focused pane, on hover on the others), split right, split down, maximize, close. Close (×) only detaches; only Kill kills. Kill asks first ("Kill agent 7 (claude, ~/fleetd)?"); its "Don't ask again" sets `confirm_kill = false`.
 
 | Key | Action |
 |---|---|
 | `cmd-d` / `cmd-shift-d` | split right / down |
 | `cmd-w` | close the pane (detach) |
+| `cmd-shift-w` | kill the focused pane's agent (asks first) |
 | `cmd-shift-enter` | maximize or restore the pane |
 | `cmd-alt-arrows` | move focus between panes |
 | `cmd-1` … `cmd-4` | focus pane 1 to 4 |
@@ -307,6 +310,8 @@ A status item is always present: Show fleetd, the running agents, New agent…, 
 | `font_family` | `"SF Mono"` | terminal font; SF Mono is loaded from Terminal.app, any other family must be installed; Menlo when it is not |
 | `font_size` | `13` | |
 | `option_as_meta` | `true` | Option sends Esc-prefixed keys |
+| `agent_emoji` | `false` | each agent's emoji in place of its colour swatch (row) and terminal icon (pane header) |
+| `confirm_kill` | `true` | ask before killing an agent; the question's "Don't ask again" writes `false` |
 
 The GUI keeps its own state (recent targets and directories, layouts) in `~/.fleet/gui-state.toml`. `--state-dir` and `--target` override both for one launch.
 

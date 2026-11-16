@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,9 @@ pub struct GuiState {
     /// for older builds. Entries that do not parse are dropped.
     #[serde(deserialize_with = "lenient_tabs")]
     pub tabs: BTreeMap<String, SavedTabs>,
+    /// Keyed by target string: the titles of the sidebar groups shown
+    /// collapsed (issue #40).
+    pub collapsed_groups: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn lenient_targets<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Target>, D::Error> {
@@ -162,6 +165,8 @@ mod tests {
         s.recent_dirs
             .insert("local".into(), vec!["/a".into(), "/b".into()]);
         s.layouts.insert("local".into(), SavedLayout::default());
+        s.collapsed_groups
+            .insert("local".into(), ["fleetd".to_owned()].into());
         s.save(dir.path()).unwrap();
         assert_eq!(GuiState::load(dir.path()), s);
         let mode = std::fs::metadata(dir.path().join("gui-state.toml"))
@@ -174,6 +179,19 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["gui-state.toml"]);
+    }
+
+    #[test]
+    fn state_without_collapsed_groups_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("gui-state.toml"),
+            "recent_targets = [\"local\"]\n",
+        )
+        .unwrap();
+        let s = GuiState::load(dir.path());
+        assert_eq!(s.recent_targets, [Target::Local]);
+        assert!(s.collapsed_groups.is_empty());
     }
 
     #[test]

@@ -279,17 +279,34 @@ impl PtyAttach {
         self.rx = Some(rx);
     }
 
+    /// Waits up to 10 s for `needle` in the output. The deadline holds even
+    /// while output keeps coming (`recv_timeout` with nothing left still
+    /// returns a ready chunk), and only new bytes are searched, so a
+    /// never-ending stream cannot keep this busy.
     fn until(&mut self, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         let rx = self.rx.as_ref().unwrap();
-        while !String::from_utf8_lossy(&self.seen).contains(needle) {
+        let needle_bytes = needle.as_bytes();
+        let mut from = 0;
+        loop {
+            if self.seen[from..]
+                .windows(needle_bytes.len())
+                .any(|w| w == needle_bytes)
+            {
+                return;
+            }
+            from = self.seen.len().saturating_sub(needle_bytes.len() - 1);
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
-                Ok(chunk) => self.seen.extend(chunk),
-                Err(_) => panic!(
-                    "no {needle:?} in {:?}",
-                    String::from_utf8_lossy(&self.seen).into_owned()
-                ),
+                Ok(chunk) if !left.is_zero() => self.seen.extend(chunk),
+                _ => {
+                    let tail = self.seen.len().saturating_sub(2000);
+                    panic!(
+                        "no {needle:?} within 10s in {} bytes of output, ending {:?}",
+                        self.seen.len(),
+                        String::from_utf8_lossy(&self.seen[tail..])
+                    )
+                }
             }
         }
     }
@@ -514,7 +531,27 @@ fn stalled_terminal_gets_lagged_exit_2() {
     let d = Daemon::start();
     let id = d.ok(&["spawn", "--", "yes"]).trim().to_string();
     let mut p = PtyAttach::start(&d, &id, true);
-    std::thread::sleep(Duration::from_secs(3));
+    // The terminal stays stalled until the backlog reaches the daemon and
+    // it drops the subscriber, however long the machine takes to produce
+    // that much output. A fixed pause is not enough under load: once the
+    // terminal reads again, attach keeps up and no lag ever comes.
+    let log = d.dir.path().join("logs").join("fleetd.log");
+    let dropped = format!("agent={id} conn=");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text
+            .lines()
+            .any(|l| l.contains("subscriber dropped: its queue is full") && l.contains(&dropped))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not drop the stalled subscriber within 20s; log:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     p.drain();
     p.until(RESTORE);
     assert_eq!(p.exit_code(), 2);
@@ -534,6 +571,38 @@ fn spawn_cwd_is_used() {
         let out = d.ok(&["screen", &id]);
         out.contains(dir_path.file_name().unwrap().to_str().unwrap())
     });
+}
+
+#[test]
+fn spawn_priority_low_lowers_the_agent() {
+    // The test daemon runs with the setting off: `low` lowers by 10.
+    let d = Daemon::start();
+    // SAFETY: no memory effects; cannot fail for the calling process.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    for (priority, want) in [("low", (own + 10).min(19)), ("normal", own)] {
+        let id = d
+            .ok(&[
+                "spawn",
+                "--priority",
+                priority,
+                "--",
+                "sh",
+                "-c",
+                "echo nice=$(ps -o nice= -p $$)=; sleep 100",
+            ])
+            .trim()
+            .to_string();
+        wait_for("nice reported", || {
+            d.ok(&["screen", &id]).contains(&format!("nice={want}="))
+                || d.ok(&["screen", &id]).contains(&format!("nice= {want}="))
+        });
+        d.ok(&["kill", &id]);
+    }
+    assert!(
+        !d.fleet(&["spawn", "--priority", "high", "--", "cat"])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -1000,18 +1069,7 @@ fn ls_ids(d: &Daemon) -> Vec<String> {
 }
 
 fn spawn_exited(d: &Daemon) -> String {
-    let id = d
-        .ok(&["spawn", "--", "sh", "-c", "exit 0"])
-        .trim()
-        .to_string();
-    wait_for("exited", || {
-        let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
-        v.as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["id"].as_u64().unwrap().to_string() == id && a["state"] == "exited")
-    });
-    id
+    spawn_exited_labelled(d, &[])
 }
 
 #[test]
@@ -1040,13 +1098,80 @@ fn rm_removes_exited_and_refuses_running() {
 }
 
 #[test]
-fn rm_exited_counts() {
+fn rm_exited_prints_removed_ids_and_spares_running() {
     let d = Daemon::start();
-    spawn_exited(&d);
-    spawn_exited(&d);
+    let a = spawn_exited(&d);
+    let b = spawn_exited(&d);
     let live = d.ok(&["spawn", "--", "cat"]).trim().to_string();
-    assert_eq!(d.ok(&["rm", "--exited"]).trim(), "removed 2 agents");
+    let out = d.ok(&["rm", "--exited"]);
+    let mut removed: Vec<&str> = out.lines().collect();
+    removed.sort();
+    let mut want = [a.as_str(), b.as_str()];
+    want.sort();
+    assert_eq!(removed, want);
+    assert_eq!(ls_ids(&d), std::slice::from_ref(&live));
+    // Nothing left to remove: no output, success.
+    assert_eq!(d.ok(&["rm", "--exited"]), "");
     assert_eq!(ls_ids(&d), [live]);
+}
+
+/// Spawns an agent with these labels that exits at once; returns its id.
+fn spawn_exited_labelled(d: &Daemon, labels: &[&str]) -> String {
+    let mut args = vec!["spawn"];
+    for l in labels {
+        args.extend(["--label", l]);
+    }
+    args.extend(["--", "sh", "-c", "exit 0"]);
+    let id = d.ok(&args).trim().to_string();
+    wait_for("exited", || {
+        let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"].as_u64().unwrap().to_string() == id && a["state"] == "exited")
+    });
+    id
+}
+
+#[test]
+fn rm_exited_respects_label_filters() {
+    let d = Daemon::start();
+    let both = spawn_exited_labelled(&d, &["project=a", "role=coder"]);
+    let other_role = spawn_exited_labelled(&d, &["project=a", "role=reviewer"]);
+    let other_project = spawn_exited_labelled(&d, &["project=b"]);
+    let live = d
+        .ok(&[
+            "spawn",
+            "--label",
+            "project=a",
+            "--label",
+            "role=coder",
+            "--",
+            "cat",
+        ])
+        .trim()
+        .to_string();
+    // Repeatable: every pair must match. The running match is spared.
+    let out = d.ok(&[
+        "rm",
+        "--exited",
+        "--label",
+        "project=a",
+        "--label",
+        "role=coder",
+    ]);
+    assert_eq!(out.trim(), both);
+    let mut left = ls_ids(&d);
+    left.sort();
+    let mut want = vec![other_role.clone(), other_project.clone(), live.clone()];
+    want.sort();
+    assert_eq!(left, want);
+    // The old --selector spelling still works.
+    let out = d.ok(&["rm", "--exited", "--selector", "project=a"]);
+    assert_eq!(out.trim(), other_role);
+    // --label needs --exited.
+    let out = d.fleet(&["rm", &other_project, "--label", "project=b"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]

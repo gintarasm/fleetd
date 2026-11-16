@@ -109,7 +109,8 @@ fn has_keyboard_focus(s: &mut Setup<'_>, pane: PaneId) -> bool {
     let app = s.app.clone();
     s.cx.update(|window, cx| {
         let view = app.read(cx).pane_view(pane).unwrap().clone();
-        view.read(cx).focus_handle().is_focused(window)
+        // The pane's view, or the split chooser drawn in it.
+        view.read(cx).focus_handle().contains_focused(window, cx)
     })
 }
 

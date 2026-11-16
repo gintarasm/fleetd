@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::glass::GlassChoice;
+use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, ThemeChoice};
 use super::state::write_atomic;
 use super::target::Target;
 
@@ -61,6 +63,33 @@ pub struct GuiConfig {
     pub font_family: String,
     pub font_size: f32,
     pub option_as_meta: bool,
+    /// Light, dark, or the system's appearance.
+    pub theme: ThemeChoice,
+    /// The window backdrop's blur radius, in points.
+    pub blur: f32,
+    /// The alpha of the window tint over the blurred desktop.
+    pub window_opacity: f32,
+    /// Overrides System Settings' Reduce Motion, or follows it.
+    pub reduce_motion: MotionChoice,
+    /// Kill asks first.
+    pub confirm_kill: bool,
+    /// macOS notifications when an agent needs you or ends while the
+    /// window is not focused (ADR 0042). Off unless asked for.
+    pub notifications: bool,
+    /// The New agent sheet's directory; empty: the most recent one.
+    pub default_dir: String,
+    /// Focus mode: panes without focus are dimmed.
+    pub focus_mode: bool,
+    /// A soft sound and a small burst when an agent exits with code 0.
+    pub celebrate: bool,
+    /// Liquid glass behind the window or its chrome (macOS 26; ADR 0049).
+    pub glass: GlassChoice,
+    /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
+    /// blank means `$VISUAL`, then `$EDITOR` (ADR 0046).
+    pub editor: String,
+    /// Each agent's emoji (ADR 0064) in place of its colour swatch on the
+    /// sidebar row and of the terminal icon in its pane header.
+    pub agent_emoji: bool,
 }
 
 impl Default for GuiConfig {
@@ -71,6 +100,18 @@ impl Default for GuiConfig {
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
             option_as_meta: true,
+            theme: ThemeChoice::System,
+            blur: DEFAULT_BLUR,
+            window_opacity: DEFAULT_OPACITY,
+            reduce_motion: MotionChoice::System,
+            confirm_kill: true,
+            notifications: false,
+            default_dir: String::new(),
+            focus_mode: false,
+            celebrate: false,
+            glass: GlassChoice::Off,
+            editor: String::new(),
+            agent_emoji: false,
         }
     }
 }
@@ -112,6 +153,33 @@ pub fn load_config(state_dir: &Path) -> Result<GuiConfig, ConfigError> {
 
 /// Sets `[gui] connection`, leaving comments and every other key as they were.
 pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
+    save_gui_values(
+        state_dir,
+        vec![("connection", toml_edit::Value::from(target.to_string()))],
+    )
+}
+
+/// Sets `[gui] confirm_kill`, leaving comments and every other key as they
+/// were.
+pub fn save_confirm_kill(state_dir: &Path, confirm: bool) -> io::Result<()> {
+    save_gui_values(
+        state_dir,
+        vec![("confirm_kill", toml_edit::Value::from(confirm))],
+    )
+}
+
+/// Sets `[gui] notifications`, leaving comments and every other key as they were.
+pub fn save_notifications(state_dir: &Path, on: bool) -> io::Result<()> {
+    save_gui_values(
+        state_dir,
+        vec![("notifications", toml_edit::Value::from(on))],
+    )
+}
+
+/// Sets these keys of `[gui]`, leaving comments and every other key as
+/// they were; creates the file (and the table) when missing. The file's
+/// mode is kept.
+pub fn save_gui_values(state_dir: &Path, values: Vec<(&str, toml_edit::Value)>) -> io::Result<()> {
     let path = config_path(state_dir);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -128,7 +196,19 @@ pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
         doc["gui"] = toml_edit::table();
     }
     let gui = doc["gui"].as_table_like_mut().expect("gui is a table");
-    gui.insert("connection", toml_edit::value(target.to_string()));
+    for (key, value) in values {
+        // Keep a trailing comment on a key that was already there.
+        match gui.get_mut(key).and_then(|i| i.as_value_mut()) {
+            Some(old) => {
+                let decor = old.decor().clone();
+                *old = value;
+                *old.decor_mut() = decor;
+            }
+            None => {
+                gui.insert(key, toml_edit::Item::Value(value));
+            }
+        }
+    }
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o777);
     write_atomic(&path, doc.to_string().as_bytes(), mode)
@@ -173,7 +253,24 @@ mod tests {
         assert_eq!(c.font_family, "SF Mono");
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
+        assert!(!c.notifications);
+        assert!(!c.agent_emoji);
         assert_eq!(c.connection, None);
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
+    fn config_reads_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\neditor = \"zed\"\n");
+        assert_eq!(load_config(dir.path()).unwrap().editor, "zed");
+    }
+
+    #[test]
+    fn agent_emoji_is_read_from_the_gui_table() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\nagent_emoji = true\n");
+        assert!(load_config(dir.path()).unwrap().agent_emoji);
     }
 
     #[test]
@@ -242,5 +339,19 @@ mod tests {
         let c = load_config(dir.path()).unwrap();
         assert_eq!(c.font_size, 15.0);
         assert_eq!(c.connection, Some(Target::Local));
+    }
+
+    #[test]
+    fn save_notifications_round_trips_and_keeps_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\nfont_size = 15 # big\n");
+        save_notifications(dir.path(), true).unwrap();
+        let c = load_config(dir.path()).unwrap();
+        assert!(c.notifications);
+        assert_eq!(c.font_size, 15.0);
+        save_notifications(dir.path(), false).unwrap();
+        assert!(!load_config(dir.path()).unwrap().notifications);
+        let out = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(out.contains("font_size = 15 # big"), "{out}");
     }
 }

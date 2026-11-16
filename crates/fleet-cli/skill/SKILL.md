@@ -92,6 +92,7 @@ fleet spawn --cwd DIR -- claude "review the diff"
 fleet kill <id>
 fleet restart <id>
 fleet rm <id>
+fleet rm --exited
 ```
 
 - `spawn` prints the new agent's id. Everything after `--` is the command
@@ -101,6 +102,9 @@ fleet rm <id>
 - `restart`: same command/cwd/labels, new id (printed), only after the
   agent exited. The environment is not restored.
 - `rm`: forgets an exited agent and its history. Only when asked.
+- `rm --exited`: forgets every exited or lost agent and prints their ids;
+  never a running one. `--label k=v` (repeatable) narrows it as in `ls`.
+  Only when asked.
 - `fleet daemon restart`: restarts fleetd into its new binary; agents keep running. Only when asked.
 
 ## Errors

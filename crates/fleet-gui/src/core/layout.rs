@@ -268,33 +268,47 @@ impl Node {
         }
     }
 
-    /// Replaces leaf `id` by a split holding it and `new`. False if absent.
-    fn split(&mut self, id: PaneId, axis: Axis, new: PaneId) -> bool {
+    /// Replaces leaf `id` by an even split holding it and `new`, `new`
+    /// on `dir`'s side of it. False if absent.
+    fn insert_beside(&mut self, id: PaneId, dir: Dir, new: Node) -> bool {
         match self {
             Node::Leaf { pane, .. } if *pane == id => {
-                let orig = std::mem::replace(
+                let orig = std::mem::replace(self, new);
+                let new = std::mem::replace(
                     self,
                     Node::Leaf {
-                        pane: new,
+                        pane: id,
                         agent: None,
                     },
                 );
+                let (axis, new_first) = match dir {
+                    Dir::Left => (Axis::Horizontal, true),
+                    Dir::Right => (Axis::Horizontal, false),
+                    Dir::Up => (Axis::Vertical, true),
+                    Dir::Down => (Axis::Vertical, false),
+                };
+                let (first, second) = if new_first { (new, orig) } else { (orig, new) };
                 *self = Node::Split {
                     axis,
                     ratio: EVEN,
-                    first: Box::new(orig),
-                    second: Box::new(Node::Leaf {
-                        pane: new,
-                        agent: None,
-                    }),
+                    first: Box::new(first),
+                    second: Box::new(second),
                 };
                 true
             }
             Node::Leaf { .. } => false,
             Node::Split { first, second, .. } => {
-                first.split(id, axis, new) || second.split(id, axis, new)
+                if first.has(id) {
+                    first.insert_beside(id, dir, new)
+                } else {
+                    second.insert_beside(id, dir, new)
+                }
             }
         }
+    }
+
+    fn has(&self, id: PaneId) -> bool {
+        self.leaf(id).is_some()
     }
 
     /// Removes leaf `id`, collapsing its parent into the sibling. Returns the
@@ -462,13 +476,68 @@ impl Layout {
 
     /// Splits `pane`; the new pane goes right / below. `None` at `MAX_PANES` or for an unknown pane.
     pub fn split(&mut self, pane: PaneId, axis: Axis) -> Option<PaneId> {
-        if self.panes().len() >= MAX_PANES || !self.panes().contains(&pane) {
+        self.split_toward(
+            pane,
+            match axis {
+                Axis::Horizontal => Dir::Right,
+                Axis::Vertical => Dir::Down,
+            },
+        )
+    }
+
+    /// Splits `pane` evenly, the new, empty pane on its `dir` side. `None`
+    /// at `MAX_PANES` or for an unknown pane.
+    pub fn split_toward(&mut self, pane: PaneId, dir: Dir) -> Option<PaneId> {
+        if self.panes().len() >= MAX_PANES || !self.root.has(pane) {
             return None;
         }
         let new = PaneId(self.next_id);
-        self.root.split(pane, axis, new);
+        self.root.insert_beside(
+            pane,
+            dir,
+            Node::Leaf {
+                pane: new,
+                agent: None,
+            },
+        );
         self.next_id += 1;
         Some(new)
+    }
+
+    /// Swaps panes `a` and `b` (each with its agent); every split keeps
+    /// its ratio. `false` unless both exist and differ.
+    pub fn swap(&mut self, a: PaneId, b: PaneId) -> bool {
+        if a == b || !self.root.has(a) || !self.root.has(b) {
+            return false;
+        }
+        let (agent_a, agent_b) = (self.agent(a), self.agent(b));
+        let mut stack = vec![&mut self.root];
+        while let Some(node) = stack.pop() {
+            match node {
+                Node::Leaf { pane, agent } if *pane == a => (*pane, *agent) = (b, agent_b),
+                Node::Leaf { pane, agent } if *pane == b => (*pane, *agent) = (a, agent_a),
+                Node::Leaf { .. } => {}
+                Node::Split { first, second, .. } => {
+                    stack.push(second);
+                    stack.push(first);
+                }
+            }
+        }
+        true
+    }
+
+    /// Moves `pane` (with its agent) beside `target`, on its `dir` side,
+    /// in an even split; the split `pane` left collapses into its other
+    /// side, and every other split keeps its ratio. `false` unless both
+    /// exist and differ.
+    pub fn move_pane(&mut self, pane: PaneId, target: PaneId, dir: Dir) -> bool {
+        if pane == target || !self.root.has(pane) || !self.root.has(target) {
+            return false;
+        }
+        let agent = self.agent(pane);
+        self.root.close(pane);
+        self.root
+            .insert_beside(target, dir, Node::Leaf { pane, agent })
     }
 
     /// Closes `pane`, returning the new focus. Closing the last pane leaves a
@@ -1123,5 +1192,101 @@ mod tests {
             };
             assert_eq!(Layout::from_saved(&saved).ratio(SplitId(0)), Some(0.5));
         }
+    }
+
+    #[test]
+    fn split_toward_puts_the_new_pane_on_that_side() {
+        for (dir, new_first, axis) in [
+            (Dir::Left, true, Axis::Horizontal),
+            (Dir::Right, false, Axis::Horizontal),
+            (Dir::Up, true, Axis::Vertical),
+            (Dir::Down, false, Axis::Vertical),
+        ] {
+            let mut l = Layout::single();
+            let a = l.panes()[0];
+            let b = l.split_toward(a, dir).unwrap();
+            let (ra, rb) = (rect(&l, a), rect(&l, b));
+            let before = match axis {
+                Axis::Horizontal => rb.x < ra.x,
+                Axis::Vertical => rb.y < ra.y,
+            };
+            assert_eq!(before, new_first, "{dir:?}");
+            assert_eq!(l.ratio(SplitId(0)), Some(EVEN));
+            assert_eq!(l.agent(b), None);
+        }
+        let (mut full, [a, ..]) = four();
+        assert_eq!(full.split_toward(a, Dir::Left), None);
+        assert_eq!(Layout::single().split_toward(PaneId(9), Dir::Left), None);
+    }
+
+    #[test]
+    fn swap_exchanges_two_panes_and_keeps_the_ratios() {
+        let mut l = Layout::single();
+        let a = l.panes()[0];
+        let b = l.split(a, Axis::Horizontal).unwrap();
+        l.set_agent(a, Some(1));
+        l.set_agent(b, Some(2));
+        assert!(l.move_divider(SplitId(0), 200.0, W, H, 10.0));
+        let (ra, rb) = (rect(&l, a), rect(&l, b));
+        assert!(l.swap(a, b));
+        assert_eq!(rect(&l, a), rb);
+        assert_eq!(rect(&l, b), ra);
+        // Each pane keeps its agent (it is the same pane, moved).
+        assert_eq!(l.agent(a), Some(1));
+        assert_eq!(l.agent(b), Some(2));
+        assert_eq!(l.panes(), vec![b, a]);
+        assert!(!l.swap(a, a));
+        assert!(!l.swap(a, PaneId(9)));
+    }
+
+    #[test]
+    fn move_pane_beside_another_keeps_the_other_ratios() {
+        // a | (b / c), the outer split at 200 px, the inner at 450 px.
+        let mut l = Layout::single();
+        let a = l.panes()[0];
+        let b = l.split(a, Axis::Horizontal).unwrap();
+        let c = l.split(b, Axis::Vertical).unwrap();
+        l.set_agent(c, Some(3));
+        assert!(l.move_divider(SplitId(0), 200.0, W, H, 10.0));
+        assert!(l.move_divider(SplitId(1), 450.0, W, H, 10.0));
+        let inner = l.ratio(SplitId(1)).unwrap();
+        // c to the left of a: (c | a) | b, the outer ratio kept, the new split even.
+        assert!(l.move_pane(c, a, Dir::Left));
+        assert_eq!(l.panes(), vec![c, a, b]);
+        assert_eq!(l.agent(c), Some(3));
+        assert_eq!(rect(&l, b).x, 200.0);
+        assert_eq!(rect(&l, c).w, 100.0);
+        assert_eq!(rect(&l, b).h, H);
+        // b below a: the moved split's own ratio is kept for the rest.
+        let mut m = Layout::single();
+        let a = m.panes()[0];
+        let b = m.split(a, Axis::Horizontal).unwrap();
+        let c = m.split(b, Axis::Vertical).unwrap();
+        assert!(m.move_divider(SplitId(1), 450.0, W, H, 10.0));
+        assert!(m.move_pane(a, c, Dir::Down));
+        // b / (c / a): b keeps its place on top, its split its ratio.
+        assert_eq!(m.panes(), vec![b, c, a]);
+        assert_eq!(m.ratio(SplitId(0)), Some(inner));
+        assert_eq!(m.ratio(SplitId(1)), Some(EVEN));
+        assert_eq!(rect(&m, b).w, W);
+    }
+
+    #[test]
+    fn move_pane_refuses_itself_unknown_panes_and_a_lone_pane() {
+        let mut l = Layout::single();
+        let a = l.panes()[0];
+        assert!(!l.move_pane(a, a, Dir::Left));
+        let b = l.split(a, Axis::Horizontal).unwrap();
+        let before = l.clone();
+        assert!(!l.move_pane(a, a, Dir::Up));
+        assert!(!l.move_pane(a, PaneId(9), Dir::Up));
+        assert!(!l.move_pane(PaneId(9), b, Dir::Up));
+        assert_eq!(l, before);
+        // a | b, a moved to b's right: b | a.
+        assert!(l.move_pane(a, b, Dir::Right));
+        assert_eq!(l.panes(), vec![b, a]);
+        // Ids are not reused: a new split still gets a fresh one.
+        let c = l.split(a, Axis::Vertical).unwrap();
+        assert!(c != a && c != b);
     }
 }

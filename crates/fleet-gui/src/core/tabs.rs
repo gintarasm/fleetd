@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::layout::{Axis, Layout, SavedLayout};
+use super::layout::{Axis, Dir, Layout, SavedLayout};
 use super::session::PaneId;
 
 /// At most this many tabs: ⌘⌥1…⌘⌥9 reach each one.
@@ -160,6 +160,32 @@ impl Tabs {
         Some(new)
     }
 
+    /// Splits `pane` of the shown tab, the new pane (unique across tabs)
+    /// on its `dir` side and focused. `None` for a pane the shown tab does
+    /// not have, or at the layout's pane limit.
+    pub fn split_toward(&mut self, pane: PaneId, dir: Dir) -> Option<PaneId> {
+        let next = self.next_free();
+        let tab = &mut self.tabs[self.active];
+        if !tab.layout.panes().contains(&pane) {
+            return None;
+        }
+        tab.layout.reserve_ids(next);
+        let new = tab.layout.split_toward(pane, dir)?;
+        tab.focused = new;
+        Some(new)
+    }
+
+    /// Focuses `pane` of the shown tab, even if it already has the focus
+    /// (a pane moved by drag and drop); `false` if the tab lacks it.
+    pub fn focus(&mut self, pane: PaneId) -> bool {
+        let tab = &mut self.tabs[self.active];
+        if !tab.layout.panes().contains(&pane) {
+            return false;
+        }
+        tab.focused = pane;
+        true
+    }
+
     /// Closes the shown tab's focused pane; the focus goes to its sibling.
     /// The last pane stays, empty. Returns the closed pane.
     pub fn close_focused(&mut self) -> Option<PaneId> {
@@ -309,6 +335,21 @@ mod tests {
         all.sort();
         all.dedup();
         assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn split_toward_takes_a_unique_id_and_only_a_shown_pane() {
+        let mut t = Tabs::single();
+        t.new_tab(); // pane 2, shown
+        assert_eq!(
+            t.split_toward(PaneId(1), Dir::Left),
+            None,
+            "pane 1 is hidden"
+        );
+        let new = t.split_toward(PaneId(2), Dir::Left).unwrap();
+        assert_eq!(new, PaneId(3));
+        assert_eq!(t.focused(), new);
+        assert_eq!(t.layout().panes(), [PaneId(3), PaneId(2)]);
     }
 
     #[test]

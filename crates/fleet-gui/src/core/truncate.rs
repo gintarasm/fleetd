@@ -1,5 +1,6 @@
-//! Shortening text to a width by keeping its end, for paths: the last
-//! directories say most about where an agent runs.
+//! Shortening text to a width: by keeping its end, for paths (the last
+//! directories say most about where an agent runs), or its start, for an
+//! agent's last output line.
 
 /// Where the kept tail of `text` starts when it is drawn as `…` + tail in
 /// `max_w`, or `None` if all of it fits. `width_from(i)` is the width of
@@ -29,9 +30,60 @@ pub fn tail_start(
     Some(snapped)
 }
 
+/// Where the kept head of `text` ends when it is drawn as head + `…` in
+/// `max_w`, or `None` if all of it fits. `width_to(i)` is the width of
+/// `text[..i]`; `ellipsis_w` the width of `…`. Trailing spaces of the head
+/// are dropped (`compiling…`, not `compiling …`).
+pub fn head_end(
+    text: &str,
+    max_w: f32,
+    ellipsis_w: f32,
+    width_to: impl Fn(usize) -> f32,
+) -> Option<usize> {
+    if width_to(text.len()) <= max_w {
+        return None;
+    }
+    let room = max_w - ellipsis_w;
+    let end = text
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&i| width_to(i) <= room)
+        .last()
+        .unwrap_or(0);
+    Some(text[..end].trim_end().len())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tail_start;
+    use super::{head_end, tail_start};
+
+    /// One unit per char, keeping the start.
+    fn head(text: &str, max_w: f32) -> String {
+        let width_to = |i: usize| text[..i].chars().count() as f32;
+        match head_end(text, max_w, 1.0, width_to) {
+            None => text.to_owned(),
+            Some(i) => format!("{}…", &text[..i]),
+        }
+    }
+
+    #[test]
+    fn head_keeps_the_start() {
+        assert_eq!(head("compiling fleetd", 16.0), "compiling fleetd");
+        assert_eq!(head("compiling fleetd", 40.0), "compiling fleetd");
+        assert_eq!(head("", 0.0), "");
+        assert_eq!(head("compiling fleetd", 8.0), "compili…");
+        // No space before the ellipsis.
+        assert_eq!(head("compiling fleetd", 11.0), "compiling…");
+        assert_eq!(head("abcdef", 1.0), "…");
+        assert_eq!(head("abcdef", 0.0), "…");
+        assert_eq!(head("ąčęėįšųū", 4.0), "ąčę…");
+        let t = "Running 12 tests in fleet-gui core";
+        for w in 1..t.len() {
+            let s = head(t, w as f32);
+            assert!(s.chars().count() <= w, "{s:?} in {w}");
+            assert!(s.ends_with('…') || s == t, "{s:?}");
+        }
+    }
 
     /// One unit per char.
     fn shown(text: &str, max_w: f32) -> String {
