@@ -64,9 +64,10 @@ use crate::term::{HistoryEvent, Terminal};
 use crate::token::{self, AgentToken};
 use bytes::{Bytes, BytesMut};
 use fleet_proto::handoff::{HandoffAgent, handoff_agent};
+use fleet_proto::status::{KIND_LABEL, SHELL_KIND};
 use fleet_proto::{
-    AGENT_TOKEN_ENV, AgentActivity, AgentExited, AgentInfo, AgentPriority, AgentRemoved, AttachOk,
-    SpawnAgent, SpawnRefused,
+    AGENT_TOKEN_ENV, AgentActivity, AgentExited, AgentInfo, AgentPriority, AgentRemoved,
+    AgentReported, AttachOk, Reported, ReportedState, SpawnAgent, SpawnRefused,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -1412,6 +1413,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The longest `fleet report` message, in characters (spec §2).
+pub const REPORT_MESSAGE_MAX: usize = 200;
+
 fn store_err(e: rusqlite::Error) -> io::Error {
     io::Error::other(e)
 }
@@ -1656,6 +1660,7 @@ pub struct Node {
     /// stored, so two spawns cannot both take the last slot.
     spawn_gate: Mutex<()>,
     refused: broadcast::Sender<SpawnRefused>,
+    reported: broadcast::Sender<AgentReported>,
 }
 
 impl Drop for Node {
@@ -1845,6 +1850,7 @@ impl Node {
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (refused, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
+        let (reported, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
         Ok(Node {
             host: Arc::new(PtyHost::new()),
@@ -1865,6 +1871,7 @@ impl Node {
             quotas: Quotas::default(),
             spawn_gate: Mutex::new(()),
             refused,
+            reported,
         })
     }
 
@@ -1900,6 +1907,55 @@ impl Node {
     /// Receives every spawn refused by a quota from now on.
     pub fn refused_events(&self) -> broadcast::Receiver<SpawnRefused> {
         self.refused.subscribe()
+    }
+
+    /// Receives every status report from now on.
+    pub fn report_events(&self) -> broadcast::Receiver<AgentReported> {
+        self.reported.subscribe()
+    }
+
+    /// Records agent `id`'s own status (ADR 0075, `fleet report`) and
+    /// announces it. `message` is at most [`REPORT_MESSAGE_MAX`] characters
+    /// without control characters. The agent must be running and not a plain
+    /// shell (shells have no status, ADR 0071).
+    pub fn report(&self, id: u64, state: ReportedState, message: &str) -> io::Result<()> {
+        if state == ReportedState::Unspecified {
+            return Err(invalid("report needs a state".into()));
+        }
+        if message.chars().count() > REPORT_MESSAGE_MAX {
+            return Err(invalid(format!(
+                "report message is longer than {REPORT_MESSAGE_MAX} characters"
+            )));
+        }
+        if message.chars().any(char::is_control) {
+            return Err(invalid("report message has control characters".into()));
+        }
+        let store = lock(&self.store);
+        let labels = store
+            .labels(id)
+            .map_err(store_err)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no agent {id}")))?;
+        if labels.get(KIND_LABEL).map(String::as_str) == Some(SHELL_KIND) {
+            return Err(invalid("a shell has no status to report".into()));
+        }
+        let at_unix_ms = store
+            .set_reported(id, state as i32, message)
+            .map_err(|e| match e {
+                rusqlite::Error::StatementChangedRows(_) => {
+                    invalid(format!("agent {id} is not running"))
+                }
+                e => store_err(e),
+            })?;
+        // No receivers is fine.
+        let _ = self.reported.send(AgentReported {
+            agent_id: id,
+            reported: Some(Reported {
+                state: state as i32,
+                message: message.to_owned(),
+                at_unix_ms,
+            }),
+        });
+        Ok(())
     }
 
     /// Who a connection is (ADR 0072), from its peer's session id and the
@@ -2408,6 +2464,7 @@ impl Node {
             created_unix_ms,
             labels: new.labels,
             exited_unix_ms: None,
+            reported: None,
         };
         Ok((info, attached))
     }
@@ -3074,6 +3131,11 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
         created_unix_ms: rec.created_unix_ms,
         labels: rec.labels,
         exited_unix_ms: rec.exited_unix_ms,
+        reported: rec.reported.map(|r| Reported {
+            state: r.state,
+            message: r.message,
+            at_unix_ms: r.at_unix_ms,
+        }),
     }
 }
 

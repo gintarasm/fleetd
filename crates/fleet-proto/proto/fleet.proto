@@ -60,6 +60,8 @@ message Request {
     RestartAgent restart = 13;
     ForgetAgents forget = 14;
     RestartDaemon restart_daemon = 15;
+    // Spec §2 (ADR 0075): the calling agent's own status.
+    ReportStatus report = 50;
   }
 }
 
@@ -90,6 +92,7 @@ message Event {
     AgentResized agent_resized = 6;
     AgentRemoved agent_removed = 7;
     SpawnRefused spawn_refused = 40;
+    AgentReported reported = 50;
   }
 }
 
@@ -165,6 +168,8 @@ message AgentInfo {
   // When an exited agent exited (ADR 0058); unset while running, for a lost
   // agent, and for an exit recorded by a node before it stored the time.
   optional int64 exited_unix_ms = 9;
+  // The agent's own last `fleet report` (ADR 0075); unset until it reports.
+  optional Reported reported = 50;
 }
 
 // With `observe`, a read-only attach (ADR 0022): it never takes or changes
@@ -234,3 +239,19 @@ message LogLine { string line = 1; }
 // An agent's spawn was refused by a quota (spec §1): `parent` is the agent
 // that asked, `reason` the refusal's text (after "forbidden: ").
 message SpawnRefused { uint64 parent = 1; string reason = 2; }
+
+// What an agent can report about itself (`fleet report`, ADR 0075).
+enum ReportedState {
+  REPORTED_STATE_UNSPECIFIED = 0;
+  REPORTED_WORKING = 1;
+  REPORTED_WAITING = 2;
+  REPORTED_DONE = 3;
+  REPORTED_ERROR = 4;
+}
+// The caller's own status, taken from the caller's identity (no agent id: an
+// agent reports only for itself). `message` is at most 200 characters;
+// answered by `Ack`.
+message ReportStatus { ReportedState state = 1; string message = 2; }
+message Reported { ReportedState state = 1; string message = 2; int64 at_unix_ms = 3; }
+// Pushed when an agent reports; scoped like the other agent events.
+message AgentReported { uint64 agent_id = 1; Reported reported = 2; }

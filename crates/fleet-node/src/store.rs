@@ -7,8 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension};
 
 /// v6 and v7 are taken by the M3 mailbox and lease branches (spec
-/// "Waves"); identity took 8.
-const SCHEMA_VERSION: i64 = 8;
+/// "Waves"); identity took 8, mailbox 9, leases 10, the status report 11
+/// (the overseer renumbers at merge if the order differs).
+const SCHEMA_VERSION: i64 = 11;
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -48,6 +49,17 @@ pub struct AgentRecord {
     /// When the agent exited; `None` while running, for a lost agent, and
     /// for an exit recorded before schema v5.
     pub exited_unix_ms: Option<i64>,
+    /// The agent's last `fleet report` (ADR 0075).
+    pub reported: Option<Reported>,
+}
+
+/// An agent's own status report: `state` is the proto `ReportedState`'s
+/// value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    pub state: i32,
+    pub message: String,
+    pub at_unix_ms: i64,
 }
 
 pub struct Store {
@@ -84,7 +96,8 @@ fn conversion_err(col: usize, e: Box<dyn std::error::Error + Send + Sync>) -> ru
 }
 
 const AGENT_COLUMNS: &str = "SELECT id, program, args_json, cwd, state, exit_code, \
-     created_unix_ms, scrollback_path, priority, exited_unix_ms FROM agents";
+     created_unix_ms, scrollback_path, priority, exited_unix_ms, \
+     reported_state, reported_message, reported_unix_ms FROM agents";
 
 fn unix_ms_now() -> i64 {
     SystemTime::now()
@@ -113,6 +126,14 @@ fn decode_agent(
         labels: labels.remove(&id).unwrap_or_default(),
         priority: r.get(8)?,
         exited_unix_ms: r.get(9)?,
+        reported: match r.get::<_, Option<i32>>(10)? {
+            Some(state) => Some(Reported {
+                state,
+                message: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                at_unix_ms: r.get::<_, Option<i64>>(12)?.unwrap_or_default(),
+            }),
+            None => None,
+        },
     })
 }
 
@@ -208,10 +229,22 @@ impl Store {
                  COMMIT;"
             ))?;
         }
+        if version < 11 {
+            // v11: the agent's own status report (ADR 0075). Old rows keep
+            // NULL. The column DDL must match `create_latest`'s.
+            self.conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE agents ADD COLUMN reported_state INTEGER;
+                 ALTER TABLE agents ADD COLUMN reported_message TEXT;
+                 ALTER TABLE agents ADD COLUMN reported_unix_ms INTEGER;
+                 PRAGMA user_version = 11;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
-    /// The latest schema for a new DB; the same tables the v1 -> ... -> v8
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v11
     /// migrations produce.
     fn create_latest(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(&format!(
@@ -224,7 +257,8 @@ impl Store {
                  state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
                  exit_code INTEGER,
                  created_unix_ms INTEGER NOT NULL,
-                 scrollback_path TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, exited_unix_ms INTEGER
+                 scrollback_path TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, exited_unix_ms INTEGER,
+                 reported_state INTEGER, reported_message TEXT, reported_unix_ms INTEGER
              );
              CREATE TABLE agent_labels (
                  agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -237,7 +271,7 @@ impl Store {
                  new_id INTEGER NOT NULL
              );
              {AGENT_TOKENS_DDL}
-             PRAGMA user_version = 8;
+             PRAGMA user_version = 11;
              COMMIT;"
         ))
     }
@@ -500,6 +534,23 @@ impl Store {
         }
     }
 
+    /// Stores the running agent's report (replacing its last one) and
+    /// returns the time it was recorded. Errors if the agent is unknown or
+    /// not running.
+    pub fn set_reported(&self, id: u64, state: i32, message: &str) -> rusqlite::Result<i64> {
+        let at = unix_ms_now();
+        let n = self.conn.execute(
+            "UPDATE agents SET reported_state = ?2, reported_message = ?3, reported_unix_ms = ?4
+             WHERE id = ?1 AND state = 'running'",
+            (id as i64, state, message, at),
+        )?;
+        if n == 1 {
+            Ok(at)
+        } else {
+            Err(rusqlite::Error::StatementChangedRows(n))
+        }
+    }
+
     /// The exit code of an `exited` agent; `None` if it is unknown or not
     /// exited.
     pub fn exit_code(&self, id: u64) -> rusqlite::Result<Option<i32>> {
@@ -635,8 +686,42 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v8() {
-        assert_eq!(SCHEMA_VERSION, 8);
+    fn schema_is_v11() {
+        assert_eq!(SCHEMA_VERSION, 11);
+    }
+
+    #[test]
+    fn a_report_is_stored_and_survives_reopening() {
+        let (_d, p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        assert_eq!(s.agent(a).unwrap().unwrap().reported, None);
+        let at = s.set_reported(a, 3, "tests green").unwrap();
+        let rep = Reported {
+            state: 3,
+            message: "tests green".into(),
+            at_unix_ms: at,
+        };
+        assert_eq!(s.agent(a).unwrap().unwrap().reported, Some(rep.clone()));
+        // A later report replaces it.
+        let at2 = s.set_reported(a, 1, "").unwrap();
+        drop(s);
+        let s = Store::open(&p).unwrap();
+        let got = s.agent(a).unwrap().unwrap().reported.unwrap();
+        assert_eq!(
+            (got.state, got.message.as_str(), got.at_unix_ms),
+            (1, "", at2)
+        );
+        assert_eq!(s.list_agents().unwrap()[0].reported.as_ref(), Some(&got));
+    }
+
+    #[test]
+    fn only_a_running_agent_can_report() {
+        let (_d, _p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        assert!(s.set_reported(999, 1, "x").is_err());
+        s.set_exited(a, 0).unwrap();
+        assert!(s.set_reported(a, 1, "x").is_err());
+        assert_eq!(s.agent(a).unwrap().unwrap().reported, None);
     }
 
     #[test]
@@ -715,6 +800,9 @@ mod tests {
         let conn = Connection::open(&p).unwrap();
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             ALTER TABLE agents DROP COLUMN reported_state;
+             ALTER TABLE agents DROP COLUMN reported_message;
+             ALTER TABLE agents DROP COLUMN reported_unix_ms;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              ALTER TABLE agents DROP COLUMN priority;
              PRAGMA user_version = 3;",
@@ -1152,6 +1240,9 @@ mod tests {
         // Back to the v4 shape: no exit time column.
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             ALTER TABLE agents DROP COLUMN reported_state;
+             ALTER TABLE agents DROP COLUMN reported_message;
+             ALTER TABLE agents DROP COLUMN reported_unix_ms;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              UPDATE agents SET state = 'exited', exit_code = 2;
              PRAGMA user_version = 4;",
