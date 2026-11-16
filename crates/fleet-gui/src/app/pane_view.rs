@@ -9,11 +9,11 @@ use fleet_term::CursorShape;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt, AnyView, AnyWindowHandle, AppContext, Bounds, BoxShadow,
-    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Font, Hsla, InteractiveElement,
-    IntoElement, KeyContext, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task,
-    UTF16Selection, Window, div, point, px, size,
+    ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, Font,
+    Hsla, Image, InteractiveElement, IntoElement, KeyContext, KeyDownEvent, Modifiers,
+    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement,
+    Styled, Subscription, Task, UTF16Selection, Window, div, point, px, size,
 };
 
 use super::agent_mark::{self, agent_color};
@@ -32,6 +32,10 @@ use super::terminal_element::TerminalElement;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::drop_paste::{
+    DROP_NEEDS_LOCAL, IMAGE_NOT_SAVED, PasteKind, dropped_text, image_extension, paste_kind,
+    save_pasted_image,
+};
 use crate::core::feedback::{self, Tween};
 use crate::core::find::status_label;
 use crate::core::icons::Icon;
@@ -196,6 +200,10 @@ pub struct PaneChrome {
     pub agent: Option<u64>,
     /// `[gui] agent_emoji`: the agent's emoji replaces the header icon.
     pub agent_emoji: bool,
+    /// The agent runs on this machine (the target is local): paths from
+    /// here mean the same to it, so files can be dropped and images
+    /// pasted (ADR 0081).
+    pub local: bool,
 }
 
 /// The focus ring's colour at full strength: the agent's colour, else the
@@ -329,6 +337,8 @@ pub enum PaneEvent {
     ContextMenu {
         on_grid: bool,
     },
+    /// A message for the toast (a drop or paste that cannot work here).
+    Notice(&'static str),
     /// The first-run welcome's buttons.
     NewAgent,
     NewTerminal,
@@ -391,6 +401,8 @@ pub struct PaneView {
     pub(crate) open_file: Arc<dyn Fn(Vec<String>, Vec<String>)>,
     /// The find bar, while open.
     find: Option<FindBar>,
+    /// Where a pasted image is saved (`$TMPDIR`; replaced in tests).
+    pub(crate) paste_dir: std::path::PathBuf,
     /// The last query, brought back when find opens again.
     find_query: String,
     find_case: bool,
@@ -466,6 +478,7 @@ impl PaneView {
             hover: None,
             open_file: Arc::new(spawn_opener),
             find: None,
+            paste_dir: std::env::temp_dir(),
             find_query: String::new(),
             find_case: false,
             find_task: None,
@@ -1018,12 +1031,88 @@ impl PaneView {
         cx.notify();
     }
 
+    /// ⌘V: the clipboard's text; else its image, saved to a temp file,
+    /// as that file's path (ADR 0081).
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        let text = item.text();
+        let image = item.into_entries().find_map(|e| match e {
+            ClipboardEntry::Image(image) => Some(image),
+            ClipboardEntry::String(_) => None,
+        });
+        match paste_kind(text.is_some(), image.is_some(), self.chrome.local) {
+            PasteKind::Text => self.paste_text(&text.unwrap_or_default(), cx),
+            PasteKind::Image => {
+                if let Some(image) = image {
+                    self.paste_image(image, cx);
+                }
+            }
+            PasteKind::Notice(text) => cx.emit(PaneEvent::Notice(text)),
+            PasteKind::Nothing => {}
+        }
+    }
+
+    /// Pastes `text` into the agent, bracketed when it asked for that.
+    pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let modes = self.model().terminal().modes();
-        self.send(encode_paste(&text, &modes), cx);
+        self.send(encode_paste(text, &modes), cx);
+    }
+
+    /// Saves `image` to a new temp file off the UI thread, then pastes its
+    /// path.
+    fn paste_image(&mut self, image: Image, cx: &mut Context<Self>) {
+        let Some(ext) = image_extension(image.format.mime_type()) else {
+            return;
+        };
+        let dir = self.paste_dir.clone();
+        let at = unix_ms();
+        let saved = cx
+            .background_executor()
+            .spawn(async move { save_pasted_image(&dir, at, ext, &image.bytes) });
+        cx.spawn(async move |this, cx| {
+            let saved = saved.await;
+            let _ = this.update(cx, |this, cx| match saved {
+                Ok(path) => {
+                    if let Some(text) = dropped_text(&[path.to_string_lossy()]) {
+                        this.paste_text(&text, cx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("fleet-gui: cannot save the pasted image: {e}");
+                    cx.emit(PaneEvent::Notice(IMAGE_NOT_SAVED));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Files dropped from Finder: the pane gets the keyboard and their
+    /// paths are typed (ADR 0081).
+    fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        let paths: Vec<String> = paths
+            .paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        self.type_paths(&paths, cx);
+    }
+
+    /// Types `paths`, quoted, into the pane's running agent; for an agent
+    /// on another machine, a notice instead.
+    pub(crate) fn type_paths(&mut self, paths: &[String], cx: &mut Context<Self>) {
+        if !self.chrome.has_agent || self.chrome.agent_ended {
+            return;
+        }
+        if !self.chrome.local {
+            cx.emit(PaneEvent::Notice(DROP_NEEDS_LOCAL));
+            return;
+        }
+        if let Some(text) = dropped_text(paths) {
+            self.paste_text(&text, cx);
+        }
     }
 
     /// The marked-text cell ([`ime_cell`]) in window coordinates.
@@ -1719,6 +1808,27 @@ impl Render for PaneView {
             );
         }
         grid = grid.children(find_bar);
+        // Files from Finder over the pane: an accent outline (and tint),
+        // as for an agent dragged here (ADR 0059), and the drop lands
+        // here. Built only while something is dragged.
+        let drop_zone = cx.has_active_drag().then(|| {
+            let accent = theme.accent;
+            let number = chrome.number;
+            div()
+                .debug_selector(move || format!("pane-{number}-file-drop"))
+                .absolute()
+                .inset_0()
+                .rounded(px(radius::LG))
+                .drag_over::<ExternalPaths>(move |s, _, _, _| {
+                    let s = s.border_2().border_color(accent);
+                    if native::reduce_transparency() {
+                        s
+                    } else {
+                        s.bg(accent.opacity(0.16))
+                    }
+                })
+                .on_drop(cx.listener(Self::drop_paths))
+        });
         div()
             .key_context({
                 // ⌘⇧G is Find Previous only while finding (ADR 0073).
@@ -1784,6 +1894,7 @@ impl Render for PaneView {
                 }
             }))
             .children(ended_bar(self, state, &theme, cx))
+            .children(drop_zone)
             .children((dim > 0.0).then(|| {
                 // The veil only draws: clicks and keys go to the pane.
                 div()
@@ -2000,13 +2111,16 @@ mod tests {
         VisualTestContext, bounds, point, px, size,
     };
 
+    use gpui::{ExternalPaths, FileDropEvent, Image, ImageFormat};
+
     use super::{
-        HeaderParts, InputSink, PaneChrome, PaneView, banner, draws_cursor, empty_message,
-        grid_size, header_parts, ime_cell, point_to_cell,
+        HeaderParts, InputSink, PaneChrome, PaneEvent, PaneView, banner, draws_cursor,
+        empty_message, grid_size, header_parts, ime_cell, point_to_cell,
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
+    use crate::core::drop_paste::{DROP_NEEDS_LOCAL, IMAGE_NEEDS_LOCAL, shell_quote};
     use crate::core::pane::PaneState;
     use crate::core::pane::{PaneModel, ViewRow};
     use crate::core::selection::{LineRef, SelPoint};
@@ -2723,6 +2837,136 @@ mod tests {
         cx.write_to_clipboard(ClipboardItem::new_string("x\ny".to_owned()));
         cx.dispatch_action(Paste);
         assert_eq!(sink.take(), vec![b"\x1b[200~x\ry\x1b[201~".to_vec()]);
+    }
+
+    /// The pane's notices, as they are emitted.
+    fn notices(view: &Entity<PaneView>, cx: &mut VisualTestContext) -> Arc<Mutex<Vec<String>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(view, move |_, e: &PaneEvent, _| {
+                if let PaneEvent::Notice(text) = e {
+                    log.lock().unwrap().push((*text).to_owned());
+                }
+            })
+            .detach();
+        });
+        seen
+    }
+
+    /// A pane showing a running agent, on this machine (`local`) or not.
+    fn agent_pane(view: &Entity<PaneView>, cx: &mut VisualTestContext, local: bool) {
+        view.update(cx, |v, _| {
+            v.chrome.has_agent = true;
+            v.chrome.local = local;
+        });
+    }
+
+    #[gpui::test]
+    fn pasting_an_image_saves_it_and_pastes_its_path(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, blank_model());
+        let dir = tempfile::tempdir().unwrap();
+        agent_pane(&view, cx, true);
+        view.update(cx, |v, _| v.paste_dir = dir.path().to_path_buf());
+        let image = Image::from_bytes(ImageFormat::Png, b"png bytes".to_vec());
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        cx.dispatch_action(Paste);
+        cx.run_until_parked();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("fleet-paste-") && name.ends_with(".png"),
+            "{name}"
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"png bytes");
+        let typed = shell_quote(&file.to_string_lossy());
+        assert_eq!(sink.take(), vec![typed.into_bytes()]);
+    }
+
+    #[gpui::test]
+    fn text_on_the_clipboard_wins_over_nothing_and_an_image_needs_a_local_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, sink, cx) = pane(cx, blank_model());
+        let dir = tempfile::tempdir().unwrap();
+        agent_pane(&view, cx, false);
+        view.update(cx, |v, _| v.paste_dir = dir.path().to_path_buf());
+        let seen = notices(&view, cx);
+        let image = Image::from_bytes(ImageFormat::Png, b"png".to_vec());
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        cx.dispatch_action(Paste);
+        cx.run_until_parked();
+
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(*seen.lock().unwrap(), vec![IMAGE_NEEDS_LOCAL.to_owned()]);
+
+        // Text still pastes into a remote agent.
+        cx.write_to_clipboard(ClipboardItem::new_string("hi".to_owned()));
+        cx.dispatch_action(Paste);
+        assert_eq!(sink.take(), vec![b"hi".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn dropped_paths_are_typed_quoted_and_bracketed(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"\x1b[?2004h");
+        let (view, sink, cx) = pane(cx, model);
+        let seen = notices(&view, cx);
+        let paths = vec!["/a/b.txt".to_owned(), "/c d/it's.png".to_owned()];
+
+        // No agent: nothing.
+        view.update(cx, |v, cx| v.type_paths(&paths, cx));
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+
+        agent_pane(&view, cx, true);
+        view.update(cx, |v, cx| v.type_paths(&paths, cx));
+        let typed = b"\x1b[200~/a/b.txt '/c d/it'\\''s.png'\x1b[201~".to_vec();
+        assert_eq!(sink.take(), vec![typed]);
+
+        // An ended agent: nothing.
+        view.update(cx, |v, cx| {
+            v.chrome.agent_ended = true;
+            v.type_paths(&paths, cx);
+        });
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+
+        // On another machine the paths would not exist: a notice.
+        agent_pane(&view, cx, false);
+        view.update(cx, |v, cx| {
+            v.chrome.agent_ended = false;
+            v.type_paths(&paths, cx);
+        });
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+        assert_eq!(*seen.lock().unwrap(), vec![DROP_NEEDS_LOCAL.to_owned()]);
+    }
+
+    #[gpui::test]
+    fn a_file_drag_highlights_the_pane_and_the_drop_focuses_it(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_history(0));
+        agent_pane(&view, cx, true);
+        cx.update(|window, _| window.blur());
+        let at = cell(&view, cx, 10, 5);
+        assert!(cx.debug_bounds("pane-0-file-drop").is_none());
+
+        cx.simulate_event(FileDropEvent::Entered {
+            position: at,
+            paths: ExternalPaths::default(),
+        });
+        cx.simulate_event(FileDropEvent::Pending { position: at });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("pane-0-file-drop").is_some());
+
+        cx.simulate_event(FileDropEvent::Submit { position: at });
+        cx.run_until_parked();
+        let focused = cx.update(|window, cx| view.read(cx).focus_handle().is_focused(window));
+        assert!(focused, "the drop gives the pane the keyboard");
     }
 
     #[gpui::test]

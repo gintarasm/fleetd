@@ -9,11 +9,11 @@ use fleet_client::names::name_of;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Action, Animation, AnimationExt, App, AppContext, Bounds, Context, Div, Entity, EntityId,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, ParentElement, PromptButton, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px, relative,
-    size,
+    ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement, PromptButton, PromptLevel,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px,
+    relative, size,
 };
 
 use super::app_state::AppState;
@@ -920,6 +920,25 @@ impl Workspace {
     pub fn show_agent(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.app.update(cx, |a, cx| a.show_agent(agent_id, cx));
         self.focus_current(window, cx);
+    }
+
+    /// Files from Finder dropped on `agent`'s sidebar row.
+    pub(super) fn drop_paths_on_agent(
+        &mut self,
+        agent: u64,
+        paths: &ExternalPaths,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal() {
+            return;
+        }
+        let paths: Vec<String> = paths
+            .paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        self.app
+            .update(cx, |a, cx| a.drop_paths_on_agent(agent, &paths, cx));
     }
 
     /// The sidebar's groups under its filter and the target's collapsed
@@ -2023,6 +2042,9 @@ impl Workspace {
             PaneEvent::Kill => self.kill_in_pane(pane, window, cx),
             PaneEvent::Remove => self.app.read(cx).remove_in_pane(pane, cx),
             PaneEvent::ContextMenu { on_grid } => self.open_pane_menu(pane, on_grid, cx),
+            PaneEvent::Notice(text) => self
+                .app
+                .update(cx, |a, cx| a.show_notice(text.to_owned(), cx)),
         }
     }
 
@@ -3171,6 +3193,98 @@ mod tests {
         let at = center(s, selector);
         s.cx.simulate_click(at, Modifiers::none());
         s.cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn files_dropped_on_a_row_are_typed_into_its_agent(cx: &mut TestAppContext) {
+        let fake = Arc::new(Fake::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = setup(cx, &fake, dir.path());
+        let rows = vec![
+            row(1, "/w", 1),
+            row(2, "/w", 2),
+            ended(3, "/w", 3, AgentState::Exited),
+        ];
+        agents(&mut s, &fake, rows);
+        s.ws.update_in(s.cx, |w, window, cx| w.show_agent(1, window, cx));
+        s.cx.run_until_parked();
+        let pane = focused(&mut s);
+        fake.model(pane).lock().unwrap().on_output(b"\x1b[?2004h");
+        fake.inputs.lock().unwrap().clear();
+        let paths = vec!["/a b.png".to_owned(), "/c".to_owned()];
+
+        // Shown in a pane: through it, bracketed as the agent asked.
+        s.app
+            .update(s.cx, |a, cx| a.drop_paths_on_agent(1, &paths, cx));
+        let typed = b"\x1b[200~'/a b.png' /c\x1b[201~".to_vec();
+        assert_eq!(*fake.inputs.lock().unwrap(), vec![typed]);
+
+        // Not shown: on the control connection.
+        s.app
+            .update(s.cx, |a, cx| a.drop_paths_on_agent(2, &paths, cx));
+        let sent = Call::Send(2, b"'/a b.png' /c".to_vec());
+        assert!(fake.calls().contains(&sent), "{:?}", fake.calls());
+
+        // An ended agent takes nothing.
+        let before = fake.calls().len();
+        s.app
+            .update(s.cx, |a, cx| a.drop_paths_on_agent(3, &paths, cx));
+        assert_eq!(fake.calls().len(), before);
+        assert_eq!(fake.inputs.lock().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn a_pane_notice_shows_in_the_toast(cx: &mut TestAppContext) {
+        let fake = Arc::new(Fake::default());
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = setup(cx, &fake, dir.path());
+        let pane = focused(&mut s);
+        let view = s
+            .app
+            .read_with(s.cx, |a, _| a.pane_view(pane).cloned())
+            .unwrap();
+        view.update(s.cx, |v, cx| {
+            v.chrome.has_agent = true;
+            v.chrome.local = false;
+            v.type_paths(&["/a".to_owned()], cx);
+        });
+        s.cx.run_until_parked();
+        let notice = s.app.read_with(s.cx, |a, _| a.notice().map(str::to_owned));
+        assert_eq!(
+            notice.as_deref(),
+            Some(crate::core::drop_paste::DROP_NEEDS_LOCAL)
+        );
+    }
+
+    #[gpui::test]
+    fn files_dropped_on_a_remote_agent_show_a_notice(cx: &mut TestAppContext) {
+        let fake = Arc::new(Fake::default());
+        *fake.agents.lock().unwrap() = vec![row(1, "/w", 1)];
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = async_channel::unbounded();
+        let session: Arc<dyn SessionApi> = fake.clone();
+        let target = Target::Ssh { dest: "box".into() };
+        let path = dir.path().to_owned();
+        let app = cx.new(|cx| {
+            AppState::new(
+                session,
+                rx,
+                target,
+                path,
+                GuiConfig::default(),
+                Theme::dark(),
+                cx,
+            )
+        });
+        let paths = vec!["/a".to_owned()];
+        app.update(cx, |a, cx| a.drop_paths_on_agent(1, &paths, cx));
+        let notice = app.read_with(cx, |a, _| a.notice().map(str::to_owned));
+        assert_eq!(
+            notice.as_deref(),
+            Some(crate::core::drop_paste::DROP_NEEDS_LOCAL)
+        );
+        assert!(!fake.calls().iter().any(|c| matches!(c, Call::Send(..))));
+        assert!(fake.inputs.lock().unwrap().is_empty());
     }
 
     fn agents(s: &mut Setup<'_>, fake: &Fake, rows: Vec<AgentRow>) {

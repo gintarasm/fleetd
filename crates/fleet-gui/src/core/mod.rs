@@ -4,6 +4,7 @@ pub mod backoff;
 pub mod broadcast;
 pub mod config;
 pub mod drag_drop;
+pub mod drop_paste;
 pub mod ended;
 pub mod feedback;
 pub mod find;
