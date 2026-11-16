@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use fleet_term::CursorShape;
+use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyWindowHandle, AppContext, Bounds, BoxShadow, ClipboardItem, Context, Entity, EventEmitter,
     FocusHandle, Font, InteractiveElement, IntoElement, KeyDownEvent, Modifiers,
@@ -28,6 +29,7 @@ use crate::core::config::GuiConfig;
 use crate::core::find::status_label;
 use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
+use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
 use crate::core::pane::{PaneModel, PaneState, ViewRow};
@@ -230,6 +232,9 @@ pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> (String, St
     (title, chrome.cwd.clone().unwrap_or_default())
 }
 
+/// The pane header's hover group (its agent buttons show on hover).
+const PANE_HEADER_GROUP: &str = "pane-header";
+
 /// A header button, asking the workspace to act on this pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneEvent {
@@ -239,7 +244,9 @@ pub enum PaneEvent {
     Close,
     /// The summary bar's Restart: the ended agent again, in this pane.
     Restart,
-    /// The summary bar's Remove: forgets the ended agent.
+    /// The header's Stop: kill the pane's running agent (after asking).
+    Kill,
+    /// Remove, in the header or the summary bar: forgets the ended agent.
     Remove,
     /// A right-click asks for the pane's context menu: on the header, or
     /// on the grid (`on_grid`) while the agent does not take the mouse.
@@ -1108,8 +1115,34 @@ impl Render for PaneView {
                 .debug_selector(move || format!("pane-{}-{id}", chrome.number))
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
         };
+        // Stop for a running agent, Restart and Remove for an ended one:
+        // always on the focused pane, on hover on the others.
+        let ended = chrome.agent_ended || restartable(chrome, state);
+        let agent_buttons = match agent_buttons(chrome.has_agent, ended) {
+            AgentButtons::None => Vec::new(),
+            AgentButtons::Stop => vec![("stop", Icon::Stop, PaneEvent::Kill)],
+            // Restart once the pane holds the final screen (as ⌘R).
+            AgentButtons::RestartRemove => restartable(chrome, state)
+                .then_some(("restart-agent", Icon::Restart, PaneEvent::Restart))
+                .into_iter()
+                .chain([("remove", Icon::Trash, PaneEvent::Remove)])
+                .collect(),
+        };
+        let agent_buttons = (!agent_buttons.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .children(agent_buttons.into_iter().map(|(id, icon, event)| {
+                    icon_button(id, icon, event).when(!chrome.focused, |b| {
+                        b.invisible()
+                            .group_hover(PANE_HEADER_GROUP, |s| s.visible())
+                    })
+                }))
+        });
         let header = div()
             .id("pane-header")
+            .group(PANE_HEADER_GROUP)
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ContextMenu { on_grid: false })),
@@ -1180,6 +1213,7 @@ impl Render for PaneView {
                     .text_color(theme.tertiary)
                     .child(SharedString::from(format!("⌘{}", chrome.number)))
             }))
+            .children(agent_buttons)
             .child(icon_button(
                 "split-right",
                 Icon::SplitRight,

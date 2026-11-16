@@ -7,6 +7,7 @@ pub mod find;
 pub mod fuzzy;
 pub mod icons;
 pub mod keys;
+pub mod kill;
 pub mod launch;
 pub mod layout;
 pub mod links;

@@ -17,12 +17,15 @@ pub enum Icon {
     Terminal,
     Server,
     Folder,
+    /// Kill an agent: not the pane's Close (×), which only detaches.
+    Stop,
+    Check,
     ChevronUp,
     ChevronDown,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 13] = [
+    pub const ALL: [Icon; 15] = [
         Icon::Plus,
         Icon::Close,
         Icon::SplitRight,
@@ -34,6 +37,8 @@ impl Icon {
         Icon::Terminal,
         Icon::Server,
         Icon::Folder,
+        Icon::Stop,
+        Icon::Check,
         Icon::ChevronUp,
         Icon::ChevronDown,
     ];
@@ -52,6 +57,8 @@ impl Icon {
             Icon::Terminal => "terminal",
             Icon::Server => "server",
             Icon::Folder => "folder-open",
+            Icon::Stop => "circle-stop",
+            Icon::Check => "check",
             Icon::ChevronUp => "chevron-up",
             Icon::ChevronDown => "chevron-down",
         }
@@ -71,6 +78,8 @@ impl Icon {
             Icon::Terminal => "icons/terminal.svg",
             Icon::Server => "icons/server.svg",
             Icon::Folder => "icons/folder-open.svg",
+            Icon::Stop => "icons/circle-stop.svg",
+            Icon::Check => "icons/check.svg",
             Icon::ChevronUp => "icons/chevron-up.svg",
             Icon::ChevronDown => "icons/chevron-down.svg",
         }

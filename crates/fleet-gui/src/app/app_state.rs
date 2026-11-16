@@ -1240,15 +1240,4 @@ impl AppState {
         self.error_is_connection = false;
         cx.notify();
     }
-
-    pub(super) fn label(&self, agent_id: u64) -> String {
-        match self.agents.iter().find(|r| r.info.id == agent_id) {
-            Some(r) => format!(
-                "{} in {}",
-                program_name(&r.info.program),
-                tilde(&r.info.cwd, &self.home)
-            ),
-            None => format!("agent {agent_id}"),
-        }
-    }
 }
