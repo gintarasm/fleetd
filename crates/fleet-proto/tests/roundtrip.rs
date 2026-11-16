@@ -203,6 +203,7 @@ fn roundtrip_every_kind() {
         Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client: "c".into(),
+            ..Default::default()
         }),
         Frame::HelloOk(HelloOk {
             protocol_version: PROTOCOL_VERSION,

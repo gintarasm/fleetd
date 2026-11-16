@@ -179,6 +179,7 @@ fn running_ino(dir: &Path) -> u64 {
     let hello = Frame::Hello(fleet_proto::Hello {
         protocol_version: PROTOCOL_VERSION,
         client: "restart-test".into(),
+        ..Default::default()
     });
     FrameCodec::default().encode(hello, &mut out).unwrap();
     s.write_all(&out).unwrap();

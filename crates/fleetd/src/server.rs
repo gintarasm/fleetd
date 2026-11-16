@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
 use fleet_node::node::{ActivityReceiver, ConnId, Node, Removed, StreamItem, Subscription};
+use fleet_node::scope::Caller;
 use fleet_proto::{
     Ack, AgentList, AgentRemoved, AgentResized, AttachOk, AttachRole, Event, ForgetAgents,
     Forgotten, Frame, FrameCodec, HandshakeReject, HelloOk, HistoryPage, Lagged, LogLine, LogLines,
@@ -37,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use crate::handoff::Identity;
 use crate::logging;
+use crate::scope;
 
 /// Concurrent connections served; more are rejected.
 const MAX_CONNECTIONS: usize = 64;
@@ -278,14 +280,17 @@ async fn reject(writer: &mut Writer, reason: String) {
     let _ = tokio::time::timeout(HANDSHAKE_WRITE_TIMEOUT, writer.send(frame)).await;
 }
 
-/// Reads the `Hello` and answers it; the client's name if the connection
+/// Reads the `Hello`, identifies the caller (ADR 0072: `session` is the
+/// peer's) and answers it; the client's name and caller if the connection
 /// may proceed.
 async fn handshake(
     conn: ConnId,
+    node: &Arc<Node>,
+    session: Option<u32>,
     hello_ok: &HelloOk,
     reader: &mut Reader,
     writer: &mut Writer,
-) -> Option<String> {
+) -> Option<(String, Caller)> {
     let reject_reason = |reason: &str| {
         warn!(conn = conn.0, reason, "handshake rejected");
     };
@@ -317,9 +322,18 @@ async fn handshake(
         reject(writer, reason).await;
         return None;
     }
+    // Boxed: kept out of every connection's future.
+    let caller = match Box::pin(scope::identify(node, session, hello.agent_token)).await {
+        Ok(caller) => caller,
+        Err(reason) => {
+            reject_reason(&reason);
+            reject(writer, reason).await;
+            return None;
+        }
+    };
     let ok = Frame::HelloOk(hello_ok.clone());
     match tokio::time::timeout(HANDSHAKE_WRITE_TIMEOUT, writer.send(ok)).await {
-        Ok(Ok(())) => Some(hello.client),
+        Ok(Ok(())) => Some((hello.client, caller)),
         _ => {
             debug!(conn = conn.0, "connection closed during the handshake");
             None
@@ -334,6 +348,7 @@ async fn connection(
     _slot: OwnedSemaphorePermit,
 ) {
     let hello = shared.hello();
+    let session = scope::peer_session(&stream);
     let (rd, wr) = stream.into_split();
     let mut reader = FramedRead::new(rd, FrameCodec::with_max(HELLO_MAX_FRAME));
     let mut writer = FramedWrite::new(wr, FrameCodec::new());
@@ -342,14 +357,23 @@ async fn connection(
     let exits = node.exit_events();
     let removed = node.removed_events();
     let activity = node.activity_events();
+    let refused = node.refused_events();
     let id = ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
-    let Some(client) = handshake(id, &hello, &mut reader, &mut writer).await else {
+    let Some((client, caller)) =
+        handshake(id, &node, session, &hello, &mut reader, &mut writer).await
+    else {
         return;
     };
     // `?`: the name is the client's, so it is quoted and escaped.
-    info!(conn = id.0, client = ?client, "connection opened");
+    match caller {
+        Caller::User => info!(conn = id.0, client = ?client, "connection opened"),
+        Caller::Agent(agent) => {
+            info!(conn = id.0, client = ?client, agent, "connection opened by an agent");
+        }
+    }
     reader.decoder_mut().set_max(MAX_FRAME);
 
+    let node_for_scope = Arc::clone(&node);
     let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
     // Removals other connections caused, for the request loop to drop
     // this connection's state for them.
@@ -364,20 +388,35 @@ async fn connection(
         removed_pending: HashSet::new(),
         log_follower: None,
         restarting: None,
+        caller,
+        scope: scope::Scope::new(&node_for_scope, caller),
     };
+    // Boxed: kept out of every connection's future.
+    Box::pin(conn.scope.warm()).await;
     let writer = tokio::spawn(write_frames(id, writer, rx));
     let tasks = Tasks(vec![
         tokio::spawn(forward_exits(
             exits,
             conn.outbox.clone(),
             Arc::clone(&conn.attached),
+            conn.scope.clone(),
         )),
-        tokio::spawn(forward_activity(activity, conn.outbox.clone())),
+        tokio::spawn(forward_activity(
+            activity,
+            conn.outbox.clone(),
+            conn.scope.clone(),
+        )),
+        tokio::spawn(scope::forward_refused(
+            refused,
+            conn.outbox.clone(),
+            conn.scope.clone(),
+        )),
         tokio::spawn(forward_removed(
             removed,
             conn.outbox.clone(),
             id,
             removed_tx,
+            conn.scope.clone(),
         )),
     ]);
 
@@ -451,6 +490,10 @@ struct Connection {
     /// the connection ends, and tells the serve loop when the answer is
     /// written.
     restarting: Option<std::sync::mpsc::SyncSender<()>>,
+    /// Who this connection is (ADR 0072), fixed at the handshake.
+    caller: Caller,
+    /// What the caller may see and touch (all for the user).
+    scope: scope::Scope,
 }
 
 impl Drop for Connection {
@@ -495,6 +538,13 @@ impl Connection {
     /// is stuck on an agent's full input queue.
     async fn handle(&mut self, req: Request) -> bool {
         self.sweep_removed().await;
+        if let Caller::Agent(a) = self.caller {
+            // Boxed: kept out of every request's future.
+            let refused = Box::pin(scope::refusal(&self.scope, a, &req.kind));
+            if let Some(message) = refused.await {
+                return self.respond(req.id, error(message)).await;
+            }
+        }
         // `Err` refuses the request. No await of its own: each one adds
         // its states to every request's future (see `admit`).
         let admitted = match &req.kind {
@@ -514,14 +564,16 @@ impl Connection {
                 return self.spawn_attached(req.id, *spawn).await;
             }
             Some(request::Kind::Spawn(spawn)) => {
-                match blocking(&self.node, move |n| n.spawn(*spawn)).await {
+                let caller = self.caller;
+                match blocking(&self.node, move |n| n.spawn_by(caller, *spawn)).await {
                     Ok(info) => response::Kind::Spawned(Box::new(info)),
                     Err(e) => error(e.to_string()),
                 }
             }
             Some(request::Kind::List(list)) => {
+                let caller = self.caller;
                 let listed = blocking(&self.node, move |n| {
-                    Ok((n.list_matching(&list.selector)?, n.replacements()?))
+                    Ok((n.list_for(caller, &list.selector)?, n.replacements()?))
                 })
                 .await;
                 match listed {
@@ -723,9 +775,10 @@ impl Connection {
         // announced only by its forwarder, after its output.
         let attached = Arc::clone(&self.attached);
         let conn = self.id;
+        let caller = self.caller;
         let spawned = blocking(&self.node, move |n| {
             let mut started = None;
-            let r = n.spawn_attached(spawn, conn, |agent_id| {
+            let r = n.spawn_attached_by(caller, spawn, conn, |agent_id| {
                 started = Some(agent_id);
                 lock(&attached).insert(agent_id);
             });
@@ -769,11 +822,12 @@ impl Connection {
     async fn restart(&mut self, id: u64, r: RestartAgent) -> bool {
         let old_id = r.agent_id;
         let conn = self.id;
+        let caller = self.caller;
         let (info, attached) = if r.attach {
             let attached = Arc::clone(&self.attached);
             let restarted = blocking(&self.node, move |n| {
                 let mut started = None;
-                let res = n.restart_attached(old_id, r.cols, r.rows, conn, |agent_id| {
+                let res = n.restart_attached_by(caller, old_id, r.cols, r.rows, conn, |agent_id| {
                     started = Some(agent_id);
                     lock(&attached).insert(agent_id);
                 });
@@ -792,7 +846,7 @@ impl Connection {
             }
         } else {
             match blocking(&self.node, move |n| {
-                n.restart(old_id, r.cols, r.rows, Some(conn))
+                n.restart_by(caller, old_id, r.cols, r.rows, Some(conn))
             })
             .await
             {
@@ -834,8 +888,9 @@ impl Connection {
     /// before it (other connections got theirs from the broadcast).
     async fn forget(&mut self, id: u64, f: ForgetAgents) -> bool {
         let conn = self.id;
+        let caller = self.caller;
         let outcome = blocking(&self.node, move |n| {
-            Ok(n.forget(&f.ids, f.exited_only, &f.selector, Some(conn)))
+            Ok(n.forget_by(caller, &f.ids, f.exited_only, &f.selector, Some(conn)))
         })
         .await;
         let (forgotten, reply) = match outcome {
@@ -995,11 +1050,12 @@ async fn forward_exits(
     mut exits: broadcast::Receiver<fleet_proto::AgentExited>,
     outbox: mpsc::Sender<Frame>,
     attached: Arc<Mutex<HashSet<u64>>>,
+    scope: scope::Scope,
 ) {
     loop {
         match exits.recv().await {
             Ok(e) => {
-                if lock(&attached).contains(&e.agent_id) {
+                if lock(&attached).contains(&e.agent_id) || !scope.sees(e.agent_id).await {
                     continue;
                 }
                 if outbox
@@ -1033,11 +1089,23 @@ async fn forward_removed(
     outbox: mpsc::Sender<Frame>,
     own: ConnId,
     local: mpsc::UnboundedSender<u64>,
+    scope: scope::Scope,
 ) {
     loop {
         match removed.recv().await {
             Ok(r) => {
                 if r.origin == Some(own) {
+                    continue;
+                }
+                // A forgotten agent's row is gone: only the cache (warmed
+                // at the handshake, fed by its exit) still places it; a
+                // restarted one is placed by its successor.
+                let seen = scope.sees_now_cached(r.event.agent_id)
+                    || match r.event.replaced_by {
+                        Some(new) => scope.sees(new).await,
+                        None => false,
+                    };
+                if !seen {
                     continue;
                 }
                 let agent_id = r.event.agent_id;
@@ -1062,16 +1130,23 @@ async fn forward_removed(
 /// events wait in the receiver, which keeps only each agent's newest one.
 /// An event is taken only once an outbox slot is reserved, and queued
 /// without waiting, so it never follows that agent's exit event.
-async fn forward_activity(activity: ActivityReceiver, outbox: mpsc::Sender<Frame>) {
+/// An agent caller gets only its descendants' activity.
+async fn forward_activity(
+    activity: ActivityReceiver,
+    outbox: mpsc::Sender<Frame>,
+    scope: scope::Scope,
+) {
     loop {
         loop {
             let Ok(slot) = outbox.reserve().await else {
                 return;
             };
             let delivered = activity.deliver_next(|a| {
-                slot.send(Frame::Event(Event {
-                    kind: Some(event::Kind::Activity(a)),
-                }));
+                if scope.sees_now(a.agent_id) {
+                    slot.send(Frame::Event(Event {
+                        kind: Some(event::Kind::Activity(a)),
+                    }));
+                }
             });
             if !delivered {
                 break;
@@ -1193,6 +1268,8 @@ mod tests {
             removed_pending: HashSet::new(),
             log_follower: None,
             restarting: None,
+            caller: Caller::User,
+            scope: scope::Scope::user(),
         };
         (server, conn, rx)
     }
@@ -1326,7 +1403,13 @@ mod tests {
         let (outbox, mut out_rx) = mpsc::channel(OUTBOX_CAPACITY);
         let (local, mut local_rx) = mpsc::unbounded_channel();
         let own = ConnId(1);
-        let task = tokio::spawn(forward_removed(removed, outbox, own, local));
+        let task = tokio::spawn(forward_removed(
+            removed,
+            outbox,
+            own,
+            local,
+            scope::Scope::user(),
+        ));
         let removal = |agent_id, origin| Removed {
             event: AgentRemoved {
                 agent_id,

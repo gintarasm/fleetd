@@ -6,7 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 5;
+/// v6 and v7 are taken by the M3 mailbox and lease branches (spec
+/// "Waves"); identity took 8.
+const SCHEMA_VERSION: i64 = 8;
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -51,6 +53,12 @@ pub struct AgentRecord {
 pub struct Store {
     conn: Connection,
 }
+
+/// An agent's token digest (ADR 0072): only while it runs.
+const AGENT_TOKENS_DDL: &str = "CREATE TABLE agent_tokens (
+                 agent_id INTEGER PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+                 digest BLOB NOT NULL UNIQUE
+             );";
 
 impl AgentState {
     fn as_str(self) -> &'static str {
@@ -190,13 +198,23 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 8 {
+            // v8: agent token digests (ADR 0072). The DDL must match
+            // `create_latest`'s.
+            self.conn.execute_batch(&format!(
+                "BEGIN;
+                 {AGENT_TOKENS_DDL}
+                 PRAGMA user_version = 8;
+                 COMMIT;"
+            ))?;
+        }
         Ok(())
     }
 
-    /// The latest schema for a new DB; the same tables the v1 -> ... -> v5
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v8
     /// migrations produce.
     fn create_latest(&self) -> rusqlite::Result<()> {
-        self.conn.execute_batch(
+        self.conn.execute_batch(&format!(
             "BEGIN;
              CREATE TABLE agents (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -218,9 +236,10 @@ impl Store {
                  old_id INTEGER PRIMARY KEY,
                  new_id INTEGER NOT NULL
              );
-             PRAGMA user_version = 5;
-             COMMIT;",
-        )
+             {AGENT_TOKENS_DDL}
+             PRAGMA user_version = 8;
+             COMMIT;"
+        ))
     }
 
     /// v3: agent ids use AUTOINCREMENT so they are never reused, and
@@ -441,14 +460,39 @@ impl Store {
         Ok(Some(rec))
     }
 
-    /// running -> exited, recording the exit time. Errors if the agent is
-    /// unknown or not running.
+    /// Stores the digest of a running agent's token, replacing any it had.
+    pub fn set_token(&self, id: u64, digest: &[u8; 32]) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO agent_tokens (agent_id, digest) VALUES (?1, ?2)",
+            (id as i64, &digest[..]),
+        )?;
+        Ok(())
+    }
+
+    /// The running agent whose token has this digest.
+    pub fn token_agent(&self, digest: &[u8; 32]) -> rusqlite::Result<Option<u64>> {
+        self.conn
+            .query_row(
+                "SELECT t.agent_id FROM agent_tokens t JOIN agents a ON a.id = t.agent_id
+                 WHERE t.digest = ?1 AND a.state = 'running'",
+                (&digest[..],),
+                |r| r.get::<_, i64>(0).map(|id| id as u64),
+            )
+            .optional()
+    }
+
+    /// running -> exited, recording the exit time, and revokes its token.
+    /// Errors if the agent is unknown or not running.
     pub fn set_exited(&self, id: u64, code: i32) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         let n = self.conn.execute(
             "UPDATE agents SET state = 'exited', exit_code = ?2, exited_unix_ms = ?3
              WHERE id = ?1 AND state = 'running'",
             (id as i64, code, unix_ms_now()),
         )?;
+        self.conn
+            .execute("DELETE FROM agent_tokens WHERE agent_id = ?1", (id as i64,))?;
+        tx.commit()?;
         if n == 1 {
             Ok(())
         } else {
@@ -566,6 +610,8 @@ impl Store {
                 "UPDATE agents SET state = ?1 WHERE id = ?2",
                 (AgentState::Lost.as_str(), id as i64),
             )?;
+            self.conn
+                .execute("DELETE FROM agent_tokens WHERE agent_id = ?1", (id as i64,))?;
         }
         tx.commit()?;
         Ok(lost)
@@ -589,8 +635,44 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v5() {
-        assert_eq!(SCHEMA_VERSION, 5);
+    fn schema_is_v8() {
+        assert_eq!(SCHEMA_VERSION, 8);
+    }
+
+    #[test]
+    fn tokens_match_running_agents_only() {
+        let (_d, _p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        let b = s.insert_agent(&new_agent(2)).unwrap();
+        s.set_token(a, &[1; 32]).unwrap();
+        s.set_token(b, &[2; 32]).unwrap();
+        assert_eq!(s.token_agent(&[1; 32]).unwrap(), Some(a));
+        assert_eq!(s.token_agent(&[3; 32]).unwrap(), None);
+        // A new token replaces the old.
+        s.set_token(a, &[4; 32]).unwrap();
+        assert_eq!(s.token_agent(&[1; 32]).unwrap(), None);
+        assert_eq!(s.token_agent(&[4; 32]).unwrap(), Some(a));
+        // Exit revokes it.
+        s.set_exited(a, 0).unwrap();
+        assert_eq!(s.token_agent(&[4; 32]).unwrap(), None);
+        // So does being marked lost, unless spared by a handoff.
+        s.mark_running_as_lost_except(&[b]).unwrap();
+        assert_eq!(s.token_agent(&[2; 32]).unwrap(), Some(b));
+        s.mark_running_as_lost().unwrap();
+        assert_eq!(s.token_agent(&[2; 32]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_tokens_row_goes_with_its_agent() {
+        let (_d, _p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        s.set_token(a, &[1; 32]).unwrap();
+        s.delete_agent(a).unwrap();
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM agent_tokens", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -632,7 +714,8 @@ mod tests {
         // Back to v3: what a v3 store left behind.
         let conn = Connection::open(&p).unwrap();
         conn.execute_batch(
-            "ALTER TABLE agents DROP COLUMN exited_unix_ms;
+            "DROP TABLE agent_tokens;
+             ALTER TABLE agents DROP COLUMN exited_unix_ms;
              ALTER TABLE agents DROP COLUMN priority;
              PRAGMA user_version = 3;",
         )
@@ -906,6 +989,7 @@ mod tests {
             "agents",
             "agent_labels",
             "agent_replacements",
+            "agent_tokens",
             "sqlite_sequence",
         ] {
             for pragma in ["table_info", "foreign_key_list", "index_list"] {
@@ -939,7 +1023,12 @@ mod tests {
         // The full DDL (covers the CHECK constraint), normalised: SQLite
         // quotes the name of a renamed table, keeps the original spacing and
         // puts an added column after the last one's trailing space.
-        for table in ["agents", "agent_labels", "agent_replacements"] {
+        for table in [
+            "agents",
+            "agent_labels",
+            "agent_replacements",
+            "agent_tokens",
+        ] {
             let sql: String = conn
                 .query_row(
                     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1062,7 +1151,8 @@ mod tests {
         let conn = Connection::open(&p).unwrap();
         // Back to the v4 shape: no exit time column.
         conn.execute_batch(
-            "ALTER TABLE agents DROP COLUMN exited_unix_ms;
+            "DROP TABLE agent_tokens;
+             ALTER TABLE agents DROP COLUMN exited_unix_ms;
              UPDATE agents SET state = 'exited', exit_code = 2;
              PRAGMA user_version = 4;",
         )

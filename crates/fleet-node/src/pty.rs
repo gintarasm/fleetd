@@ -986,6 +986,12 @@ impl PtyHost {
         })
     }
 
+    /// The agent's pid, which is also its session id (ADR 0072); `None`
+    /// for an unknown agent or one spawned without a pid.
+    pub fn pid(&self, id: AgentId) -> Option<u32> {
+        lock(&self.agents).get(&id)?.pid
+    }
+
     /// Writes `bytes` to the agent's terminal input.
     pub fn write_input(&self, id: AgentId, bytes: &[u8]) -> io::Result<()> {
         self.agent(id)?.input.write_all(bytes)
@@ -1152,6 +1158,10 @@ impl AgentHost for PtyHost {
 
     fn stats(&self, id: AgentId) -> Option<AgentStats> {
         PtyHost::stats(self, id)
+    }
+
+    fn pid(&self, id: AgentId) -> Option<u32> {
+        PtyHost::pid(self, id)
     }
 
     fn freeze(&self, deadline: Instant) -> io::Result<Vec<FrozenAgent>> {

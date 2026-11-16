@@ -161,6 +161,9 @@ pub fn restart_daemon(
         Ok(response::Kind::RestartingDaemon(r)) => r.agents,
         Ok(_) => return Err(Error::Protocol("unexpected reply to restart".into())),
         Err(Error::Server(m)) if m == "empty request" => return Ok(Restart::TooOld),
+        // An agent may not restart fleetd (ADR 0072): an error, not a failed
+        // restart, so the CLI exits 3 for it.
+        Err(e) if e.is_forbidden() => return Err(e),
         // The daemon refused before exec; it is still serving.
         Err(Error::Server(reason)) => {
             return Ok(Restart::Outcome(RestartOutcome::Failed(reason)));

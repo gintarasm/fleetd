@@ -76,6 +76,9 @@ pub trait AgentHost: Send + Sync {
 
     fn stats(&self, id: AgentId) -> Option<AgentStats>;
 
+    /// The agent's pid: a session leader, so also its session id.
+    fn pid(&self, id: AgentId) -> Option<u32>;
+
     /// Stops every agent's output at a clean boundary: once this returns
     /// `Ok`, no reader holds bytes it has read but not passed to its sink,
     /// and none reads again until [`AgentHost::thaw`]; what agents write

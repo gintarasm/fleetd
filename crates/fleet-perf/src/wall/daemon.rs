@@ -64,6 +64,7 @@ impl Client {
         client.send(Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client: "fleet-perf".into(),
+            ..Default::default()
         }))?;
         match client.recv()? {
             Frame::HelloOk(_) => Ok(client),

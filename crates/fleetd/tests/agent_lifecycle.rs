@@ -75,6 +75,7 @@ impl Client {
         c.send(Frame::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             client: "lifecycle-test".into(),
+            ..Default::default()
         }));
         match c.next_frame() {
             Some(Frame::HelloOk(_)) => {}

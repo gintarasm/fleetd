@@ -57,13 +57,16 @@ use crate::handoff::{self, HandoffGate};
 use crate::history::{History, HistoryInfo, Page};
 use crate::host::{AdoptSpec, AgentHost, TerminalHandle};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
+use crate::scope::{self, Caller, Member, Quotas, Tree};
 use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
+use crate::token::{self, AgentToken};
 use bytes::{Bytes, BytesMut};
 use fleet_proto::handoff::{HandoffAgent, handoff_agent};
 use fleet_proto::{
-    AgentActivity, AgentExited, AgentInfo, AgentPriority, AgentRemoved, AttachOk, SpawnAgent,
+    AGENT_TOKEN_ENV, AgentActivity, AgentExited, AgentInfo, AgentPriority, AgentRemoved, AttachOk,
+    SpawnAgent, SpawnRefused,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -1294,15 +1297,20 @@ const DEFAULT_TERM: &str = "xterm-256color";
 /// The agent's own id, set by the node in every agent's environment.
 pub const AGENT_ID_ENV: &str = "FLEET_AGENT_ID";
 
-/// The agent's environment: the request's, `TERM` defaulted, and
-/// [`AGENT_ID_ENV`] set to `id`. The node sets the id last, so a spawn
-/// request cannot make an agent claim another's id (ADR 0025).
-fn agent_env(env: HashMap<String, String>, id: u64) -> Vec<(String, String)> {
-    let mut env: Vec<_> = env.into_iter().filter(|(k, _)| k != AGENT_ID_ENV).collect();
+/// The agent's environment: the request's, `TERM` defaulted,
+/// [`AGENT_ID_ENV`] set to `id` and `FLEET_AGENT_TOKEN` to its token (ADR
+/// 0072). The node sets both last, so a spawn request cannot make an agent
+/// claim another's id or token (ADR 0025).
+fn agent_env(env: HashMap<String, String>, id: u64, token: &AgentToken) -> Vec<(String, String)> {
+    let mut env: Vec<_> = env
+        .into_iter()
+        .filter(|(k, _)| k != AGENT_ID_ENV && k != AGENT_TOKEN_ENV)
+        .collect();
     if !env.iter().any(|(k, _)| k == "TERM") {
         env.push(("TERM".into(), DEFAULT_TERM.into()));
     }
     env.push((AGENT_ID_ENV.into(), id.to_string()));
+    env.push((AGENT_TOKEN_ENV.into(), token.expose().to_owned()));
     env
 }
 
@@ -1642,6 +1650,12 @@ pub struct Node {
     agent_nice: u8,
     /// Holds spawns, restarts and forgets out of a handoff.
     handoff: HandoffGate,
+    /// Limits on agents' spawns (spec §1).
+    quotas: Quotas,
+    /// Held by an agent's spawn from its quota check until its row is
+    /// stored, so two spawns cannot both take the last slot.
+    spawn_gate: Mutex<()>,
+    refused: broadcast::Sender<SpawnRefused>,
 }
 
 impl Drop for Node {
@@ -1830,6 +1844,7 @@ impl Node {
         prune_orphan_rings(&scrollback_dir, &store.agent_ids().map_err(store_err)?)?;
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
+        let (refused, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
         Ok(Node {
             host: Arc::new(PtyHost::new()),
@@ -1847,6 +1862,9 @@ impl Node {
             base_env: LoginEnv::daemon(),
             agent_nice: 0,
             handoff: HandoffGate::default(),
+            quotas: Quotas::default(),
+            spawn_gate: Mutex::new(()),
+            refused,
         })
     }
 
@@ -1871,6 +1889,149 @@ impl Node {
     pub fn with_agent_nice(mut self, nice: u8) -> Node {
         self.agent_nice = nice;
         self
+    }
+
+    /// Limits agents' spawns by `quotas` (the user's are never limited).
+    pub fn with_quotas(mut self, quotas: Quotas) -> Node {
+        self.quotas = quotas;
+        self
+    }
+
+    /// Receives every spawn refused by a quota from now on.
+    pub fn refused_events(&self) -> broadcast::Receiver<SpawnRefused> {
+        self.refused.subscribe()
+    }
+
+    /// Who a connection is (ADR 0072), from its peer's session id and the
+    /// token its `Hello` carried: the running agent whose pid is the
+    /// session, else the running agent the token belongs to, else the user.
+    /// `Err` (the handshake is refused) when the two name different agents.
+    /// A token that is no running agent's is ignored.
+    ///
+    /// A root shell (`kind=shell` without a parent: the user's own
+    /// terminal, ADR 0071) is the user: its session and its token mean the
+    /// user.
+    pub fn resolve_caller(
+        &self,
+        session: Option<u32>,
+        token: Option<&str>,
+    ) -> Result<Caller, String> {
+        let by_session = session
+            .and_then(|sid| self.agent_with_pid(sid))
+            .filter(|&id| !self.is_root_shell(id));
+        let by_token = match token {
+            None => None,
+            // An unknown token is no token: one from another daemon (a
+            // `--state-dir` of its own) or from an agent that has exited.
+            Some(t) => lock(&self.store)
+                .token_agent(&token::digest(t))
+                .map_err(|e| format!("checking the agent token failed: {e}"))?,
+        };
+        let id = match (by_session, by_token) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(format!(
+                    "the caller's session belongs to agent {a} but its token to agent {b}"
+                ));
+            }
+            (Some(id), _) | (None, Some(id)) => id,
+            (None, None) => return Ok(Caller::User),
+        };
+        Ok(if self.is_root_shell(id) {
+            Caller::User
+        } else {
+            Caller::Agent(id)
+        })
+    }
+
+    /// The running agent whose process is `pid`.
+    fn agent_with_pid(&self, pid: u32) -> Option<u64> {
+        let agents = lock(&self.agents);
+        agents
+            .live
+            .iter()
+            .find(|(_, live)| self.host.pid(live.host_id) == Some(pid))
+            .map(|(&id, _)| id)
+    }
+
+    fn is_root_shell(&self, id: u64) -> bool {
+        match lock(&self.store).labels(id) {
+            Ok(Some(labels)) => scope::is_root_shell(&labels),
+            _ => false,
+        }
+    }
+
+    /// The spawned-by tree of every agent the node knows (ADR 0072).
+    pub fn tree(&self) -> io::Result<Tree> {
+        let db = lock(&self.store);
+        let (records, _) = db.list_agents_lossy().map_err(store_err)?;
+        let replaced = db.replacements().map_err(store_err)?;
+        drop(db);
+        Ok(Tree::new(
+            records.iter().map(|r| Member {
+                id: r.id,
+                labels: &r.labels,
+                running: r.state == store::AgentState::Running,
+            }),
+            &replaced,
+        ))
+    }
+
+    /// The agents `caller` may see whose labels contain every `selector`
+    /// pair: all of them for the user, an agent's descendants for an agent.
+    pub fn list_for(&self, caller: Caller, selector: &Labels) -> io::Result<Vec<AgentInfo>> {
+        let mut agents = self.list_matching(selector)?;
+        if let Caller::Agent(a) = caller {
+            let mine = self.tree()?.descendants(a);
+            agents.retain(|info| mine.contains(&info.id));
+        }
+        Ok(agents)
+    }
+
+    /// Admits a spawn (or, with `restarting`, a restart of that agent) by
+    /// `caller`: nothing to check for the user. For an agent, refuses it
+    /// past a quota (announcing a [`SpawnRefused`]) and narrows `labels`
+    /// (a new agent's) to the parent's plus new keys, with `fleet.parent`.
+    /// The guard holds other agents' spawns until this one's row is stored.
+    fn admit_spawn(
+        &self,
+        caller: Caller,
+        labels: Option<&mut Labels>,
+        restarting: Option<u64>,
+    ) -> io::Result<Option<MutexGuard<'_, ()>>> {
+        let Caller::Agent(a) = caller else {
+            return Ok(None);
+        };
+        let gate = lock(&self.spawn_gate);
+        let tree = self.tree()?;
+        // A restarted agent comes back under its own parent.
+        let parent = match restarting {
+            Some(old) => tree.parent(old).unwrap_or(a),
+            None => a,
+        };
+        if let Err(reason) = tree.check_quota(&self.quotas, parent) {
+            warn!(agent = a, reason = %reason, "spawn refused");
+            // No receivers is fine.
+            let _ = self.refused.send(SpawnRefused {
+                parent: a,
+                reason: reason.clone(),
+            });
+            return Err(scope::forbidden(reason));
+        }
+        if let Some(labels) = labels {
+            let parent_labels = lock(&self.store)
+                .labels(a)
+                .map_err(store_err)?
+                .unwrap_or_default();
+            let narrowed = scope::child_labels(a, &parent_labels, std::mem::take(labels))?;
+            if narrowed.len() > MAX_LABELS {
+                return Err(invalid(format!(
+                    "{} labels with the inherited ones (at most {MAX_LABELS})",
+                    narrowed.len()
+                )));
+            }
+            *labels = narrowed;
+        }
+        Ok(Some(gate))
     }
 
     /// Receives every agent exit from now on.
@@ -1899,7 +2060,14 @@ impl Node {
     /// The labels must pass the label limits, without reserved keys.
     /// `req.attach` is ignored (see [`Node::spawn_attached`]).
     pub fn spawn(&self, req: SpawnAgent) -> io::Result<AgentInfo> {
+        self.spawn_by(Caller::User, req)
+    }
+
+    /// [`Node::spawn`] by `caller`: an agent's spawn becomes its child
+    /// (`fleet.parent`, narrowed labels) and is subject to the quotas.
+    pub fn spawn_by(&self, caller: Caller, mut req: SpawnAgent) -> io::Result<AgentInfo> {
         check_labels(&req.labels)?;
+        let _gate = self.admit_spawn(caller, Some(&mut req.labels), None)?;
         self.start(req, None).map(|(info, _)| info)
     }
 
@@ -1914,7 +2082,19 @@ impl Node {
         conn: ConnId,
         before_start: impl FnOnce(u64),
     ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
+        self.spawn_attached_by(Caller::User, req, conn, before_start)
+    }
+
+    /// [`Node::spawn_attached`] by `caller`, as for [`Node::spawn_by`].
+    pub fn spawn_attached_by(
+        &self,
+        caller: Caller,
+        mut req: SpawnAgent,
+        conn: ConnId,
+        before_start: impl FnOnce(u64),
+    ) -> io::Result<(AgentInfo, AttachOk, Subscription)> {
         check_labels(&req.labels)?;
+        let _gate = self.admit_spawn(caller, Some(&mut req.labels), None)?;
         let (info, attached) = self.start(req, Some((conn, Box::new(before_start))))?;
         let (ok, sub) = attached.expect("an attached start returns its attachment");
         Ok((info, ok, sub))
@@ -1934,7 +2114,20 @@ impl Node {
         rows: u32,
         origin: Option<ConnId>,
     ) -> io::Result<RestartOutcome> {
-        self.restart_with(id, cols, rows, None, origin)
+        self.restart_by(Caller::User, id, cols, rows, origin)
+    }
+
+    /// [`Node::restart`] by `caller`: an agent's restart is subject to the
+    /// quotas, under the restarted agent's parent.
+    pub fn restart_by(
+        &self,
+        caller: Caller,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        origin: Option<ConnId>,
+    ) -> io::Result<RestartOutcome> {
+        self.restart_with(caller, id, cols, rows, None, origin)
             .map(|(out, _)| out)
     }
 
@@ -1948,7 +2141,21 @@ impl Node {
         conn: ConnId,
         before_start: impl FnOnce(u64),
     ) -> io::Result<(RestartOutcome, AttachOk, Subscription)> {
+        self.restart_attached_by(Caller::User, id, cols, rows, conn, before_start)
+    }
+
+    /// [`Node::restart_attached`] by `caller`, as for [`Node::restart_by`].
+    pub fn restart_attached_by(
+        &self,
+        caller: Caller,
+        id: u64,
+        cols: u32,
+        rows: u32,
+        conn: ConnId,
+        before_start: impl FnOnce(u64),
+    ) -> io::Result<(RestartOutcome, AttachOk, Subscription)> {
         let (out, attached) = self.restart_with(
+            caller,
             id,
             cols,
             rows,
@@ -1961,6 +2168,7 @@ impl Node {
 
     fn restart_with(
         &self,
+        caller: Caller,
         id: u64,
         cols: u32,
         rows: u32,
@@ -2013,6 +2221,7 @@ impl Node {
                 format!("working directory {} does not exist", old.cwd),
             ));
         }
+        let _gate = self.admit_spawn(caller, None, Some(id))?;
         // Stored labels were checked when set; not re-checked here.
         let req = SpawnAgent {
             program: old.program,
@@ -2081,6 +2290,7 @@ impl Node {
         } else {
             PathBuf::from(&req.cwd)
         };
+        let token = AgentToken::generate()?;
         let created_unix_ms = unix_ms_now();
         let new = NewAgent {
             program: req.program.clone(),
@@ -2091,14 +2301,22 @@ impl Node {
             labels: req.labels,
             priority: req.priority,
         };
-        let (id, path) = lock(&self.store)
-            .insert_agent_with_scrollback(&new, |id| {
-                self.scrollback_dir
-                    .join(format!("{id}.ring"))
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .map_err(store_err)?;
+        let (id, path) = {
+            let db = lock(&self.store);
+            let (id, path) = db
+                .insert_agent_with_scrollback(&new, |id| {
+                    self.scrollback_dir
+                        .join(format!("{id}.ring"))
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .map_err(store_err)?;
+            if let Err(e) = db.set_token(id, &token.digest()) {
+                let _ = db.delete_agent(id);
+                return Err(store_err(e));
+            }
+            (id, path)
+        };
         // Until the agent is registered, its history must not be opened
         // from disk (its pipeline may already be writing it).
         let history_path = {
@@ -2124,7 +2342,7 @@ impl Node {
                     program: PathBuf::from(&req.program),
                     args: req.args.clone(),
                     cwd: Some(cwd),
-                    env: agent_env(req.env, id),
+                    env: agent_env(req.env, id, &token),
                     cols,
                     rows,
                     nice: crate::priority::agent_nice(self.agent_nice, priority),
@@ -2291,6 +2509,39 @@ impl Node {
             out.forgotten.push(id);
         }
         Ok(out)
+    }
+
+    /// [`Node::forget`] by `caller`: an agent's `exited_only` forgets only
+    /// its own exited descendants. (Explicit ids are checked against its
+    /// scope by the caller of this.)
+    pub fn forget_by(
+        &self,
+        caller: Caller,
+        ids: &[u64],
+        exited_only: bool,
+        selector: &Labels,
+        origin: Option<ConnId>,
+    ) -> Result<ForgetOutcome, ForgetError> {
+        let Caller::Agent(a) = caller else {
+            return self.forget(ids, exited_only, selector, origin);
+        };
+        if !exited_only {
+            return self.forget(ids, false, selector, origin);
+        }
+        if !ids.is_empty() {
+            return self.forget(ids, true, selector, origin);
+        }
+        let mine = self.tree()?.descendants(a);
+        let targets: Vec<u64> = self
+            .list_matching(selector)?
+            .into_iter()
+            .filter(|i| mine.contains(&i.id) && i.state != fleet_proto::AgentState::Running as i32)
+            .map(|i| i.id)
+            .collect();
+        if targets.is_empty() {
+            return Ok(ForgetOutcome::default());
+        }
+        self.forget(&targets, false, &Labels::new(), origin)
     }
 
     /// Drops everything the node keeps of a removed agent besides its row:
