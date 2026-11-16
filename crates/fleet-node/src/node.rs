@@ -52,6 +52,7 @@
 //! drops the agent's pending events under that lock before its stream ends,
 //! so no activity follows an agent's exit.
 
+use crate::approval::Approvals;
 use crate::env::LoginEnv;
 use crate::git::GitCache;
 use crate::handoff::{self, HandoffGate};
@@ -75,7 +76,7 @@ use fleet_proto::handoff::{HandoffAgent, handoff_agent};
 use fleet_proto::status::{KIND_LABEL, SHELL_KIND};
 use fleet_proto::{
     AGENT_TOKEN_ENV, AgentActivity, AgentExited, AgentInfo, AgentPriority, AgentRemoved,
-    AgentReported, AttachOk, Reported, ReportedState, SpawnAgent, SpawnRefused,
+    AgentReported, AttachOk, PendingSpawn, Reported, ReportedState, SpawnAgent, SpawnRefused,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -1678,6 +1679,8 @@ pub struct Node {
     notices: broadcast::Sender<Notice>,
     /// Agents' git checkouts, by cwd (ADR 0085).
     git: GitCache,
+    /// Agents' spawns waiting for the user (ADR 0079).
+    approvals: Approvals,
 }
 
 impl Drop for Node {
@@ -1895,6 +1898,7 @@ impl Node {
             leases,
             notices,
             git: GitCache::default(),
+            approvals: Approvals::new(),
         })
     }
 
@@ -1930,6 +1934,40 @@ impl Node {
     pub fn with_quotas(mut self, quotas: Quotas) -> Node {
         self.quotas = quotas;
         self
+    }
+
+    /// Agents' spawns waiting for the user (ADR 0079).
+    pub fn approvals(&self) -> &Approvals {
+        &self.approvals
+    }
+
+    /// How long an agent's spawn waits for the user's approval, in
+    /// seconds; `None` when agents' spawns need none (the default).
+    pub fn spawn_approval(&self) -> Option<u32> {
+        self.quotas
+            .spawn_approval
+            .then_some(self.quotas.spawn_approval_timeout_secs)
+    }
+
+    /// What an agent's spawn would be, for the user to approve (ADR 0079):
+    /// the quotas are checked first (a refusal is announced as usual) and
+    /// the labels narrowed, but nothing is started. The spawn itself checks
+    /// again once approved. The pending spawn's id and times are unset.
+    pub fn precheck_spawn(&self, caller: Caller, req: &SpawnAgent) -> io::Result<PendingSpawn> {
+        let Caller::Agent(parent) = caller else {
+            return Err(invalid("only an agent's spawn waits for approval".into()));
+        };
+        check_labels(&req.labels)?;
+        let mut labels = req.labels.clone();
+        drop(self.admit_spawn(caller, Some(&mut labels), None)?);
+        Ok(PendingSpawn {
+            parent,
+            program: req.program.clone(),
+            args: req.args.clone(),
+            cwd: req.cwd.clone(),
+            labels,
+            ..Default::default()
+        })
     }
 
     /// Receives every spawn refused by a quota from now on.

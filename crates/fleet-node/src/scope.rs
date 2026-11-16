@@ -36,7 +36,8 @@ pub fn forbidden(what: impl std::fmt::Display) -> io::Error {
     )
 }
 
-/// Limits on agents' spawns (`[node]` in `<state-dir>/config.toml`).
+/// Limits on agents' spawns (`[node]` in `<state-dir>/config.toml`),
+/// and whether they wait for the user's approval (ADR 0079).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quotas {
     /// Deepest level an agent may spawn into (roots are at depth 0).
@@ -45,7 +46,15 @@ pub struct Quotas {
     pub max_children: u32,
     /// Running agents on the node.
     pub max_agents: u32,
+    /// An agent's spawn waits for the user's approval (`spawn_approval`).
+    pub spawn_approval: bool,
+    /// How long it waits before it is refused (`spawn_approval_timeout`,
+    /// seconds, at least 1).
+    pub spawn_approval_timeout_secs: u32,
 }
+
+/// The default `spawn_approval_timeout`: five minutes.
+pub const SPAWN_APPROVAL_TIMEOUT_SECS: u32 = 300;
 
 impl Default for Quotas {
     fn default() -> Self {
@@ -53,6 +62,8 @@ impl Default for Quotas {
             max_depth: 3,
             max_children: 8,
             max_agents: 30,
+            spawn_approval: false,
+            spawn_approval_timeout_secs: SPAWN_APPROVAL_TIMEOUT_SECS,
         }
     }
 }
@@ -61,9 +72,9 @@ impl Quotas {
     /// The quotas in a `config.toml`'s `[node]` table, defaults for keys it
     /// does not set; and a warning per line of that table it could not use.
     ///
-    /// A small reader for `key = integer` lines, not a TOML parser: fleetd
-    /// needs three numbers and nothing else from the file (the GUI owns
-    /// the rest of it).
+    /// A small reader for `key = integer` (and `spawn_approval = bool`)
+    /// lines, not a TOML parser: fleetd needs these few keys and nothing
+    /// else from the file (the GUI owns the rest of it).
     pub fn from_config(text: &str) -> (Quotas, Vec<String>) {
         let mut quotas = Quotas::default();
         let mut warnings = Vec::new();
@@ -85,16 +96,28 @@ impl Quotas {
                 continue;
             };
             let (key, value) = (key.trim(), value.trim().replace('_', ""));
-            let slot = match key {
-                "max_depth" => &mut quotas.max_depth,
-                "max_children" => &mut quotas.max_children,
-                "max_agents" => &mut quotas.max_agents,
+            if key == "spawn_approval" {
+                match value.as_str() {
+                    "true" => quotas.spawn_approval = true,
+                    "false" => quotas.spawn_approval = false,
+                    _ => warnings.push(format!(
+                        "config.toml line {}: [node] spawn_approval must be true or false",
+                        n + 1
+                    )),
+                }
+                continue;
+            }
+            let (slot, min) = match key {
+                "max_depth" => (&mut quotas.max_depth, 0),
+                "max_children" => (&mut quotas.max_children, 0),
+                "max_agents" => (&mut quotas.max_agents, 0),
+                "spawn_approval_timeout" => (&mut quotas.spawn_approval_timeout_secs, 1),
                 _ => continue,
             };
             match value.parse::<u32>() {
-                Ok(v) => *slot = v,
-                Err(_) => warnings.push(format!(
-                    "config.toml line {}: [node] {key} must be a non-negative integer",
+                Ok(v) if v >= min => *slot = v,
+                _ => warnings.push(format!(
+                    "config.toml line {}: [node] {key} must be an integer of at least {min}",
                     n + 1
                 )),
             }
@@ -426,12 +449,38 @@ mod tests {
             Quotas {
                 max_depth: 2,
                 max_children: 4,
-                max_agents: 1000
+                max_agents: 1000,
+                ..Quotas::default()
             }
         );
         let (q, w) = Quotas::from_config("[node]\nmax_depth = -1\nmax_agents\n");
         assert_eq!(q, Quotas::default());
         assert_eq!(w.len(), 2, "{w:?}");
         assert_eq!(Quotas::from_config("").0, Quotas::default());
+    }
+
+    #[test]
+    fn config_reads_spawn_approval() {
+        assert!(!Quotas::default().spawn_approval);
+        assert_eq!(Quotas::default().spawn_approval_timeout_secs, 300);
+        let (q, w) = Quotas::from_config(
+            "[node]\nspawn_approval = true # ask me\nspawn_approval_timeout = 60\n",
+        );
+        assert!(w.is_empty(), "{w:?}");
+        assert!(q.spawn_approval);
+        assert_eq!(q.spawn_approval_timeout_secs, 60);
+        assert!(
+            !Quotas::from_config("[node]\nspawn_approval = false\n")
+                .0
+                .spawn_approval
+        );
+        let (q, w) =
+            Quotas::from_config("[node]\nspawn_approval = 1\nspawn_approval_timeout = 0\n");
+        assert!(!q.spawn_approval);
+        assert_eq!(
+            q.spawn_approval_timeout_secs, 300,
+            "a zero timeout is unusable"
+        );
+        assert_eq!(w.len(), 2, "{w:?}");
     }
 }
