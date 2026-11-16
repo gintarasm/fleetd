@@ -204,7 +204,7 @@ pub fn refusal(decision: SpawnDecision, timeout_secs: u32) -> Option<String> {
 
 /// `300` as `5m`, `90` as `90s`.
 fn duration(secs: u32) -> String {
-    if secs >= 60 && secs % 60 == 0 {
+    if secs >= 60 && secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")

@@ -1398,6 +1398,9 @@ mod tests {
             caller: Caller::User,
             scope: scope::Scope::user(),
             waits: Vec::new(),
+            approvals: Vec::new(),
+            approved_tx: mpsc::unbounded_channel().0,
+            approved: HashSet::new(),
         };
         (server, conn, rx)
     }
