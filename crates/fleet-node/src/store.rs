@@ -6,9 +6,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
 
-/// v6 and v7 are taken by the M3 mailbox and lease branches (spec
-/// "Waves"); identity took 8.
-const SCHEMA_VERSION: i64 = 8;
+/// Identity took 8 (spec "Waves"); the mailbox (M3-E) takes 9.
+const SCHEMA_VERSION: i64 = 9;
+
+mod mailbox;
+use mailbox::MAILBOX_DDL;
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -208,10 +210,19 @@ impl Store {
                  COMMIT;"
             ))?;
         }
+        if version < 9 {
+            // v9: mailboxes (ADR 0076). The DDL must match `create_latest`'s.
+            self.conn.execute_batch(&format!(
+                "BEGIN;
+                 {MAILBOX_DDL}
+                 PRAGMA user_version = 9;
+                 COMMIT;"
+            ))?;
+        }
         Ok(())
     }
 
-    /// The latest schema for a new DB; the same tables the v1 -> ... -> v8
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v9
     /// migrations produce.
     fn create_latest(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(&format!(
@@ -237,7 +248,8 @@ impl Store {
                  new_id INTEGER NOT NULL
              );
              {AGENT_TOKENS_DDL}
-             PRAGMA user_version = 8;
+             {MAILBOX_DDL}
+             PRAGMA user_version = 9;
              COMMIT;"
         ))
     }
@@ -410,6 +422,7 @@ impl Store {
                 "DELETE FROM agent_replacements WHERE new_id = ?1",
                 (id as i64,),
             )?;
+            self.drop_mailbox_mark(id)?;
         }
         tx.commit()?;
         Ok(n == 1)
@@ -419,6 +432,7 @@ impl Store {
     /// that pointed at `old` to `new` (chains collapse), in one transaction.
     pub fn replace_agent(&self, old: u64, new: u64) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        self.move_mailbox(old, new)?;
         self.conn
             .execute("DELETE FROM agents WHERE id = ?1", (old as i64,))?;
         self.conn.execute(
@@ -592,7 +606,8 @@ impl Store {
     }
 
     /// [`Store::mark_running_as_lost`], sparing `keep`: the agents a previous
-    /// daemon handed over, still running. One transaction.
+    /// daemon handed over, still running. Each lost agent reports it (a
+    /// `lost` message to its parent or the user, ADR 0076). One transaction.
     pub fn mark_running_as_lost_except(&self, keep: &[u64]) -> rusqlite::Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let running: Vec<u64> = {
@@ -612,6 +627,7 @@ impl Store {
             )?;
             self.conn
                 .execute("DELETE FROM agent_tokens WHERE agent_id = ?1", (id as i64,))?;
+            self.report_lost(id)?;
         }
         tx.commit()?;
         Ok(lost)
@@ -622,7 +638,7 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn new_agent(n: i64) -> NewAgent {
+    pub(super) fn new_agent(n: i64) -> NewAgent {
         NewAgent {
             program: "claude".into(),
             args: vec!["--flag".into(), format!("a b\"{n}")],
@@ -635,8 +651,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v8() {
-        assert_eq!(SCHEMA_VERSION, 8);
+    fn schema_is_v9() {
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 
     #[test]
@@ -715,6 +731,8 @@ mod tests {
         let conn = Connection::open(&p).unwrap();
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE messages;
+             DROP TABLE inbox_marks;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              ALTER TABLE agents DROP COLUMN priority;
              PRAGMA user_version = 3;",
@@ -727,7 +745,7 @@ mod tests {
         assert_eq!((rec.program.as_str(), rec.priority), ("claude", 0));
     }
 
-    fn open_tmp() -> (tempfile::TempDir, std::path::PathBuf, Store) {
+    pub(super) fn open_tmp() -> (tempfile::TempDir, std::path::PathBuf, Store) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let s = Store::open(&path).unwrap();
@@ -990,6 +1008,8 @@ mod tests {
             "agent_labels",
             "agent_replacements",
             "agent_tokens",
+            "messages",
+            "inbox_marks",
             "sqlite_sequence",
         ] {
             for pragma in ["table_info", "foreign_key_list", "index_list"] {
@@ -1028,6 +1048,8 @@ mod tests {
             "agent_labels",
             "agent_replacements",
             "agent_tokens",
+            "messages",
+            "inbox_marks",
         ] {
             let sql: String = conn
                 .query_row(
@@ -1152,6 +1174,8 @@ mod tests {
         // Back to the v4 shape: no exit time column.
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE messages;
+             DROP TABLE inbox_marks;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              UPDATE agents SET state = 'exited', exit_code = 2;
              PRAGMA user_version = 4;",
