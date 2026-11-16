@@ -26,6 +26,7 @@ use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
+use super::split_dividers::SplitDrag;
 use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use crate::core::config::save_connection;
@@ -123,6 +124,8 @@ pub struct Workspace {
     window_title: String,
     /// Reduce Motion is on (read at launch and on appearance changes).
     reduce_motion: bool,
+    /// A split divider being dragged.
+    split_drag: SplitDrag,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -189,6 +192,7 @@ impl Workspace {
             drawn: Vec::new(),
             window_title: String::new(),
             reduce_motion: native::reduce_motion(),
+            split_drag: SplitDrag::default(),
             _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -694,7 +698,7 @@ impl Workspace {
 
     /// The pane cards, [`chrome::PANE_GAP`] apart and from the edges;
     /// only the maximized one when a pane is maximized (the others stay
-    /// attached).
+    /// attached); then the split dividers' strips over the gaps.
     fn render_panes(&mut self, cx: &App) -> impl IntoElement + use<> {
         let app = self.app.read(cx);
         let rects = match app.maximized {
@@ -710,6 +714,10 @@ impl Workspace {
             None => app.layout.rects(1.0, 1.0),
         };
         self.drawn = rects.iter().map(|(p, _)| *p).collect();
+        let dividers = match app.maximized {
+            Some(_) => Vec::new(),
+            None => self.split_drag.render(&app.layout, &self.app),
+        };
         let children: Vec<_> = rects
             .into_iter()
             .filter_map(|(pane, r)| {
@@ -731,7 +739,8 @@ impl Workspace {
             div()
                 .absolute()
                 .inset(px(chrome::PANE_GAP / 2.0))
-                .children(children),
+                .children(children)
+                .children(dividers),
         )
     }
 
