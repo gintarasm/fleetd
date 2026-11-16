@@ -1,5 +1,6 @@
 //! `fleet`: command-line client for `fleetd`.
 
+mod approval;
 mod attach;
 mod history;
 mod lease;
@@ -91,6 +92,12 @@ enum Command {
     Report(report::Args),
     /// Show agents as a spawned-by tree
     Tree(tree::Args),
+    /// List agents' spawns waiting for your approval (`[node] spawn_approval = true`)
+    Pending(approval::ListArgs),
+    /// Approve a pending spawn
+    Approve(approval::DecideArgs),
+    /// Deny a pending spawn
+    Deny(approval::DecideArgs),
     /// Hold a named lease while a command runs, or take, release and list leases
     Lease(lease::Args),
     /// Set or remove labels on an agent
@@ -522,6 +529,9 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }
         Command::Report(args) => return report::run(&mut client, &args),
+        Command::Pending(args) => return approval::list(&mut client, &args),
+        Command::Approve(args) => return approval::decide(&mut client, &args, true),
+        Command::Deny(args) => return approval::decide(&mut client, &args, false),
         Command::Tree(args) => tree::run(&mut client, &args, &parse_labels(&args.labels)?)?,
         Command::Lease(args) => return lease::run(client, &sock, token.as_deref(), args),
         Command::Label { agent, set, remove } => {
