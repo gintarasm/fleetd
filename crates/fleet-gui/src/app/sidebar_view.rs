@@ -14,6 +14,7 @@ use gpui::{
     MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 
+use super::agent_mark::{MARK_SLOT, agent_mark};
 use super::controls;
 use super::keymap::{Kill, Remove, Restart};
 use super::status_dot::status_dot;
@@ -65,6 +66,9 @@ pub struct SidebarData<'a> {
     /// Agents that rang the bell unseen: their row is tinted.
     pub bells: &'a HashSet<u64>,
     pub reduce_motion: bool,
+    /// `[gui] agent_emoji`: each row shows its agent's emoji, not its
+    /// colour (ADR 0064).
+    pub agent_emoji: bool,
     /// The groups to draw, filtered and collapsed (`core::sidebar::sidebar_groups`).
     pub groups: Vec<SidebarGroup>,
     pub filter_field: Entity<TextField>,
@@ -288,6 +292,7 @@ fn render_tab(
         .flex_row()
         .items_center()
         .gap(px(space::SM - space::XXS))
+        .child(agent_mark(id, theme, data.agent_emoji))
         .child(mark_el)
         .child(
             div()
@@ -327,7 +332,8 @@ fn render_tab(
         });
     let line2 = div()
         .flex()
-        .pl(px(space::LG))
+        // Under the title: past the agent's mark and the status.
+        .pl(px(MARK_SLOT + space::SM - space::XXS + space::LG))
         .type_style(text::SUBHEADLINE)
         .text_color(if running {
             theme.secondary

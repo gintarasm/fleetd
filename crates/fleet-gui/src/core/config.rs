@@ -87,6 +87,9 @@ pub struct GuiConfig {
     /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
     /// blank means `$VISUAL`, then `$EDITOR` (ADR 0046).
     pub editor: String,
+    /// Each agent's emoji (ADR 0064) in place of its colour swatch on the
+    /// sidebar row and of the terminal icon in its pane header.
+    pub agent_emoji: bool,
 }
 
 impl Default for GuiConfig {
@@ -108,6 +111,7 @@ impl Default for GuiConfig {
             celebrate: false,
             glass: GlassChoice::Off,
             editor: String::new(),
+            agent_emoji: false,
         }
     }
 }
@@ -250,6 +254,7 @@ mod tests {
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
         assert!(!c.notifications);
+        assert!(!c.agent_emoji);
         assert_eq!(c.connection, None);
         assert_eq!(c.editor, "");
     }
@@ -259,6 +264,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "[gui]\neditor = \"zed\"\n");
         assert_eq!(load_config(dir.path()).unwrap().editor, "zed");
+    }
+
+    #[test]
+    fn agent_emoji_is_read_from_the_gui_table() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\nagent_emoji = true\n");
+        assert!(load_config(dir.path()).unwrap().agent_emoji);
     }
 
     #[test]

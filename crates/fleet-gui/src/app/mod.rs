@@ -1,5 +1,6 @@
 //! gpui shell (macOS only).
 
+mod agent_mark;
 mod app_state;
 mod attention;
 mod bench;

@@ -991,6 +991,8 @@ impl AppState {
                 maximized: self.maximized == Some(pane),
                 dims,
                 status: agent.and_then(|id| self.statuses.get(&id).copied()),
+                agent,
+                agent_emoji: self.config.agent_emoji,
                 no_agents,
                 run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
             };

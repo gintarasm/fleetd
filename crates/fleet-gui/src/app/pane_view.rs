@@ -9,13 +9,14 @@ use fleet_term::CursorShape;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt, AnyView, AnyWindowHandle, AppContext, Bounds, BoxShadow,
-    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Font, InteractiveElement,
+    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Font, Hsla, InteractiveElement,
     IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
     SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection,
     Window, div, point, px, size,
 };
 
+use super::agent_mark::{self, agent_color};
 use super::controls::{self, ButtonKind};
 use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
@@ -31,6 +32,7 @@ use crate::core::config::GuiConfig;
 use crate::core::feedback::{self, Tween};
 use crate::core::find::status_label;
 use crate::core::icons::Icon;
+use crate::core::identity::agent_colour;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
@@ -181,6 +183,30 @@ pub struct PaneChrome {
     pub no_agents: bool,
     /// How long the ended agent ran, if known (the summary bar).
     pub run_time: Option<Duration>,
+    /// The agent the layout puts here: its colour marks the header icon
+    /// and the focus ring (ADR 0064).
+    pub agent: Option<u64>,
+    /// `[gui] agent_emoji`: the agent's emoji replaces the header icon.
+    pub agent_emoji: bool,
+}
+
+/// The focus ring's colour at full strength: the agent's colour, else the
+/// accent.
+pub fn focus_ring(chrome: &PaneChrome, theme: &Theme) -> Hsla {
+    match chrome.agent {
+        Some(id) => agent_color(id, theme),
+        None => theme.accent.opacity(0.55),
+    }
+}
+
+/// The header's terminal icon: in the agent's colour, focused or not, so
+/// every pane names its agent; without one, the accent when focused.
+pub fn header_icon_color(chrome: &PaneChrome, theme: &Theme) -> Hsla {
+    match (chrome.agent, chrome.focused) {
+        (Some(id), _) => agent_color(id, theme),
+        (None, true) => theme.accent,
+        (None, false) => theme.tertiary,
+    }
 }
 
 /// The line drawn over the grid, if any.
@@ -1291,11 +1317,24 @@ impl Render for PaneView {
             .items_center()
             .gap(px(space::SM - space::XXS))
             .type_style(text::CALLOUT)
-            .child(icons::icon(Icon::Terminal).text_color(if chrome.focused {
-                theme.accent
-            } else {
-                theme.tertiary
-            }))
+            .child({
+                let number = chrome.number;
+                match chrome.agent.filter(|_| chrome.agent_emoji) {
+                    Some(id) => agent_mark::emoji(id)
+                        .debug_selector(move || format!("pane-{number}-identity-emoji"))
+                        .into_any_element(),
+                    None => {
+                        let name = chrome.agent.map(|id| agent_colour(id).name);
+                        icons::icon(Icon::Terminal)
+                            .text_color(header_icon_color(chrome, &theme))
+                            .debug_selector(move || match name {
+                                Some(name) => format!("pane-{number}-identity-{name}"),
+                                None => format!("pane-{number}-icon"),
+                            })
+                            .into_any_element()
+                    }
+                }
+            })
             .children(chrome.status.map(|s| {
                 let number = chrome.number;
                 status_dot(s, &theme, unix_ms(), (self.reduce_motion)())
@@ -1548,7 +1587,7 @@ impl Render for PaneView {
                 spread_radius: px(0.),
             }])
             .border_1()
-            .border_color(ring_color(&theme, ring))
+            .border_color(ring_color(&theme, focus_ring(chrome, &theme), ring))
             .bg(theme.card)
             .relative()
             .child(header)
@@ -1584,9 +1623,8 @@ impl Render for PaneView {
 }
 
 /// The card's border at focus-ring strength `ring`: the plain border at
-/// 0, the accent ring at 1, cross-faded between.
-fn ring_color(theme: &super::theme::Theme, ring: f32) -> gpui::Hsla {
-    let lit = theme.accent.opacity(0.55);
+/// 0, the focus ring (`lit`) at 1, cross-faded between.
+fn ring_color(theme: &super::theme::Theme, lit: Hsla, ring: f32) -> Hsla {
     if ring >= 1.0 {
         lit
     } else if ring <= 0.0 {
@@ -1794,6 +1832,7 @@ mod tests {
         header_parts, ime_cell, point_to_cell,
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
+    use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
     use crate::core::pane::PaneState;
     use crate::core::pane::{PaneModel, ViewRow};
@@ -2701,5 +2740,41 @@ mod tests {
             ("Refactor".into(), "~/dev".into())
         );
         assert_eq!(header_parts(&chrome, Some("  ")).0, "claude");
+    }
+
+    /// Issue #33: the focused pane's ring is its agent's colour; with no
+    /// agent it is the accent, and an unfocused pane keeps the plain border.
+    #[test]
+    fn the_focus_ring_takes_the_agent_colour() {
+        use super::{agent_color, focus_ring, header_icon_color, ring_color};
+        let theme = Theme::light();
+        let focused = PaneChrome {
+            focused: true,
+            agent: Some(3),
+            ..PaneChrome::default()
+        };
+        assert_eq!(focus_ring(&focused, &theme), agent_color(3, &theme));
+        assert_eq!(header_icon_color(&focused, &theme), agent_color(3, &theme));
+        let unfocused = PaneChrome {
+            focused: false,
+            ..focused.clone()
+        };
+        assert_eq!(
+            ring_color(&theme, focus_ring(&unfocused, &theme), 0.0),
+            theme.border
+        );
+        // Unfocused, the icon still names the agent.
+        assert_eq!(
+            header_icon_color(&unfocused, &theme),
+            agent_color(3, &theme)
+        );
+        let empty = PaneChrome {
+            focused: true,
+            ..PaneChrome::default()
+        };
+        assert_eq!(focus_ring(&empty, &theme), theme.accent.opacity(0.55));
+        assert_eq!(header_icon_color(&empty, &theme), theme.accent);
+        let empty_unfocused = PaneChrome::default();
+        assert_eq!(header_icon_color(&empty_unfocused, &theme), theme.tertiary);
     }
 }

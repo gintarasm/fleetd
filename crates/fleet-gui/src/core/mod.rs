@@ -9,6 +9,7 @@ pub mod find;
 pub mod fuzzy;
 pub mod glass;
 pub mod icons;
+pub mod identity;
 pub mod keys;
 pub mod kill;
 pub mod launch;
