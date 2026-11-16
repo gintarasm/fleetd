@@ -16,20 +16,26 @@ use super::pane_view::{InputSink, PaneChrome, PaneView};
 use super::sidebar_view::{TabMark, program_name};
 use super::theme::Theme;
 use super::workspace::Workspace;
+use crate::core::broadcast::{RETURN, RETURN_DELAY_MS, SendPlan, encode_text};
 use crate::core::config::{GuiConfig, load_config};
 use crate::core::drag_drop::DropAction;
+use crate::core::drop_paste::{DROP_NEEDS_LOCAL, dropped_text};
 use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
+use crate::core::git;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
+use crate::core::presets::{Preset, detect_presets, usable};
 use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::settings::{Change, save_changes};
 use crate::core::shortcuts::ClosedPanes;
-use crate::core::sidebar::{ended, tilde, toggle_collapsed};
+use crate::core::sidebar::{GroupBy, ended, tilde, toggle_collapsed};
 use crate::core::sidebar_tree::{removable_ended, toggle_disclosure};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
-use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
+use crate::core::state::{
+    GuiState, MAX_RECENT_COMMANDS, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent,
+};
 use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
 use crate::core::style::chrome;
 use crate::core::tabs::Tabs;
@@ -39,6 +45,10 @@ use crate::core::zoom::{FontZoom, Zoom};
 
 /// Saved state is written once it has been still this long.
 pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// A blocking job reading an agent's output as plain text (see
+/// [`SessionApi::read_output`]).
+pub type OutputJob = Box<dyn FnOnce() -> Result<String, String> + Send>;
 
 /// What the workspace needs from the session: [`Session`], or a recording
 /// fake in tests.
@@ -65,8 +75,18 @@ pub trait SessionApi: InputSink {
         rows: u16,
     ) -> Result<(), String>;
     fn forget(&self, ids: Vec<u64>);
+    /// A job reading the agent's whole output (fleetd's history, then the
+    /// screen) as plain text; it blocks, so it runs off the UI thread.
+    fn read_output(&self, _agent_id: u64) -> OutputJob {
+        Box::new(|| Err("not connected to a fleetd".into()))
+    }
     /// Sets an agent's name (ADR 0052).
     fn rename(&self, agent_id: u64, name: String);
+    /// Sets, then removes, an agent's labels (Edit Labels, ADR 0087).
+    fn set_labels(&self, _agent_id: u64, _set: HashMap<String, String>, _remove: Vec<String>) {}
+    /// Types `data` into an agent, shown in a pane or not (Send to
+    /// Agents…, ADR 0083).
+    fn send_input(&self, _agent_id: u64, _data: Vec<u8>) {}
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
@@ -131,8 +151,20 @@ impl SessionApi for Session {
         Session::forget(self, ids);
     }
 
+    fn read_output(&self, agent_id: u64) -> OutputJob {
+        Box::new(Session::read_output(self, agent_id))
+    }
+
     fn rename(&self, agent_id: u64, name: String) {
         Session::rename(self, agent_id, name);
+    }
+
+    fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
+        Session::set_labels(self, agent_id, set, remove);
+    }
+
+    fn send_input(&self, agent_id: u64, data: Vec<u8>) {
+        Session::send_input(self, agent_id, data);
     }
 
     fn clear_exited(&self) {
@@ -318,6 +350,12 @@ pub struct AppState {
     /// The directory of the spawn on its way into a pane; it becomes a
     /// recent directory once the pane shows the new agent.
     spawn_dirs: HashMap<PaneId, String>,
+    /// The New agent sheet's command line of the spawn on its way into a
+    /// pane; it becomes a recent command with the directory (ADR 0084).
+    spawn_commands: HashMap<PaneId, String>,
+    /// The presets found on `PATH` for this target, once asked for
+    /// (`[gui] presets` unset; ADR 0084).
+    detected_presets: Option<(Target, Vec<Preset>)>,
     /// Agents asked for in a pane (sidebar click) that it does not show
     /// yet; until then the pane's old agent is not adopted back.
     requested: HashMap<PaneId, u64>,
@@ -390,6 +428,8 @@ impl AppState {
             celebrating: None,
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
+            spawn_commands: HashMap::new(),
+            detected_presets: None,
             requested: HashMap::new(),
             restarting: HashMap::new(),
             unlisted: HashMap::new(),
@@ -472,6 +512,7 @@ impl AppState {
         self.celebrating = None;
         self.starting.clear();
         self.spawn_dirs.clear();
+        self.spawn_commands.clear();
         self.requested.clear();
         self.restarting.clear();
         self.unlisted.clear();
@@ -589,6 +630,22 @@ impl AppState {
     /// rows under it as drawn).
     pub fn toggle_disclosure(&mut self, id: u64, children: usize, cx: &mut Context<Self>) {
         toggle_disclosure(&mut self.disclosure, id, children);
+        cx.notify();
+    }
+
+    /// What the sidebar groups by (ADR 0085).
+    pub fn group_by(&self) -> GroupBy {
+        self.gui_state.sidebar_group_by
+    }
+
+    /// Groups the sidebar `by` folder or repository, remembered for
+    /// every target.
+    pub fn set_group_by(&mut self, by: GroupBy, cx: &mut Context<Self>) {
+        if self.gui_state.sidebar_group_by == by {
+            return;
+        }
+        self.gui_state.sidebar_group_by = by;
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -774,6 +831,14 @@ impl AppState {
                 .entry(self.target.to_string())
                 .or_default();
             push_recent(dirs, dir, MAX_RECENT_DIRS);
+        }
+        if let Some(line) = self.spawn_commands.remove(&pane) {
+            let commands = self
+                .gui_state
+                .recent_commands
+                .entry(self.target.to_string())
+                .or_default();
+            push_recent(commands, line, MAX_RECENT_COMMANDS);
         }
         true
     }
@@ -1015,6 +1080,7 @@ impl AppState {
                     (None, None) => None,
                 },
                 cwd: row.map(|r| tilde(&r.info.cwd, &self.home)),
+                git: row.and_then(|r| git::header_text(&r.info)),
                 name: row.and_then(|r| name_of(&r.info)).map(str::to_owned),
                 link_dir: row
                     .filter(|_| self.target == Target::Local)
@@ -1027,6 +1093,7 @@ impl AppState {
                 status: agent.and_then(|id| self.statuses.get(&id).copied()),
                 agent,
                 agent_emoji: self.config.agent_emoji,
+                local: self.target == Target::Local,
                 no_agents,
                 run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
             };
@@ -1306,6 +1373,7 @@ impl AppState {
     fn forget_pending(&mut self, pane: PaneId) {
         self.starting.remove(&pane);
         self.spawn_dirs.remove(&pane);
+        self.spawn_commands.remove(&pane);
         self.requested.remove(&pane);
         self.restarting.remove(&pane);
     }
@@ -1385,6 +1453,23 @@ impl AppState {
         self.spawn_dirs.insert(pane, cwd);
         self.refresh_chrome(cx);
         cx.notify();
+        Ok(())
+    }
+
+    /// A spawn from the New agent sheet: as [`AppState::spawn`], and
+    /// `command` (as typed, without the prompt) becomes a recent command
+    /// once the pane shows the new agent.
+    pub fn spawn_from_sheet(
+        &mut self,
+        req: SpawnRequest,
+        command: String,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.spawn(req, cx)?;
+        let command = command.trim().to_owned();
+        if !command.is_empty() {
+            self.spawn_commands.insert(self.tabs.focused(), command);
+        }
         Ok(())
     }
 
@@ -1486,6 +1571,77 @@ impl AppState {
         self.session.rename(agent_id, name);
     }
 
+    pub fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
+        self.session.set_labels(agent_id, set, remove);
+    }
+
+    /// A job reading `agent_id`'s output as plain text (ADR 0086).
+    pub(super) fn read_output(&self, agent_id: u64) -> OutputJob {
+        self.session.read_output(agent_id)
+    }
+
+    /// Forgets these agents (fleetd refuses running ones).
+    pub(super) fn forget_all(&self, ids: Vec<u64>) {
+        if !ids.is_empty() {
+            self.session.forget(ids);
+        }
+    }
+
+    /// Shows `text` in the neutral toast, until dismissed.
+    pub(super) fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notice = Some(text);
+        cx.notify();
+    }
+
+    /// Types `data` into an agent (Send to Agents…, ADR 0083).
+    pub fn send_input(&self, agent_id: u64, data: Vec<u8>) {
+        self.session.send_input(agent_id, data);
+    }
+
+    /// Send to Agents… (ADR 0083): types the plan's text into each
+    /// target, as `fleet send` does (a bracketed paste for several lines
+    /// where a pane says the agent wants one), then the Return,
+    /// [`RETURN_DELAY_MS`] later if there was text.
+    pub fn send_text(&mut self, plan: &SendPlan, cx: &mut Context<Self>) {
+        if !plan.text.is_empty() {
+            for &id in &plan.targets {
+                let bracketed = self.bracketed_paste(id, cx).unwrap_or(false);
+                self.send_input(id, encode_text(&plan.text, bracketed));
+            }
+        }
+        if !plan.press_return {
+            return;
+        }
+        let targets = plan.targets.clone();
+        if !plan.return_delayed() {
+            for id in targets {
+                self.send_input(id, RETURN.to_vec());
+            }
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(RETURN_DELAY_MS))
+                .await;
+            let _ = this.update(cx, |a, _| {
+                for id in targets {
+                    a.send_input(id, RETURN.to_vec());
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Whether a pane showing `agent_id` (in any tab) has bracketed paste
+    /// on; `None` when no pane shows it.
+    pub fn bracketed_paste(&self, agent_id: u64, cx: &App) -> Option<bool> {
+        self.panes
+            .iter()
+            .filter(|(pane, _)| self.tabs.agent(**pane) == Some(agent_id))
+            .map(|(_, view)| view.read(cx).bracketed_paste())
+            .reduce(|a, b| a || b)
+    }
+
     /// The summary bar's Remove: forgets the agent `pane` shows if it
     /// exited or is lost; otherwise does nothing. The pane empties when the
     /// node announces the removal.
@@ -1552,6 +1708,35 @@ impl AppState {
         }
     }
 
+    /// Files dropped from Finder on `agent`'s sidebar row: their quoted
+    /// paths are typed into it (ADR 0081), through a pane of the shown
+    /// tab showing it (the focused one first: bracketed paste as it
+    /// asked), else on the control connection, unbracketed
+    /// (as Send to Agents…, so a refusal shows an error). Not for an
+    /// ended agent; on a remote target, a notice instead.
+    pub fn drop_paths_on_agent(&mut self, agent: u64, paths: &[String], cx: &mut Context<Self>) {
+        if self.target != Target::Local {
+            self.show_notice(DROP_NEEDS_LOCAL.to_owned(), cx);
+            return;
+        }
+        let running = self.agents.iter().any(|r| r.info.id == agent && !ended(r));
+        let Some(text) = dropped_text(paths).filter(|_| running) else {
+            return;
+        };
+        let focused = self.tabs.focused();
+        let pane = self
+            .tabs
+            .layout()
+            .panes()
+            .into_iter()
+            .filter(|p| self.tabs.agent(*p) == Some(agent))
+            .min_by_key(|p| *p != focused);
+        match pane.and_then(|p| self.panes.get(&p)) {
+            Some(view) => view.update(cx, |v, cx| v.paste_text(&text, cx)),
+            None => self.session.send_input(agent, text.into_bytes()),
+        }
+    }
+
     /// Shows `text` in the error toast, until dismissed.
     pub(super) fn show_error(&mut self, text: String, cx: &mut Context<Self>) {
         eprintln!("fleet-gui: {text}");
@@ -1564,6 +1749,12 @@ impl AppState {
     /// while one of its descendants runs (ADR 0074).
     pub fn ended_count(&self) -> usize {
         removable_ended(&self.agents).len()
+    }
+
+    /// The ids of the exited or lost agents Clear exited removes: not an
+    /// ended parent while one of its descendants runs (ADR 0074).
+    pub fn ended_ids(&self) -> Vec<u64> {
+        removable_ended(&self.agents)
     }
 
     /// Restarts the agent the focused pane shows, in that pane at its
@@ -1598,6 +1789,39 @@ impl AppState {
             .get(&self.target.to_string())
             .map_or(&[][..], Vec::as_slice);
         dir_choices(recent, &self.agents)
+    }
+
+    /// The New agent sheet's recent commands for the target, most recent
+    /// first.
+    pub fn recent_commands(&self) -> Vec<String> {
+        self.gui_state
+            .recent_commands
+            .get(&self.target.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The command presets (ADR 0084): `[gui] presets`, else the agents
+    /// found on `PATH`, looked for once per target on first use (a few
+    /// `stat`s, never per frame).
+    pub fn presets(&mut self) -> Vec<Preset> {
+        if let Some(presets) = &self.config.presets {
+            return usable(presets);
+        }
+        match &self.detected_presets {
+            Some((target, presets)) if *target == self.target => presets.clone(),
+            _ => {
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let found = detect_presets(&self.target, &path, &self.home);
+                self.detected_presets = Some((self.target.clone(), found.clone()));
+                found
+            }
+        }
+    }
+
+    /// The presets come from `PATH` (no `[gui] presets`).
+    pub fn presets_detected(&self) -> bool {
+        self.config.presets.is_none()
     }
 
     pub fn config(&self) -> &GuiConfig {

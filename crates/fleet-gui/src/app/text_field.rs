@@ -3,6 +3,11 @@
 //! ⌥ word and ⌘ line moves, ⌘A, ⌘C/⌘X/⌘V, ⌘Z/⇧⌘Z, the Emacs keys
 //! Cocoa supports (⌃A ⌃E ⌃B ⌃F ⌃D ⌃H ⌃K), and IME composition. Editing
 //! is [`TextEdit`]; this draws it and turns events into its commands.
+//!
+//! [`TextField::multiline`] makes a text box instead (the Send sheet's
+//! message, ADR 0083): Return types a line break, the text wraps at the
+//! field's width, ↑/↓ move by row, ⌘←/⌘→ to the line's ends, and the
+//! box scrolls to keep the caret in view.
 
 use std::ops::Range;
 use std::time::Duration;
@@ -13,8 +18,8 @@ use gpui::{
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, GlobalElementId,
     InspectorElementId, InteractiveElement, IntoElement, KeyDownEvent, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ShapedLine,
-    SharedString, Style, Styled, Task, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill,
-    point, px, relative, size,
+    SharedString, Style, Styled, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
+    WrappedLine, div, fill, point, px, relative, size,
 };
 
 use super::keymap::{Copy, Cut, Paste, Redo, SelectAll, TEXT_FIELD_CONTEXT, Undo};
@@ -43,6 +48,12 @@ pub struct TextField {
     drawn_focused: bool,
     /// The blink timer, while the field is focused.
     blink: Option<Task<()>>,
+    /// A text box: how many rows it shows ([`TextField::multiline`]).
+    rows: Option<usize>,
+    /// A text box's last frame: its wrapped text and where it was drawn.
+    last_block: Option<(Block, Bounds<Pixels>)>,
+    /// How far a text box is scrolled up to keep the caret in view.
+    scroll_y: Pixels,
 }
 
 impl TextField {
@@ -57,6 +68,19 @@ impl TextField {
             caret_on: true,
             drawn_focused: false,
             blink: None,
+            rows: None,
+            last_block: None,
+            scroll_y: px(0.),
+        }
+    }
+
+    /// A text box `rows` rows tall: line breaks are kept, Return types
+    /// one (⌘Return still reaches the sheet).
+    pub fn multiline(text: String, placeholder: &str, rows: usize, cx: &mut Context<Self>) -> Self {
+        TextField {
+            edit: TextEdit::multiline(text),
+            rows: Some(rows.max(1)),
+            ..TextField::new(String::new(), placeholder, cx)
         }
     }
 
@@ -132,6 +156,11 @@ impl TextField {
         if self.edit.marked().is_some() {
             return;
         }
+        if self.rows.is_some() && self.box_key_down(ev) {
+            self.changed(cx);
+            cx.stop_propagation();
+            return;
+        }
         let m = &ev.keystroke.modifiers;
         let e = &mut self.edit;
         let moved = |m_plain, m_alt, m_cmd| {
@@ -202,6 +231,56 @@ impl TextField {
         }
     }
 
+    /// A text box's own keys: Return, ↑/↓ by row, ⌘ and ⌃ moves to the
+    /// line's ends. True if handled.
+    fn box_key_down(&mut self, ev: &KeyDownEvent) -> bool {
+        let m = &ev.keystroke.modifiers;
+        let e = &mut self.edit;
+        match ev.keystroke.key.as_str() {
+            "enter" if !m.platform && !m.control && !m.alt => {
+                e.unmark();
+                e.insert("\n");
+            }
+            "left" if m.platform && !m.control => e.move_caret(Movement::LineStart, m.shift),
+            "right" if m.platform && !m.control => e.move_caret(Movement::LineEnd, m.shift),
+            "a" if m.control => e.move_caret(Movement::LineStart, m.shift),
+            "e" if m.control => e.move_caret(Movement::LineEnd, m.shift),
+            "up" if m.platform => e.move_caret(Movement::Home, m.shift),
+            "down" if m.platform => e.move_caret(Movement::End, m.shift),
+            "up" | "down" if !m.control && !m.alt => {
+                let to = self.row_move(ev.keystroke.key == "down");
+                self.edit.set_caret(to, m.shift);
+            }
+            "p" | "n" if m.control => {
+                let to = self.row_move(ev.keystroke.key == "n");
+                self.edit.set_caret(to, m.shift);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Where ↑ (or ↓, `down`) takes the caret in the last frame's text
+    /// box: the row above (below) at the same x, else the text's start
+    /// (end).
+    fn row_move(&self, down: bool) -> usize {
+        let end = if down { self.edit.text().len() } else { 0 };
+        let Some((block, _)) = &self.last_block else {
+            return end;
+        };
+        let caret = self.edit.caret();
+        let row = block.row_of(caret);
+        let to = if down {
+            Some(row + 1)
+        } else {
+            row.checked_sub(1)
+        };
+        match to.filter(|&r| r < block.rows.len()) {
+            Some(to) => block.index_in_row(to, block.x_in_row(row, caret)),
+            None => end,
+        }
+    }
+
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.edit.select_all();
         self.changed(cx);
@@ -221,12 +300,17 @@ impl TextField {
         }
     }
 
-    /// Pastes the clipboard's first line (the field is one line).
+    /// Pastes the clipboard's first line (a one-line field), or all of
+    /// it (a text box).
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
-            let line = text.lines().next().unwrap_or("");
+            let pasted = if self.rows.is_some() {
+                text.as_str()
+            } else {
+                text.lines().next().unwrap_or("")
+            };
             self.edit.unmark();
-            self.edit.insert(line);
+            self.edit.insert(pasted);
             self.changed(cx);
         }
     }
@@ -243,18 +327,26 @@ impl TextField {
         }
     }
 
-    /// The byte offset under window x `x` in the last frame's text.
-    fn index_at(&self, x: Pixels) -> Option<usize> {
+    /// The byte offset under window point `p` in the last frame's text.
+    fn index_at(&self, p: Point<Pixels>) -> Option<usize> {
+        if self.rows.is_some() {
+            let (block, bounds) = self.last_block.as_ref()?;
+            if self.edit.text().is_empty() {
+                return Some(0);
+            }
+            let at = point(p.x - bounds.left(), p.y - bounds.top() + self.scroll_y);
+            return Some(block.index_at(at));
+        }
         let (line, bounds) = self.last.as_ref()?;
         if self.edit.text().is_empty() {
             return Some(0);
         }
-        Some(line.closest_index_for_x(x - bounds.left() + self.scroll_x))
+        Some(line.closest_index_for_x(p.x - bounds.left() + self.scroll_x))
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
-        let Some(at) = self.index_at(ev.position.x) else {
+        let Some(at) = self.index_at(ev.position) else {
             return;
         };
         match ev.click_count {
@@ -274,7 +366,7 @@ impl TextField {
             self.selecting = false;
             return;
         }
-        if let Some(at) = self.index_at(ev.position.x) {
+        if let Some(at) = self.index_at(ev.position) {
             self.edit.set_caret(at, true);
             self.changed(cx);
         }
@@ -284,8 +376,20 @@ impl TextField {
         self.selecting = false;
     }
 
-    /// The window bounds of byte range `r` in the last frame's text.
+    /// The window bounds of byte range `r` in the last frame's text (a
+    /// text box: from its start, on the start's row).
     fn bounds_of(&self, r: Range<usize>) -> Option<Bounds<Pixels>> {
+        if self.rows.is_some() {
+            let (block, bounds) = self.last_block.as_ref()?;
+            let start = block.position(r.start);
+            let end = block.position(r.end);
+            let end_x = if end.y == start.y { end.x } else { start.x };
+            let top = bounds.top() + start.y - self.scroll_y;
+            return Some(Bounds::from_corners(
+                point(bounds.left() + start.x, top),
+                point(bounds.left() + end_x, top + block.line_height),
+            ));
+        }
         let (line, bounds) = self.last.as_ref()?;
         let x = |i| bounds.left() + line.x_for_index(i) - self.scroll_x;
         Some(Bounds::from_corners(
@@ -299,6 +403,7 @@ impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let focused = self.focus.is_focused(window);
+        let text_box = self.rows.is_some();
         div()
             .key_context(TEXT_FIELD_CONTEXT)
             .track_focus(&self.focus)
@@ -316,8 +421,12 @@ impl Render for TextField {
             .cursor(CursorStyle::IBeam)
             .flex()
             .flex_row()
-            .items_center()
-            .h(px(chrome::CONTROL_HEIGHT))
+            .when(!text_box, |d| {
+                d.items_center().h(px(chrome::CONTROL_HEIGHT))
+            })
+            .when(text_box, |d| {
+                d.w_full().items_start().py(px(space::XS + space::XXS))
+            })
             .px(px(space::SM))
             .rounded(px(radius::MD))
             .border_1()
@@ -335,8 +444,63 @@ impl Render for TextField {
             .type_style(text::BODY)
             .text_color(theme.text)
             .overflow_hidden()
-            .child(TextLine { field: cx.entity() })
+            .when(!text_box, |d| d.child(TextLine { field: cx.entity() }))
+            .when(text_box, |d| d.child(TextBlock { field: cx.entity() }))
     }
+}
+
+/// What a field draws (its text, or the placeholder dimmed), styled in
+/// runs: the IME's marked text underlined.
+fn shown_text(field: &TextField, window: &Window, cx: &App) -> (SharedString, Vec<TextRun>) {
+    let theme = theme(cx);
+    let edit = &field.edit;
+    let style = window.text_style();
+    let (shown, color) = if edit.text().is_empty() {
+        (field.placeholder.clone(), theme.tertiary)
+    } else {
+        (SharedString::from(edit.text().to_owned()), style.color)
+    };
+    let run = TextRun {
+        len: shown.len(),
+        font: style.font(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    // Clamped: a stale range must never cut the text off a char.
+    let marked = edit.marked().filter(|m| {
+        m.start <= m.end
+            && m.end <= shown.len()
+            && shown.is_char_boundary(m.start)
+            && shown.is_char_boundary(m.end)
+    });
+    let runs = match marked {
+        Some(m) if !edit.text().is_empty() => [
+            TextRun {
+                len: m.start,
+                ..run.clone()
+            },
+            TextRun {
+                len: m.end - m.start,
+                underline: Some(UnderlineStyle {
+                    color: Some(color),
+                    thickness: px(1.),
+                    wavy: false,
+                }),
+                ..run.clone()
+            },
+            TextRun {
+                len: shown.len() - m.end,
+                ..run
+            },
+        ]
+        .into_iter()
+        .filter(|r| r.len > 0)
+        .collect(),
+        _ => vec![run],
+    };
+    (shown, runs)
 }
 
 /// The field's text: the caret, the selection, the IME's marked text
@@ -395,55 +559,10 @@ impl Element for TextLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepaint {
-        let theme = theme(cx);
         let field = self.field.read(cx);
         let edit = &field.edit;
         let style = window.text_style();
-        let (shown, color) = if edit.text().is_empty() {
-            (field.placeholder.clone(), theme.tertiary)
-        } else {
-            (SharedString::from(edit.text().to_owned()), style.color)
-        };
-        let run = TextRun {
-            len: shown.len(),
-            font: style.font(),
-            color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        // Clamped: a stale range must never cut the text off a char.
-        let marked = edit.marked().filter(|m| {
-            m.start <= m.end
-                && m.end <= shown.len()
-                && shown.is_char_boundary(m.start)
-                && shown.is_char_boundary(m.end)
-        });
-        let runs = match marked {
-            Some(m) if !edit.text().is_empty() => [
-                TextRun {
-                    len: m.start,
-                    ..run.clone()
-                },
-                TextRun {
-                    len: m.end - m.start,
-                    underline: Some(UnderlineStyle {
-                        color: Some(color),
-                        thickness: px(1.),
-                        wavy: false,
-                    }),
-                    ..run.clone()
-                },
-                TextRun {
-                    len: shown.len() - m.end,
-                    ..run
-                },
-            ]
-            .into_iter()
-            .filter(|r| r.len > 0)
-            .collect(),
-            _ => vec![run],
-        };
+        let (shown, runs) = shown_text(field, window, cx);
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window
             .text_system()
@@ -532,6 +651,287 @@ impl Element for TextLine {
     }
 }
 
+/// A text box's text wrapped at its width: the logical lines (split at
+/// `\n`) and the rows they wrap into.
+#[derive(Clone)]
+struct Block {
+    lines: Vec<WrappedLine>,
+    /// Each line's byte offset in the text.
+    starts: Vec<usize>,
+    rows: Vec<Row>,
+    line_height: Pixels,
+}
+
+/// A row of a [`Block`]: part of line `line`, bytes `start..end` of the
+/// text, `x0` into the line's unwrapped layout.
+#[derive(Clone, Copy)]
+struct Row {
+    line: usize,
+    start: usize,
+    end: usize,
+    x0: Pixels,
+}
+
+impl Block {
+    fn new(lines: Vec<WrappedLine>, line_height: Pixels) -> Self {
+        let mut starts = Vec::with_capacity(lines.len());
+        let mut rows = Vec::new();
+        let mut at = 0;
+        for (li, line) in lines.iter().enumerate() {
+            starts.push(at);
+            let layout = &line.unwrapped_layout;
+            let mut row_start = 0;
+            let breaks = line.wrap_boundaries.iter().map(|b| {
+                layout
+                    .runs
+                    .get(b.run_ix)
+                    .and_then(|r| r.glyphs.get(b.glyph_ix))
+                    .map_or(line.len(), |g| g.index)
+            });
+            for end in breaks.chain([line.len()]) {
+                rows.push(Row {
+                    line: li,
+                    start: at + row_start,
+                    end: at + end,
+                    x0: layout.x_for_index(row_start),
+                });
+                row_start = end;
+            }
+            at += line.len() + 1;
+        }
+        Block {
+            lines,
+            starts,
+            rows,
+            line_height,
+        }
+    }
+
+    fn height(&self) -> Pixels {
+        self.line_height * self.rows.len().max(1) as f32
+    }
+
+    /// The row byte `at` is drawn on (at a wrap: the later row).
+    fn row_of(&self, at: usize) -> usize {
+        self.rows.iter().rposition(|r| r.start <= at).unwrap_or(0)
+    }
+
+    /// The x of byte `at` on row `row`.
+    fn x_in_row(&self, row: usize, at: usize) -> Pixels {
+        let r = self.rows[row];
+        let layout = &self.lines[r.line].unwrapped_layout;
+        layout.x_for_index(at.saturating_sub(self.starts[r.line])) - r.x0
+    }
+
+    /// Where byte `at` is drawn, from the block's top left.
+    fn position(&self, at: usize) -> Point<Pixels> {
+        if self.rows.is_empty() {
+            return point(px(0.), px(0.));
+        }
+        let row = self.row_of(at);
+        point(self.x_in_row(row, at), self.line_height * row as f32)
+    }
+
+    /// The byte closest to x `x` on row `row`.
+    fn index_in_row(&self, row: usize, x: Pixels) -> usize {
+        let r = self.rows[row];
+        let layout = &self.lines[r.line].unwrapped_layout;
+        let at = self.starts[r.line] + layout.closest_index_for_x(x + r.x0);
+        at.clamp(r.start, r.end)
+    }
+
+    /// The byte closest to `p`, from the block's top left.
+    fn index_at(&self, p: Point<Pixels>) -> usize {
+        if self.rows.is_empty() {
+            return 0;
+        }
+        let row = (p.y / self.line_height).floor().max(0.) as usize;
+        self.index_in_row(row.min(self.rows.len() - 1), p.x)
+    }
+
+    /// The rectangles of selection `sel`, from the block's top left (a
+    /// row's line break shows as a little width).
+    fn selection_rects(&self, sel: &Range<usize>) -> Vec<Bounds<Pixels>> {
+        let lh = self.line_height;
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| sel.start <= r.end && sel.end >= r.start && !sel.is_empty())
+            .filter_map(|(i, r)| {
+                let from = sel.start.max(r.start);
+                let to = sel.end.min(r.end);
+                let x0 = self.x_in_row(i, from);
+                let mut x1 = self.x_in_row(i, to);
+                // The selection goes on past the row's line break.
+                if sel.end > r.end && self.rows.get(i + 1).is_some_and(|n| n.line != r.line) {
+                    x1 += px(4.);
+                }
+                (x1 > x0).then(|| {
+                    Bounds::from_corners(point(x0, lh * i as f32), point(x1, lh * (i + 1) as f32))
+                })
+            })
+            .collect()
+    }
+}
+
+/// A text box's text ([`TextField::multiline`]): wrapped at its width,
+/// `rows` rows tall, scrolled to keep the caret's row in view.
+struct TextBlock {
+    field: Entity<TextField>,
+}
+
+struct BlockPrepaint {
+    block: Block,
+    scroll_y: Pixels,
+    caret: Option<Bounds<Pixels>>,
+    selection: Vec<Bounds<Pixels>>,
+    focused: bool,
+}
+
+impl IntoElement for TextBlock {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for TextBlock {
+    type RequestLayoutState = ();
+    type PrepaintState = BlockPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let rows = self.field.read(cx).rows.unwrap_or(1);
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = (window.line_height() * rows as f32).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) -> BlockPrepaint {
+        let field = self.field.read(cx);
+        let edit = &field.edit;
+        let (shown, runs) = shown_text(field, window, cx);
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let lines = window
+            .text_system()
+            .shape_text(shown, font_size, &runs, Some(bounds.size.width), None)
+            .map(|l| l.into_vec())
+            .unwrap_or_default();
+        let block = Block::new(lines, line_height);
+        let focused = field.focus.is_focused(window);
+        let (caret_at, sel) = if edit.text().is_empty() {
+            (point(px(0.), px(0.)), 0..0)
+        } else {
+            (block.position(edit.caret()), edit.selection())
+        };
+        // Keep the caret's row in view.
+        let mut scroll_y = field.scroll_y;
+        if caret_at.y + line_height - scroll_y > bounds.size.height {
+            scroll_y = caret_at.y + line_height - bounds.size.height;
+        }
+        if caret_at.y < scroll_y {
+            scroll_y = caret_at.y;
+        }
+        let max_scroll = (block.height() - bounds.size.height).max(px(0.));
+        scroll_y = scroll_y.clamp(px(0.), max_scroll);
+        let origin = point(bounds.left(), bounds.top() - scroll_y);
+        let caret = (focused && field.caret_on && sel.is_empty()).then(|| {
+            Bounds::new(
+                point(origin.x + caret_at.x, origin.y + caret_at.y),
+                size(px(1.5), line_height),
+            )
+        });
+        let selection = block
+            .selection_rects(&sel)
+            .into_iter()
+            .map(|b| Bounds::new(point(origin.x + b.left(), origin.y + b.top()), b.size))
+            .collect();
+        BlockPrepaint {
+            block,
+            scroll_y,
+            caret,
+            selection,
+            focused,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        p: &mut BlockPrepaint,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let theme = theme(cx);
+        let focus = self.field.read(cx).focus.clone();
+        window.handle_input(
+            &focus,
+            ElementInputHandler::new(bounds, self.field.clone()),
+            cx,
+        );
+        let lh = p.block.line_height;
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            let color = if p.focused {
+                theme.accent.opacity(0.35)
+            } else {
+                theme.secondary.opacity(0.25)
+            };
+            for sel in &p.selection {
+                window.paint_quad(fill(*sel, color));
+            }
+            for (li, line) in p.block.lines.iter().enumerate() {
+                let first_row = p.block.rows.iter().position(|r| r.line == li).unwrap_or(0);
+                let origin = point(
+                    bounds.left(),
+                    bounds.top() - p.scroll_y + lh * first_row as f32,
+                );
+                let _ = line.paint(origin, lh, TextAlign::Left, None, window, cx);
+            }
+            if let Some(caret) = p.caret {
+                window.paint_quad(fill(caret, theme.accent));
+            }
+        });
+        let block = p.block.clone();
+        let (scroll_y, focused) = (p.scroll_y, p.focused);
+        self.field.update(cx, |f, cx| {
+            f.last_block = Some((block, bounds));
+            f.scroll_y = scroll_y;
+            f.drawn_focused = focused;
+            if focused && f.blink.is_none() {
+                f.start_blink(cx);
+            }
+        });
+    }
+}
+
 impl EntityInputHandler for TextField {
     fn text_for_range(
         &mut self,
@@ -608,7 +1008,7 @@ impl EntityInputHandler for TextField {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let at = self.index_at(point.x)?;
+        let at = self.index_at(point)?;
         Some(self.edit.to_utf16(at))
     }
 }
@@ -716,6 +1116,40 @@ mod tests {
         assert!(!view.read_with(cx, |f, _| f.caret_on));
         cx.simulate_input("d");
         assert!(view.read_with(cx, |f, _| f.caret_on));
+    }
+
+    /// A text box: Return types a line break (⌘Return reaches the sheet),
+    /// a paste keeps its lines, ⌘← and ⌃E go to the line's ends, ↑ row
+    /// by row to the start, ⌘↓ to the end.
+    #[gpui::test]
+    fn a_text_box_keeps_lines(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| TextField::multiline(String::new(), "Message", 4, cx));
+        cx.update(|window, cx| window.focus(view.read(cx).focus_handle()));
+        cx.run_until_parked();
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("enter cmd-enter");
+        cx.simulate_input("two");
+        assert_eq!(text(&view, cx), "one\ntwo");
+        cx.write_to_clipboard(ClipboardItem::new_string("\nthree\r\nfour".into()));
+        cx.simulate_keystrokes("cmd-v");
+        assert_eq!(text(&view, cx), "one\ntwo\nthree\nfour");
+        cx.simulate_keystrokes("cmd-left");
+        cx.simulate_input("> ");
+        assert_eq!(text(&view, cx), "one\ntwo\nthree\n> four");
+        cx.simulate_keystrokes("cmd-left ctrl-e");
+        cx.simulate_input("!");
+        assert_eq!(text(&view, cx), "one\ntwo\nthree\n> four!");
+        // ↑ row by row to the start (here a row per character: the test
+        // window's field has no width to wrap at).
+        for _ in 0..30 {
+            cx.simulate_keystrokes("up");
+        }
+        cx.simulate_input("# ");
+        cx.simulate_keystrokes("cmd-down");
+        cx.simulate_input("?");
+        assert_eq!(text(&view, cx), "# one\ntwo\nthree\n> four!?");
     }
 
     #[gpui::test]

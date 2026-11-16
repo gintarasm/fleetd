@@ -53,6 +53,7 @@
 //! so no activity follows an agent's exit.
 
 use crate::env::LoginEnv;
+use crate::git::GitCache;
 use crate::handoff::{self, HandoffGate};
 use crate::history::{History, HistoryInfo, Page};
 use crate::host::{AdoptSpec, AgentHost, TerminalHandle};
@@ -1667,6 +1668,8 @@ pub struct Node {
     refused: broadcast::Sender<SpawnRefused>,
     /// Mailbox notices for waiters (ADR 0076); never on the output path.
     notices: broadcast::Sender<Notice>,
+    /// Agents' git checkouts, by cwd (ADR 0085).
+    git: GitCache,
 }
 
 impl Drop for Node {
@@ -1878,6 +1881,7 @@ impl Node {
             spawn_gate: Mutex::new(()),
             refused,
             notices,
+            git: GitCache::default(),
         })
     }
 
@@ -2411,6 +2415,7 @@ impl Node {
             labels = ?label_keys,
             "agent spawned"
         );
+        let git = self.git.get(&new.cwd);
         let info = AgentInfo {
             id,
             program: new.program,
@@ -2421,12 +2426,14 @@ impl Node {
             created_unix_ms,
             labels: new.labels,
             exited_unix_ms: None,
+            git,
         };
         Ok((info, attached))
     }
 
-    /// Every agent this node knows of, including exited and lost ones. A
-    /// corrupt row is logged and left out.
+    /// Every agent this node knows of, including exited and lost ones,
+    /// with the git checkout of its cwd (cached, ADR 0085). A corrupt row
+    /// is logged and left out.
     pub fn list(&self) -> io::Result<Vec<AgentInfo>> {
         let (records, bad) = lock(&self.store).list_agents_lossy().map_err(store_err)?;
         for e in bad {
@@ -2434,7 +2441,14 @@ impl Node {
             let _ = e;
             warn!("skipping an unreadable agent row");
         }
-        Ok(records.into_iter().map(agent_info).collect())
+        Ok(records
+            .into_iter()
+            .map(|rec| {
+                let mut info = agent_info(rec);
+                info.git = self.git.get(&info.cwd);
+                info
+            })
+            .collect())
     }
 
     /// The agents whose labels contain every `selector` pair (all of them
@@ -3088,6 +3102,7 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
         created_unix_ms: rec.created_unix_ms,
         labels: rec.labels,
         exited_unix_ms: rec.exited_unix_ms,
+        git: None,
     }
 }
 

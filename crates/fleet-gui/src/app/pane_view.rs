@@ -9,11 +9,11 @@ use fleet_term::CursorShape;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt, AnyView, AnyWindowHandle, AppContext, Bounds, BoxShadow,
-    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Font, Hsla, InteractiveElement,
-    IntoElement, KeyContext, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task,
-    UTF16Selection, Window, div, point, px, size,
+    ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, Font,
+    Hsla, Image, InteractiveElement, IntoElement, KeyContext, KeyDownEvent, Modifiers,
+    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement,
+    Styled, Subscription, Task, UTF16Selection, Window, div, point, px, size,
 };
 
 use super::agent_mark::{self, agent_color};
@@ -21,7 +21,10 @@ use super::controls::{self, ButtonKind};
 use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
-use super::keymap::{Copy, FINDING, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
+use super::keymap::{
+    ClearScrollback, Copy, FINDING, Find, FindNext, FindPrevious, Paste, ScrollPageDown,
+    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAll, TERMINAL_CONTEXT, to_key,
+};
 use super::native;
 use super::status_dot::status_dot;
 use super::tail_text::tail_text;
@@ -29,6 +32,10 @@ use super::terminal_element::TerminalElement;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::drop_paste::{
+    DROP_NEEDS_LOCAL, IMAGE_NOT_SAVED, PasteKind, dropped_text, image_extension, paste_kind,
+    save_pasted_image,
+};
 use crate::core::feedback::{self, Tween};
 use crate::core::find::status_label;
 use crate::core::icons::Icon;
@@ -37,7 +44,7 @@ use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
-use crate::core::pane::{PaneModel, PaneState, ViewRow};
+use crate::core::pane::{PaneModel, PaneState, ViewRow, ViewScroll};
 use crate::core::scroll_feedback::{
     Fade, HIT_WIDTH, INSET, Thumb, Wake, end_jumps_to_bottom, offset_for_thumb, thumb,
 };
@@ -164,6 +171,9 @@ pub struct PaneChrome {
     pub program: Option<String>,
     /// The agent's directory, with `~`.
     pub cwd: Option<String>,
+    /// The git checkout the directory is in, as the header shows it
+    /// (`core::git::header_text`, ADR 0085).
+    pub git: Option<String>,
     /// The agent's name (ADR 0052), if it has one.
     pub name: Option<String>,
     /// The agent's directory when it is on this machine: file paths in the
@@ -190,6 +200,10 @@ pub struct PaneChrome {
     pub agent: Option<u64>,
     /// `[gui] agent_emoji`: the agent's emoji replaces the header icon.
     pub agent_emoji: bool,
+    /// The agent runs on this machine (the target is local): paths from
+    /// here mean the same to it, so files can be dropped and images
+    /// pasted (ADR 0081).
+    pub local: bool,
 }
 
 /// The focus ring's colour at full strength: the agent's colour, else the
@@ -265,6 +279,8 @@ pub struct HeaderParts {
     pub title: String,
     /// `program · id` once the agent is listed; else empty.
     pub detail: String,
+    /// The git repository and branch (ADR 0085); else empty.
+    pub git: String,
     /// The directory, with `~`.
     pub path: String,
 }
@@ -288,6 +304,7 @@ pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> HeaderParts
     HeaderParts {
         title,
         detail,
+        git: chrome.git.clone().unwrap_or_default(),
         path: chrome.cwd.clone().unwrap_or_default(),
     }
 }
@@ -306,6 +323,11 @@ pub enum PaneEvent {
     Restart,
     /// A double-click on the name: rename the pane's agent.
     Rename,
+    /// Edit Labels… in the pane's menu.
+    EditLabels,
+    /// The menu's Duplicate Agent…: the New agent sheet, prefilled with
+    /// the pane's agent (ADR 0084).
+    Duplicate,
     /// The header's Stop: kill the pane's running agent (after asking).
     Kill,
     /// Remove, in the header or the summary bar: forgets the ended agent.
@@ -315,6 +337,8 @@ pub enum PaneEvent {
     ContextMenu {
         on_grid: bool,
     },
+    /// A message for the toast (a drop or paste that cannot work here).
+    Notice(&'static str),
     /// The first-run welcome's buttons.
     NewAgent,
     NewTerminal,
@@ -377,6 +401,8 @@ pub struct PaneView {
     pub(crate) open_file: Arc<dyn Fn(Vec<String>, Vec<String>)>,
     /// The find bar, while open.
     find: Option<FindBar>,
+    /// Where a pasted image is saved (`$TMPDIR`; replaced in tests).
+    pub(crate) paste_dir: std::path::PathBuf,
     /// The last query, brought back when find opens again.
     find_query: String,
     find_case: bool,
@@ -452,6 +478,7 @@ impl PaneView {
             hover: None,
             open_file: Arc::new(spawn_opener),
             find: None,
+            paste_dir: std::env::temp_dir(),
             find_query: String::new(),
             find_case: false,
             find_task: None,
@@ -841,8 +868,25 @@ impl PaneView {
     }
 
     /// Some text is selected (the context menu's Copy).
+    /// The agent asked for bracketed paste (Send to Agents…, ADR 0083).
+    pub fn bracketed_paste(&self) -> bool {
+        self.model().terminal().modes().bracketed_paste
+    }
+
     pub fn has_selection(&self) -> bool {
         self.model().has_selection()
+    }
+
+    /// The view can scroll from the keyboard, is scrolled up, and has
+    /// history (the context menu's Scroll to Top, Scroll to Bottom and
+    /// Clear Scrollback).
+    pub fn scroll_state(&self) -> (bool, bool, bool) {
+        let model = self.model();
+        (
+            model.can_scroll_view(),
+            model.scroll_offset() > 0,
+            !model.scrollback().is_empty(),
+        )
     }
 
     /// The pane's agent exited or is gone (the context menu's Restart).
@@ -928,12 +972,147 @@ impl PaneView {
         )
     }
 
+    /// ⇧PageUp, ⇧PageDown, ⌘↑ and ⌘↓ (ADR 0082). On the alternate screen
+    /// the key goes on to the program; ⌘↑ and ⌘↓ from the find field move
+    /// its caret instead.
+    fn scroll_view(&mut self, scroll: ViewScroll, window: &mut Window, cx: &mut Context<Self>) {
+        let caret_key = matches!(scroll, ViewScroll::Top | ViewScroll::Bottom);
+        if caret_key && !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        let before = self.model().scroll_offset();
+        if !self.model().scroll_view(scroll) {
+            cx.propagate();
+            return;
+        }
+        if self.model().scroll_offset() != before {
+            self.show_scrollbar();
+            self.sink.check_paging(self.pane);
+            cx.notify();
+        }
+    }
+
+    fn scroll_page_up(&mut self, _: &ScrollPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_view(ViewScroll::PageUp, window, cx);
+    }
+
+    fn scroll_page_down(
+        &mut self,
+        _: &ScrollPageDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_view(ViewScroll::PageDown, window, cx);
+    }
+
+    fn scroll_to_top(&mut self, _: &ScrollToTop, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_view(ViewScroll::Top, window, cx);
+    }
+
+    fn scroll_to_bottom(
+        &mut self,
+        _: &ScrollToBottom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_view(ViewScroll::Bottom, window, cx);
+    }
+
+    /// ⌘A: the loaded history and the grid, ready for ⌘C.
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.model().select_all();
+        cx.notify();
+    }
+
+    /// ⌘K: clears this view's history only (ADR 0082).
+    fn clear_scrollback(&mut self, _: &ClearScrollback, _: &mut Window, cx: &mut Context<Self>) {
+        self.model().clear_scrollback();
+        cx.notify();
+    }
+
+    /// ⌘V: the clipboard's text; else its image, saved to a temp file,
+    /// as that file's path (ADR 0081).
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        let text = item.text();
+        let image = item.into_entries().find_map(|e| match e {
+            ClipboardEntry::Image(image) => Some(image),
+            ClipboardEntry::String(_) => None,
+        });
+        match paste_kind(text.is_some(), image.is_some(), self.chrome.local) {
+            PasteKind::Text => self.paste_text(&text.unwrap_or_default(), cx),
+            PasteKind::Image => {
+                if let Some(image) = image {
+                    self.paste_image(image, cx);
+                }
+            }
+            PasteKind::Notice(text) => cx.emit(PaneEvent::Notice(text)),
+            PasteKind::Nothing => {}
+        }
+    }
+
+    /// Pastes `text` into the agent, bracketed when it asked for that.
+    pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let modes = self.model().terminal().modes();
-        self.send(encode_paste(&text, &modes), cx);
+        self.send(encode_paste(text, &modes), cx);
+    }
+
+    /// Saves `image` to a new temp file off the UI thread, then pastes its
+    /// path.
+    fn paste_image(&mut self, image: Image, cx: &mut Context<Self>) {
+        let Some(ext) = image_extension(image.format.mime_type()) else {
+            return;
+        };
+        let dir = self.paste_dir.clone();
+        let at = unix_ms();
+        let saved = cx
+            .background_executor()
+            .spawn(async move { save_pasted_image(&dir, at, ext, &image.bytes) });
+        cx.spawn(async move |this, cx| {
+            let saved = saved.await;
+            let _ = this.update(cx, |this, cx| match saved {
+                Ok(path) => {
+                    if let Some(text) = dropped_text(&[path.to_string_lossy()]) {
+                        this.paste_text(&text, cx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("fleet-gui: cannot save the pasted image: {e}");
+                    cx.emit(PaneEvent::Notice(IMAGE_NOT_SAVED));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Files dropped from Finder: the pane gets the keyboard and their
+    /// paths are typed (ADR 0081).
+    fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        let paths: Vec<String> = paths
+            .paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        self.type_paths(&paths, cx);
+    }
+
+    /// Types `paths`, quoted, into the pane's running agent; for an agent
+    /// on another machine, a notice instead.
+    pub(crate) fn type_paths(&mut self, paths: &[String], cx: &mut Context<Self>) {
+        if !self.chrome.has_agent || self.chrome.agent_ended {
+            return;
+        }
+        if !self.chrome.local {
+            cx.emit(PaneEvent::Notice(DROP_NEEDS_LOCAL));
+            return;
+        }
+        if let Some(text) = dropped_text(paths) {
+            self.paste_text(&text, cx);
+        }
     }
 
     /// The marked-text cell ([`ime_cell`]) in window coordinates.
@@ -1301,6 +1480,7 @@ impl Render for PaneView {
         let HeaderParts {
             title: title_text,
             detail,
+            git,
             path,
         } = header_parts(chrome, title.as_deref());
         let icon_button = |id: &'static str, icon: Icon, event: PaneEvent| {
@@ -1408,6 +1588,25 @@ impl Render for PaneView {
                             .flex_none()
                             .text_color(theme.tertiary)
                             .child(SharedString::from(detail))
+                    }))
+                    .children((!git.is_empty()).then(|| {
+                        let number = chrome.number;
+                        let shown = git.clone();
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_shrink()
+                            .min_w_0()
+                            .gap(px(space::XS))
+                            .text_color(theme.secondary)
+                            .child(div().flex_none().text_color(theme.tertiary).child("·"))
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("pane-{number}-git-{shown}"))
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(git)),
+                            )
                     }))
                     .children((!path.is_empty()).then(|| {
                         div()
@@ -1609,6 +1808,27 @@ impl Render for PaneView {
             );
         }
         grid = grid.children(find_bar);
+        // Files from Finder over the pane: an accent outline (and tint),
+        // as for an agent dragged here (ADR 0059), and the drop lands
+        // here. Built only while something is dragged.
+        let drop_zone = cx.has_active_drag().then(|| {
+            let accent = theme.accent;
+            let number = chrome.number;
+            div()
+                .debug_selector(move || format!("pane-{number}-file-drop"))
+                .absolute()
+                .inset_0()
+                .rounded(px(radius::LG))
+                .drag_over::<ExternalPaths>(move |s, _, _, _| {
+                    let s = s.border_2().border_color(accent);
+                    if native::reduce_transparency() {
+                        s
+                    } else {
+                        s.bg(accent.opacity(0.16))
+                    }
+                })
+                .on_drop(cx.listener(Self::drop_paths))
+        });
         div()
             .key_context({
                 // ⌘⇧G is Find Previous only while finding (ADR 0073).
@@ -1631,6 +1851,12 @@ impl Render for PaneView {
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
+            .on_action(cx.listener(Self::scroll_page_up))
+            .on_action(cx.listener(Self::scroll_page_down))
+            .on_action(cx.listener(Self::scroll_to_top))
+            .on_action(cx.listener(Self::scroll_to_bottom))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::clear_scrollback))
             .size_full()
             .flex()
             .flex_col()
@@ -1668,6 +1894,7 @@ impl Render for PaneView {
                 }
             }))
             .children(ended_bar(self, state, &theme, cx))
+            .children(drop_zone)
             .children((dim > 0.0).then(|| {
                 // The veil only draws: clicks and keys go to the pane.
                 div()
@@ -1884,13 +2111,16 @@ mod tests {
         VisualTestContext, bounds, point, px, size,
     };
 
+    use gpui::{ExternalPaths, FileDropEvent, Image, ImageFormat};
+
     use super::{
-        HeaderParts, InputSink, PaneChrome, PaneView, banner, draws_cursor, empty_message,
-        grid_size, header_parts, ime_cell, point_to_cell,
+        HeaderParts, InputSink, PaneChrome, PaneEvent, PaneView, banner, draws_cursor,
+        empty_message, grid_size, header_parts, ime_cell, point_to_cell,
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
+    use crate::core::drop_paste::{DROP_NEEDS_LOCAL, IMAGE_NEEDS_LOCAL, shell_quote};
     use crate::core::pane::PaneState;
     use crate::core::pane::{PaneModel, ViewRow};
     use crate::core::selection::{LineRef, SelPoint};
@@ -2335,6 +2565,87 @@ mod tests {
         assert_eq!(sink.take(), vec![b"\x1b[F".to_vec()]);
     }
 
+    #[gpui::test]
+    fn scroll_keys_page_and_jump_through_history(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_history(100));
+        sink.take();
+        cx.simulate_keystrokes("shift-pageup");
+        assert_eq!(offset(&view, cx), 23);
+        cx.simulate_keystrokes("shift-pageup shift-pagedown");
+        assert_eq!(offset(&view, cx), 23);
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(offset(&view, cx), 100);
+        cx.simulate_keystrokes("cmd-down");
+        assert_eq!(offset(&view, cx), 0);
+        cx.simulate_keystrokes("cmd-home");
+        assert_eq!(offset(&view, cx), 100);
+        cx.simulate_keystrokes("cmd-end");
+        assert_eq!(offset(&view, cx), 0);
+        assert!(sink.take().is_empty(), "the keys stay in the GUI");
+    }
+
+    #[gpui::test]
+    fn scroll_keys_go_to_the_program_on_the_alternate_screen(cx: &mut TestAppContext) {
+        let mut model = model_with_history(100);
+        model.on_output(b"\x1b[?1049h");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        cx.simulate_keystrokes("shift-pageup");
+        cx.simulate_keystrokes("shift-pagedown");
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(offset(&view, cx), 0);
+        assert_eq!(
+            sink.take(),
+            vec![b"\x1b[5;2~".to_vec(), b"\x1b[6;2~".to_vec()]
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_up_in_the_find_field_moves_its_caret_not_the_view(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_history(100));
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(offset(&view, cx), 0);
+        // Paging works from the find field too.
+        cx.simulate_keystrokes("shift-pageup");
+        assert_eq!(offset(&view, cx), 23);
+    }
+
+    #[gpui::test]
+    fn cmd_a_selects_history_and_grid_for_cmd_c(cx: &mut TestAppContext) {
+        let mut model = model_with_history(3);
+        model.on_output(b"$ ls");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(
+            selected(&view, cx).as_deref(),
+            Some(format!("h0\nh1\nh2{}\n$ ls", "\n".repeat(23)).as_str())
+        );
+        cx.simulate_keystrokes("cmd-c");
+        let clip = cx.read_from_clipboard().and_then(|c| c.text());
+        assert!(clip.is_some_and(|t| t.starts_with("h0\nh1") && t.ends_with("$ ls")));
+        assert!(sink.take().is_empty());
+    }
+
+    #[gpui::test]
+    fn cmd_k_clears_the_view_history_only(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_history(100));
+        sink.take();
+        cx.simulate_keystrokes("shift-pageup");
+        cx.simulate_keystrokes("cmd-k");
+        assert_eq!(offset(&view, cx), 0);
+        assert!(view.read_with(cx, |v, _| v.model().scrollback().is_empty()));
+        assert!(sink.take().is_empty(), "nothing reaches the agent");
+        // Nothing left to scroll.
+        cx.simulate_keystrokes("shift-pageup");
+        assert_eq!(offset(&view, cx), 0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.scroll_state()),
+            (false, false, false)
+        );
+    }
+
     /// A pane whose scrollbar shows at once (Reduce Motion: no fade-in).
     fn pane_without_motion(
         cx: &mut TestAppContext,
@@ -2526,6 +2837,136 @@ mod tests {
         cx.write_to_clipboard(ClipboardItem::new_string("x\ny".to_owned()));
         cx.dispatch_action(Paste);
         assert_eq!(sink.take(), vec![b"\x1b[200~x\ry\x1b[201~".to_vec()]);
+    }
+
+    /// The pane's notices, as they are emitted.
+    fn notices(view: &Entity<PaneView>, cx: &mut VisualTestContext) -> Arc<Mutex<Vec<String>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(view, move |_, e: &PaneEvent, _| {
+                if let PaneEvent::Notice(text) = e {
+                    log.lock().unwrap().push((*text).to_owned());
+                }
+            })
+            .detach();
+        });
+        seen
+    }
+
+    /// A pane showing a running agent, on this machine (`local`) or not.
+    fn agent_pane(view: &Entity<PaneView>, cx: &mut VisualTestContext, local: bool) {
+        view.update(cx, |v, _| {
+            v.chrome.has_agent = true;
+            v.chrome.local = local;
+        });
+    }
+
+    #[gpui::test]
+    fn pasting_an_image_saves_it_and_pastes_its_path(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, blank_model());
+        let dir = tempfile::tempdir().unwrap();
+        agent_pane(&view, cx, true);
+        view.update(cx, |v, _| v.paste_dir = dir.path().to_path_buf());
+        let image = Image::from_bytes(ImageFormat::Png, b"png bytes".to_vec());
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        cx.dispatch_action(Paste);
+        cx.run_until_parked();
+
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("fleet-paste-") && name.ends_with(".png"),
+            "{name}"
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"png bytes");
+        let typed = shell_quote(&file.to_string_lossy());
+        assert_eq!(sink.take(), vec![typed.into_bytes()]);
+    }
+
+    #[gpui::test]
+    fn text_on_the_clipboard_wins_over_nothing_and_an_image_needs_a_local_agent(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, sink, cx) = pane(cx, blank_model());
+        let dir = tempfile::tempdir().unwrap();
+        agent_pane(&view, cx, false);
+        view.update(cx, |v, _| v.paste_dir = dir.path().to_path_buf());
+        let seen = notices(&view, cx);
+        let image = Image::from_bytes(ImageFormat::Png, b"png".to_vec());
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        cx.dispatch_action(Paste);
+        cx.run_until_parked();
+
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(*seen.lock().unwrap(), vec![IMAGE_NEEDS_LOCAL.to_owned()]);
+
+        // Text still pastes into a remote agent.
+        cx.write_to_clipboard(ClipboardItem::new_string("hi".to_owned()));
+        cx.dispatch_action(Paste);
+        assert_eq!(sink.take(), vec![b"hi".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn dropped_paths_are_typed_quoted_and_bracketed(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"\x1b[?2004h");
+        let (view, sink, cx) = pane(cx, model);
+        let seen = notices(&view, cx);
+        let paths = vec!["/a/b.txt".to_owned(), "/c d/it's.png".to_owned()];
+
+        // No agent: nothing.
+        view.update(cx, |v, cx| v.type_paths(&paths, cx));
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+
+        agent_pane(&view, cx, true);
+        view.update(cx, |v, cx| v.type_paths(&paths, cx));
+        let typed = b"\x1b[200~/a/b.txt '/c d/it'\\''s.png'\x1b[201~".to_vec();
+        assert_eq!(sink.take(), vec![typed]);
+
+        // An ended agent: nothing.
+        view.update(cx, |v, cx| {
+            v.chrome.agent_ended = true;
+            v.type_paths(&paths, cx);
+        });
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+
+        // On another machine the paths would not exist: a notice.
+        agent_pane(&view, cx, false);
+        view.update(cx, |v, cx| {
+            v.chrome.agent_ended = false;
+            v.type_paths(&paths, cx);
+        });
+        assert_eq!(sink.take(), Vec::<Vec<u8>>::new());
+        assert_eq!(*seen.lock().unwrap(), vec![DROP_NEEDS_LOCAL.to_owned()]);
+    }
+
+    #[gpui::test]
+    fn a_file_drag_highlights_the_pane_and_the_drop_focuses_it(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_history(0));
+        agent_pane(&view, cx, true);
+        cx.update(|window, _| window.blur());
+        let at = cell(&view, cx, 10, 5);
+        assert!(cx.debug_bounds("pane-0-file-drop").is_none());
+
+        cx.simulate_event(FileDropEvent::Entered {
+            position: at,
+            paths: ExternalPaths::default(),
+        });
+        cx.simulate_event(FileDropEvent::Pending { position: at });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("pane-0-file-drop").is_some());
+
+        cx.simulate_event(FileDropEvent::Submit { position: at });
+        cx.run_until_parked();
+        let focused = cx.update(|window, cx| view.read(cx).focus_handle().is_focused(window));
+        assert!(focused, "the drop gives the pane the keyboard");
     }
 
     #[gpui::test]
@@ -2792,6 +3233,7 @@ mod tests {
         let parts = |title: &str| HeaderParts {
             title: title.into(),
             detail: "claude · 4".into(),
+            git: String::new(),
             path: "~/dev".into(),
         };
         assert_eq!(header_parts(&chrome, None), parts("claude"));
@@ -2809,6 +3251,15 @@ mod tests {
             ..PaneChrome::default()
         };
         assert_eq!(header_parts(&unlisted, None).detail, "");
+        // In a git checkout: its repository and branch (ADR 0085).
+        let in_repo = PaneChrome {
+            git: Some("fleetd (issue-97) · feat/x".into()),
+            ..chrome.clone()
+        };
+        assert_eq!(
+            header_parts(&in_repo, None).git,
+            "fleetd (issue-97) · feat/x"
+        );
     }
 
     /// Issue #33: the focused pane's ring is its agent's colour; with no
