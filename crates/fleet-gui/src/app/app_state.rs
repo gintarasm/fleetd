@@ -27,6 +27,7 @@ use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restar
 use crate::core::settings::{Change, save_changes};
 use crate::core::shortcuts::ClosedPanes;
 use crate::core::sidebar::{ended, tilde, toggle_collapsed};
+use crate::core::sidebar_tree::{removable_ended, toggle_disclosure};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
@@ -272,6 +273,9 @@ pub struct AppState {
     /// ⌘+ / ⌘− / ⌘0 (window-wide, not saved).
     zoom: FontZoom,
     gui_state: GuiState,
+    /// Which parents' children the user opened (true) or closed in the
+    /// sidebar this session; the default is by child count (ADR 0074).
+    disclosure: HashMap<u64, bool>,
     /// The workspace tabs, each a layout with its focused pane (ADR 0061).
     /// Every tab's panes are open; only the shown tab's are drawn.
     tabs: Tabs,
@@ -368,6 +372,7 @@ impl AppState {
             tabs,
             panes: HashMap::new(),
             zoom: FontZoom::default(),
+            disclosure: HashMap::new(),
             closed: ClosedPanes::default(),
             maximized: None,
             titles: HashMap::new(),
@@ -453,6 +458,7 @@ impl AppState {
         self.panes.clear();
         self.maximized = None;
         self.closed.clear();
+        self.disclosure.clear();
         self.titles.clear();
         // The new target's waiting and ended agents are not news.
         self.statuses.clear();
@@ -571,6 +577,18 @@ impl AppState {
             self.gui_state.collapsed_groups.remove(&key);
         }
         self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// What the user opened or closed in the sidebar tree.
+    pub fn disclosure(&self) -> &HashMap<u64, bool> {
+        &self.disclosure
+    }
+
+    /// Opens or closes the children of agent `id` (which has `children`
+    /// rows under it as drawn).
+    pub fn toggle_disclosure(&mut self, id: u64, children: usize, cx: &mut Context<Self>) {
+        toggle_disclosure(&mut self.disclosure, id, children);
         cx.notify();
     }
 
@@ -1472,8 +1490,18 @@ impl AppState {
         }
     }
 
+    /// Clear exited. Every ended agent goes in one request fleetd answers
+    /// under its lock (ADR 0070), unless an ended agent has a running
+    /// descendant: that one stays (ADR 0074), so the ones that may go are
+    /// named.
     pub fn clear_exited(&self) {
-        self.session.clear_exited();
+        let removable = removable_ended(&self.agents);
+        let ended = self.agents.iter().filter(|r| ended(r)).count();
+        if removable.len() == ended {
+            self.session.clear_exited();
+        } else if !removable.is_empty() {
+            self.session.forget(removable);
+        }
     }
 
     /// Restarts fleetd into its binary on disk; agents keep running and
@@ -1511,9 +1539,10 @@ impl AppState {
         cx.notify();
     }
 
-    /// Exited or lost agents in the list.
+    /// Exited or lost agents Clear exited removes: not an ended parent
+    /// while one of its descendants runs (ADR 0074).
     pub fn ended_count(&self) -> usize {
-        self.agents.iter().filter(|r| ended(r)).count()
+        removable_ended(&self.agents).len()
     }
 
     /// Restarts the agent the focused pane shows, in that pane at its

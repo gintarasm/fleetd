@@ -31,6 +31,7 @@ use crate::core::session::AgentRow;
 use crate::core::sidebar::ended;
 pub use crate::core::sidebar::program_name;
 use crate::core::sidebar::{SidebarGroup, StatusFilter, label_chips, program_and_id};
+use crate::core::sidebar_tree::{Disclosure, RowLayout};
 use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
@@ -199,7 +200,14 @@ fn render_group(
     let tabs: Vec<_> = group
         .agents
         .iter()
-        .map(|row| render_tab(row, data, theme, cx))
+        .zip(
+            group
+                .layout
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(RowLayout::FLAT)),
+        )
+        .map(|(row, layout)| render_tab(row, layout, data, theme, cx))
         .collect();
     let title = group.title.clone();
     let selector = format!("group-{}", group.title);
@@ -250,6 +258,7 @@ fn render_group(
 
 fn render_tab(
     row: &AgentRow,
+    layout: RowLayout,
     data: &SidebarData<'_>,
     theme: &Theme,
     cx: &mut Context<Workspace>,
@@ -292,11 +301,33 @@ fn render_tab(
             ("remove", Icon::Trash, Box::new(Remove { agent_id: id })),
         ],
     };
+    let children = layout.children;
+    let disclosure = (layout.disclosure != Disclosure::Leaf).then(|| {
+        let open = layout.disclosure == Disclosure::Open;
+        div()
+            .id(("disclose", id))
+            .debug_selector(move || format!("disclose-{id}"))
+            .flex_none()
+            .cursor_pointer()
+            .type_style(text::CAPTION)
+            .text_color(theme.tertiary)
+            .child(SharedString::from(if open {
+                "▾".to_owned()
+            } else {
+                format!("▸ {children}")
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_disclosure(id, children, cx);
+                // Not also the row's click, which would focus a pane.
+                cx.stop_propagation();
+            }))
+    });
     let line1 = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::SM - space::XXS))
+        .children(disclosure)
         .child(agent_mark(id, theme, data.agent_emoji))
         .child(mark_el)
         .child(
@@ -408,6 +439,10 @@ fn render_tab(
         .py(px(space::XS + space::XXS))
         .rounded(px(radius::MD))
         .cursor_pointer()
+        // Children sit under their parent (ADR 0074).
+        .ml(px(TREE_INDENT * layout.depth as f32))
+        // An ancestor kept only for the filter's match.
+        .when(layout.context, |s| s.opacity(0.55))
         .when(mark == TabMark::Focused, |s| s.bg(theme.selected))
         .when(rang && mark != TabMark::Focused, |s| {
             s.bg(theme.warning.opacity(0.14))
@@ -464,6 +499,9 @@ fn chip(id: u64, key: String, value: String, theme: &Theme) -> impl IntoElement 
 /// Where a row's second and third lines start: under the title, past
 /// the agent's mark and the status.
 const ROW_INDENT: f32 = MARK_SLOT + space::SM - space::XXS + space::LG;
+
+/// How far each level of the tree moves a row to the right.
+const TREE_INDENT: f32 = space::MD;
 
 /// A row's hover group (its agent buttons show on hover).
 const ROW_GROUP: &str = "agent-row";
