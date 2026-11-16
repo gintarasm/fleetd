@@ -306,7 +306,8 @@ mod tests {
             let t = Tokens::for_appearance(appearance).with_window_opacity(0.9);
             let g = glass_tint(&t);
             assert_eq!((g.r, g.g, g.b), (t.window.r, t.window.g, t.window.b));
-            assert!((g.a - 0.9 * GLASS_TINT_SHARE).abs() < 1e-6);
+            // The window's own alpha (each theme scales the setting).
+            assert!((g.a - t.window.a * GLASS_TINT_SHARE).abs() < 1e-6);
         }
     }
 }
