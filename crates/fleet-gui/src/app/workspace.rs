@@ -25,8 +25,9 @@ use super::keymap::{
     ClosePane, CloseTab, CommandPalette, Copy, FocusDown, FocusFilter, FocusLeft, FocusPane1,
     FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTab,
     NewTerminal, NextAgent, NextTab, Paste, PrevTab, PreviousAgent, Remove, RemoveExited,
-    ReopenClosedPane, Restart, RestartPane, SelectTab, ShowShortcuts, SplitDown, SplitRight,
-    ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+    RemovePane, RenamePane, ReopenClosedPane, Restart, RestartPane, SelectTab, ShowShortcuts,
+    SplitDown, SplitRight, ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
+    ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::native;
@@ -52,7 +53,7 @@ use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
 };
-use crate::core::palette::{Entry, palette_items, remove_exited_prompt};
+use crate::core::palette::{Entry, PaletteState, palette_items, remove_exited_prompt};
 use crate::core::picker::Recents;
 use crate::core::session::PaneId;
 use crate::core::settings::{MotionChoice, ThemeChoice};
@@ -1249,9 +1250,11 @@ impl Workspace {
         if self.modal() {
             return;
         }
+        let state = self.palette_state(cx);
         let app = self.app.read(cx);
         let (entries, items): (Vec<Entry>, Vec<_>) = palette_items(
             |c| command_shortcut(c, window),
+            &state,
             &app.agents,
             &app.dir_choices(),
             &app.home,
@@ -1265,6 +1268,23 @@ impl Workspace {
         palette.read(cx).focus(window, cx);
         self.palette = Some((palette, entries, sub));
         cx.notify();
+    }
+
+    /// What the palette's commands depend on: the shown tab's panes, the
+    /// tabs, and the focused pane's agent (as its menu has them).
+    fn palette_state(&self, cx: &App) -> PaletteState {
+        let app = self.app.read(cx);
+        let pane = app.focused();
+        let view = app.pane_view(pane).map(|v| v.read(cx));
+        let agent = app.layout().agent(pane);
+        PaletteState {
+            panes: app.layout().panes().len(),
+            tabs: app.tabs().len(),
+            has_agent: agent.is_some(),
+            running: agent.is_some_and(|id| kill_sheet::running(app, id)),
+            restartable: view.is_some_and(|v| v.restartable()),
+            has_selection: view.is_some_and(|v| v.has_selection()),
+        }
     }
 
     fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
@@ -1465,6 +1485,25 @@ impl Workspace {
     fn kill_pane(&mut self, _: &KillPane, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.app.read(cx).focused();
         self.kill_in_pane(pane, window, cx);
+    }
+
+    /// Rename Agent… (palette): the focused pane's agent.
+    fn rename_pane(&mut self, _: &RenamePane, window: &mut Window, cx: &mut Context<Self>) {
+        let app = self.app.read(cx);
+        if let Some(agent_id) = app.layout().agent(app.focused()) {
+            self.open_rename(agent_id, window, cx);
+        }
+    }
+
+    /// Remove Exited Agent in Pane (palette): forgets the focused pane's
+    /// agent if it ended, as the pane's summary bar does.
+    fn remove_pane(&mut self, _: &RemovePane, _: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let app = self.app.read(cx);
+        app.remove_in_pane(app.focused(), cx);
+        cx.notify();
     }
 
     /// Restarts an ended agent from the row menu: no confirmation.
@@ -2174,6 +2213,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_filter))
             .on_action(cx.listener(Self::kill))
             .on_action(cx.listener(Self::kill_pane))
+            .on_action(cx.listener(Self::rename_pane))
+            .on_action(cx.listener(Self::remove_pane))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::remove_exited))
@@ -4806,6 +4847,115 @@ mod tests {
         assert_eq!(tabs_drawn(&mut s), [1, 2, 3, 4, 5]);
         click(&mut s, "disclose-1");
         assert_eq!(tabs_drawn(&mut s), [1]);
+    }
+
+    /// The palette's rows now, as (title, shortcut); closes it again.
+    fn palette_rows(s: &mut Setup<'_>) -> Vec<(String, Option<String>)> {
+        s.cx.simulate_keystrokes("cmd-p");
+        let rows = s.ws.read_with(s.cx, |w, cx| {
+            let palette = w.palette().expect("palette open").read(cx);
+            palette
+                .picker()
+                .items()
+                .iter()
+                .map(|i| (i.title.clone(), i.shortcut.clone()))
+                .collect()
+        });
+        s.cx.simulate_keystrokes("escape");
+        rows
+    }
+
+    fn has_row(rows: &[(String, Option<String>)], title: &str) -> bool {
+        rows.iter().any(|(t, _)| t == title)
+    }
+
+    fn pick_in_palette(s: &mut Setup<'_>, query: &str) {
+        s.cx.simulate_keystrokes("cmd-p");
+        s.cx.simulate_input(query);
+        s.cx.simulate_keystrokes("enter");
+        s.cx.run_until_parked();
+    }
+
+    /// What acts on the focused pane's agent shows only while it has one,
+    /// in the right state.
+    #[gpui::test]
+    fn agent_commands_follow_the_focused_pane(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        let rows = palette_rows(&mut s);
+        for title in [
+            "Kill Agent…",
+            "Rename Agent…",
+            "Find in Scrollback…",
+            "Restart Agent in Pane",
+            "Remove Exited Agent in Pane",
+        ] {
+            assert!(!has_row(&rows, title), "{title} with an empty pane");
+        }
+        assert!(has_row(&rows, "Zoom In") && has_row(&rows, "Settings…"));
+
+        click(&mut s, "tab-7");
+        let rows = palette_rows(&mut s);
+        assert!(has_row(&rows, "Kill Agent…") && has_row(&rows, "Rename Agent…"));
+        assert!(!has_row(&rows, "Restart Agent in Pane"));
+        pick_in_palette(&mut s, "kill agent");
+        assert_eq!(kill_asked(&mut s), Some(7));
+        s.cx.simulate_keystrokes("escape");
+    }
+
+    #[gpui::test]
+    fn rename_and_remove_from_the_palette(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![named(3, "old-name", &[])]);
+        click(&mut s, "tab-3");
+        pick_in_palette(&mut s, "rename agent");
+        rename_to(&mut s, "from-palette");
+        assert!(
+            fake.calls()
+                .contains(&Call::Rename(3, "from-palette".into()))
+        );
+
+        agents(&mut s, &fake, vec![ended(3, "/w", 3, AgentState::Exited)]);
+        attach_model(&fake, PaneId(1), 3);
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        let rows = palette_rows(&mut s);
+        assert!(has_row(&rows, "Remove Exited Agent in Pane"));
+        assert!(!has_row(&rows, "Kill Agent…"));
+        pick_in_palette(&mut s, "remove exited agent in pane");
+        assert!(!s.cx.has_pending_prompt());
+        assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![3])));
+    }
+
+    /// Tab commands show with more than one tab, each with its shortcut.
+    #[gpui::test]
+    fn tab_commands_show_their_shortcuts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let rows = palette_rows(&mut s);
+        assert!(has_row(&rows, "New Tab"));
+        assert!(!has_row(&rows, "Show Next Tab") && !has_row(&rows, "Go to Tab 1"));
+        s.cx.simulate_keystrokes("cmd-alt-t");
+        let rows = palette_rows(&mut s);
+        let shortcut = |title: &str| {
+            rows.iter()
+                .find(|(t, _)| t == title)
+                .unwrap_or_else(|| panic!("{title} listed"))
+                .1
+                .clone()
+        };
+        assert_eq!(shortcut("Go to Tab 2").as_deref(), Some("⌥⌘2"));
+        assert_eq!(shortcut("Show Next Tab").as_deref(), Some("⇧⌘]"));
+        assert_eq!(shortcut("Close Tab").as_deref(), Some("⌥⌘W"));
+        assert!(!has_row(&rows, "Go to Tab 3"));
+        pick_in_palette(&mut s, "go to tab 1");
+        assert_eq!(s.app.read_with(s.cx, |a, _| a.tabs().active()), 0);
     }
 
     #[gpui::test]

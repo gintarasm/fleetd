@@ -30,6 +30,10 @@ actions!(
         InstallSkill,
         RestartPane,
         KillPane,
+        // Unbound: the palette's Rename Agent… and Remove Exited Agent in
+        // Pane, on the focused pane's agent.
+        RenamePane,
+        RemovePane,
         SelectAll,
         Cut,
         Undo,
@@ -117,13 +121,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", PreviousAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         // Workspace tabs (ADR 0061). ⌘⇧] and ⌘⇧[ may arrive as the shifted
-        // characters with shift off, so both spellings are bound.
+        // characters with shift off, so both spellings are bound; the
+        // shifted spelling last, so the palette shows ⇧⌘] (ADR 0080).
         KeyBinding::new("cmd-alt-t", NewTab, None),
         KeyBinding::new("cmd-alt-w", CloseTab, None),
-        KeyBinding::new("cmd-shift-]", NextTab, None),
         KeyBinding::new("cmd-}", NextTab, None),
-        KeyBinding::new("cmd-shift-[", PrevTab, None),
+        KeyBinding::new("cmd-shift-]", NextTab, None),
         KeyBinding::new("cmd-{", PrevTab, None),
+        KeyBinding::new("cmd-shift-[", PrevTab, None),
         KeyBinding::new("cmd-alt-1", SelectTab { number: 1 }, None),
         KeyBinding::new("cmd-alt-2", SelectTab { number: 2 }, None),
         KeyBinding::new("cmd-alt-3", SelectTab { number: 3 }, None),
