@@ -12,7 +12,8 @@ use fleet_proto::AgentInfo;
 use super::ended::{format_run_time, run_time};
 use super::session::{AgentRow, PaneId};
 use super::sidebar::{ended, program_name, query_matches, tilde};
-use super::status::AgentStatus;
+pub use super::status::DotFill;
+use super::status::{AgentStatus, dot_fill};
 use super::tabs::Tabs;
 
 /// The spawned-by tree over `nodes` (`(id, parent)`), siblings and roots
@@ -129,14 +130,6 @@ pub fn filter_shown(
     Some(with_ancestors(tree, matches.map(|r| r.info.id)))
 }
 
-/// How a status dot is drawn (ADR 0033): solid for a status the agent
-/// reported (`fleet report`), hollow for one inferred from its output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DotFill {
-    Solid,
-    Hollow,
-}
-
 /// A card's status dot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardDot {
@@ -144,14 +137,13 @@ pub struct CardDot {
     pub fill: DotFill,
 }
 
-/// The dot for an agent with the `inferred` status (ADR 0042; `None` for a
-/// shell). Only inferred statuses exist until M3-D adds reported ones
-/// (`AgentInfo.reported`): that is the one place a reported status wins and
-/// is drawn [`DotFill::Solid`].
-pub fn card_dot(_info: &AgentInfo, inferred: Option<AgentStatus>) -> Option<CardDot> {
-    inferred.map(|status| CardDot {
+/// The dot for an agent with `status` (`agent_status`: its report if it
+/// made one, else inferred; `None` for a shell). Solid for a reported (or
+/// exit) status, hollow for an inferred one (ADR 0075).
+pub fn card_dot(info: &AgentInfo, status: Option<AgentStatus>) -> Option<CardDot> {
+    status.map(|status| CardDot {
         status,
-        fill: DotFill::Hollow,
+        fill: dot_fill(info, status),
     })
 }
 

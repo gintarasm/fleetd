@@ -12,7 +12,38 @@ use fleet_proto::AgentInfo;
 
 use super::session::AgentRow;
 
-pub use fleet_proto::status::{AgentStatus, QUIET_MS, is_shell, looks_like_prompt};
+use fleet_proto::ReportedState;
+pub use fleet_proto::status::{AgentStatus, QUIET_MS, is_shell, live_report, looks_like_prompt};
+
+/// How a status dot is drawn (ADR 0033, 0075): solid for a status the agent
+/// reported (`fleet report`) or that is a fact (it exited), hollow for one
+/// inferred from a running agent's output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DotFill {
+    Solid,
+    #[default]
+    Hollow,
+}
+
+/// The fill of the dot for `status` of `info`.
+pub fn dot_fill(info: &AgentInfo, status: AgentStatus) -> DotFill {
+    if live_report(info).is_some() || status.ended() {
+        DotFill::Solid
+    } else {
+        DotFill::Hollow
+    }
+}
+
+/// The status an agent's report says (ADR 0075).
+fn reported_status(state: ReportedState) -> Option<AgentStatus> {
+    match state {
+        ReportedState::ReportedWorking => Some(AgentStatus::Working),
+        ReportedState::ReportedWaiting => Some(AgentStatus::NeedsYou),
+        ReportedState::ReportedDone => Some(AgentStatus::Done),
+        ReportedState::ReportedError => Some(AgentStatus::Failed),
+        ReportedState::Unspecified => None,
+    }
+}
 
 /// What a row or pane shows, as the GUI names it to the user: a shell
 /// from New terminal is never called an agent (ADR 0071), though the node
@@ -50,9 +81,14 @@ impl Subject {
     }
 }
 
-/// The status of `row` at `now_ms`; `rang` is an unseen bell from a pane
+/// The status of `row` at `now_ms`: the agent's own report while it runs,
+/// else inferred (the exit for an ended agent); `rang` is an unseen bell from a pane
 /// showing it. `None` for a shell, or a state the GUI does not know.
 pub fn agent_status(row: &AgentRow, rang: bool, now_ms: i64) -> Option<AgentStatus> {
+    // What the agent said about itself beats a guess (ADR 0075).
+    if let Some(status) = live_report(&row.info).and_then(|r| reported_status(r.state())) {
+        return Some(status);
+    }
     fleet_proto::status::inferred_status(
         &row.info,
         &row.last_line,
@@ -214,6 +250,61 @@ mod tests {
         // No output seen yet.
         let r = row(AgentState::Running, None, "", None);
         assert_eq!(agent_status(&r, false, NOW), Some(AgentStatus::Idle));
+    }
+
+    fn reported(mut r: AgentRow, state: fleet_proto::ReportedState) -> AgentRow {
+        r.info.reported = Some(fleet_proto::Reported {
+            state: state.into(),
+            message: "m".into(),
+            at_unix_ms: 1,
+        });
+        r
+    }
+
+    #[test]
+    fn a_reported_status_wins_over_the_inferred_one_and_is_solid() {
+        use fleet_proto::ReportedState as R;
+        // Quiet with no prompt would be idle; a bell would need you.
+        let quiet = row(AgentState::Running, None, "compiling", Some(NOW - 60_000));
+        assert_eq!(agent_status(&quiet, false, NOW), Some(AgentStatus::Idle));
+        assert_eq!(dot_fill(&quiet.info, AgentStatus::Idle), DotFill::Hollow);
+        for (state, want) in [
+            (R::ReportedWorking, AgentStatus::Working),
+            (R::ReportedWaiting, AgentStatus::NeedsYou),
+            (R::ReportedDone, AgentStatus::Done),
+            (R::ReportedError, AgentStatus::Failed),
+        ] {
+            let r = reported(quiet.clone(), state);
+            assert_eq!(agent_status(&r, false, NOW), Some(want), "{state:?}");
+            assert_eq!(agent_status(&r, true, NOW), Some(want), "bell, {state:?}");
+            assert_eq!(dot_fill(&r.info, want), DotFill::Solid);
+        }
+        // Counted like any needs-you.
+        let waiting = reported(quiet, R::ReportedWaiting);
+        assert_eq!(
+            needs_you_count(&statuses(&[waiting], &HashSet::new(), NOW)),
+            1
+        );
+    }
+
+    #[test]
+    fn an_ended_agent_ignores_its_last_report_and_is_solid() {
+        let r = reported(
+            row(AgentState::Exited, Some(2), "", None),
+            fleet_proto::ReportedState::ReportedWorking,
+        );
+        assert_eq!(agent_status(&r, false, NOW), Some(AgentStatus::Failed));
+        // The exit is a fact, not an inference.
+        assert_eq!(dot_fill(&r.info, AgentStatus::Failed), DotFill::Solid);
+        let shell = {
+            let mut s = reported(
+                row(AgentState::Running, None, "$", Some(0)),
+                fleet_proto::ReportedState::ReportedWorking,
+            );
+            s.info.labels.insert("kind".into(), "shell".into());
+            s
+        };
+        assert_eq!(agent_status(&shell, false, NOW), None);
     }
 
     #[test]
