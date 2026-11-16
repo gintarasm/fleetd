@@ -1,11 +1,11 @@
 use bytes::{Bytes, BytesMut};
 use fleet_proto::{
     Ack, AgentActivity, AgentExited, AgentInfo, AgentList, AgentRemoved, AgentReported,
-    AgentResized, AgentState, Attach, AttachOk, AttachRole, Detach, Error, Event, ForgetAgents,
-    Forgotten, Frame, FrameCodec, HandshakeReject, Hello, HelloOk, HistoryPage, KillAgent, Lagged,
-    ListAgents, PROTOCOL_VERSION, ReadHistory, ReportStatus, Reported, ReportedState, Request,
-    Resize, Response, RestartAgent, Restarted, SendInput, SetLabels, SpawnAgent, SpawnedAttached,
-    event, request, response,
+    AgentResized, AgentState, AnswerQuestion, Attach, AttachOk, AttachRole, Detach, Error, Event,
+    ForgetAgents, Forgotten, Frame, FrameCodec, HandshakeReject, Hello, HelloOk, HistoryPage,
+    KillAgent, Lagged, ListAgents, PROTOCOL_VERSION, ReadHistory, ReportStatus, Reported,
+    ReportedState, Request, Resize, Response, RestartAgent, Restarted, SendInput, SetLabels,
+    SpawnAgent, SpawnedAttached, event, request, response,
 };
 use fleet_proto::{
     Broadcast, Inbox, Message, MessageKind, MessagesSent, ReadInbox, SendMessage, Wait, WaitMatch,
@@ -184,6 +184,17 @@ fn roundtrip_every_kind() {
             state: ReportedState::ReportedDone.into(),
             message: "tests green".into(),
             ..Default::default()
+        }),
+        request::Kind::Report(ReportStatus {
+            state: ReportedState::ReportedWaiting.into(),
+            message: "stuck".into(),
+            question: Some("Which branch?".into()),
+            choices: vec!["main".into(), "dev".into()],
+        }),
+        request::Kind::Answer(AnswerQuestion {
+            agent_id: 3,
+            text: "dev".into(),
+            question_id: Some(9),
         }),
         request::Kind::SendMessage(Box::new(SendMessage {
             body: "hi".into(),
