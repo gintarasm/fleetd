@@ -56,6 +56,7 @@ use crate::env::LoginEnv;
 use crate::handoff::{self, HandoffGate};
 use crate::history::{History, HistoryInfo, Page};
 use crate::host::{AdoptSpec, AgentHost, TerminalHandle};
+use crate::lease::{Leases, load_average, now_ms};
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scope::{self, Caller, Member, Quotas, Tree};
 use crate::scrollback::{self, Scrollback};
@@ -1656,6 +1657,8 @@ pub struct Node {
     /// stored, so two spawns cannot both take the last slot.
     spawn_gate: Mutex<()>,
     refused: broadcast::Sender<SpawnRefused>,
+    /// Named locks (ADR 0077).
+    leases: Leases,
 }
 
 impl Drop for Node {
@@ -1846,9 +1849,11 @@ impl Node {
         let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (refused, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
+        let store = Arc::new(Mutex::new(store));
+        let leases = Leases::load(Arc::clone(&store), now_ms(), load_average)?;
         Ok(Node {
             host: Arc::new(PtyHost::new()),
-            store: Arc::new(Mutex::new(store)),
+            store,
             agents: Arc::new(Mutex::new(Agents::default())),
             exits,
             removed,
@@ -1865,7 +1870,13 @@ impl Node {
             quotas: Quotas::default(),
             spawn_gate: Mutex::new(()),
             refused,
+            leases,
         })
+    }
+
+    /// The node's leases (ADR 0077).
+    pub fn leases(&self) -> &Leases {
+        &self.leases
     }
 
     /// Marks every agent the store under `state_dir` has running as lost,

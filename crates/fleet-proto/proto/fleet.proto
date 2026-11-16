@@ -60,6 +60,10 @@ message Request {
     RestartAgent restart = 13;
     ForgetAgents forget = 14;
     RestartDaemon restart_daemon = 15;
+    // Leases (ADR 0077, spec §4): any caller may use them (ADR 0034).
+    AcquireLease acquire_lease = 65;
+    ReleaseLease release_lease = 66;
+    ListLeases list_leases = 67;
   }
 }
 
@@ -77,6 +81,8 @@ message Response {
     Restarted restarted = 10;
     Forgotten forgotten = 11;
     RestartingDaemon restarting_daemon = 12;
+    LeaseGranted lease_granted = 65;
+    LeaseList leases = 66;
   }
 }
 
@@ -234,3 +240,41 @@ message LogLine { string line = 1; }
 // An agent's spawn was refused by a quota (spec §1): `parent` is the agent
 // that asked, `reason` the refusal's text (after "forbidden: ").
 message SpawnRefused { uint64 parent = 1; string reason = 2; }
+
+// Take the lease `name` (ADR 0077). Answered by `LeaseGranted`, or an
+// `Error` starting `busy:` when it is held (or the load is too high) and
+// `wait` is off. With `wait` the answer comes when the lease is granted;
+// the connection keeps working meanwhile, and closing it leaves the queue.
+message AcquireLease {
+  string name = 1;
+  // A random id the client picks once per hold: after a daemon restart the
+  // same key on a new connection reclaims a `hold` lease (within 30 s).
+  int64 holder_key = 2;
+  // Release after this many seconds; 0: no limit. The user's lease without
+  // `hold` needs one (nothing watches the user).
+  uint64 ttl_secs = 3;
+  // Granted only while the 1-minute load average is below this.
+  optional double max_load = 4;
+  bool wait = 5;
+  // Tie the lease to this connection: released when it closes.
+  bool hold = 6;
+}
+// Release `name`: the holder (or the user, any lease). Answered by `Ack`.
+message ReleaseLease { string name = 1; }
+message ListLeases {}
+message LeaseInfo {
+  string name = 1;
+  // False for a name only waiters are queued on (they wait for the load).
+  bool held = 2;
+  // The holding agent; unset for the user, or when `holder_hidden`.
+  optional uint64 holder = 3;
+  // Held by an agent the (agent) caller may not see (ADR 0072's scope).
+  bool holder_hidden = 4;
+  int64 acquired_unix_ms = 5;
+  optional int64 expires_unix_ms = 6;
+  // Tied to a connection (released when it closes).
+  bool held_by_connection = 7;
+  uint32 waiters = 8;
+}
+message LeaseGranted { LeaseInfo lease = 1; }
+message LeaseList { repeated LeaseInfo leases = 1; }
