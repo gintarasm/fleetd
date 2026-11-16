@@ -225,6 +225,9 @@ fn key_equivalent(shortcut: Option<Shortcut>) -> (&'static str, NSEventModifierF
     };
     let key = match s.key {
         "enter" => "\r",
+        // NSUpArrowFunctionKey, NSDownArrowFunctionKey.
+        "up" => "\u{F700}",
+        "down" => "\u{F701}",
         k => k,
     };
     let mut mods = NSEventModifierFlags::Command;

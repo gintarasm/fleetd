@@ -21,7 +21,10 @@ use super::controls::{self, ButtonKind};
 use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
-use super::keymap::{Copy, FINDING, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
+use super::keymap::{
+    ClearScrollback, Copy, FINDING, Find, FindNext, FindPrevious, Paste, ScrollPageDown,
+    ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAll, TERMINAL_CONTEXT, to_key,
+};
 use super::native;
 use super::status_dot::status_dot;
 use super::tail_text::tail_text;
@@ -37,7 +40,7 @@ use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
-use crate::core::pane::{PaneModel, PaneState, ViewRow};
+use crate::core::pane::{PaneModel, PaneState, ViewRow, ViewScroll};
 use crate::core::scroll_feedback::{
     Fade, HIT_WIDTH, INSET, Thumb, Wake, end_jumps_to_bottom, offset_for_thumb, thumb,
 };
@@ -853,6 +856,18 @@ impl PaneView {
         self.model().has_selection()
     }
 
+    /// The view can scroll from the keyboard, is scrolled up, and has
+    /// history (the context menu's Scroll to Top, Scroll to Bottom and
+    /// Clear Scrollback).
+    pub fn scroll_state(&self) -> (bool, bool, bool) {
+        let model = self.model();
+        (
+            model.can_scroll_view(),
+            model.scroll_offset() > 0,
+            !model.scrollback().is_empty(),
+        )
+    }
+
     /// The pane's agent exited or is gone (the context menu's Restart).
     pub fn restartable(&self) -> bool {
         restartable(&self.chrome, self.model().state())
@@ -934,6 +949,65 @@ impl PaneView {
             feedback::ring(self.chrome.focused, fade.map(|t| t.value(now))),
             fade.is_some(),
         )
+    }
+
+    /// ⇧PageUp, ⇧PageDown, ⌘↑ and ⌘↓ (ADR 0082). On the alternate screen
+    /// the key goes on to the program; ⌘↑ and ⌘↓ from the find field move
+    /// its caret instead.
+    fn scroll_view(&mut self, scroll: ViewScroll, window: &mut Window, cx: &mut Context<Self>) {
+        let caret_key = matches!(scroll, ViewScroll::Top | ViewScroll::Bottom);
+        if caret_key && !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        let before = self.model().scroll_offset();
+        if !self.model().scroll_view(scroll) {
+            cx.propagate();
+            return;
+        }
+        if self.model().scroll_offset() != before {
+            self.show_scrollbar();
+            self.sink.check_paging(self.pane);
+            cx.notify();
+        }
+    }
+
+    fn scroll_page_up(&mut self, _: &ScrollPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_view(ViewScroll::PageUp, window, cx);
+    }
+
+    fn scroll_page_down(
+        &mut self,
+        _: &ScrollPageDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_view(ViewScroll::PageDown, window, cx);
+    }
+
+    fn scroll_to_top(&mut self, _: &ScrollToTop, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_view(ViewScroll::Top, window, cx);
+    }
+
+    fn scroll_to_bottom(
+        &mut self,
+        _: &ScrollToBottom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_view(ViewScroll::Bottom, window, cx);
+    }
+
+    /// ⌘A: the loaded history and the grid, ready for ⌘C.
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.model().select_all();
+        cx.notify();
+    }
+
+    /// ⌘K: clears this view's history only (ADR 0082).
+    fn clear_scrollback(&mut self, _: &ClearScrollback, _: &mut Window, cx: &mut Context<Self>) {
+        self.model().clear_scrollback();
+        cx.notify();
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1659,6 +1733,12 @@ impl Render for PaneView {
             .on_action(cx.listener(Self::open_find))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
+            .on_action(cx.listener(Self::scroll_page_up))
+            .on_action(cx.listener(Self::scroll_page_down))
+            .on_action(cx.listener(Self::scroll_to_top))
+            .on_action(cx.listener(Self::scroll_to_bottom))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::clear_scrollback))
             .size_full()
             .flex()
             .flex_col()
@@ -2361,6 +2441,87 @@ mod tests {
         // At the bottom, End goes to the agent.
         cx.simulate_keystrokes("end");
         assert_eq!(sink.take(), vec![b"\x1b[F".to_vec()]);
+    }
+
+    #[gpui::test]
+    fn scroll_keys_page_and_jump_through_history(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_history(100));
+        sink.take();
+        cx.simulate_keystrokes("shift-pageup");
+        assert_eq!(offset(&view, cx), 23);
+        cx.simulate_keystrokes("shift-pageup shift-pagedown");
+        assert_eq!(offset(&view, cx), 23);
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(offset(&view, cx), 100);
+        cx.simulate_keystrokes("cmd-down");
+        assert_eq!(offset(&view, cx), 0);
+        cx.simulate_keystrokes("cmd-home");
+        assert_eq!(offset(&view, cx), 100);
+        cx.simulate_keystrokes("cmd-end");
+        assert_eq!(offset(&view, cx), 0);
+        assert!(sink.take().is_empty(), "the keys stay in the GUI");
+    }
+
+    #[gpui::test]
+    fn scroll_keys_go_to_the_program_on_the_alternate_screen(cx: &mut TestAppContext) {
+        let mut model = model_with_history(100);
+        model.on_output(b"\x1b[?1049h");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        cx.simulate_keystrokes("shift-pageup");
+        cx.simulate_keystrokes("shift-pagedown");
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(offset(&view, cx), 0);
+        assert_eq!(
+            sink.take(),
+            vec![b"\x1b[5;2~".to_vec(), b"\x1b[6;2~".to_vec()]
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_up_in_the_find_field_moves_its_caret_not_the_view(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_history(100));
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_keystrokes("cmd-up");
+        assert_eq!(offset(&view, cx), 0);
+        // Paging works from the find field too.
+        cx.simulate_keystrokes("shift-pageup");
+        assert_eq!(offset(&view, cx), 23);
+    }
+
+    #[gpui::test]
+    fn cmd_a_selects_history_and_grid_for_cmd_c(cx: &mut TestAppContext) {
+        let mut model = model_with_history(3);
+        model.on_output(b"$ ls");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        cx.simulate_keystrokes("cmd-a");
+        assert_eq!(
+            selected(&view, cx).as_deref(),
+            Some(format!("h0\nh1\nh2{}\n$ ls", "\n".repeat(23)).as_str())
+        );
+        cx.simulate_keystrokes("cmd-c");
+        let clip = cx.read_from_clipboard().and_then(|c| c.text());
+        assert!(clip.is_some_and(|t| t.starts_with("h0\nh1") && t.ends_with("$ ls")));
+        assert!(sink.take().is_empty());
+    }
+
+    #[gpui::test]
+    fn cmd_k_clears_the_view_history_only(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_history(100));
+        sink.take();
+        cx.simulate_keystrokes("shift-pageup");
+        cx.simulate_keystrokes("cmd-k");
+        assert_eq!(offset(&view, cx), 0);
+        assert!(view.read_with(cx, |v, _| v.model().scrollback().is_empty()));
+        assert!(sink.take().is_empty(), "nothing reaches the agent");
+        // Nothing left to scroll.
+        cx.simulate_keystrokes("shift-pageup");
+        assert_eq!(offset(&view, cx), 0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.scroll_state()),
+            (false, false, false)
+        );
     }
 
     /// A pane whose scrollbar shows at once (Reduce Motion: no fade-in).

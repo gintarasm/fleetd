@@ -61,6 +61,11 @@ actions!(
         SaveOutput,
         OpenOutput,
         CopyLastOutput,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollToTop,
+        ScrollToBottom,
+        ClearScrollback,
     ]
 );
 
@@ -156,6 +161,18 @@ pub fn bind_keys(cx: &mut App) {
         // otherwise it toggles the graph (ADR 0073).
         KeyBinding::new("cmd-shift-g", FindPrevious, Some(FINDING_CONTEXT)),
         KeyBinding::new("cmd-shift-g", ToggleGraph, None),
+        // Scrollback from the keyboard (ADR 0082). On the alternate screen
+        // the pane lets these through to the program.
+        KeyBinding::new("shift-pageup", ScrollPageUp, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("shift-pagedown", ScrollPageDown, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-up", ScrollToTop, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-home", ScrollToTop, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-down", ScrollToBottom, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-end", ScrollToBottom, Some(TERMINAL_CONTEXT)),
+        // The pane's history and grid; a text field's own ⌘A wins inside it.
+        KeyBinding::new("cmd-a", SelectAll, Some(TERMINAL_CONTEXT)),
+        // This view's history only; the agent and the node keep theirs.
+        KeyBinding::new("cmd-k", ClearScrollback, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(TEXT_FIELD_CONTEXT)),

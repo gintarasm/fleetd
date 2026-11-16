@@ -63,6 +63,12 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollToTop,
+    ScrollToBottom,
+    SelectAll,
+    ClearScrollback,
     RemoveExited,
     ToggleGraph,
     ShowShortcuts,
@@ -139,6 +145,12 @@ impl Command {
         Command::ZoomIn,
         Command::ZoomOut,
         Command::ZoomReset,
+        Command::ScrollPageUp,
+        Command::ScrollPageDown,
+        Command::ScrollToTop,
+        Command::ScrollToBottom,
+        Command::SelectAll,
+        Command::ClearScrollback,
         Command::RemoveExited,
         Command::ToggleGraph,
         Command::ShowShortcuts,
@@ -190,6 +202,12 @@ impl Command {
             Command::ZoomIn => "Zoom In",
             Command::ZoomOut => "Zoom Out",
             Command::ZoomReset => "Reset Zoom",
+            Command::ScrollPageUp => "Scroll Up a Page",
+            Command::ScrollPageDown => "Scroll Down a Page",
+            Command::ScrollToTop => "Scroll to Top",
+            Command::ScrollToBottom => "Scroll to Bottom",
+            Command::SelectAll => "Select All in Pane",
+            Command::ClearScrollback => "Clear Scrollback",
             Command::RemoveExited => "Remove Exited Agents…",
             Command::ToggleGraph => "Show or Hide the Agent Graph",
             Command::ShowShortcuts => "Keyboard Shortcuts",
@@ -229,6 +247,12 @@ impl Command {
             Command::CopyLastOutput => "screen clipboard",
             Command::SaveOutput => "history transcript export file",
             Command::OpenOutput => "history transcript text edit",
+            Command::ScrollPageUp
+            | Command::ScrollPageDown
+            | Command::ScrollToTop
+            | Command::ScrollToBottom => "scrollback history",
+            Command::SelectAll => "copy text",
+            Command::ClearScrollback => "erase history buffer",
             Command::RemoveExited => "clear forget rm lost",
             Command::ShowShortcuts => "cheat sheet keys help",
             Command::OpenSettings => "preferences config",
@@ -259,7 +283,13 @@ impl Command {
             | Command::OpenOutput
             | Command::Find
             | Command::FindNext
-            | Command::FindPrevious => s.has_agent,
+            | Command::FindPrevious
+            | Command::ScrollPageUp
+            | Command::ScrollPageDown
+            | Command::ScrollToTop
+            | Command::ScrollToBottom
+            | Command::SelectAll
+            | Command::ClearScrollback => s.has_agent,
             Command::KillPane | Command::Paste => s.running,
             Command::RestartPane | Command::RemovePane => s.restartable,
             Command::Copy => s.has_selection,
@@ -417,6 +447,10 @@ pub fn shortcut_text(mods: Mods, key: &str) -> String {
         "escape" => s.push('⎋'),
         "backspace" => s.push('⌫'),
         "delete" => s.push('⌦'),
+        "home" => s.push('↖'),
+        "end" => s.push('↘'),
+        "pageup" => s.push('⇞'),
+        "pagedown" => s.push('⇟'),
         "space" => s.push_str("Space"),
         k => s.push_str(&k.to_uppercase()),
     }
@@ -489,6 +523,16 @@ mod tests {
         assert_eq!(shortcut_text(Mods { alt: true, ..cmd }, "left"), "⌥⌘←");
         assert_eq!(shortcut_text(all, "1"), "⌃⌥⇧⌘1");
         assert_eq!(shortcut_text(Mods::default(), "escape"), "⎋");
+        assert_eq!(
+            shortcut_text(
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                },
+                "pageup"
+            ),
+            "⇧⇞"
+        );
     }
 
     /// Everything there is to act on: every command is shown.
@@ -659,6 +703,30 @@ mod tests {
         assert!(!listed.contains(&Command::NewTab));
         assert!(listed.contains(&Command::FocusPane4));
         assert!(listed.contains(&Command::SelectTab(MAX_TABS)));
+    }
+
+    #[test]
+    fn terminal_commands_are_found_by_what_they_do() {
+        let items: Vec<PickerItem> = palette_items(|_| None, &everything(), &[], &[], home())
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect();
+        let first = |q: &str| {
+            let mut p = Picker::new(items.clone(), Recents::default());
+            p.set_query(q);
+            p.selected_item().map(|i| i.title.clone())
+        };
+        // They act on the focused pane's agent: none, none shown.
+        let none = shown(&PaletteState::default());
+        assert!(!none.contains(&Command::ScrollToTop));
+        assert!(!none.contains(&Command::SelectAll));
+        assert!(!none.contains(&Command::ClearScrollback));
+        assert_eq!(
+            first("clear scrollback").as_deref(),
+            Some("Clear Scrollback")
+        );
+        assert_eq!(first("select all").as_deref(), Some("Select All in Pane"));
+        assert_eq!(first("scroll to top").as_deref(), Some("Scroll to Top"));
     }
 
     #[test]

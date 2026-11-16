@@ -120,6 +120,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Copy", keymap::Copy),
                     MenuItem::action("Paste", keymap::Paste),
                     MenuItem::action("Select All", keymap::SelectAll),
+                    MenuItem::action("Clear Scrollback", keymap::ClearScrollback),
                     MenuItem::separator(),
                     MenuItem::action("Find…", keymap::Find),
                     MenuItem::action("Find Next", keymap::FindNext),

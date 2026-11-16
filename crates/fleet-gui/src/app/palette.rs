@@ -8,12 +8,13 @@
 use gpui::{Action, Window};
 
 use super::keymap::{
-    ClosePane, CloseTab, Copy, CopyLastOutput, EditLabelsPane, Find, FindNext, FindPrevious,
-    FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
-    FocusUp, InstallSkill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenOutput,
-    OpenSettings, Paste, PrevTab, PreviousAgent, Quit, RemoveExited, RemovePane, RenamePane,
-    ReopenClosedPane, RestartPane, SaveOutput, SelectTab, ShowShortcuts, SplitDown, SplitRight,
-    SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn, ZoomOut, ZoomReset,
+    ClearScrollback, ClosePane, CloseTab, Copy, CopyLastOutput, EditLabelsPane, Find, FindNext,
+    FindPrevious, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
+    FocusPane4, FocusRight, FocusUp, InstallSkill, KillPane, NewAgent, NewTab, NewTerminal,
+    NextAgent, NextTab, OpenOutput, OpenSettings, Paste, PrevTab, PreviousAgent, Quit,
+    RemoveExited, RemovePane, RenamePane, ReopenClosedPane, RestartPane, SaveOutput,
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, SelectAll, SelectTab, ShowShortcuts,
+    SplitDown, SplitRight, SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::core::palette::{Command, Mods, shortcut_text};
 
@@ -24,7 +25,6 @@ const NOT_IN_PALETTE: &[(&str, &str)] = &[
     ("fleet::CommandPalette", "opens the palette itself"),
     // The palette takes the focus from the text field these act on.
     ("fleet::Cut", "text fields only"),
-    ("fleet::SelectAll", "text fields only"),
     ("fleet::Undo", "text fields only"),
     ("fleet::Redo", "text fields only"),
     // Row menu actions naming an agent; the palette's Kill Agent…,
@@ -81,6 +81,12 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::ToggleGraph => Box::new(ToggleGraph),
         Command::ShowShortcuts => Box::new(ShowShortcuts),
         Command::OpenSettings => Box::new(OpenSettings),
+        Command::ScrollPageUp => Box::new(ScrollPageUp),
+        Command::ScrollPageDown => Box::new(ScrollPageDown),
+        Command::ScrollToTop => Box::new(ScrollToTop),
+        Command::ScrollToBottom => Box::new(ScrollToBottom),
+        Command::SelectAll => Box::new(SelectAll),
+        Command::ClearScrollback => Box::new(ClearScrollback),
         Command::SwitchFleetd => Box::new(SwitchFleetd),
         Command::InstallSkill => Box::new(InstallSkill),
         Command::Quit => Box::new(Quit),
