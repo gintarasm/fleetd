@@ -5,6 +5,7 @@ mod bench;
 mod connect;
 mod context_menu;
 mod controls;
+mod ended_view;
 mod fonts;
 mod icons;
 mod keymap;
@@ -100,6 +101,10 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Copy", keymap::Copy),
                     MenuItem::action("Paste", keymap::Paste),
                     MenuItem::action("Select All", keymap::SelectAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Find…", keymap::Find),
+                    MenuItem::action("Find Next", keymap::FindNext),
+                    MenuItem::action("Find Previous", keymap::FindPrevious),
                 ],
             },
             Menu {

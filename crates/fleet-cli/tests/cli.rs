@@ -574,6 +574,38 @@ fn spawn_cwd_is_used() {
 }
 
 #[test]
+fn spawn_priority_low_lowers_the_agent() {
+    // The test daemon runs with the setting off: `low` lowers by 10.
+    let d = Daemon::start();
+    // SAFETY: no memory effects; cannot fail for the calling process.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    for (priority, want) in [("low", (own + 10).min(19)), ("normal", own)] {
+        let id = d
+            .ok(&[
+                "spawn",
+                "--priority",
+                priority,
+                "--",
+                "sh",
+                "-c",
+                "echo nice=$(ps -o nice= -p $$)=; sleep 100",
+            ])
+            .trim()
+            .to_string();
+        wait_for("nice reported", || {
+            d.ok(&["screen", &id]).contains(&format!("nice={want}="))
+                || d.ok(&["screen", &id]).contains(&format!("nice= {want}="))
+        });
+        d.ok(&["kill", &id]);
+    }
+    assert!(
+        !d.fleet(&["spawn", "--priority", "high", "--", "cat"])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn ls_json_parses() {
     let d = Daemon::start();
     let id = d

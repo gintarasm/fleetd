@@ -505,6 +505,7 @@ pub fn flood_host(agents: usize, bytes: u64, fake_agent: &Path) -> Result<HostUs
                 env: vec![],
                 cols: 120,
                 rows: 40,
+                nice: 0,
             })
             .map_err(|e| format!("spawning agent {i}: {e}"))?;
         ids.push(id);

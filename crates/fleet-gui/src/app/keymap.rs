@@ -35,7 +35,12 @@ actions!(
         Redo,
         ReopenClosedPane,
         ShowShortcuts,
+        Find,
+        FindNext,
+        FindPrevious,
         CommandPalette,
+        NextAgent,
+        PreviousAgent,
     ]
 );
 
@@ -83,10 +88,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-n", NewAgent, None),
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-p", CommandPalette, None),
+        KeyBinding::new("ctrl-tab", NextAgent, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
+        // Also from the pane's find field, inside the terminal's context.
+        KeyBinding::new("cmd-f", Find, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-g", FindNext, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-shift-g", FindPrevious, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(TEXT_FIELD_CONTEXT)),

@@ -3,30 +3,37 @@
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fleet_term::CursorShape;
 use gpui::{
-    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    UTF16Selection, Window, div, point, px, size,
+    AnyWindowHandle, AppContext, Bounds, BoxShadow, ClipboardItem, Context, Entity, EventEmitter,
+    FocusHandle, Font, InteractiveElement, IntoElement, KeyDownEvent, Modifiers,
+    ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement,
+    Styled, Subscription, Task, UTF16Selection, Window, div, point, px, size,
 };
 
 use super::controls::{self, ButtonKind};
+use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
-use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
+use super::keymap::{Copy, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
+use super::native;
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
+use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::find::status_label;
 use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
 use crate::core::pane::{PaneModel, PaneState, ViewRow};
+use crate::core::scroll_feedback::{
+    Fade, HIT_WIDTH, INSET, Thumb, Wake, end_jumps_to_bottom, offset_for_thumb, thumb,
+};
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
 use crate::core::shortcuts::{EmptyPane, HINT, empty_pane};
@@ -34,6 +41,13 @@ use crate::core::style::{self, radius, space, text};
 
 /// At most this many lines are scrolled (or reported) per wheel event.
 const MAX_WHEEL_LINES: f32 = 100.0;
+
+/// History lines a find step scans, off the UI thread, holding the pane's
+/// model lock (about a millisecond; ADR 0053).
+const FIND_STEP_LINES: usize = 2000;
+
+/// Width of the find bar's text field.
+const FIND_FIELD_WIDTH: f32 = 180.0;
 
 /// Where the pane's input goes: the [`Session`], or a recording fake in
 /// tests.
@@ -110,6 +124,8 @@ pub fn grid_size(bounds_w: f32, bounds_h: f32, cell_w: f32, line_h: f32) -> (u16
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GridLayout {
     pub origin: Point<Pixels>,
+    /// The element's size (the grid plus what is left over at its edges).
+    pub size: Size<Pixels>,
     pub cell_w: Pixels,
     pub line_h: Pixels,
     pub cols: u16,
@@ -123,6 +139,8 @@ enum Drag {
     Select,
     /// Reported to the agent; `at` is the cell last reported.
     Report { button: MouseButton, at: (u16, u16) },
+    /// Dragging the scrollbar's thumb, held `grab` points below its top.
+    Thumb { grab: f32 },
 }
 
 /// What the workspace tells a pane about itself, for its header and
@@ -151,6 +169,8 @@ pub struct PaneChrome {
     pub maximized: bool,
     /// The agent list arrived and is empty: an empty pane welcomes.
     pub no_agents: bool,
+    /// How long the ended agent ran, if known (the summary bar).
+    pub run_time: Option<Duration>,
 }
 
 /// The line drawn over the grid, if any.
@@ -165,14 +185,13 @@ pub fn banner(chrome: &PaneChrome, state: PaneState) -> Option<String> {
     match state {
         PaneState::Disconnected => Some(disconnected()),
         _ if !chrome.has_agent => None,
-        PaneState::Exited(code) => Some(format!("exited ({code})")),
         PaneState::Attaching => Some("attaching…".to_owned()),
-        PaneState::Lost => Some("the agent is gone".to_owned()),
-        PaneState::Live => None,
+        // The summary bar at the bottom says how it ended.
+        PaneState::Exited(_) | PaneState::Lost | PaneState::Live => None,
     }
 }
 
-/// The exit banner offers Restart (as ⌘R does): the pane's agent exited
+/// The summary bar offers Restart (as ⌘R does): the pane's agent exited
 /// or is gone.
 pub fn restartable(chrome: &PaneChrome, state: PaneState) -> bool {
     chrome.has_agent && matches!(state, PaneState::Exited(_) | PaneState::Lost)
@@ -218,8 +237,10 @@ pub enum PaneEvent {
     SplitDown,
     ToggleMaximize,
     Close,
-    /// The exit banner's Restart: the ended agent again, in this pane.
+    /// The summary bar's Restart: the ended agent again, in this pane.
     Restart,
+    /// The summary bar's Remove: forgets the ended agent.
+    Remove,
     /// A right-click asks for the pane's context menu: on the header, or
     /// on the grid (`on_grid`) while the agent does not take the mouse.
     ContextMenu {
@@ -250,8 +271,18 @@ pub struct PaneView {
     drag: Option<Drag>,
     /// Wheel movement not yet scrolled, in lines (positive up).
     wheel_lines: f32,
-    /// Where the "new lines" pill was last drawn, if it was.
-    pub(crate) pill: Option<Bounds<Pixels>>,
+    /// Where the "New output" chip was last drawn, if it was.
+    pub(crate) chip: Option<Bounds<Pixels>>,
+    /// The overlay scrollbar's fade.
+    pub(crate) fade: Fade,
+    /// Reduce Motion, read when the scrollbar starts showing.
+    fade_reduce_motion: bool,
+    /// The scrollbar drew in the last render (it takes presses then).
+    scrollbar_shown: bool,
+    /// The redraw that ends the scrollbar's hold, and when it is due.
+    fade_timer: Option<(Instant, Task<()>)>,
+    /// Reads Reduce Motion (replaced in tests).
+    pub(crate) reduce_motion: fn() -> bool,
     /// The window whose activation the cursor follows, and that
     /// subscription (renewed when the view moves to a new window).
     activation: Option<(AnyWindowHandle, Subscription)>,
@@ -262,6 +293,19 @@ pub struct PaneView {
     /// Runs a command that opens a file, and the one to run when that
     /// cannot start (replaced in tests).
     pub(crate) open_file: Arc<dyn Fn(Vec<String>, Vec<String>)>,
+    /// The find bar, while open.
+    find: Option<FindBar>,
+    /// The last query, brought back when find opens again.
+    find_query: String,
+    find_case: bool,
+    /// The search running off the UI thread, while lines are left.
+    find_task: Option<Task<()>>,
+}
+
+/// The find bar's field and its subscription.
+struct FindBar {
+    field: Entity<TextField>,
+    _changes: Subscription,
 }
 
 /// Runs `argv` detached; when it cannot start (an editor not on the app's
@@ -308,12 +352,138 @@ impl PaneView {
             layout: None,
             drag: None,
             wheel_lines: 0.0,
-            pill: None,
+            chip: None,
+            fade: Fade::default(),
+            fade_reduce_motion: false,
+            scrollbar_shown: false,
+            fade_timer: None,
+            reduce_motion: native::reduce_motion,
             activation: None,
             editor: config.editor.clone(),
             hover: None,
             open_file: Arc::new(spawn_opener),
+            find: None,
+            find_query: String::new(),
+            find_case: false,
+            find_task: None,
         }
+    }
+
+    /// ⌘F: opens the find bar (or focuses it) with the last query
+    /// selected.
+    fn open_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let query = self.find_query.clone();
+            let field = cx.new(|cx| TextField::new(query, "Find", cx));
+            let changes = cx.observe(&field, |v, field, cx| {
+                let text = field.read(cx).text();
+                if text != v.find_query {
+                    v.find_query = text.to_owned();
+                    v.search(cx);
+                }
+            });
+            self.find = Some(FindBar {
+                field,
+                _changes: changes,
+            });
+            self.search(cx);
+        }
+        if let Some(bar) = &self.find {
+            bar.field.update(cx, |f, cx| f.select_all_text(cx));
+            window.focus(&bar.field.read(cx).focus_handle().clone());
+        }
+        cx.notify();
+    }
+
+    /// Starts searching for the find bar's query.
+    fn search(&mut self, cx: &mut Context<Self>) {
+        self.model().find_open(&self.find_query, self.find_case);
+        self.find_task = None;
+        self.continue_search(cx);
+        cx.notify();
+    }
+
+    /// Scans what is left to scan in steps on the background executor, each
+    /// under the model lock, redrawing as matches come in. Nothing here
+    /// runs while drawing.
+    fn continue_search(&mut self, cx: &mut Context<Self>) {
+        if self.find_task.is_some() || !self.model().find_pending() {
+            return;
+        }
+        let model = Arc::clone(&self.model);
+        self.find_task = Some(cx.spawn(async move |view, cx| {
+            loop {
+                let m = Arc::clone(&model);
+                let step = cx
+                    .background_executor()
+                    .spawn(async move { lock(&m).find_step(FIND_STEP_LINES) })
+                    .await;
+                let go_on = view.update(cx, |v, cx| {
+                    if step.changed {
+                        cx.notify();
+                    }
+                    if !step.more {
+                        v.find_task = None;
+                        // At the oldest loaded line: page in older history.
+                        v.sink.check_paging(v.pane);
+                    }
+                    step.more
+                });
+                if !matches!(go_on, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The next match up (Enter, ⌘G) or down (⇧Enter, ⌘⇧G).
+    fn step_find(&mut self, up: bool, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            return;
+        }
+        if self.model().find_next(up) {
+            self.sink.check_paging(self.pane);
+            cx.notify();
+        }
+    }
+
+    fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(true, cx);
+    }
+
+    fn find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(false, cx);
+    }
+
+    fn toggle_find_case(&mut self, cx: &mut Context<Self>) {
+        self.find_case = !self.find_case;
+        self.search(cx);
+    }
+
+    /// Esc: closes the find bar; the keys go back to the terminal.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        self.find_task = None;
+        self.model().find_close();
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn find_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let m = &ev.keystroke.modifiers;
+        match ev.keystroke.key.as_str() {
+            "enter" if !m.platform => self.step_find(!m.shift, cx),
+            "escape" => self.close_find(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// The find bar's count, while it is open.
+    pub(crate) fn find_label(&self) -> Option<String> {
+        self.find.as_ref()?;
+        let status = self.model().find_status()?;
+        Some(status_label(status, !self.find_query.is_empty()))
     }
 
     /// The link underlined under the pointer: its line and columns.
@@ -397,6 +567,98 @@ impl PaneView {
         }
     }
 
+    /// The strip along the grid's right edge that the scrollbar takes
+    /// presses in, in window coordinates.
+    pub(crate) fn scrollbar_track(&self) -> Option<Bounds<Pixels>> {
+        let l = self.layout?;
+        let height = l.size.height - px(2.0 * INSET);
+        (height > px(0.)).then(|| {
+            Bounds::new(
+                point(
+                    l.origin.x + l.size.width - px(HIT_WIDTH),
+                    l.origin.y + px(INSET),
+                ),
+                size(px(HIT_WIDTH), height),
+            )
+        })
+    }
+
+    /// The thumb on `track` for the view as it is.
+    fn thumb_on(&self, track: Bounds<Pixels>) -> Option<Thumb> {
+        let model = self.model();
+        let rows = model.terminal().size().1;
+        thumb(
+            f32::from(track.size.height),
+            model.scrollback().len(),
+            rows,
+            model.scroll_offset(),
+        )
+    }
+
+    /// The view scrolled: the scrollbar shows (again) from now.
+    fn show_scrollbar(&mut self) {
+        if !self.fade.is_active() {
+            self.fade_reduce_motion = (self.reduce_motion)();
+        }
+        self.fade.show(Instant::now());
+    }
+
+    /// The scrollbar's opacity this render, scheduling what keeps it
+    /// current: frames while it fades, one timer to the end of its hold,
+    /// nothing once it is gone (or never shown).
+    fn scrollbar_opacity(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<f32> {
+        if !self.fade.is_active() {
+            return None;
+        }
+        let now = Instant::now();
+        let rm = self.fade_reduce_motion;
+        let opacity = self.fade.opacity(now, rm);
+        match self.fade.wake(now, rm) {
+            Wake::Frame => window.request_animation_frame(),
+            Wake::After(d) => {
+                let due = now + d;
+                if self.fade_timer.as_ref().is_none_or(|(at, _)| *at != due) {
+                    let task = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(d).await;
+                        let _ = this.update(cx, |_, cx| cx.notify());
+                    });
+                    self.fade_timer = Some((due, task));
+                }
+            }
+            Wake::Idle => {
+                self.fade.settle(now, rm);
+                self.fade_timer = None;
+            }
+        }
+        (opacity > 0.0).then_some(opacity)
+    }
+
+    /// Moves the view so the dragged thumb's top is `grab` above `y`.
+    fn drag_thumb(&mut self, y: Pixels, grab: f32, cx: &mut Context<Self>) {
+        let Some(track) = self.scrollbar_track() else {
+            return;
+        };
+        let Some(t) = self.thumb_on(track) else {
+            return;
+        };
+        let top = f32::from(y - track.origin.y) - grab;
+        let track_h = f32::from(track.size.height);
+        {
+            let mut model = self.model();
+            let history = model.scrollback().len();
+            model.scroll_to(offset_for_thumb(track_h, t.height, history, top));
+        }
+        self.sink.check_paging(self.pane);
+        cx.notify();
+    }
+
+    /// The pointer let go of the scrollbar: it fades after a new hold.
+    fn release_scrollbar(&mut self, cx: &mut Context<Self>) {
+        self.fade.hold(false);
+        self.show_scrollbar();
+        cx.notify();
+    }
+
     pub fn pane(&self) -> PaneId {
         self.pane
     }
@@ -461,14 +723,22 @@ impl PaneView {
         }
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // While composing, the IME owns the keys.
-        if self.marked.is_some() {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // While composing, the IME owns the keys; the find field's keys
+        // are its own.
+        if self.marked.is_some() || !self.focus.is_focused(window) {
             return;
         }
         let Some(key) = to_key(&ev.keystroke) else {
             return;
         };
+        let scrolled = self.model().scroll_offset() > 0;
+        if end_jumps_to_bottom(&key, scrolled) {
+            self.model().scroll_to_bottom();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let modes = self.model().terminal().modes();
         // `None`: the key is text; it reaches `replace_text_in_range`.
         if let Some(bytes) = encode_key(&key, &modes, self.option_as_meta) {
@@ -512,7 +782,7 @@ impl PaneView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus);
-        if self.pill.is_some_and(|p| p.contains(&ev.position)) {
+        if self.chip.is_some_and(|p| p.contains(&ev.position)) {
             self.drag = None;
             self.model().scroll_to_bottom();
             cx.notify();
@@ -521,6 +791,23 @@ impl PaneView {
         let Some(button) = to_button(ev.button) else {
             return;
         };
+        // A shown scrollbar takes presses on its strip: on the thumb it is
+        // dragged from there, elsewhere the thumb jumps under the pointer.
+        let track = self.scrollbar_track().filter(|t| {
+            self.scrollbar_shown && button == MouseButton::Left && t.contains(&ev.position)
+        });
+        if let Some((track, t)) = track.and_then(|tr| self.thumb_on(tr).map(|t| (tr, t))) {
+            let y = f32::from(ev.position.y - track.origin.y);
+            let on_thumb = y >= t.top && y <= t.top + t.height;
+            let grab = if on_thumb { y - t.top } else { t.height / 2.0 };
+            self.drag = Some(Drag::Thumb { grab });
+            self.fade.hold(true);
+            if !on_thumb {
+                self.drag_thumb(ev.position.y, grab, cx);
+            }
+            cx.notify();
+            return;
+        }
         // ⌘-click on a link opens it, even when the agent reports the mouse.
         let link = (button == MouseButton::Left && ev.modifiers.platform)
             .then(|| self.link_under(ev.position))
@@ -577,15 +864,41 @@ impl PaneView {
         cx: &mut Context<Self>,
     ) {
         let Some(drag) = self.drag else {
+            // Over a showing scrollbar, it stays.
+            if self.fade.is_active() {
+                let over = self.scrollbar_shown
+                    && self
+                        .scrollbar_track()
+                        .is_some_and(|t| t.contains(&ev.position));
+                if over != self.fade.is_held() {
+                    if over {
+                        self.fade.hold(true);
+                    } else {
+                        self.release_scrollbar(cx);
+                    }
+                }
+            }
             self.update_hover(ev.position, ev.modifiers, cx);
             return;
         };
         let pressed = ev.pressed_button.and_then(to_button);
+        if let Drag::Thumb { grab } = drag {
+            if pressed == Some(MouseButton::Left) {
+                self.drag_thumb(ev.position.y, grab, cx);
+            } else {
+                // The release happened where it was not seen.
+                self.drag = None;
+                self.release_scrollbar(cx);
+            }
+            return;
+        }
         let mut model = lock(&self.model);
         let Some(at) = cell_at(self.layout, &model, ev.position) else {
             return;
         };
         match drag {
+            // Handled above, without the model locked.
+            Drag::Thumb { .. } => {}
             // The release happened where it was not seen.
             Drag::Select if pressed != Some(MouseButton::Left) => self.drag = None,
             Drag::Select => {
@@ -618,6 +931,11 @@ impl PaneView {
         let Some(drag) = self.drag else {
             return;
         };
+        if let Drag::Thumb { .. } = drag {
+            self.drag = None;
+            self.release_scrollbar(cx);
+            return;
+        }
         let Drag::Report { button, at: last } = drag else {
             self.drag = None;
             return;
@@ -692,6 +1010,7 @@ impl PaneView {
         }
         model.scroll_lines(lines);
         drop(model);
+        self.show_scrollbar();
         self.sink.check_paging(self.pane);
         cx.notify();
     }
@@ -753,6 +1072,10 @@ fn sel_point(model: &PaneModel, (col, row): (u16, u16)) -> SelPoint {
 impl Render for PaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_activation(window, cx);
+        // New output while find is open: scan it (off the UI thread).
+        if self.find.is_some() {
+            self.continue_search(cx);
+        }
         let theme = theme(cx);
         let focused = window.is_window_active() && self.focus.is_focused(window);
         let (state, title, observing) = {
@@ -761,6 +1084,8 @@ impl Render for PaneView {
             let observing = state == PaneState::Live && !model.is_primary();
             (state, model.title(), observing)
         };
+        let scrollbar = self.scrollbar_opacity(window, cx);
+        self.scrollbar_shown = scrollbar.is_some();
         let element = TerminalElement {
             view: cx.entity(),
             pane: self.pane,
@@ -774,6 +1099,7 @@ impl Render for PaneView {
             show_cursor: draws_cursor(&self.chrome, state),
             marked: self.marked.clone(),
             link: self.hover,
+            scrollbar,
         };
         let chrome = &self.chrome;
         let (title_text, path) = header_parts(chrome, title.as_deref());
@@ -882,44 +1208,87 @@ impl Render for PaneView {
             .mb(px(space::SM - space::XXS))
             .overflow_hidden()
             .child(element);
-        if let Some(text) = banner(chrome, state) {
+        let find_bar = self.find.as_ref().map(|bar| {
             let number = chrome.number;
-            let restart = restartable(chrome, state).then(|| {
-                div()
-                    .id("restart")
-                    .debug_selector(move || format!("pane-{number}-restart"))
-                    .px(px(space::SM))
-                    .py(px(space::XXS))
-                    .rounded(px(radius::SM))
-                    .bg(theme.accent)
-                    .text_color(gpui::white())
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .active(|s| s.opacity(0.8))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::XS))
-                    .child(icons::sized(Icon::Restart, 12.0).text_color(gpui::white()))
-                    .child("Restart")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Restart)))
-            });
+            let label = self.find_label().unwrap_or_default();
+            let case_on = self.find_case;
+            let step = |id: &'static str, icon: Icon, up: bool| {
+                controls::icon_button(id, icon, &theme, true)
+                    .debug_selector(move || format!("pane-{number}-{id}"))
+                    .on_click(cx.listener(move |v, _, _, cx| v.step_find(up, cx)))
+            };
+            div()
+                .id("find")
+                .debug_selector(move || format!("pane-{number}-find"))
+                .occlude()
+                .on_key_down(cx.listener(Self::find_key_down))
+                .absolute()
+                .top(px(space::XS))
+                .right(px(space::XS))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::XS))
+                .p(px(space::XS))
+                .rounded(px(radius::MD))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.raised)
+                .shadow_md()
+                .type_style(text::CALLOUT)
+                .child(div().w(px(FIND_FIELD_WIDTH)).child(bar.field.clone()))
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(space::XL * 3.0))
+                        .text_color(theme.secondary)
+                        .whitespace_nowrap()
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .id("find-case")
+                        .debug_selector(move || format!("pane-{number}-find-case"))
+                        .flex_none()
+                        .px(px(space::XS))
+                        .rounded(px(radius::SM))
+                        .bg(if case_on {
+                            theme.selected
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .text_color(if case_on { theme.text } else { theme.tertiary })
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(theme.hover))
+                        .child("Aa")
+                        .on_click(cx.listener(|v, _, _, cx| v.toggle_find_case(cx))),
+                )
+                .child(step("find-up", Icon::ChevronUp, true))
+                .child(step("find-down", Icon::ChevronDown, false))
+                .child(
+                    controls::icon_button("find-close", Icon::Close, &theme, true)
+                        .debug_selector(move || format!("pane-{number}-find-close"))
+                        .on_click(cx.listener(|v, _, window, cx| v.close_find(window, cx))),
+                )
+        });
+        let find_open = find_bar.is_some();
+        if let Some(text) = banner(chrome, state) {
+            // Below the find bar when that is open.
+            let top = if find_open {
+                space::XS * 4.0 + style::chrome::CONTROL_HEIGHT + space::SM
+            } else {
+                space::XS
+            };
             grid = grid.child(
                 div()
                     .absolute()
-                    .top(px(space::XS))
+                    .top(px(top))
                     .right(px(space::XS))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(space::SM))
-                    .pl(px(space::MD))
-                    .pr(px(if restart.is_some() {
-                        space::XS
-                    } else {
-                        space::MD
-                    }))
+                    .px(px(space::MD))
                     .py(px(space::XS))
                     .rounded(px(radius::MD))
                     .border_1()
@@ -928,8 +1297,7 @@ impl Render for PaneView {
                     .shadow_md()
                     .text_color(theme.text)
                     .type_style(text::CALLOUT)
-                    .child(SharedString::from(text))
-                    .children(restart),
+                    .child(SharedString::from(text)),
             );
         }
         if empty_state(chrome) == EmptyPane::Welcome {
@@ -948,6 +1316,7 @@ impl Render for PaneView {
                     .child(text),
             );
         }
+        grid = grid.children(find_bar);
         div()
             .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
@@ -959,6 +1328,9 @@ impl Render for PaneView {
             }))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
             .size_full()
             .flex()
             .flex_col()
@@ -980,6 +1352,7 @@ impl Render for PaneView {
             .bg(theme.card)
             .child(header)
             .child(grid)
+            .children(ended_bar(self, state, &theme, cx))
     }
 }
 
@@ -1176,8 +1549,8 @@ mod tests {
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::core::config::GuiConfig;
-    use crate::core::pane::PaneModel;
     use crate::core::pane::PaneState;
+    use crate::core::pane::{PaneModel, ViewRow};
     use crate::core::selection::{LineRef, SelPoint};
     use crate::core::session::PaneId;
     use fleet_proto::AttachOk;
@@ -1547,22 +1920,142 @@ mod tests {
     }
 
     #[gpui::test]
-    fn new_lines_pill_shows_while_scrolled_up_and_returns_to_bottom(cx: &mut TestAppContext) {
+    fn new_output_chip_shows_while_scrolled_up_and_returns_to_bottom(cx: &mut TestAppContext) {
         let (view, _sink, cx) = pane(cx, model_with_history(50));
         let at = cell(&view, cx, 0, 0);
         wheel(cx, at, ScrollDelta::Lines(point(0.0, 5.0)));
-        assert_eq!(view.read_with(cx, |v, _| v.pill), None);
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
+        // A redraw in place is no new output.
+        view.update(cx, |v, cx| {
+            v.model().on_output(b"\rspinning");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
         view.update(cx, |v, cx| {
             v.model().on_output(b"\r\nx\r\ny");
             cx.notify();
         });
         cx.run_until_parked();
-        let pill = view.read_with(cx, |v, _| v.pill).expect("pill shown");
+        let chip = view.read_with(cx, |v, _| v.chip).expect("chip shown");
         assert_eq!(offset(&view, cx), 7);
-        cx.simulate_click(pill.center(), Modifiers::none());
+        cx.simulate_click(chip.center(), Modifiers::none());
         assert_eq!(offset(&view, cx), 0);
-        assert_eq!(view.read_with(cx, |v, _| v.pill), None);
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
         assert_eq!(selected(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn end_returns_a_scrolled_up_view_to_the_bottom(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_history(50));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 5.0)));
+        view.update(cx, |v, cx| {
+            v.model().on_output(b"\r\nx");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.chip.is_some()));
+        cx.simulate_keystrokes("end");
+        assert_eq!(offset(&view, cx), 0);
+        assert!(sink.take().is_empty(), "End stays in the GUI");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
+        // At the bottom, End goes to the agent.
+        cx.simulate_keystrokes("end");
+        assert_eq!(sink.take(), vec![b"\x1b[F".to_vec()]);
+    }
+
+    /// A pane whose scrollbar shows at once (Reduce Motion: no fade-in).
+    fn pane_without_motion(
+        cx: &mut TestAppContext,
+        model: PaneModel,
+    ) -> (Entity<PaneView>, Arc<Recorder>, &mut VisualTestContext) {
+        let (view, sink, cx) = pane(cx, model);
+        view.update(cx, |v, _| v.reduce_motion = || true);
+        (view, sink, cx)
+    }
+
+    #[gpui::test]
+    fn the_scrollbar_shows_only_once_the_view_scrolls(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane_without_motion(cx, model_with_history(50));
+        // Idle: nothing shown, nothing scheduled.
+        view.update(cx, |v, cx| {
+            v.model().on_output(b"\r\nx");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let idle = view.read_with(cx, |v, _| {
+            (
+                v.scrollbar_shown,
+                v.fade.is_active(),
+                v.fade_timer.is_some(),
+            )
+        });
+        assert_eq!(idle, (false, false, false));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 5.0)));
+        cx.run_until_parked();
+        let shown = view.read_with(cx, |v, _| (v.scrollbar_shown, v.fade_timer.is_some()));
+        assert_eq!(shown, (true, true), "shown, one timer to fade it");
+    }
+
+    #[gpui::test]
+    fn dragging_the_thumb_scrolls_the_view(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane_without_motion(cx, model_with_history(50));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 1.0)));
+        cx.run_until_parked();
+        let track = view
+            .read_with(cx, |v, _| v.scrollbar_track())
+            .expect("laid out");
+        let thumb = view.read_with(cx, |v, _| v.thumb_on(track)).expect("thumb");
+        let grab = point(
+            track.center().x,
+            track.origin.y + px(thumb.top + thumb.height / 2.0),
+        );
+        let top = point(track.center().x, track.origin.y);
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        assert!(view.read_with(cx, |v, _| v.fade.is_held()));
+        cx.simulate_mouse_move(top, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 50, "dragged to the oldest line");
+        let bottom = point(track.center().x, track.bottom() + px(100.0));
+        cx.simulate_mouse_move(bottom, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 0, "dragged back to the live grid");
+        cx.simulate_mouse_up(bottom, MouseButton::Left, Modifiers::none());
+        assert!(!view.read_with(cx, |v, _| v.fade.is_held()));
+        // Nothing was selected or sent, and paging was checked.
+        assert_eq!(selected(&view, cx), None);
+        assert!(sink.take().is_empty());
+        assert!(*sink.paging_checks.lock().unwrap() >= 2);
+    }
+
+    #[gpui::test]
+    fn a_press_on_the_track_jumps_the_thumb_there(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane_without_motion(cx, model_with_history(50));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 1.0)));
+        cx.run_until_parked();
+        let track = view
+            .read_with(cx, |v, _| v.scrollbar_track())
+            .expect("laid out");
+        let top = point(track.center().x, track.origin.y + px(1.0));
+        cx.simulate_mouse_down(top, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(top, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 50);
+    }
+
+    #[gpui::test]
+    fn a_hidden_scrollbar_leaves_the_right_edge_to_the_selection(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane_without_motion(cx, model_with_history(50));
+        let track = view
+            .read_with(cx, |v, _| v.scrollbar_track())
+            .expect("laid out");
+        let edge = point(track.center().x, track.origin.y + px(1.0));
+        cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 0);
+        assert!(!view.read_with(cx, |v, _| v.fade.is_held()));
     }
 
     #[gpui::test]
@@ -1718,6 +2211,138 @@ mod tests {
         assert_eq!(marked.as_deref(), Some("に"));
     }
 
+    /// A live 80×24 pane whose history has `needle` on lines 10 and 40.
+    fn model_with_needles() -> PaneModel {
+        let mut model = blank_model();
+        model.on_attached(&AttachOk {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            history_tail: (0..50)
+                .map(|i| match i {
+                    10 | 40 => format!("a Needle {i}"),
+                    _ => format!("h{i}"),
+                })
+                .map(|s| s.into_bytes().into())
+                .collect(),
+            ..Default::default()
+        });
+        model.on_output(b"\x1b[24;1H");
+        model
+    }
+
+    fn find_status(
+        view: &Entity<PaneView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<crate::core::find::FindStatus> {
+        view.read_with(cx, |v, _| v.model().find_status())
+    }
+
+    fn shows_line(view: &Entity<PaneView>, cx: &mut VisualTestContext, line: u64) -> bool {
+        view.read_with(cx, |v, _| {
+            let mut rows = Vec::new();
+            v.model().view_rows(24, &mut rows);
+            rows.contains(&ViewRow::History(line))
+        })
+    }
+
+    #[gpui::test]
+    fn cmd_f_finds_in_history_and_steps_through_matches(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_needles());
+        sink.take();
+        cx.simulate_keystrokes("cmd-f");
+        assert!(cx.debug_bounds("pane-0-find").is_some());
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        // The query went to the find field, not to the agent.
+        assert!(sink.take().is_empty());
+        let status = find_status(&view, cx).unwrap();
+        assert_eq!((status.index, status.count), (Some(2), 2));
+        assert!(shows_line(&view, cx, 40));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.find_label()).as_deref(),
+            Some("2 of 2")
+        );
+
+        // Enter goes up to the older match, Shift-Enter back down.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        assert!(shows_line(&view, cx, 10));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        cx.simulate_keystrokes("cmd-g");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        cx.simulate_keystrokes("cmd-shift-g");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        assert!(sink.take().is_empty());
+
+        // Case sensitive: "needle" is not "Needle".
+        let case = cx.debug_bounds("pane-0-find-case").unwrap().center();
+        cx.simulate_click(case, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.find_label()).as_deref(),
+            Some("No matches")
+        );
+        cx.simulate_click(case, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 2);
+
+        // Esc closes it and gives the keys back to the agent.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(find_status(&view, cx), None);
+        assert_eq!(view.read_with(cx, |v, _| v.find_label()), None);
+        assert!(sink.take().is_empty());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sink.take(), vec![b"\r".to_vec()]);
+
+        // ⌘F again brings the last query back, selected.
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 2);
+        cx.simulate_input("h4");
+        cx.run_until_parked();
+        // h4, h40..h49 minus the needle on 40.
+        assert_eq!(find_status(&view, cx).unwrap().count, 10);
+    }
+
+    #[gpui::test]
+    fn find_bar_buttons_step_and_close(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_needles());
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, id: &'static str| {
+            let at = cx.debug_bounds(id).unwrap().center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(cx, "pane-0-find-up");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        click(cx, "pane-0-find-down");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        click(cx, "pane-0-find-close");
+        assert_eq!(find_status(&view, cx), None);
+        // The keys go back to the terminal.
+        let focused = cx.update(|window, cx| view.read(cx).focus_handle().is_focused(window));
+        assert!(focused);
+    }
+
+    #[gpui::test]
+    fn find_follows_output_while_open(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_needles());
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        let model = view.read_with(cx, |v, _| Arc::clone(v.model_handle()));
+        model.lock().unwrap().on_output(b"\r\nneedle again");
+        // The session notifies the view of output.
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 3);
+    }
+
     #[test]
     fn resize_computes_cols_rows_from_cell_metrics() {
         assert_eq!(grid_size(800.0, 600.0, 8.0, 16.0), (100, 37));
@@ -1747,10 +2372,9 @@ mod tests {
             banner(&shown, PaneState::Attaching).as_deref(),
             Some("attaching…")
         );
-        assert_eq!(
-            banner(&shown, PaneState::Exited(3)).as_deref(),
-            Some("exited (3)")
-        );
+        // The summary bar says how it ended, not a banner.
+        assert_eq!(banner(&shown, PaneState::Exited(3)), None);
+        assert_eq!(banner(&shown, PaneState::Lost), None);
         assert_eq!(banner(&shown, PaneState::Live), None);
         assert_eq!(
             banner(&shown, PaneState::Disconnected).as_deref(),

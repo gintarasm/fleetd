@@ -1,5 +1,5 @@
 //! Draws a pane's grid: cell backgrounds, text, selection, cursor, IME
-//! marked text and the "new lines" pill, and routes the pane's mouse events
+//! marked text, the overlay scrollbar and the "New output" chip, and routes the pane's mouse events
 //! to [`PaneView`]. Built each frame by [`PaneView`].
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -18,6 +18,7 @@ use super::bench;
 use super::pane_view::{GridLayout, InputSink, PaneView, grid_size, ime_cell};
 use super::theme::Theme;
 use crate::core::pane::{PaneModel, ViewRow};
+use crate::core::scroll_feedback::{BAR_WIDTH, INSET, thumb};
 use crate::core::selection::LineRef;
 use crate::core::session::PaneId;
 
@@ -43,6 +44,9 @@ pub struct TerminalElement {
     pub(crate) marked: Option<String>,
     /// The link under the pointer while ⌘ is held: underlined.
     pub(crate) link: Option<(LineRef, u16, u16)>,
+    /// The scrollbar's opacity while it shows (`None` hidden: nothing is
+    /// drawn or computed for it).
+    pub(crate) scrollbar: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +62,9 @@ struct RowSnapshot {
     selected: Option<(u16, u16)>,
     /// The hovered link's columns, `from..to`.
     link: Option<(u16, u16)>,
+    /// Find matches, `from..to`, and whether each is the current one
+    /// (looked up, not searched: ADR 0053).
+    found: Vec<(u16, u16, bool)>,
 }
 
 /// What a frame draws, copied out under one model lock.
@@ -67,8 +74,11 @@ struct Snapshot {
     cursor: Option<CursorView>,
     /// Where IME marked text goes, `(col, row)`.
     ime_at: (u16, u16),
-    /// Lines of output below a scrolled-up view (0 when following).
-    unseen: u64,
+    /// Output arrived below a scrolled-up view: the chip shows.
+    new_output: bool,
+    /// Loaded history lines, and how far the view is scrolled up into them.
+    history: u64,
+    offset: u64,
 }
 
 fn lock(model: &Mutex<PaneModel>) -> MutexGuard<'_, PaneModel> {
@@ -105,10 +115,18 @@ impl TerminalElement {
                     .filter(|&(l, _, _)| l == line)
                     .map(|(_, from, to)| (from.min(cols), to.min(cols)))
                     .filter(|(from, to)| from < to);
+                let mut found = Vec::new();
+                model.find_matches(line, &mut found);
+                found.retain_mut(|(from, to, _)| {
+                    *from = (*from).min(cols);
+                    *to = (*to).min(cols);
+                    from < to
+                });
                 RowSnapshot {
                     cells,
                     selected,
                     link,
+                    found,
                 }
             })
             .collect();
@@ -120,7 +138,9 @@ impl TerminalElement {
             rows,
             cursor,
             ime_at: ime_cell(&model),
-            unseen: if scrolled { model.unseen_lines() } else { 0 },
+            new_output: model.new_output(),
+            history: model.scrollback().len(),
+            offset: model.scroll_offset(),
         }
     }
 
@@ -412,6 +432,7 @@ impl Element for TerminalElement {
         );
         let layout = GridLayout {
             origin: bounds.origin,
+            size: bounds.size,
             cell_w,
             line_h,
             cols,
@@ -481,6 +502,14 @@ impl Element for TerminalElement {
                         self.theme.accent,
                     ));
                 }
+                for &(from, to, current) in &row.found {
+                    let fill_color = if current {
+                        self.theme.find_current
+                    } else {
+                        self.theme.find_match
+                    };
+                    window.paint_quad(fill(cell_bounds(origin, m, from, to - from), fill_color));
+                }
                 if let Some((from, to)) = row.selected {
                     window.paint_quad(fill(
                         cell_bounds(origin, m, from, to - from),
@@ -494,9 +523,13 @@ impl Element for TerminalElement {
             if let Some(marked) = &self.marked {
                 self.paint_marked(marked, snap.ime_at, bounds.origin, m, window, cx);
             }
-            let pill =
-                (snap.unseen > 0).then(|| self.paint_pill(snap.unseen, bounds, m, window, cx));
-            self.view.update(cx, |view, _| view.pill = pill);
+            if let Some(opacity) = self.scrollbar {
+                self.paint_scrollbar(opacity, &snap, bounds, window);
+            }
+            let chip = snap
+                .new_output
+                .then(|| self.paint_chip(bounds, m, window, cx));
+            self.view.update(cx, |view, _| view.chip = chip);
         });
     }
 }
@@ -594,16 +627,39 @@ impl TerminalElement {
         let _ = line.paint(at, m.line_h, window, cx);
     }
 
-    /// Paints "↓ N new lines" at the bottom right; returns its bounds.
-    fn paint_pill(
+    /// Paints the thumb along the right edge, `opacity` faded.
+    fn paint_scrollbar(
         &self,
-        unseen: u64,
+        opacity: f32,
+        snap: &Snapshot,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+    ) {
+        let track = f32::from(bounds.size.height) - 2.0 * INSET;
+        let rows = u16::try_from(snap.rows.len()).unwrap_or(u16::MAX);
+        let Some(t) = thumb(track, snap.history, rows, snap.offset) else {
+            return;
+        };
+        let at = point(
+            bounds.right() - px(INSET + BAR_WIDTH),
+            bounds.top() + px(INSET + t.top),
+        );
+        let color = self.theme.secondary.opacity(opacity);
+        window.paint_quad(
+            fill(Bounds::new(at, size(px(BAR_WIDTH), px(t.height))), color)
+                .corner_radii(px(BAR_WIDTH / 2.0)),
+        );
+    }
+
+    /// Paints "↓ New output" at the bottom middle; returns its bounds.
+    fn paint_chip(
+        &self,
         bounds: Bounds<Pixels>,
         m: Metrics,
         window: &mut Window,
         cx: &mut App,
     ) -> Bounds<Pixels> {
-        let text = format!("↓ {unseen} new line{}", if unseen == 1 { "" } else { "s" });
+        let text = "↓ New output".to_owned();
         let run = TextRun {
             len: text.len(),
             font: self.font.clone(),
@@ -616,19 +672,24 @@ impl TerminalElement {
             window
                 .text_system()
                 .shape_line(SharedString::from(text), self.font_size, &[run], None);
-        let pad = m.cell_w;
-        let pill_size = size(line.width + pad * 2.0, m.line_h * 1.5);
-        let pill = Bounds::new(
+        let pad = m.cell_w * 1.5;
+        let chip_size = size(line.width + pad * 2.0, m.line_h * 1.5);
+        let chip = Bounds::new(
             point(
-                bounds.right() - pill_size.width - pad,
-                bounds.bottom() - pill_size.height - m.line_h * 0.5,
+                bounds.center().x - chip_size.width / 2.0,
+                bounds.bottom() - chip_size.height - m.line_h * 0.5,
             ),
-            pill_size,
+            chip_size,
         );
-        window.paint_quad(fill(pill, self.theme.raised).corner_radii(pill_size.height / 2.0));
-        let text_at = point(pill.origin.x + pad, pill.origin.y + m.line_h * 0.25);
+        window.paint_quad(
+            fill(chip, self.theme.raised)
+                .corner_radii(chip_size.height / 2.0)
+                .border_widths(px(1.0))
+                .border_color(self.theme.border),
+        );
+        let text_at = point(chip.origin.x + pad, chip.origin.y + m.line_h * 0.25);
         let _ = line.paint(text_at, m.line_h, window, cx);
-        pill
+        chip
     }
 
     /// Routes this frame's mouse events to the view: presses and the wheel

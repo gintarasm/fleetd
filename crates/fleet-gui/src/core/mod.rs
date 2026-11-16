@@ -2,6 +2,8 @@
 
 pub mod backoff;
 pub mod config;
+pub mod ended;
+pub mod find;
 pub mod fuzzy;
 pub mod icons;
 pub mod keys;
@@ -14,6 +16,7 @@ pub mod palette;
 pub mod pane;
 mod pane_link;
 pub mod picker;
+pub mod scroll_feedback;
 pub mod scrollback;
 pub mod selection;
 pub mod session;
@@ -23,6 +26,7 @@ pub mod spawn;
 pub mod state;
 pub mod status_menu;
 pub mod style;
+pub mod switcher;
 pub mod target;
 pub mod text_edit;
 pub mod theme;
