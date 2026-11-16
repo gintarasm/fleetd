@@ -22,6 +22,7 @@ pub mod spawn;
 pub mod state;
 pub mod status_menu;
 pub mod style;
+pub mod switcher;
 pub mod target;
 pub mod text_edit;
 pub mod theme;

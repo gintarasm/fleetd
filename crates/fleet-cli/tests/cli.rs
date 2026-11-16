@@ -279,17 +279,34 @@ impl PtyAttach {
         self.rx = Some(rx);
     }
 
+    /// Waits up to 10 s for `needle` in the output. The deadline holds even
+    /// while output keeps coming (`recv_timeout` with nothing left still
+    /// returns a ready chunk), and only new bytes are searched, so a
+    /// never-ending stream cannot keep this busy.
     fn until(&mut self, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         let rx = self.rx.as_ref().unwrap();
-        while !String::from_utf8_lossy(&self.seen).contains(needle) {
+        let needle_bytes = needle.as_bytes();
+        let mut from = 0;
+        loop {
+            if self.seen[from..]
+                .windows(needle_bytes.len())
+                .any(|w| w == needle_bytes)
+            {
+                return;
+            }
+            from = self.seen.len().saturating_sub(needle_bytes.len() - 1);
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
-                Ok(chunk) => self.seen.extend(chunk),
-                Err(_) => panic!(
-                    "no {needle:?} in {:?}",
-                    String::from_utf8_lossy(&self.seen).into_owned()
-                ),
+                Ok(chunk) if !left.is_zero() => self.seen.extend(chunk),
+                _ => {
+                    let tail = self.seen.len().saturating_sub(2000);
+                    panic!(
+                        "no {needle:?} within 10s in {} bytes of output, ending {:?}",
+                        self.seen.len(),
+                        String::from_utf8_lossy(&self.seen[tail..])
+                    )
+                }
             }
         }
     }
@@ -514,7 +531,27 @@ fn stalled_terminal_gets_lagged_exit_2() {
     let d = Daemon::start();
     let id = d.ok(&["spawn", "--", "yes"]).trim().to_string();
     let mut p = PtyAttach::start(&d, &id, true);
-    std::thread::sleep(Duration::from_secs(3));
+    // The terminal stays stalled until the backlog reaches the daemon and
+    // it drops the subscriber, however long the machine takes to produce
+    // that much output. A fixed pause is not enough under load: once the
+    // terminal reads again, attach keeps up and no lag ever comes.
+    let log = d.dir.path().join("logs").join("fleetd.log");
+    let dropped = format!("agent={id} conn=");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text
+            .lines()
+            .any(|l| l.contains("subscriber dropped: its queue is full") && l.contains(&dropped))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon did not drop the stalled subscriber within 20s; log:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     p.drain();
     p.until(RESTORE);
     assert_eq!(p.exit_code(), 2);

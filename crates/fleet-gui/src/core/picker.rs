@@ -24,6 +24,8 @@ pub struct PickerItem {
     pub keywords: String,
     /// Shown at the row's end (a shortcut like `⇧⌘D`); not matched.
     pub shortcut: Option<String>,
+    /// A dim line under the row (an agent's last output); not matched.
+    pub preview: String,
 }
 
 /// A row that matches the query, with where it matched.
