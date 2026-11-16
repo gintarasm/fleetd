@@ -34,6 +34,7 @@ actions!(
         Cut,
         Undo,
         Redo,
+        OpenSettings,
         ReopenClosedPane,
         ShowShortcuts,
         Find,
@@ -108,6 +109,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-z", Undo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-shift-z", Redo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-shift-t", ReopenClosedPane, None),
         KeyBinding::new("cmd-/", ShowShortcuts, None),
     ]);

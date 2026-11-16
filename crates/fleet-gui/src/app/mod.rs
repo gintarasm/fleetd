@@ -16,6 +16,7 @@ mod palette;
 mod pane_view;
 mod picker_view;
 mod resident;
+mod settings_window;
 mod sidebar_view;
 mod split_dividers;
 mod status_item;
@@ -39,6 +40,7 @@ pub use connect::{
 pub use keymap::{CommandPalette, bind_keys, to_key};
 pub use pane_view::{InputSink, PaneChrome, PaneView, grid_size};
 pub use picker_view::{PickerEvent, PickerView};
+pub use settings_window::{SettingsWindow, TextSetting, open_settings, settings_window};
 pub use terminal_element::TerminalElement;
 pub use theme::Theme;
 pub use workspace::{Workspace, open_main_window};
@@ -79,10 +81,14 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
         cx.on_action(|_: &keymap::Quit, cx| cx.quit());
         cx.on_action(|_: &keymap::SwitchFleetd, cx| switch_fleetd(cx));
         cx.on_action(|_: &keymap::InstallSkill, cx| resident::install_agent_skill(cx));
+        cx.on_action(|_: &keymap::OpenSettings, cx| open_settings(cx));
+        // `[gui] theme` before any window draws (the themes then follow).
+        native::set_app_appearance(config.theme);
         cx.set_menus(vec![
             Menu {
                 name: "fleet".into(),
                 items: vec![
+                    MenuItem::action("Settings…", keymap::OpenSettings),
                     MenuItem::action("Command Palette…", keymap::CommandPalette),
                     MenuItem::separator(),
                     MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),

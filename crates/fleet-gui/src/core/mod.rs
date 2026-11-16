@@ -21,6 +21,7 @@ pub mod scroll_feedback;
 pub mod scrollback;
 pub mod selection;
 pub mod session;
+pub mod settings;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod spawn;

@@ -173,6 +173,27 @@ impl Tokens {
         }
     }
 
+    /// These tokens with the window tint at `[gui] window_opacity` `a`
+    /// (kept within the range text stays readable in). The setting scales
+    /// each theme's own transparency: at the default the tint is the
+    /// theme's (0.84 dark, 0.94 light), at 1 it is opaque. Light's text
+    /// needs at least its own tint for WCAG AA (#47), so there the setting
+    /// only ever makes the window more opaque.
+    pub fn with_window_opacity(self, a: f32) -> Tokens {
+        use super::settings::{DEFAULT_OPACITY, OPACITY_MAX, OPACITY_MIN};
+        let a = a.clamp(OPACITY_MIN, OPACITY_MAX);
+        let scale = (1.0 - self.window.a) / (1.0 - DEFAULT_OPACITY);
+        let scaled = 1.0 - (1.0 - a) * scale;
+        let a = match self.appearance {
+            Appearance::Light => scaled.max(self.window.a),
+            Appearance::Dark => scaled,
+        };
+        Tokens {
+            window: Rgba { a, ..self.window },
+            ..self
+        }
+    }
+
     /// These tokens for an opaque window (Reduce Transparency is on): the
     /// window tint as it looks over a plain backdrop, and the cards and
     /// sheets as they look over that.
@@ -538,6 +559,31 @@ mod tests {
             // Only the surfaces change.
             assert_eq!(o.text, t.text);
             assert_eq!(o.palette, t.palette);
+        }
+    }
+
+    #[test]
+    fn text_stays_readable_across_the_window_opacity_range() {
+        use crate::core::settings::{DEFAULT_OPACITY, OPACITY_MAX, OPACITY_MIN};
+        for t in [Tokens::dark(), Tokens::light()] {
+            for a in [OPACITY_MIN, DEFAULT_OPACITY, OPACITY_MAX] {
+                check(&t.with_window_opacity(a));
+            }
+            assert_eq!(t.with_window_opacity(DEFAULT_OPACITY), t);
+            assert_eq!(t.with_window_opacity(OPACITY_MAX).window.a, 1.0);
+            assert_eq!(
+                t.with_window_opacity(0.1),
+                t.with_window_opacity(OPACITY_MIN)
+            );
+        }
+        // Dark follows the setting as is.
+        assert_eq!(
+            Tokens::dark().with_window_opacity(OPACITY_MIN).window.a,
+            OPACITY_MIN
+        );
+        // Light keeps WCAG AA over the whole range (#47).
+        for a in [OPACITY_MIN, DEFAULT_OPACITY, OPACITY_MAX] {
+            check_light_aa(&Tokens::light().with_window_opacity(a));
         }
     }
 
