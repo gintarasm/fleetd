@@ -3,36 +3,59 @@
 
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fleet_term::CursorShape;
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyWindowHandle, Bounds, BoxShadow, ClipboardItem, Context, EventEmitter, FocusHandle, Font,
-    InteractiveElement, IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    UTF16Selection, Window, div, point, px, size,
+    Animation, AnimationExt, AnyView, AnyWindowHandle, AppContext, Bounds, BoxShadow,
+    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Font, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection,
+    Window, div, point, px, size,
 };
 
-use super::controls;
+use super::agent_mark::{self, agent_color};
+use super::controls::{self, ButtonKind};
+use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
-use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
+use super::keymap::{Copy, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
+use super::native;
+use super::status_dot::status_dot;
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
-use super::theme::{Typography, current as theme};
+use super::text_field::TextField;
+use super::theme::{Theme, Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::feedback::{self, Tween};
+use crate::core::find::status_label;
 use crate::core::icons::Icon;
+use crate::core::identity::agent_colour;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
+use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
 use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
 use crate::core::pane::{PaneModel, PaneState, ViewRow};
+use crate::core::scroll_feedback::{
+    Fade, HIT_WIDTH, INSET, Thumb, Wake, end_jumps_to_bottom, offset_for_thumb, thumb,
+};
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
+use crate::core::shortcuts::{EmptyPane, HINT, empty_pane};
+use crate::core::status::AgentStatus;
 use crate::core::style::{self, radius, space, text};
 
 /// At most this many lines are scrolled (or reported) per wheel event.
 const MAX_WHEEL_LINES: f32 = 100.0;
+
+/// History lines a find step scans, off the UI thread, holding the pane's
+/// model lock (about a millisecond; ADR 0053).
+const FIND_STEP_LINES: usize = 2000;
+
+/// Width of the find bar's text field.
+const FIND_FIELD_WIDTH: f32 = 180.0;
 
 /// Where the pane's input goes: the [`Session`], or a recording fake in
 /// tests.
@@ -109,6 +132,8 @@ pub fn grid_size(bounds_w: f32, bounds_h: f32, cell_w: f32, line_h: f32) -> (u16
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GridLayout {
     pub origin: Point<Pixels>,
+    /// The element's size (the grid plus what is left over at its edges).
+    pub size: Size<Pixels>,
     pub cell_w: Pixels,
     pub line_h: Pixels,
     pub cols: u16,
@@ -122,6 +147,8 @@ enum Drag {
     Select,
     /// Reported to the agent; `at` is the cell last reported.
     Report { button: MouseButton, at: (u16, u16) },
+    /// Dragging the scrollbar's thumb, held `grab` points below its top.
+    Thumb { grab: f32 },
 }
 
 /// What the workspace tells a pane about itself, for its header and
@@ -148,6 +175,38 @@ pub struct PaneChrome {
     pub focused: bool,
     /// The pane fills the window (its button offers Restore).
     pub maximized: bool,
+    /// Focus mode dims this pane while it lacks focus.
+    pub dims: bool,
+    /// The agent's status (ADR 0042); none for a shell or no agent.
+    pub status: Option<AgentStatus>,
+    /// The agent list arrived and is empty: an empty pane welcomes.
+    pub no_agents: bool,
+    /// How long the ended agent ran, if known (the summary bar).
+    pub run_time: Option<Duration>,
+    /// The agent the layout puts here: its colour marks the header icon
+    /// and the focus ring (ADR 0064).
+    pub agent: Option<u64>,
+    /// `[gui] agent_emoji`: the agent's emoji replaces the header icon.
+    pub agent_emoji: bool,
+}
+
+/// The focus ring's colour at full strength: the agent's colour, else the
+/// accent.
+pub fn focus_ring(chrome: &PaneChrome, theme: &Theme) -> Hsla {
+    match chrome.agent {
+        Some(id) => agent_color(id, theme),
+        None => theme.accent.opacity(0.55),
+    }
+}
+
+/// The header's terminal icon: in the agent's colour, focused or not, so
+/// every pane names its agent; without one, the accent when focused.
+pub fn header_icon_color(chrome: &PaneChrome, theme: &Theme) -> Hsla {
+    match (chrome.agent, chrome.focused) {
+        (Some(id), _) => agent_color(id, theme),
+        (None, true) => theme.accent,
+        (None, false) => theme.tertiary,
+    }
 }
 
 /// The line drawn over the grid, if any.
@@ -162,25 +221,29 @@ pub fn banner(chrome: &PaneChrome, state: PaneState) -> Option<String> {
     match state {
         PaneState::Disconnected => Some(disconnected()),
         _ if !chrome.has_agent => None,
-        PaneState::Exited(code) => Some(format!("exited ({code})")),
         PaneState::Attaching => Some("attaching…".to_owned()),
-        PaneState::Lost => Some("the agent is gone".to_owned()),
-        PaneState::Live => None,
+        // The summary bar at the bottom says how it ended.
+        PaneState::Exited(_) | PaneState::Lost | PaneState::Live => None,
     }
 }
 
-/// The exit banner offers Restart (as ⌘R does): the pane's agent exited
+/// The summary bar offers Restart (as ⌘R does): the pane's agent exited
 /// or is gone.
 pub fn restartable(chrome: &PaneChrome, state: PaneState) -> bool {
     chrome.has_agent && matches!(state, PaneState::Exited(_) | PaneState::Lost)
 }
 
-/// The text centred in a pane with no agent.
+/// What a pane with no agent shows.
+pub fn empty_state(chrome: &PaneChrome) -> EmptyPane {
+    empty_pane(chrome.has_agent, chrome.starting, chrome.no_agents)
+}
+
+/// The text centred in a pane with no agent (not the welcome).
 pub fn empty_message(chrome: &PaneChrome) -> Option<&'static str> {
-    match (chrome.has_agent, chrome.starting) {
-        (true, _) => None,
-        (false, true) => Some("starting…"),
-        (false, false) => Some("Select an agent or press ⌘N"),
+    match empty_state(chrome) {
+        EmptyPane::Starting => Some("starting…"),
+        EmptyPane::Hint => Some(HINT),
+        EmptyPane::None | EmptyPane::Welcome => None,
     }
 }
 
@@ -203,6 +266,9 @@ pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> (String, St
     (title, chrome.cwd.clone().unwrap_or_default())
 }
 
+/// The pane header's hover group (its agent buttons show on hover).
+const PANE_HEADER_GROUP: &str = "pane-header";
+
 /// A header button, asking the workspace to act on this pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneEvent {
@@ -210,13 +276,22 @@ pub enum PaneEvent {
     SplitDown,
     ToggleMaximize,
     Close,
-    /// The exit banner's Restart: the ended agent again, in this pane.
+    /// The summary bar's Restart: the ended agent again, in this pane.
     Restart,
+    /// The header's Stop: kill the pane's running agent (after asking).
+    Kill,
+    /// Remove, in the header or the summary bar: forgets the ended agent.
+    Remove,
     /// A right-click asks for the pane's context menu: on the header, or
     /// on the grid (`on_grid`) while the agent does not take the mouse.
     ContextMenu {
         on_grid: bool,
     },
+    /// The first-run welcome's buttons.
+    NewAgent,
+    NewTerminal,
+    InstallSkill,
+    ShowShortcuts,
 }
 
 impl EventEmitter<PaneEvent> for PaneView {}
@@ -237,11 +312,34 @@ pub struct PaneView {
     drag: Option<Drag>,
     /// Wheel movement not yet scrolled, in lines (positive up).
     wheel_lines: f32,
-    /// Where the "new lines" pill was last drawn, if it was.
-    pub(crate) pill: Option<Bounds<Pixels>>,
+    /// Where the "New output" chip was last drawn, if it was.
+    pub(crate) chip: Option<Bounds<Pixels>>,
+    /// The overlay scrollbar's fade.
+    pub(crate) fade: Fade,
+    /// Reduce Motion, read when the scrollbar starts showing.
+    fade_reduce_motion: bool,
+    /// The scrollbar drew in the last render (it takes presses then).
+    scrollbar_shown: bool,
+    /// The redraw that ends the scrollbar's hold, and when it is due.
+    fade_timer: Option<(Instant, Task<()>)>,
+    /// Reads Reduce Motion (replaced in tests).
+    pub(crate) reduce_motion: fn() -> bool,
     /// The window whose activation the cursor follows, and that
     /// subscription (renewed when the view moves to a new window).
     activation: Option<(AnyWindowHandle, Subscription)>,
+    /// The focus ring's (and the dim veil's) cross-fade since focus last
+    /// moved to or from this pane.
+    focus_fade: Option<Tween>,
+    /// When the selection was last copied, while "Copied" shows, and the
+    /// timer that hides it.
+    copied: Option<(Instant, Task<()>)>,
+    /// What to start here, while the pane a split opened is empty (the
+    /// split chooser); drawn in place of [`empty_message`].
+    chooser: Option<AnyView>,
+    /// The bell flash being drawn (its number, so each restarts the fade),
+    /// and the task that ends it.
+    flash: Option<(u32, Task<()>)>,
+    flashes: u32,
     /// `[gui] editor`, for ⌘-clicked files.
     pub(crate) editor: String,
     /// The link under the pointer while ⌘ is held: its line and columns.
@@ -249,6 +347,19 @@ pub struct PaneView {
     /// Runs a command that opens a file, and the one to run when that
     /// cannot start (replaced in tests).
     pub(crate) open_file: Arc<dyn Fn(Vec<String>, Vec<String>)>,
+    /// The find bar, while open.
+    find: Option<FindBar>,
+    /// The last query, brought back when find opens again.
+    find_query: String,
+    find_case: bool,
+    /// The search running off the UI thread, while lines are left.
+    find_task: Option<Task<()>>,
+}
+
+/// The find bar's field and its subscription.
+struct FindBar {
+    field: Entity<TextField>,
+    _changes: Subscription,
 }
 
 /// Runs `argv` detached; when it cannot start (an editor not on the app's
@@ -273,6 +384,9 @@ fn spawn_opener(argv: Vec<String>, fallback: Vec<String>) {
     }
 }
 
+/// How long the bell flash lasts.
+const FLASH_MS: u64 = 600;
+
 impl PaneView {
     pub fn new(
         pane: PaneId,
@@ -295,12 +409,174 @@ impl PaneView {
             layout: None,
             drag: None,
             wheel_lines: 0.0,
-            pill: None,
+            chip: None,
+            fade: Fade::default(),
+            fade_reduce_motion: false,
+            scrollbar_shown: false,
+            fade_timer: None,
+            reduce_motion: native::reduce_motion,
             activation: None,
+            focus_fade: None,
+            copied: None,
+            flash: None,
+            flashes: 0,
             editor: config.editor.clone(),
             hover: None,
             open_file: Arc::new(spawn_opener),
+            find: None,
+            find_query: String::new(),
+            find_case: false,
+            find_task: None,
+            chooser: None,
         }
+    }
+
+    /// Draws `chooser` while the pane has no agent (or no longer).
+    pub fn set_chooser(&mut self, chooser: Option<AnyView>, cx: &mut Context<Self>) {
+        if self.chooser.as_ref().map(AnyView::entity_id) != chooser.as_ref().map(AnyView::entity_id)
+        {
+            self.chooser = chooser;
+            cx.notify();
+        }
+    }
+
+    /// The agent rang the bell: the card's border flashes (fading out,
+    /// or shown and then removed under Reduce Motion).
+    pub fn flash(&mut self, cx: &mut Context<Self>) {
+        self.flashes = self.flashes.wrapping_add(1);
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FLASH_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.flash = None;
+                cx.notify();
+            });
+        });
+        self.flash = Some((self.flashes, task));
+        cx.notify();
+    }
+
+    /// A bell flash is being drawn.
+    pub fn flashing(&self) -> bool {
+        self.flash.is_some()
+    }
+
+    /// ⌘F: opens the find bar (or focuses it) with the last query
+    /// selected.
+    fn open_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            let query = self.find_query.clone();
+            let field = cx.new(|cx| TextField::new(query, "Find", cx));
+            let changes = cx.observe(&field, |v, field, cx| {
+                let text = field.read(cx).text();
+                if text != v.find_query {
+                    v.find_query = text.to_owned();
+                    v.search(cx);
+                }
+            });
+            self.find = Some(FindBar {
+                field,
+                _changes: changes,
+            });
+            self.search(cx);
+        }
+        if let Some(bar) = &self.find {
+            bar.field.update(cx, |f, cx| f.select_all_text(cx));
+            window.focus(&bar.field.read(cx).focus_handle().clone());
+        }
+        cx.notify();
+    }
+
+    /// Starts searching for the find bar's query.
+    fn search(&mut self, cx: &mut Context<Self>) {
+        self.model().find_open(&self.find_query, self.find_case);
+        self.find_task = None;
+        self.continue_search(cx);
+        cx.notify();
+    }
+
+    /// Scans what is left to scan in steps on the background executor, each
+    /// under the model lock, redrawing as matches come in. Nothing here
+    /// runs while drawing.
+    fn continue_search(&mut self, cx: &mut Context<Self>) {
+        if self.find_task.is_some() || !self.model().find_pending() {
+            return;
+        }
+        let model = Arc::clone(&self.model);
+        self.find_task = Some(cx.spawn(async move |view, cx| {
+            loop {
+                let m = Arc::clone(&model);
+                let step = cx
+                    .background_executor()
+                    .spawn(async move { lock(&m).find_step(FIND_STEP_LINES) })
+                    .await;
+                let go_on = view.update(cx, |v, cx| {
+                    if step.changed {
+                        cx.notify();
+                    }
+                    if !step.more {
+                        v.find_task = None;
+                        // At the oldest loaded line: page in older history.
+                        v.sink.check_paging(v.pane);
+                    }
+                    step.more
+                });
+                if !matches!(go_on, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The next match up (Enter, ⌘G) or down (⇧Enter, ⌘⇧G).
+    fn step_find(&mut self, up: bool, cx: &mut Context<Self>) {
+        if self.find.is_none() {
+            return;
+        }
+        if self.model().find_next(up) {
+            self.sink.check_paging(self.pane);
+            cx.notify();
+        }
+    }
+
+    fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(true, cx);
+    }
+
+    fn find_previous(&mut self, _: &FindPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_find(false, cx);
+    }
+
+    fn toggle_find_case(&mut self, cx: &mut Context<Self>) {
+        self.find_case = !self.find_case;
+        self.search(cx);
+    }
+
+    /// Esc: closes the find bar; the keys go back to the terminal.
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        self.find_task = None;
+        self.model().find_close();
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn find_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let m = &ev.keystroke.modifiers;
+        match ev.keystroke.key.as_str() {
+            "enter" if !m.platform => self.step_find(!m.shift, cx),
+            "escape" => self.close_find(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    /// The find bar's count, while it is open.
+    pub(crate) fn find_label(&self) -> Option<String> {
+        self.find.as_ref()?;
+        let status = self.model().find_status()?;
+        Some(status_label(status, !self.find_query.is_empty()))
     }
 
     /// The link underlined under the pointer: its line and columns.
@@ -384,6 +660,98 @@ impl PaneView {
         }
     }
 
+    /// The strip along the grid's right edge that the scrollbar takes
+    /// presses in, in window coordinates.
+    pub(crate) fn scrollbar_track(&self) -> Option<Bounds<Pixels>> {
+        let l = self.layout?;
+        let height = l.size.height - px(2.0 * INSET);
+        (height > px(0.)).then(|| {
+            Bounds::new(
+                point(
+                    l.origin.x + l.size.width - px(HIT_WIDTH),
+                    l.origin.y + px(INSET),
+                ),
+                size(px(HIT_WIDTH), height),
+            )
+        })
+    }
+
+    /// The thumb on `track` for the view as it is.
+    fn thumb_on(&self, track: Bounds<Pixels>) -> Option<Thumb> {
+        let model = self.model();
+        let rows = model.terminal().size().1;
+        thumb(
+            f32::from(track.size.height),
+            model.scrollback().len(),
+            rows,
+            model.scroll_offset(),
+        )
+    }
+
+    /// The view scrolled: the scrollbar shows (again) from now.
+    fn show_scrollbar(&mut self) {
+        if !self.fade.is_active() {
+            self.fade_reduce_motion = (self.reduce_motion)();
+        }
+        self.fade.show(Instant::now());
+    }
+
+    /// The scrollbar's opacity this render, scheduling what keeps it
+    /// current: frames while it fades, one timer to the end of its hold,
+    /// nothing once it is gone (or never shown).
+    fn scrollbar_opacity(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<f32> {
+        if !self.fade.is_active() {
+            return None;
+        }
+        let now = Instant::now();
+        let rm = self.fade_reduce_motion;
+        let opacity = self.fade.opacity(now, rm);
+        match self.fade.wake(now, rm) {
+            Wake::Frame => window.request_animation_frame(),
+            Wake::After(d) => {
+                let due = now + d;
+                if self.fade_timer.as_ref().is_none_or(|(at, _)| *at != due) {
+                    let task = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(d).await;
+                        let _ = this.update(cx, |_, cx| cx.notify());
+                    });
+                    self.fade_timer = Some((due, task));
+                }
+            }
+            Wake::Idle => {
+                self.fade.settle(now, rm);
+                self.fade_timer = None;
+            }
+        }
+        (opacity > 0.0).then_some(opacity)
+    }
+
+    /// Moves the view so the dragged thumb's top is `grab` above `y`.
+    fn drag_thumb(&mut self, y: Pixels, grab: f32, cx: &mut Context<Self>) {
+        let Some(track) = self.scrollbar_track() else {
+            return;
+        };
+        let Some(t) = self.thumb_on(track) else {
+            return;
+        };
+        let top = f32::from(y - track.origin.y) - grab;
+        let track_h = f32::from(track.size.height);
+        {
+            let mut model = self.model();
+            let history = model.scrollback().len();
+            model.scroll_to(offset_for_thumb(track_h, t.height, history, top));
+        }
+        self.sink.check_paging(self.pane);
+        cx.notify();
+    }
+
+    /// The pointer let go of the scrollbar: it fades after a new hold.
+    fn release_scrollbar(&mut self, cx: &mut Context<Self>) {
+        self.fade.hold(false);
+        self.show_scrollbar();
+        cx.notify();
+    }
+
     pub fn pane(&self) -> PaneId {
         self.pane
     }
@@ -400,9 +768,32 @@ impl PaneView {
     /// Replaces the header and banner facts; redraws if they changed.
     pub fn set_chrome(&mut self, chrome: PaneChrome, cx: &mut Context<Self>) {
         if self.chrome != chrome {
+            // Focus moved (not the first facts): the ring cross-fades.
+            let moved = self.chrome.number > 0 && self.chrome.focused != chrome.focused;
+            if moved && !controls::reduces_motion(cx) {
+                self.focus_fade = Some(Tween::new(Instant::now(), feedback::FOCUS_FADE_MS));
+            }
             self.chrome = chrome;
             cx.notify();
         }
+    }
+
+    /// Settings changed: the terminal font and Option as Meta follow at
+    /// once (the next layout resizes the grid if the cells changed).
+    pub fn apply_config(&mut self, config: &GuiConfig, cx: &mut Context<Self>) {
+        self.option_as_meta = config.option_as_meta;
+        let font = terminal_font(&config.font_family, cx);
+        let font_size = px(config.font_size);
+        if font != self.font || font_size != self.font_size {
+            self.font = font;
+            self.font_size = font_size;
+            cx.notify();
+        }
+    }
+
+    /// The terminal font size, in points.
+    pub fn font_size(&self) -> f32 {
+        f32::from(self.font_size)
     }
 
     /// The cursor turns hollow when the window loses activation. The view
@@ -448,14 +839,22 @@ impl PaneView {
         }
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // While composing, the IME owns the keys.
-        if self.marked.is_some() {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // While composing, the IME owns the keys; the find field's keys
+        // are its own.
+        if self.marked.is_some() || !self.focus.is_focused(window) {
             return;
         }
         let Some(key) = to_key(&ev.keystroke) else {
             return;
         };
+        let scrolled = self.model().scroll_offset() > 0;
+        if end_jumps_to_bottom(&key, scrolled) {
+            self.model().scroll_to_bottom();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let modes = self.model().terminal().modes();
         // `None`: the key is text; it reaches `replace_text_in_range`.
         if let Some(bytes) = encode_key(&key, &modes, self.option_as_meta) {
@@ -468,7 +867,37 @@ impl PaneView {
         let text = self.model().selection_text();
         if let Some(text) = text.filter(|t| !t.is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+            // "Copied" shows for a moment (one timer, no ticking).
+            let hide = cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(feedback::COPIED_MS))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.copied = None;
+                    cx.notify();
+                });
+            });
+            self.copied = Some((Instant::now(), hide));
+            cx.notify();
         }
+    }
+
+    /// "Copied" is showing.
+    pub fn copied_shown(&self) -> bool {
+        self.copied.is_some()
+    }
+
+    /// How strongly the focus ring is drawn now, 0..=1, and whether it is
+    /// still fading (another frame is due).
+    fn ring(&mut self, now: Instant) -> (f32, bool) {
+        let fade = self.focus_fade.filter(|t| t.running(now));
+        if fade.is_none() {
+            self.focus_fade = None;
+        }
+        (
+            feedback::ring(self.chrome.focused, fade.map(|t| t.value(now))),
+            fade.is_some(),
+        )
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
@@ -499,7 +928,7 @@ impl PaneView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus);
-        if self.pill.is_some_and(|p| p.contains(&ev.position)) {
+        if self.chip.is_some_and(|p| p.contains(&ev.position)) {
             self.drag = None;
             self.model().scroll_to_bottom();
             cx.notify();
@@ -508,6 +937,23 @@ impl PaneView {
         let Some(button) = to_button(ev.button) else {
             return;
         };
+        // A shown scrollbar takes presses on its strip: on the thumb it is
+        // dragged from there, elsewhere the thumb jumps under the pointer.
+        let track = self.scrollbar_track().filter(|t| {
+            self.scrollbar_shown && button == MouseButton::Left && t.contains(&ev.position)
+        });
+        if let Some((track, t)) = track.and_then(|tr| self.thumb_on(tr).map(|t| (tr, t))) {
+            let y = f32::from(ev.position.y - track.origin.y);
+            let on_thumb = y >= t.top && y <= t.top + t.height;
+            let grab = if on_thumb { y - t.top } else { t.height / 2.0 };
+            self.drag = Some(Drag::Thumb { grab });
+            self.fade.hold(true);
+            if !on_thumb {
+                self.drag_thumb(ev.position.y, grab, cx);
+            }
+            cx.notify();
+            return;
+        }
         // ⌘-click on a link opens it, even when the agent reports the mouse.
         let link = (button == MouseButton::Left && ev.modifiers.platform)
             .then(|| self.link_under(ev.position))
@@ -564,15 +1010,41 @@ impl PaneView {
         cx: &mut Context<Self>,
     ) {
         let Some(drag) = self.drag else {
+            // Over a showing scrollbar, it stays.
+            if self.fade.is_active() {
+                let over = self.scrollbar_shown
+                    && self
+                        .scrollbar_track()
+                        .is_some_and(|t| t.contains(&ev.position));
+                if over != self.fade.is_held() {
+                    if over {
+                        self.fade.hold(true);
+                    } else {
+                        self.release_scrollbar(cx);
+                    }
+                }
+            }
             self.update_hover(ev.position, ev.modifiers, cx);
             return;
         };
         let pressed = ev.pressed_button.and_then(to_button);
+        if let Drag::Thumb { grab } = drag {
+            if pressed == Some(MouseButton::Left) {
+                self.drag_thumb(ev.position.y, grab, cx);
+            } else {
+                // The release happened where it was not seen.
+                self.drag = None;
+                self.release_scrollbar(cx);
+            }
+            return;
+        }
         let mut model = lock(&self.model);
         let Some(at) = cell_at(self.layout, &model, ev.position) else {
             return;
         };
         match drag {
+            // Handled above, without the model locked.
+            Drag::Thumb { .. } => {}
             // The release happened where it was not seen.
             Drag::Select if pressed != Some(MouseButton::Left) => self.drag = None,
             Drag::Select => {
@@ -605,6 +1077,11 @@ impl PaneView {
         let Some(drag) = self.drag else {
             return;
         };
+        if let Drag::Thumb { .. } = drag {
+            self.drag = None;
+            self.release_scrollbar(cx);
+            return;
+        }
         let Drag::Report { button, at: last } = drag else {
             self.drag = None;
             return;
@@ -679,6 +1156,7 @@ impl PaneView {
         }
         model.scroll_lines(lines);
         drop(model);
+        self.show_scrollbar();
         self.sink.check_paging(self.pane);
         cx.notify();
     }
@@ -740,14 +1218,41 @@ fn sel_point(model: &PaneModel, (col, row): (u16, u16)) -> SelPoint {
 impl Render for PaneView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_activation(window, cx);
+        // New output while find is open: scan it (off the UI thread).
+        if self.find.is_some() {
+            self.continue_search(cx);
+        }
         let theme = theme(cx);
         let focused = window.is_window_active() && self.focus.is_focused(window);
+        let reduce_motion = controls::reduces_motion(cx);
+        let now = Instant::now();
+        let (ring, fading) = self.ring(now);
+        let dim = feedback::dim_alpha(self.chrome.dims, ring);
+        // "Copied" holds then fades; the selection glows then settles.
+        let (copied_alpha, glow, copy_moving) = match &self.copied {
+            None => (0.0, 0.0, false),
+            Some(_) if reduce_motion => (1.0, 0.0, false),
+            Some((at, _)) => {
+                let flash = Tween::new(*at, feedback::COPIED_MS);
+                let glow = Tween::new(*at, feedback::GLOW_MS);
+                (
+                    feedback::flash_alpha(flash.progress(now)),
+                    feedback::glow(glow.value(now)),
+                    flash.running(now),
+                )
+            }
+        };
+        if fading || copy_moving {
+            window.request_animation_frame();
+        }
         let (state, title, observing) = {
             let model = self.model();
             let state = model.state();
             let observing = state == PaneState::Live && !model.is_primary();
             (state, model.title(), observing)
         };
+        let scrollbar = self.scrollbar_opacity(window, cx);
+        self.scrollbar_shown = scrollbar.is_some();
         let element = TerminalElement {
             view: cx.entity(),
             pane: self.pane,
@@ -760,7 +1265,9 @@ impl Render for PaneView {
             focused,
             show_cursor: draws_cursor(&self.chrome, state),
             marked: self.marked.clone(),
+            selection_glow: glow,
             link: self.hover,
+            scrollbar,
         };
         let chrome = &self.chrome;
         let (title_text, path) = header_parts(chrome, title.as_deref());
@@ -769,8 +1276,34 @@ impl Render for PaneView {
                 .debug_selector(move || format!("pane-{}-{id}", chrome.number))
                 .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
         };
+        // Stop for a running agent, Restart and Remove for an ended one:
+        // always on the focused pane, on hover on the others.
+        let ended = chrome.agent_ended || restartable(chrome, state);
+        let agent_buttons = match agent_buttons(chrome.has_agent, ended) {
+            AgentButtons::None => Vec::new(),
+            AgentButtons::Stop => vec![("stop", Icon::Stop, PaneEvent::Kill)],
+            // Restart once the pane holds the final screen (as ⌘R).
+            AgentButtons::RestartRemove => restartable(chrome, state)
+                .then_some(("restart-agent", Icon::Restart, PaneEvent::Restart))
+                .into_iter()
+                .chain([("remove", Icon::Trash, PaneEvent::Remove)])
+                .collect(),
+        };
+        let agent_buttons = (!agent_buttons.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .children(agent_buttons.into_iter().map(|(id, icon, event)| {
+                    icon_button(id, icon, event).when(!chrome.focused, |b| {
+                        b.invisible()
+                            .group_hover(PANE_HEADER_GROUP, |s| s.visible())
+                    })
+                }))
+        });
         let header = div()
             .id("pane-header")
+            .group(PANE_HEADER_GROUP)
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ContextMenu { on_grid: false })),
@@ -784,10 +1317,28 @@ impl Render for PaneView {
             .items_center()
             .gap(px(space::SM - space::XXS))
             .type_style(text::CALLOUT)
-            .child(icons::icon(Icon::Terminal).text_color(if chrome.focused {
-                theme.accent
-            } else {
-                theme.tertiary
+            .child({
+                let number = chrome.number;
+                match chrome.agent.filter(|_| chrome.agent_emoji) {
+                    Some(id) => agent_mark::emoji(id)
+                        .debug_selector(move || format!("pane-{number}-identity-emoji"))
+                        .into_any_element(),
+                    None => {
+                        let name = chrome.agent.map(|id| agent_colour(id).name);
+                        icons::icon(Icon::Terminal)
+                            .text_color(header_icon_color(chrome, &theme))
+                            .debug_selector(move || match name {
+                                Some(name) => format!("pane-{number}-identity-{name}"),
+                                None => format!("pane-{number}-icon"),
+                            })
+                            .into_any_element()
+                    }
+                }
+            })
+            .children(chrome.status.map(|s| {
+                let number = chrome.number;
+                status_dot(s, &theme, unix_ms(), (self.reduce_motion)())
+                    .debug_selector(move || format!("pane-{number}-status-{}", s.label()))
             }))
             .child(
                 div()
@@ -841,6 +1392,7 @@ impl Render for PaneView {
                     .text_color(theme.tertiary)
                     .child(SharedString::from(format!("⌘{}", chrome.number)))
             }))
+            .children(agent_buttons)
             .child(icon_button(
                 "split-right",
                 Icon::SplitRight,
@@ -869,44 +1421,87 @@ impl Render for PaneView {
             .mb(px(space::SM - space::XXS))
             .overflow_hidden()
             .child(element);
-        if let Some(text) = banner(chrome, state) {
+        let find_bar = self.find.as_ref().map(|bar| {
             let number = chrome.number;
-            let restart = restartable(chrome, state).then(|| {
-                div()
-                    .id("restart")
-                    .debug_selector(move || format!("pane-{number}-restart"))
-                    .px(px(space::SM))
-                    .py(px(space::XXS))
-                    .rounded(px(radius::SM))
-                    .bg(theme.accent)
-                    .text_color(gpui::white())
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .active(|s| s.opacity(0.8))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::XS))
-                    .child(icons::sized(Icon::Restart, 12.0).text_color(gpui::white()))
-                    .child("Restart")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Restart)))
-            });
+            let label = self.find_label().unwrap_or_default();
+            let case_on = self.find_case;
+            let step = |id: &'static str, icon: Icon, up: bool| {
+                controls::icon_button(id, icon, &theme, true)
+                    .debug_selector(move || format!("pane-{number}-{id}"))
+                    .on_click(cx.listener(move |v, _, _, cx| v.step_find(up, cx)))
+            };
+            div()
+                .id("find")
+                .debug_selector(move || format!("pane-{number}-find"))
+                .occlude()
+                .on_key_down(cx.listener(Self::find_key_down))
+                .absolute()
+                .top(px(space::XS))
+                .right(px(space::XS))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::XS))
+                .p(px(space::XS))
+                .rounded(px(radius::MD))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.raised)
+                .shadow_md()
+                .type_style(text::CALLOUT)
+                .child(div().w(px(FIND_FIELD_WIDTH)).child(bar.field.clone()))
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(space::XL * 3.0))
+                        .text_color(theme.secondary)
+                        .whitespace_nowrap()
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .id("find-case")
+                        .debug_selector(move || format!("pane-{number}-find-case"))
+                        .flex_none()
+                        .px(px(space::XS))
+                        .rounded(px(radius::SM))
+                        .bg(if case_on {
+                            theme.selected
+                        } else {
+                            gpui::transparent_black()
+                        })
+                        .text_color(if case_on { theme.text } else { theme.tertiary })
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(theme.hover))
+                        .child("Aa")
+                        .on_click(cx.listener(|v, _, _, cx| v.toggle_find_case(cx))),
+                )
+                .child(step("find-up", Icon::ChevronUp, true))
+                .child(step("find-down", Icon::ChevronDown, false))
+                .child(
+                    controls::icon_button("find-close", Icon::Close, &theme, true)
+                        .debug_selector(move || format!("pane-{number}-find-close"))
+                        .on_click(cx.listener(|v, _, window, cx| v.close_find(window, cx))),
+                )
+        });
+        let find_open = find_bar.is_some();
+        if let Some(text) = banner(chrome, state) {
+            // Below the find bar when that is open.
+            let top = if find_open {
+                space::XS * 4.0 + style::chrome::CONTROL_HEIGHT + space::SM
+            } else {
+                space::XS
+            };
             grid = grid.child(
                 div()
                     .absolute()
-                    .top(px(space::XS))
+                    .top(px(top))
                     .right(px(space::XS))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(space::SM))
-                    .pl(px(space::MD))
-                    .pr(px(if restart.is_some() {
-                        space::XS
-                    } else {
-                        space::MD
-                    }))
+                    .px(px(space::MD))
                     .py(px(space::XS))
                     .rounded(px(radius::MD))
                     .border_1()
@@ -915,11 +1510,43 @@ impl Render for PaneView {
                     .shadow_md()
                     .text_color(theme.text)
                     .type_style(text::CALLOUT)
-                    .child(SharedString::from(text))
-                    .children(restart),
+                    .child(SharedString::from(text)),
             );
         }
-        if let Some(text) = empty_message(chrome) {
+        if self.copied.is_some() {
+            let number = chrome.number;
+            grid = grid.child(
+                div()
+                    .absolute()
+                    .top(px(space::XS))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .debug_selector(move || format!("pane-{number}-copied"))
+                            .px(px(space::SM))
+                            .py(px(space::XXS))
+                            .rounded(px(radius::MD))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.raised)
+                            .shadow_md()
+                            .text_color(theme.text)
+                            .type_style(text::CALLOUT)
+                            .opacity(copied_alpha)
+                            .child("Copied"),
+                    ),
+            );
+        }
+        let chooser = self.chooser.clone().filter(|_| !chrome.has_agent);
+        if chooser.is_none() && empty_state(chrome) == EmptyPane::Welcome {
+            grid = grid.child(welcome(&theme, cx));
+        }
+        if let Some(chooser) = chooser {
+            grid = grid.child(chooser);
+        } else if let Some(text) = empty_message(chrome) {
             grid = grid.child(
                 div()
                     .absolute()
@@ -932,6 +1559,7 @@ impl Render for PaneView {
                     .child(text),
             );
         }
+        grid = grid.children(find_bar);
         div()
             .key_context(TERMINAL_CONTEXT)
             .track_focus(&self.focus)
@@ -943,6 +1571,9 @@ impl Render for PaneView {
             }))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::open_find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
             .size_full()
             .flex()
             .flex_col()
@@ -956,15 +1587,57 @@ impl Render for PaneView {
                 spread_radius: px(0.),
             }])
             .border_1()
-            .border_color(if chrome.focused {
-                theme.accent.opacity(0.55)
-            } else {
-                theme.border
-            })
+            .border_color(ring_color(&theme, focus_ring(chrome, &theme), ring))
             .bg(theme.card)
+            .relative()
             .child(header)
             .child(grid)
+            .children(self.flash.as_ref().map(|(n, _)| {
+                let ring = div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(radius::LG))
+                    .border_2()
+                    .border_color(theme.warning);
+                if (self.reduce_motion)() {
+                    ring.into_any_element()
+                } else {
+                    ring.with_animation(
+                        ("bell-flash", *n),
+                        Animation::new(Duration::from_millis(FLASH_MS)),
+                        |el, t| el.opacity(1.0 - t),
+                    )
+                    .into_any_element()
+                }
+            }))
+            .children(ended_bar(self, state, &theme, cx))
+            .children((dim > 0.0).then(|| {
+                // The veil only draws: clicks and keys go to the pane.
+                div()
+                    .debug_selector(move || format!("pane-{}-dim", chrome.number))
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.window.opacity(dim))
+            }))
     }
+}
+
+/// The card's border at focus-ring strength `ring`: the plain border at
+/// 0, the focus ring (`lit`) at 1, cross-faded between.
+fn ring_color(theme: &super::theme::Theme, lit: Hsla, ring: f32) -> Hsla {
+    if ring >= 1.0 {
+        lit
+    } else if ring <= 0.0 {
+        theme.border
+    } else {
+        theme.border.blend(lit.opacity(ring))
+    }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn utf16_len(s: &str) -> usize {
@@ -1074,6 +1747,76 @@ impl gpui::EntityInputHandler for PaneView {
     }
 }
 
+/// The first-run welcome (no agents yet): New agent, Terminal, Install
+/// agent skill and the shortcuts, centred in the empty pane.
+fn welcome(theme: &Theme, cx: &mut Context<PaneView>) -> impl IntoElement {
+    let button = |id: &'static str, label: &'static str, kind, event: PaneEvent| {
+        controls::button(id, label, theme, kind, true)
+            .debug_selector(move || format!("welcome-{id}"))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
+    };
+    let new_agent = button(
+        "new-agent",
+        "New Agent  ⌘N",
+        ButtonKind::Primary,
+        PaneEvent::NewAgent,
+    );
+    let terminal = button(
+        "terminal",
+        "Terminal  ⌘T",
+        ButtonKind::Secondary,
+        PaneEvent::NewTerminal,
+    );
+    let skill = button(
+        "install-skill",
+        "Install Agent Skill",
+        ButtonKind::Secondary,
+        PaneEvent::InstallSkill,
+    );
+    let shortcuts = div()
+        .id("shortcuts")
+        .debug_selector(|| "welcome-shortcuts".to_owned())
+        .type_style(text::CALLOUT)
+        .text_color(theme.accent)
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.8))
+        .child("Keyboard shortcuts  ⌘/")
+        .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ShowShortcuts)));
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("welcome")
+                .debug_selector(|| "welcome".to_owned())
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(space::MD))
+                .text_color(theme.text)
+                .child(div().type_style(text::TITLE).child("Welcome to fleet"))
+                .child(
+                    div()
+                        .type_style(text::BODY)
+                        .text_color(theme.secondary)
+                        .child("Start an agent, or a plain shell, to get going."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(space::SM))
+                        .child(new_agent)
+                        .child(terminal)
+                        .child(skill),
+                )
+                .child(shortcuts),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -1089,9 +1832,10 @@ mod tests {
         header_parts, ime_cell, point_to_cell,
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
+    use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
-    use crate::core::pane::PaneModel;
     use crate::core::pane::PaneState;
+    use crate::core::pane::{PaneModel, ViewRow};
     use crate::core::selection::{LineRef, SelPoint};
     use crate::core::session::PaneId;
     use fleet_proto::AttachOk;
@@ -1287,6 +2031,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn copying_flashes_copied_for_a_moment(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"hello world");
+        let (view, _sink, cx) = pane(cx, model);
+        // Nothing selected: nothing copied, nothing shown.
+        cx.dispatch_action(Copy);
+        assert!(!view.read_with(cx, |v, _| v.copied_shown()));
+        let (from, to) = (cell(&view, cx, 0, 0), cell(&view, cx, 4, 0));
+        drag(cx, from, to, Modifiers::none());
+        cx.dispatch_action(Copy);
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.copied_shown()));
+        assert!(
+            cx.debug_bounds("pane-0-copied").is_some(),
+            "Copied is drawn"
+        );
+        cx.executor()
+            .advance_clock(Duration::from_millis(crate::core::feedback::COPIED_MS));
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |v, _| v.copied_shown()),
+            "and goes by itself"
+        );
+        assert!(cx.debug_bounds("pane-0-copied").is_none());
+    }
+
+    #[gpui::test]
     fn drag_selects_across_history_and_grid(cx: &mut TestAppContext) {
         let mut model = model_with_history(50);
         model.on_output(b"\x1b[1;1Hgrid top");
@@ -1461,22 +2232,142 @@ mod tests {
     }
 
     #[gpui::test]
-    fn new_lines_pill_shows_while_scrolled_up_and_returns_to_bottom(cx: &mut TestAppContext) {
+    fn new_output_chip_shows_while_scrolled_up_and_returns_to_bottom(cx: &mut TestAppContext) {
         let (view, _sink, cx) = pane(cx, model_with_history(50));
         let at = cell(&view, cx, 0, 0);
         wheel(cx, at, ScrollDelta::Lines(point(0.0, 5.0)));
-        assert_eq!(view.read_with(cx, |v, _| v.pill), None);
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
+        // A redraw in place is no new output.
+        view.update(cx, |v, cx| {
+            v.model().on_output(b"\rspinning");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
         view.update(cx, |v, cx| {
             v.model().on_output(b"\r\nx\r\ny");
             cx.notify();
         });
         cx.run_until_parked();
-        let pill = view.read_with(cx, |v, _| v.pill).expect("pill shown");
+        let chip = view.read_with(cx, |v, _| v.chip).expect("chip shown");
         assert_eq!(offset(&view, cx), 7);
-        cx.simulate_click(pill.center(), Modifiers::none());
+        cx.simulate_click(chip.center(), Modifiers::none());
         assert_eq!(offset(&view, cx), 0);
-        assert_eq!(view.read_with(cx, |v, _| v.pill), None);
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
         assert_eq!(selected(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn end_returns_a_scrolled_up_view_to_the_bottom(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_history(50));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 5.0)));
+        view.update(cx, |v, cx| {
+            v.model().on_output(b"\r\nx");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.chip.is_some()));
+        cx.simulate_keystrokes("end");
+        assert_eq!(offset(&view, cx), 0);
+        assert!(sink.take().is_empty(), "End stays in the GUI");
+        cx.run_until_parked();
+        assert_eq!(view.read_with(cx, |v, _| v.chip), None);
+        // At the bottom, End goes to the agent.
+        cx.simulate_keystrokes("end");
+        assert_eq!(sink.take(), vec![b"\x1b[F".to_vec()]);
+    }
+
+    /// A pane whose scrollbar shows at once (Reduce Motion: no fade-in).
+    fn pane_without_motion(
+        cx: &mut TestAppContext,
+        model: PaneModel,
+    ) -> (Entity<PaneView>, Arc<Recorder>, &mut VisualTestContext) {
+        let (view, sink, cx) = pane(cx, model);
+        view.update(cx, |v, _| v.reduce_motion = || true);
+        (view, sink, cx)
+    }
+
+    #[gpui::test]
+    fn the_scrollbar_shows_only_once_the_view_scrolls(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane_without_motion(cx, model_with_history(50));
+        // Idle: nothing shown, nothing scheduled.
+        view.update(cx, |v, cx| {
+            v.model().on_output(b"\r\nx");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let idle = view.read_with(cx, |v, _| {
+            (
+                v.scrollbar_shown,
+                v.fade.is_active(),
+                v.fade_timer.is_some(),
+            )
+        });
+        assert_eq!(idle, (false, false, false));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 5.0)));
+        cx.run_until_parked();
+        let shown = view.read_with(cx, |v, _| (v.scrollbar_shown, v.fade_timer.is_some()));
+        assert_eq!(shown, (true, true), "shown, one timer to fade it");
+    }
+
+    #[gpui::test]
+    fn dragging_the_thumb_scrolls_the_view(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane_without_motion(cx, model_with_history(50));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 1.0)));
+        cx.run_until_parked();
+        let track = view
+            .read_with(cx, |v, _| v.scrollbar_track())
+            .expect("laid out");
+        let thumb = view.read_with(cx, |v, _| v.thumb_on(track)).expect("thumb");
+        let grab = point(
+            track.center().x,
+            track.origin.y + px(thumb.top + thumb.height / 2.0),
+        );
+        let top = point(track.center().x, track.origin.y);
+        cx.simulate_mouse_down(grab, MouseButton::Left, Modifiers::none());
+        assert!(view.read_with(cx, |v, _| v.fade.is_held()));
+        cx.simulate_mouse_move(top, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 50, "dragged to the oldest line");
+        let bottom = point(track.center().x, track.bottom() + px(100.0));
+        cx.simulate_mouse_move(bottom, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 0, "dragged back to the live grid");
+        cx.simulate_mouse_up(bottom, MouseButton::Left, Modifiers::none());
+        assert!(!view.read_with(cx, |v, _| v.fade.is_held()));
+        // Nothing was selected or sent, and paging was checked.
+        assert_eq!(selected(&view, cx), None);
+        assert!(sink.take().is_empty());
+        assert!(*sink.paging_checks.lock().unwrap() >= 2);
+    }
+
+    #[gpui::test]
+    fn a_press_on_the_track_jumps_the_thumb_there(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane_without_motion(cx, model_with_history(50));
+        let at = cell(&view, cx, 0, 0);
+        wheel(cx, at, ScrollDelta::Lines(point(0.0, 1.0)));
+        cx.run_until_parked();
+        let track = view
+            .read_with(cx, |v, _| v.scrollbar_track())
+            .expect("laid out");
+        let top = point(track.center().x, track.origin.y + px(1.0));
+        cx.simulate_mouse_down(top, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(top, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 50);
+    }
+
+    #[gpui::test]
+    fn a_hidden_scrollbar_leaves_the_right_edge_to_the_selection(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane_without_motion(cx, model_with_history(50));
+        let track = view
+            .read_with(cx, |v, _| v.scrollbar_track())
+            .expect("laid out");
+        let edge = point(track.center().x, track.origin.y + px(1.0));
+        cx.simulate_mouse_down(edge, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 0);
+        assert!(!view.read_with(cx, |v, _| v.fade.is_held()));
     }
 
     #[gpui::test]
@@ -1632,6 +2523,138 @@ mod tests {
         assert_eq!(marked.as_deref(), Some("に"));
     }
 
+    /// A live 80×24 pane whose history has `needle` on lines 10 and 40.
+    fn model_with_needles() -> PaneModel {
+        let mut model = blank_model();
+        model.on_attached(&AttachOk {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            history_tail: (0..50)
+                .map(|i| match i {
+                    10 | 40 => format!("a Needle {i}"),
+                    _ => format!("h{i}"),
+                })
+                .map(|s| s.into_bytes().into())
+                .collect(),
+            ..Default::default()
+        });
+        model.on_output(b"\x1b[24;1H");
+        model
+    }
+
+    fn find_status(
+        view: &Entity<PaneView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<crate::core::find::FindStatus> {
+        view.read_with(cx, |v, _| v.model().find_status())
+    }
+
+    fn shows_line(view: &Entity<PaneView>, cx: &mut VisualTestContext, line: u64) -> bool {
+        view.read_with(cx, |v, _| {
+            let mut rows = Vec::new();
+            v.model().view_rows(24, &mut rows);
+            rows.contains(&ViewRow::History(line))
+        })
+    }
+
+    #[gpui::test]
+    fn cmd_f_finds_in_history_and_steps_through_matches(cx: &mut TestAppContext) {
+        let (view, sink, cx) = pane(cx, model_with_needles());
+        sink.take();
+        cx.simulate_keystrokes("cmd-f");
+        assert!(cx.debug_bounds("pane-0-find").is_some());
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        // The query went to the find field, not to the agent.
+        assert!(sink.take().is_empty());
+        let status = find_status(&view, cx).unwrap();
+        assert_eq!((status.index, status.count), (Some(2), 2));
+        assert!(shows_line(&view, cx, 40));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.find_label()).as_deref(),
+            Some("2 of 2")
+        );
+
+        // Enter goes up to the older match, Shift-Enter back down.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        assert!(shows_line(&view, cx, 10));
+        cx.simulate_keystrokes("shift-enter");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        cx.simulate_keystrokes("cmd-g");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        cx.simulate_keystrokes("cmd-shift-g");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        assert!(sink.take().is_empty());
+
+        // Case sensitive: "needle" is not "Needle".
+        let case = cx.debug_bounds("pane-0-find-case").unwrap().center();
+        cx.simulate_click(case, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 0);
+        assert_eq!(
+            view.read_with(cx, |v, _| v.find_label()).as_deref(),
+            Some("No matches")
+        );
+        cx.simulate_click(case, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 2);
+
+        // Esc closes it and gives the keys back to the agent.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(find_status(&view, cx), None);
+        assert_eq!(view.read_with(cx, |v, _| v.find_label()), None);
+        assert!(sink.take().is_empty());
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sink.take(), vec![b"\r".to_vec()]);
+
+        // ⌘F again brings the last query back, selected.
+        cx.simulate_keystrokes("cmd-f");
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 2);
+        cx.simulate_input("h4");
+        cx.run_until_parked();
+        // h4, h40..h49 minus the needle on 40.
+        assert_eq!(find_status(&view, cx).unwrap().count, 10);
+    }
+
+    #[gpui::test]
+    fn find_bar_buttons_step_and_close(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_needles());
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        let click = |cx: &mut VisualTestContext, id: &'static str| {
+            let at = cx.debug_bounds(id).unwrap().center();
+            cx.simulate_click(at, Modifiers::none());
+            cx.run_until_parked();
+        };
+        click(cx, "pane-0-find-up");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(1));
+        click(cx, "pane-0-find-down");
+        assert_eq!(find_status(&view, cx).unwrap().index, Some(2));
+        click(cx, "pane-0-find-close");
+        assert_eq!(find_status(&view, cx), None);
+        // The keys go back to the terminal.
+        let focused = cx.update(|window, cx| view.read(cx).focus_handle().is_focused(window));
+        assert!(focused);
+    }
+
+    #[gpui::test]
+    fn find_follows_output_while_open(cx: &mut TestAppContext) {
+        let (view, _sink, cx) = pane(cx, model_with_needles());
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("needle");
+        cx.run_until_parked();
+        let model = view.read_with(cx, |v, _| Arc::clone(v.model_handle()));
+        model.lock().unwrap().on_output(b"\r\nneedle again");
+        // The session notifies the view of output.
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(find_status(&view, cx).unwrap().count, 3);
+    }
+
     #[test]
     fn resize_computes_cols_rows_from_cell_metrics() {
         assert_eq!(grid_size(800.0, 600.0, 8.0, 16.0), (100, 37));
@@ -1661,10 +2684,9 @@ mod tests {
             banner(&shown, PaneState::Attaching).as_deref(),
             Some("attaching…")
         );
-        assert_eq!(
-            banner(&shown, PaneState::Exited(3)).as_deref(),
-            Some("exited (3)")
-        );
+        // The summary bar says how it ended, not a banner.
+        assert_eq!(banner(&shown, PaneState::Exited(3)), None);
+        assert_eq!(banner(&shown, PaneState::Lost), None);
         assert_eq!(banner(&shown, PaneState::Live), None);
         assert_eq!(
             banner(&shown, PaneState::Disconnected).as_deref(),
@@ -1718,5 +2740,41 @@ mod tests {
             ("Refactor".into(), "~/dev".into())
         );
         assert_eq!(header_parts(&chrome, Some("  ")).0, "claude");
+    }
+
+    /// Issue #33: the focused pane's ring is its agent's colour; with no
+    /// agent it is the accent, and an unfocused pane keeps the plain border.
+    #[test]
+    fn the_focus_ring_takes_the_agent_colour() {
+        use super::{agent_color, focus_ring, header_icon_color, ring_color};
+        let theme = Theme::light();
+        let focused = PaneChrome {
+            focused: true,
+            agent: Some(3),
+            ..PaneChrome::default()
+        };
+        assert_eq!(focus_ring(&focused, &theme), agent_color(3, &theme));
+        assert_eq!(header_icon_color(&focused, &theme), agent_color(3, &theme));
+        let unfocused = PaneChrome {
+            focused: false,
+            ..focused.clone()
+        };
+        assert_eq!(
+            ring_color(&theme, focus_ring(&unfocused, &theme), 0.0),
+            theme.border
+        );
+        // Unfocused, the icon still names the agent.
+        assert_eq!(
+            header_icon_color(&unfocused, &theme),
+            agent_color(3, &theme)
+        );
+        let empty = PaneChrome {
+            focused: true,
+            ..PaneChrome::default()
+        };
+        assert_eq!(focus_ring(&empty, &theme), theme.accent.opacity(0.55));
+        assert_eq!(header_icon_color(&empty, &theme), theme.accent);
+        let empty_unfocused = PaneChrome::default();
+        assert_eq!(header_icon_color(&empty_unfocused, &theme), theme.tertiary);
     }
 }

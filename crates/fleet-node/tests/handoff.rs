@@ -322,6 +322,7 @@ fn other_running_rows_are_still_marked_lost() {
             created_unix_ms: 1,
             scrollback_path: String::new(),
             labels: Labels::new(),
+            priority: 0,
         })
         .unwrap();
     let (new, kept, _) = hand_over(old, dir.path());
@@ -378,6 +379,7 @@ fn restored_screen_reaches_only_the_grid() {
                 env: vec![],
                 cols: 80,
                 rows: 24,
+                nice: 0,
             },
             Box::new(pipeline.clone()),
         )

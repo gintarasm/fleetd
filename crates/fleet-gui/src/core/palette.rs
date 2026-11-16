@@ -151,6 +151,7 @@ pub fn agent_item(row: &AgentRow, home: &Path) -> PickerItem {
         detail: format!("{cwd} · {}", status_text(row)),
         keywords: format!("agent {} {}", program_name(&info.program), labels.join(" ")),
         shortcut: None,
+        preview: String::new(),
     }
 }
 
@@ -173,6 +174,7 @@ pub fn palette_items(
                 detail: String::new(),
                 keywords: c.keywords().to_owned(),
                 shortcut: shortcut(c),
+                preview: String::new(),
             },
         ));
     }
@@ -191,6 +193,7 @@ pub fn palette_items(
                 detail: "new agent here".to_owned(),
                 keywords: "folder directory recent".to_owned(),
                 shortcut: None,
+                preview: String::new(),
             },
         ));
     }
