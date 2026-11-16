@@ -244,7 +244,7 @@ impl Store {
         Ok(())
     }
 
-    /// The latest schema for a new DB; the same tables the v1 -> ... -> v8
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v10
     /// migrations produce.
     fn create_latest(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(&format!(
@@ -855,6 +855,7 @@ mod tests {
         let conn = Connection::open(&p).unwrap();
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE leases;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              ALTER TABLE agents DROP COLUMN priority;
              PRAGMA user_version = 3;",
@@ -1292,6 +1293,7 @@ mod tests {
         // Back to the v4 shape: no exit time column.
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE leases;
              ALTER TABLE agents DROP COLUMN exited_unix_ms;
              UPDATE agents SET state = 'exited', exit_code = 2;
              PRAGMA user_version = 4;",
