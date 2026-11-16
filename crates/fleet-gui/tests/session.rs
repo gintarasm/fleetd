@@ -281,6 +281,7 @@ fn sidebar_follows_an_agents_report() {
         .call(request::Kind::Report(fleet_proto::ReportStatus {
             state: fleet_proto::ReportedState::ReportedWaiting.into(),
             message: "need a review".into(),
+            ..Default::default()
         }))
         .expect("report");
     wait_until("the report in the row", || {

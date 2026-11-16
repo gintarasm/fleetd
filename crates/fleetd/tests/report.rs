@@ -94,6 +94,7 @@ fn report(state: ReportedState, message: &str) -> request::Kind {
     request::Kind::Report(ReportStatus {
         state: state.into(),
         message: message.into(),
+        ..Default::default()
     })
 }
 

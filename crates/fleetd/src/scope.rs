@@ -210,6 +210,8 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
             return Some(forbidden("agents cannot read fleetd's log"));
         }
         Kind::RestartDaemon(_) => return Some(forbidden("agents cannot restart fleetd")),
+        // Only the user's words close a question (ADR 0078).
+        Kind::Answer(_) => return Some(forbidden("only the user answers questions")),
         Kind::Attach(r) => vec![r.agent_id],
         Kind::Input(r) => vec![r.agent_id],
         Kind::Resize(r) => vec![r.agent_id],

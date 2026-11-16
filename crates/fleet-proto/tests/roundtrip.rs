@@ -183,6 +183,7 @@ fn roundtrip_every_kind() {
         request::Kind::Report(ReportStatus {
             state: ReportedState::ReportedDone.into(),
             message: "tests green".into(),
+            ..Default::default()
         }),
         request::Kind::SendMessage(Box::new(SendMessage {
             body: "hi".into(),

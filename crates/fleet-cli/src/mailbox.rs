@@ -276,6 +276,7 @@ pub fn message_json(m: &Message) -> Value {
         "status": (!m.status.is_empty()).then_some(&m.status),
         "exit_code": m.exit_code,
         "body": m.body,
+        "choices": m.choices,
         "created_unix_ms": m.created_unix_ms,
         "trusted": trusted(m),
     })
@@ -317,10 +318,16 @@ pub fn message_text(m: &Message) -> String {
         },
         _ => kind_name(m).to_owned(),
     };
-    if m.body.is_empty() {
-        format!("{} {what}", from(m))
+    let choices = if m.choices.is_empty() {
+        String::new()
     } else {
-        format!("{} {what}: {}", from(m), clean(&m.body))
+        let all: Vec<String> = m.choices.iter().map(|c| clean(c)).collect();
+        format!(" [choices: {}]", all.join(" | "))
+    };
+    if m.body.is_empty() {
+        format!("{} {what}{choices}", from(m))
+    } else {
+        format!("{} {what}: {}{choices}", from(m), clean(&m.body))
     }
 }
 
@@ -514,12 +521,26 @@ mod tests {
 
     fn msg(sender: Option<u64>, kind: MessageKind, body: &str) -> Message {
         Message {
+            choices: Vec::new(),
             id: 1,
             sender,
             kind: kind as i32,
             body: body.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_question_shows_its_choices() {
+        let q = Message {
+            choices: vec!["main".into(), "dev\nfake".into()],
+            ..msg(Some(3), MessageKind::Question, "Which?")
+        };
+        assert_eq!(
+            message_text(&q),
+            "[from agent 3] question: Which? [choices: main | dev\n    fake]"
+        );
+        assert_eq!(message_json(&q)["choices"][0], "main");
     }
 
     #[test]

@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
 use fleet_node::lease::now_ms;
-use fleet_node::node::{ActivityReceiver, ConnId, Node, Removed, StreamItem, Subscription};
+use fleet_node::node::{
+    ActivityReceiver, ConnId, Node, QuestionIn, Removed, StreamItem, Subscription,
+};
 use fleet_node::scope::Caller;
 use fleet_proto::{
     Ack, AgentList, AgentRemoved, AgentResized, AttachOk, AttachRole, Event, ForgetAgents,
@@ -648,7 +650,21 @@ impl Connection {
             Some(request::Kind::Report(r)) => {
                 let caller = self.caller;
                 let state = r.state();
-                ack(blocking(&self.node, move |n| n.report_by(caller, state, &r.message)).await)
+                ack(blocking(&self.node, move |n| {
+                    let question = r.question.as_deref().map(|text| QuestionIn {
+                        text,
+                        choices: &r.choices,
+                    });
+                    n.report_question_by(caller, state, &r.message, question)
+                })
+                .await)
+            }
+            Some(request::Kind::Answer(a)) => {
+                let caller = self.caller;
+                ack(blocking(&self.node, move |n| {
+                    n.answer(caller, a.agent_id, a.question_id, &a.text)
+                })
+                .await)
             }
             Some(request::Kind::AcquireLease(a)) => return self.acquire_lease(req.id, *a).await,
             Some(request::Kind::ReleaseLease(r)) => {

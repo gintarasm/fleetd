@@ -1,5 +1,6 @@
 //! `fleet`: command-line client for `fleetd`.
 
+mod answer;
 mod attach;
 mod history;
 mod lease;
@@ -89,6 +90,8 @@ enum Command {
     },
     /// Report this agent's own status (run inside an agent)
     Report(report::Args),
+    /// Answer an agent's open question (the user only)
+    Answer(answer::Args),
     /// Show agents as a spawned-by tree
     Tree(tree::Args),
     /// Hold a named lease while a command runs, or take, release and list leases
@@ -289,6 +292,7 @@ fn print_json(agents: &[AgentInfo]) {
                     "state": r.state().name(),
                     "message": r.message,
                     "at_unix_ms": r.at_unix_ms,
+                    "question": report::question_json(r),
                 })),
             })
         })
@@ -522,6 +526,7 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }
         Command::Report(args) => return report::run(&mut client, &args),
+        Command::Answer(args) => return answer::run(&mut client, &args),
         Command::Tree(args) => tree::run(&mut client, &args, &parse_labels(&args.labels)?)?,
         Command::Lease(args) => return lease::run(client, &sock, token.as_deref(), args),
         Command::Label { agent, set, remove } => {
