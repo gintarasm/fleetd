@@ -300,19 +300,17 @@ impl Node {
             .map_err(store_err)?;
         let edges = rows
             .into_iter()
-            .map(
-                |(id, sender, recipient, kind, created_unix_ms)| fleet_proto::MessageEdge {
-                    id,
-                    sender,
-                    recipient,
-                    kind: match kind {
-                        MessageKind::Question => K::Question,
-                        MessageKind::Answer => K::Answer,
-                        _ => K::Message,
-                    } as i32,
-                    created_unix_ms,
-                },
-            )
+            .map(|e| fleet_proto::MessageEdge {
+                id: e.id,
+                sender: e.sender,
+                recipient: e.recipient,
+                kind: match e.kind {
+                    MessageKind::Question => K::Question,
+                    MessageKind::Answer => K::Answer,
+                    _ => K::Message,
+                } as i32,
+                created_unix_ms: e.created_ms,
+            })
             .collect();
         Ok(fleet_proto::MessageEdges { edges })
     }
