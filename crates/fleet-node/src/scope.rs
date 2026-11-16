@@ -107,6 +107,18 @@ fn strip_comment(line: &str) -> &str {
     line.split_once('#').map_or(line, |(before, _)| before)
 }
 
+/// The label the GUI marks its terminals with (ADR 0071): `kind=shell`.
+pub const KIND_LABEL: &str = "kind";
+pub const SHELL_KIND: &str = "shell";
+
+/// Whether these are a root shell's labels: a terminal the user opened
+/// (`kind=shell`, no parent). What runs in it is the user (ADR 0072, as
+/// amended).
+pub fn is_root_shell(labels: &Labels) -> bool {
+    labels.get(KIND_LABEL).map(String::as_str) == Some(SHELL_KIND)
+        && !labels.contains_key(PARENT_LABEL)
+}
+
 /// The parent an agent's labels name, if any.
 pub fn parent_of(labels: &Labels) -> Option<u64> {
     labels.get(PARENT_LABEL)?.parse().ok()
