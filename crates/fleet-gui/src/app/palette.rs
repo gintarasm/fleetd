@@ -8,12 +8,12 @@
 use gpui::{Action, Window};
 
 use super::keymap::{
-    ClosePane, CloseTab, Copy, Find, FindNext, FindPrevious, FocusDown, FocusFilter, FocusLeft,
-    FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp, InstallSkill, KillPane,
-    NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenSettings, Paste, PrevTab, PreviousAgent,
-    Quit, RemoveExited, RemovePane, RenamePane, ReopenClosedPane, RestartPane, SelectTab,
-    ShowShortcuts, SplitDown, SplitRight, SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn,
-    ZoomOut, ZoomReset,
+    ClosePane, CloseTab, Copy, EditLabelsPane, Find, FindNext, FindPrevious, FocusDown,
+    FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp,
+    InstallSkill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenSettings, Paste,
+    PrevTab, PreviousAgent, Quit, RemoveExited, RemovePane, RenamePane, ReopenClosedPane,
+    RestartPane, SelectTab, ShowShortcuts, SplitDown, SplitRight, SwitchFleetd, ToggleGraph,
+    ToggleMaximize, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::core::palette::{Command, Mods, shortcut_text};
 
@@ -48,6 +48,7 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::RestartPane => Box::new(RestartPane),
         Command::KillPane => Box::new(KillPane),
         Command::RenamePane => Box::new(RenamePane),
+        Command::EditLabelsPane => Box::new(EditLabelsPane),
         Command::RemovePane => Box::new(RemovePane),
         Command::Find => Box::new(Find),
         Command::FindNext => Box::new(FindNext),

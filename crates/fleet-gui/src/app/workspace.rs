@@ -22,14 +22,15 @@ use super::context_menu::{self, MenuLine};
 use super::controls::{ButtonKind, ReducedMotion, appear, button};
 use super::graph_view::{GraphEvent, GraphView};
 use super::keymap::{
-    ClosePane, CloseTab, CommandPalette, Copy, FocusDown, FocusFilter, FocusLeft, FocusPane1,
-    FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTab,
-    NewTerminal, NextAgent, NextTab, Paste, PrevTab, PreviousAgent, Remove, RemoveExited,
+    ClosePane, CloseTab, CommandPalette, Copy, EditLabelsPane, FocusDown, FocusFilter, FocusLeft,
+    FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent,
+    NewTab, NewTerminal, NextAgent, NextTab, Paste, PrevTab, PreviousAgent, Remove, RemoveExited,
     RemovePane, RenamePane, ReopenClosedPane, Restart, RestartPane, SelectTab, ShowShortcuts,
     SplitDown, SplitRight, ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
     ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
+use super::labels_sheet::{LabelsEvent, LabelsSheet};
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::palette::{command_action, command_shortcut};
@@ -49,6 +50,7 @@ use crate::core::drag_drop::DropTarget;
 use crate::core::feedback::{self, Tween};
 use crate::core::glass::{Backdrop, GlassChoice, glass_tint};
 use crate::core::kill::{KillFlow, kill_flow};
+use crate::core::labels::chip_filter;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, group_menu, pane_menu, row_menu,
@@ -187,6 +189,8 @@ pub struct Workspace {
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
     /// The Rename sheet (ADR 0052).
     rename: Option<(Entity<RenameSheet>, Subscription)>,
+    /// The Edit Labels sheet (ADR 0087).
+    labels: Option<(Entity<LabelsSheet>, Subscription)>,
     /// The question before a kill (issue #27).
     kill: Option<(Entity<KillSheet>, Subscription)>,
     /// The command palette (⌘P) and what its rows stand for.
@@ -265,6 +269,7 @@ impl Workspace {
                 this.choosers.clear();
                 if this.sheet.take().is_some()
                     | this.rename.take().is_some()
+                    | this.labels.take().is_some()
                     | this.kill.take().is_some()
                     | this.palette.take().is_some()
                     | this.switcher.take().is_some()
@@ -337,6 +342,7 @@ impl Workspace {
             _ticker: ticker,
             sheet: None,
             rename: None,
+            labels: None,
             kill: None,
             palette: None,
             palette_recents: Recents::default(),
@@ -478,6 +484,10 @@ impl Workspace {
         self.rename.as_ref().map(|(s, _)| s)
     }
 
+    pub fn labels_sheet(&self) -> Option<&Entity<LabelsSheet>> {
+        self.labels.as_ref().map(|(s, _)| s)
+    }
+
     /// The command palette, while it is open.
     pub fn palette(&self) -> Option<&Entity<PickerView>> {
         self.palette.as_ref().map(|(p, _, _)| p)
@@ -508,6 +518,7 @@ impl Workspace {
     fn modal(&self) -> bool {
         self.sheet.is_some()
             || self.rename.is_some()
+            || self.labels.is_some()
             || self.kill.is_some()
             || self.connect.is_some()
             || self.shortcuts.is_some()
@@ -555,6 +566,7 @@ impl Workspace {
     ) {
         self.sheet = None;
         self.rename = None;
+        self.labels = None;
         self.kill = None;
         self.palette = None;
         self.switcher = None;
@@ -1076,6 +1088,7 @@ impl Workspace {
         match item {
             RowMenuItem::OpenSplit => self.open_menu_split(agent_id, window, cx),
             RowMenuItem::Rename => self.open_rename(agent_id, window, cx),
+            RowMenuItem::EditLabels => self.open_labels(agent_id, window, cx),
             RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
             RowMenuItem::Restart => self.restart(&Restart { agent_id }, window, cx),
             RowMenuItem::Remove => self.remove(&Remove { agent_id }, window, cx),
@@ -1152,6 +1165,7 @@ impl Workspace {
             PaneMenuItem::Maximize | PaneMenuItem::Restore => PaneEvent::ToggleMaximize,
             PaneMenuItem::Restart => PaneEvent::Restart,
             PaneMenuItem::Rename => PaneEvent::Rename,
+            PaneMenuItem::EditLabels => PaneEvent::EditLabels,
             PaneMenuItem::Kill => PaneEvent::Kill,
             PaneMenuItem::Close => PaneEvent::Close,
         };
@@ -1224,6 +1238,60 @@ impl Workspace {
         }
         self.rename = None;
         self.focus_current(window, cx);
+        cx.notify();
+    }
+
+    /// Opens the Edit Labels sheet for an agent (Edit Labels… in the row
+    /// and pane menus).
+    pub fn open_labels(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let Some(info) = self
+            .app
+            .read(cx)
+            .agents
+            .iter()
+            .find(|r| r.info.id == agent_id)
+            .map(|r| r.info.clone())
+        else {
+            return;
+        };
+        let what = match name_of(&info) {
+            Some(name) => format!("{name} · {}", program_and_id(&info)),
+            None => program_and_id(&info),
+        };
+        let sheet = cx.new(|cx| LabelsSheet::new(agent_id, info.labels.clone(), what, cx));
+        let sub = cx.subscribe_in(&sheet, window, Self::labels_event);
+        sheet.read(cx).focus(window, cx);
+        self.labels = Some((sheet, sub));
+        cx.notify();
+    }
+
+    fn labels_event(
+        &mut self,
+        _sheet: &Entity<LabelsSheet>,
+        event: &LabelsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let LabelsEvent::Save { agent_id, edit } = event
+            && !edit.is_empty()
+        {
+            self.app
+                .read(cx)
+                .set_labels(*agent_id, edit.set.clone(), edit.remove.clone());
+        }
+        self.labels = None;
+        self.focus_current(window, cx);
+        cx.notify();
+    }
+
+    /// A click on a row's label chip: the sidebar filter gets `key=value`,
+    /// or loses it on a second click.
+    pub(super) fn filter_by_label(&mut self, key: &str, value: &str, cx: &mut Context<Self>) {
+        let query = chip_filter(self.filter_field.read(cx).text(), key, value);
+        self.filter_field.update(cx, |f, cx| f.set_text(query, cx));
         cx.notify();
     }
 
@@ -1525,6 +1593,19 @@ impl Workspace {
         }
     }
 
+    /// Edit Labels… (palette): the focused pane's agent.
+    fn edit_labels_pane(
+        &mut self,
+        _: &EditLabelsPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let app = self.app.read(cx);
+        if let Some(agent_id) = app.layout().agent(app.focused()) {
+            self.open_labels(agent_id, window, cx);
+        }
+    }
+
     /// Remove Exited Agent in Pane (palette): forgets the focused pane's
     /// agent if it ended, as the pane's summary bar does.
     fn remove_pane(&mut self, _: &RemovePane, _: &mut Window, cx: &mut Context<Self>) {
@@ -1683,6 +1764,11 @@ impl Workspace {
             PaneEvent::Rename => {
                 if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
                     self.open_rename(agent_id, window, cx);
+                }
+            }
+            PaneEvent::EditLabels => {
+                if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
+                    self.open_labels(agent_id, window, cx);
                 }
             }
             PaneEvent::Kill => self.kill_in_pane(pane, window, cx),
@@ -2184,6 +2270,28 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
+        let labels = self.labels.as_ref().map(|(sheet, _)| {
+            deferred(
+                div()
+                    .id("labels-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt(px(chrome::BAR_HEIGHT + space::SM))
+                    .child(sheet_drag_strip("labels-drag-strip"))
+                    .child(appear(
+                        div().child(sheet.clone()),
+                        "labels-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
         let sheet = self.sheet.as_ref().map(|(sheet, _)| {
             // The backdrop takes every click and wheel event over the panes.
             deferred(
@@ -2244,6 +2352,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::kill))
             .on_action(cx.listener(Self::kill_pane))
             .on_action(cx.listener(Self::rename_pane))
+            .on_action(cx.listener(Self::edit_labels_pane))
             .on_action(cx.listener(Self::remove_pane))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
@@ -2285,6 +2394,7 @@ impl Render for Workspace {
             .children(switcher)
             .children(sheet)
             .children(rename)
+            .children(labels)
             .children(
                 self.kill
                     .as_ref()
@@ -2512,6 +2622,7 @@ mod tests {
         },
         Forget(Vec<u64>),
         Rename(u64, String),
+        SetLabels(u64, Vec<(String, String)>, Vec<String>),
         ClearExited,
         Spawn {
             req: SpawnRequest,
@@ -2633,6 +2744,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(Call::Rename(agent_id, name));
+        }
+
+        fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
+            let mut set: Vec<_> = set.into_iter().collect();
+            set.sort();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(Call::SetLabels(agent_id, set, remove));
         }
 
         fn clear_exited(&self) {
@@ -3551,6 +3671,118 @@ mod tests {
         assert!(fake.calls().contains(&Call::Rename(3, "from-menu".into())));
     }
 
+    fn labels_sheet(s: &mut Setup<'_>) -> Entity<super::LabelsSheet> {
+        s.ws.read_with(s.cx, |w, _| w.labels_sheet().cloned())
+            .expect("labels sheet open")
+    }
+
+    fn label_rows(s: &mut Setup<'_>) -> Vec<String> {
+        labels_sheet(s).read_with(s.cx, |sh, cx| {
+            sh.rows
+                .iter()
+                .map(|r| r.read(cx).text().to_owned())
+                .collect()
+        })
+    }
+
+    fn set_label_row(s: &mut Setup<'_>, index: usize, text: &str) {
+        let field = labels_sheet(s).read_with(s.cx, |sh, _| sh.rows[index].clone());
+        let text = text.to_owned();
+        field.update(s.cx, |f, cx| f.set_text(text, cx));
+    }
+
+    /// Edit Labels… in the row and pane menus: the editable labels as
+    /// rows (not the name or `fleet.*`); add, edit and remove go out as
+    /// one `SetLabels`.
+    #[gpui::test]
+    fn edit_labels_from_row_and_pane_menus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let labels = [("role", "coder"), ("team", "core"), ("fleet.parent", "2")];
+        agents(&mut s, &fake, vec![named(3, "otter", &labels)]);
+        pick_row(&mut s, 3, RowMenuItem::EditLabels);
+        assert_eq!(label_rows(&mut s), ["role=coder", "team=core"]);
+        assert!(s.cx.debug_bounds("labels-sheet").is_some());
+
+        // Edit one, remove one, add one; Return saves.
+        set_label_row(&mut s, 0, "role = reviewer");
+        click(&mut s, "label-remove-1");
+        assert_eq!(label_rows(&mut s), ["role = reviewer"]);
+        labels_sheet(&mut s).update_in(s.cx, |sh, window, cx| sh.add_row(window, cx));
+        set_label_row(&mut s, 1, "new=1");
+        s.cx.simulate_keystrokes("enter");
+        assert_eq!(
+            fake.calls().last(),
+            Some(&Call::SetLabels(
+                3,
+                vec![
+                    ("new".into(), "1".into()),
+                    ("role".into(), "reviewer".into())
+                ],
+                vec!["team".into()]
+            ))
+        );
+        assert!(s.ws.read_with(s.cx, |w, _| w.labels_sheet().is_none()));
+
+        // A bad row keeps the sheet open; Escape cancels; no change sends
+        // nothing.
+        let before = fake.calls().len();
+        pick_row(&mut s, 3, RowMenuItem::EditLabels);
+        set_label_row(&mut s, 0, "name=x");
+        s.cx.simulate_keystrokes("enter");
+        let sheet = labels_sheet(&mut s);
+        assert!(sheet.read_with(s.cx, |sh, _| sh.error.clone()).is_some());
+        s.cx.simulate_keystrokes("escape");
+        assert!(s.ws.read_with(s.cx, |w, _| w.labels_sheet().is_none()));
+        pick_row(&mut s, 3, RowMenuItem::EditLabels);
+        s.cx.simulate_keystrokes("enter");
+        assert!(s.ws.read_with(s.cx, |w, _| w.labels_sheet().is_none()));
+        assert_eq!(fake.calls().len(), before);
+
+        // The pane menu: shown in pane 1.
+        attach_model(&fake, PaneId(1), 3);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s.ws.update_in(s.cx, |ws, window, cx| {
+            let epoch = ws.epoch;
+            ws.pane_menu_pick(PaneId(1), PaneMenuItem::EditLabels, epoch, window, cx);
+        });
+        s.cx.run_until_parked();
+        assert_eq!(label_rows(&mut s), ["role=coder", "team=core"]);
+    }
+
+    /// A click on a label chip filters the sidebar by it; a second click
+    /// clears it.
+    #[gpui::test]
+    fn a_label_chip_filters_the_sidebar(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                named(1, "otter", &[("role", "reviewer")]),
+                named(2, "falcon", &[("role", "coder")]),
+            ],
+        );
+        click(&mut s, "tab-1-chip-role");
+        let query = |s: &mut Setup<'_>| {
+            s.ws.read_with(s.cx, |w, cx| w.filter_field.read(cx).text().to_owned())
+        };
+        assert_eq!(query(&mut s), "role=reviewer");
+        assert_eq!(tabs_drawn(&mut s), [1], "filtered out");
+        // The chip's click is not the row's: no pane shows the agent.
+        let pane = focused(&mut s);
+        assert_eq!(shown(&mut s, pane), None);
+        click(&mut s, "tab-1-chip-role");
+        assert_eq!(query(&mut s), "");
+        let mut all = tabs_drawn(&mut s);
+        all.sort();
+        assert_eq!(all, [1, 2]);
+    }
+
     fn spawn_via_sheet(s: &mut Setup<'_>, dir: &str) {
         s.cx.simulate_keystrokes("cmd-n");
         let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
@@ -4294,6 +4526,7 @@ mod tests {
             [
                 RowMenuItem::OpenSplit,
                 RowMenuItem::Rename,
+                RowMenuItem::EditLabels,
                 RowMenuItem::Kill
             ]
         );
@@ -4303,6 +4536,7 @@ mod tests {
                 [
                     RowMenuItem::OpenSplit,
                     RowMenuItem::Rename,
+                    RowMenuItem::EditLabels,
                     RowMenuItem::Restart,
                     RowMenuItem::Remove
                 ]
@@ -4331,7 +4565,11 @@ mod tests {
         s.cx.simulate_keystrokes("cmd-d cmd-d");
         assert_eq!(
             row_items(&mut s, 7),
-            [RowMenuItem::Rename, RowMenuItem::Kill]
+            [
+                RowMenuItem::Rename,
+                RowMenuItem::EditLabels,
+                RowMenuItem::Kill
+            ]
         );
     }
 
@@ -4918,6 +5156,7 @@ mod tests {
         for title in [
             "Kill Agent…",
             "Rename Agent…",
+            "Edit Labels…",
             "Find in Scrollback…",
             "Restart Agent in Pane",
             "Remove Exited Agent in Pane",
@@ -4929,6 +5168,7 @@ mod tests {
         click(&mut s, "tab-7");
         let rows = palette_rows(&mut s);
         assert!(has_row(&rows, "Kill Agent…") && has_row(&rows, "Rename Agent…"));
+        assert!(has_row(&rows, "Edit Labels…"));
         assert!(!has_row(&rows, "Restart Agent in Pane"));
         pick_in_palette(&mut s, "kill agent");
         assert_eq!(kill_asked(&mut s), Some(7));
@@ -4948,6 +5188,9 @@ mod tests {
             fake.calls()
                 .contains(&Call::Rename(3, "from-palette".into()))
         );
+        pick_in_palette(&mut s, "edit labels");
+        assert!(s.ws.read_with(s.cx, |w, _| w.labels_sheet().is_some()));
+        s.cx.simulate_keystrokes("escape");
 
         agents(&mut s, &fake, vec![ended(3, "/w", 3, AgentState::Exited)]);
         attach_model(&fake, PaneId(1), 3);

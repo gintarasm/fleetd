@@ -440,7 +440,7 @@ fn render_tab(
             .flex_wrap()
             .gap(px(space::XXS))
             .pl(px(ROW_INDENT))
-            .children(chips.into_iter().map(|(k, v)| chip(id, k, v, theme)))
+            .children(chips.into_iter().map(|(k, v)| chip(id, k, v, theme, cx)))
     });
     let bar = div()
         .absolute()
@@ -498,8 +498,15 @@ fn render_tab(
         )
 }
 
-/// A label chip: the value, with `key=value` as its tooltip.
-fn chip(id: u64, key: String, value: String, theme: &Theme) -> impl IntoElement + use<> {
+/// A label chip: the value, with `key=value` as its tooltip. A click
+/// filters the sidebar by it (ADR 0087).
+fn chip(
+    id: u64,
+    key: String,
+    value: String,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
     let tip = SharedString::from(format!("{key}={value}"));
     let tip_theme = *theme;
     let selector = format!("tab-{id}-chip-{key}");
@@ -513,7 +520,14 @@ fn chip(id: u64, key: String, value: String, theme: &Theme) -> impl IntoElement 
         .text_color(theme.secondary)
         .max_w(px(chrome::SIDEBAR_WIDTH / 2.0))
         .truncate()
-        .child(SharedString::from(value))
+        .cursor_pointer()
+        .hover(move |s| s.bg(tip_theme.pressed).text_color(tip_theme.text))
+        .child(SharedString::from(value.clone()))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.filter_by_label(&key, &value, cx);
+            // Not also the row's click, which would show the agent.
+            cx.stop_propagation();
+        }))
         .tooltip(move |_, cx| {
             cx.new(|_| Tooltip {
                 text: tip.clone(),

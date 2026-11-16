@@ -33,6 +33,7 @@ pub enum Command {
     RestartPane,
     KillPane,
     RenamePane,
+    EditLabelsPane,
     RemovePane,
     Find,
     FindNext,
@@ -98,6 +99,7 @@ impl Command {
         Command::RestartPane,
         Command::KillPane,
         Command::RenamePane,
+        Command::EditLabelsPane,
         Command::RemovePane,
         Command::Find,
         Command::FindNext,
@@ -153,6 +155,7 @@ impl Command {
             // It asks first (unless told not to).
             Command::KillPane => "Kill Agent…",
             Command::RenamePane => "Rename Agent…",
+            Command::EditLabelsPane => "Edit Labels…",
             Command::RemovePane => "Remove Exited Agent in Pane",
             Command::Find => "Find in Scrollback…",
             Command::FindNext => "Find Next",
@@ -200,6 +203,7 @@ impl Command {
             Command::ToggleMaximize => "zoom",
             Command::KillPane => "stop terminate",
             Command::RenamePane => "name label",
+            Command::EditLabelsPane => "label role project tag",
             Command::RemovePane => "forget rm ended lost",
             Command::Find | Command::FindNext | Command::FindPrevious => "search scrollback",
             Command::Copy | Command::Paste => "clipboard",
@@ -236,9 +240,11 @@ impl Command {
             Command::FocusPane1 | Command::FocusPane2 => s.panes > 1,
             Command::FocusPane3 => s.panes >= 3,
             Command::FocusPane4 => s.panes >= 4,
-            Command::RenamePane | Command::Find | Command::FindNext | Command::FindPrevious => {
-                s.has_agent
-            }
+            Command::RenamePane
+            | Command::EditLabelsPane
+            | Command::Find
+            | Command::FindNext
+            | Command::FindPrevious => s.has_agent,
             Command::KillPane | Command::Paste => s.running,
             Command::RestartPane | Command::RemovePane => s.restartable,
             Command::Copy => s.has_selection,
@@ -538,6 +544,7 @@ mod tests {
     fn what_acts_on_the_focused_agent_needs_one() {
         let agent_only = [
             Command::RenamePane,
+            Command::EditLabelsPane,
             Command::Find,
             Command::FindNext,
             Command::FindPrevious,
@@ -575,6 +582,7 @@ mod tests {
             Command::KillPane,
             Command::Paste,
             Command::RenamePane,
+            Command::EditLabelsPane,
             Command::Find,
         ] {
             assert!(listed.contains(&c), "{c:?}");

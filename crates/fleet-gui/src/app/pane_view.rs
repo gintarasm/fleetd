@@ -312,6 +312,8 @@ pub enum PaneEvent {
     Restart,
     /// A double-click on the name: rename the pane's agent.
     Rename,
+    /// Edit Labels… in the pane's menu.
+    EditLabels,
     /// The header's Stop: kill the pane's running agent (after asking).
     Kill,
     /// Remove, in the header or the summary bar: forgets the ended agent.
