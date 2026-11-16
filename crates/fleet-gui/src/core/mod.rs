@@ -11,6 +11,7 @@ pub mod menus;
 pub mod mouse;
 pub mod pane;
 mod pane_link;
+pub mod scroll_feedback;
 pub mod scrollback;
 pub mod selection;
 pub mod session;
