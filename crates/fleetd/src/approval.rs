@@ -127,7 +127,7 @@ pub(crate) async fn forward(
     }
     loop {
         let kind = match events.recv().await {
-            Ok(ApprovalEvent::Pending(p)) => event::Kind::SpawnPending(p),
+            Ok(ApprovalEvent::Pending(p)) => event::Kind::SpawnPending(Box::new(p)),
             Ok(ApprovalEvent::Decided(d)) => event::Kind::SpawnDecided(d),
             // A client that missed some re-lists (the GUI does on connect).
             Err(broadcast::error::RecvError::Lagged(_)) => continue,

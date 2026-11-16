@@ -1136,7 +1136,7 @@ impl ControlReader {
                             None => relist = true,
                         },
                         Some(event::Kind::SpawnPending(p)) => {
-                            sb.pending_spawns.insert(p.id, p);
+                            sb.pending_spawns.insert(p.id, *p);
                             changed = true;
                         }
                         Some(event::Kind::SpawnDecided(d)) => {
@@ -1475,7 +1475,7 @@ mod tests {
         })]);
         assert_eq!(ids(&r), [1, 2]);
         r.apply(vec![Frame::Event(Event {
-            kind: Some(event::Kind::SpawnPending(p(3))),
+            kind: Some(event::Kind::SpawnPending(Box::new(p(3)))),
         })]);
         drain(&events);
         r.apply(vec![Frame::Event(Event {

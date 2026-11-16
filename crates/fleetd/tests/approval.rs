@@ -147,7 +147,7 @@ impl Fleet {
     /// The next pending spawn the user's event connection hears of.
     fn next_pending(&self) -> PendingSpawn {
         next_event(&self.user_events, |k| match k {
-            event::Kind::SpawnPending(p) => Some(p),
+            event::Kind::SpawnPending(p) => Some(*p),
             _ => None,
         })
     }

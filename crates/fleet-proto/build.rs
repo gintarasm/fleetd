@@ -22,6 +22,7 @@ fn main() {
         .boxed(".fleet.v1.Response.kind.messages_sent")
         .boxed(".fleet.v1.Response.kind.inbox")
         .boxed(".fleet.v1.Response.kind.wait_result")
+        .boxed(".fleet.v1.Event.kind.spawn_pending")
         .boxed(".fleet.v1.HelloOk.binary")
         .boxed(".fleet.v1.HelloOk.restore")
         .compile_fds(fds)
