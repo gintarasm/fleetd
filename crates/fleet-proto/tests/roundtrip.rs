@@ -1,10 +1,11 @@
 use bytes::{Bytes, BytesMut};
 use fleet_proto::{
-    Ack, AgentActivity, AgentExited, AgentInfo, AgentList, AgentRemoved, AgentResized, AgentState,
-    Attach, AttachOk, AttachRole, Detach, Error, Event, ForgetAgents, Forgotten, Frame, FrameCodec,
-    HandshakeReject, Hello, HelloOk, HistoryPage, KillAgent, Lagged, ListAgents, PROTOCOL_VERSION,
-    ReadHistory, Request, Resize, Response, RestartAgent, Restarted, SendInput, SetLabels,
-    SpawnAgent, SpawnedAttached, event, request, response,
+    Ack, AgentActivity, AgentExited, AgentInfo, AgentList, AgentRemoved, AgentReported,
+    AgentResized, AgentState, Attach, AttachOk, AttachRole, Detach, Error, Event, ForgetAgents,
+    Forgotten, Frame, FrameCodec, HandshakeReject, Hello, HelloOk, HistoryPage, KillAgent, Lagged,
+    ListAgents, PROTOCOL_VERSION, ReadHistory, ReportStatus, Reported, ReportedState, Request,
+    Resize, Response, RestartAgent, Restarted, SendInput, SetLabels, SpawnAgent, SpawnedAttached,
+    event, request, response,
 };
 use fleet_proto::{
     Broadcast, Inbox, Message, MessageKind, MessagesSent, ReadInbox, SendMessage, Wait, WaitMatch,
@@ -83,6 +84,11 @@ fn info() -> AgentInfo {
         created_unix_ms: 1,
         labels: labels(),
         exited_unix_ms: Some(2),
+        reported: Some(Reported {
+            state: ReportedState::ReportedWaiting.into(),
+            message: "need a review".into(),
+            at_unix_ms: 3,
+        }),
         git: Some(fleet_proto::GitInfo {
             repo: "fleetd".into(),
             worktree: "issue-97".into(),
@@ -174,6 +180,10 @@ fn roundtrip_every_kind() {
             exited_only: false,
             selector: labels(),
         })),
+        request::Kind::Report(ReportStatus {
+            state: ReportedState::ReportedDone.into(),
+            message: "tests green".into(),
+        }),
         request::Kind::SendMessage(Box::new(SendMessage {
             body: "hi".into(),
             agent_ids: vec![3],
@@ -250,6 +260,14 @@ fn roundtrip_every_kind() {
         })),
     ];
     let events = [
+        event::Kind::Reported(AgentReported {
+            agent_id: 1,
+            reported: Some(Reported {
+                state: ReportedState::ReportedError.into(),
+                message: "build broke".into(),
+                at_unix_ms: 9,
+            }),
+        }),
         event::Kind::Exited(AgentExited {
             agent_id: 1,
             exit_code: -9,

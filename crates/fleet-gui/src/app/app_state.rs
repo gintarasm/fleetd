@@ -36,7 +36,9 @@ use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{
     GuiState, MAX_RECENT_COMMANDS, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent,
 };
-use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
+use crate::core::status::{
+    AgentStatus, Alerts, DotFill, alert_text, dot_fill, live_report, statuses,
+};
 use crate::core::style::chrome;
 use crate::core::tabs::Tabs;
 use crate::core::target::Target;
@@ -1004,7 +1006,15 @@ impl AppState {
                 AgentStatus::NeedsYou if !row.last_line.trim().is_empty() => row.last_line.trim(),
                 _ => cwd.as_str(),
             };
-            let (title, body) = alert_text(&name, status, row.info.exit_code, detail);
+            let (title, mut body) = alert_text(&name, status, row.info.exit_code, detail);
+            // What the agent said about itself beats its last line.
+            if let Some(r) = live_report(&row.info) {
+                body = if r.message.is_empty() {
+                    cwd.clone()
+                } else {
+                    r.message.clone()
+                };
+            }
             super::attention::post(self.session_epoch, id, &title, &body, cx);
         }
     }
@@ -1091,6 +1101,9 @@ impl AppState {
                 maximized: t == shown && self.maximized == Some(pane),
                 dims,
                 status: agent.and_then(|id| self.statuses.get(&id).copied()),
+                status_fill: row
+                    .zip(agent.and_then(|id| self.statuses.get(&id)))
+                    .map_or(DotFill::Hollow, |(r, s)| dot_fill(&r.info, *s)),
                 agent,
                 agent_emoji: self.config.agent_emoji,
                 local: self.target == Target::Local,

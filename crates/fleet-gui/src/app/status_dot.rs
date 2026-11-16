@@ -3,7 +3,7 @@
 use gpui::{Div, Hsla, Styled, div, px};
 
 use super::theme::Theme;
-use crate::core::status::{AgentStatus, dot_dimmed};
+use crate::core::status::{AgentStatus, DotFill, dot_dimmed};
 
 /// The dot's diameter.
 const DOT: f32 = 8.0;
@@ -19,15 +19,21 @@ pub fn dot_color(status: AgentStatus, theme: &Theme) -> Hsla {
     }
 }
 
-/// A filled dot in `status`'s colour (an idle one is a ring), dimmed on a
-/// working agent's off-beat ([`dot_dimmed`]).
-pub fn status_dot(status: AgentStatus, theme: &Theme, now_ms: i64, reduce_motion: bool) -> Div {
+/// A dot in `status`'s colour: solid for a reported (or exit) status, a
+/// ring for one inferred from output (ADR 0075), dimmed on a working
+/// agent's off-beat ([`dot_dimmed`]).
+pub fn status_dot(
+    status: AgentStatus,
+    fill: DotFill,
+    theme: &Theme,
+    now_ms: i64,
+    reduce_motion: bool,
+) -> Div {
     let color = dot_color(status, theme);
     let dot = div().flex_none().size(px(DOT)).rounded_full();
-    let dot = if status == AgentStatus::Idle {
-        dot.border_1().border_color(color)
-    } else {
-        dot.bg(color)
+    let dot = match fill {
+        DotFill::Solid => dot.bg(color),
+        DotFill::Hollow => dot.border_1().border_color(color),
     };
     if dot_dimmed(status, now_ms, reduce_motion) {
         dot.opacity(0.45)

@@ -382,10 +382,12 @@ impl Node {
                     AgentState::Lost => now.push(WaitState::Lost),
                     AgentState::Running => {}
                 }
-                let reported = db.latest_status(id).map_err(store_err)?;
-                if let Some(state) = reported
-                    .as_deref()
-                    .and_then(Status::parse)
+                // The agent's stored report (ADR 0075).
+                if let Some(state) = rec
+                    .reported
+                    .as_ref()
+                    .and_then(|r| fleet_proto::ReportedState::try_from(r.state).ok())
+                    .and_then(Status::of_reported)
                     .and_then(WaitState::of_status)
                 {
                     now.push(state);

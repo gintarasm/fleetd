@@ -9,7 +9,7 @@ use fleet_node::mailbox::{Notice, Status, WaitState};
 use fleet_node::node::{Node, WaitSpec};
 use fleet_node::scope::{Caller, FORBIDDEN_PREFIX};
 use fleet_node::store::Labels;
-use fleet_proto::{Broadcast, MessageKind, SendMessage, SpawnAgent};
+use fleet_proto::{Broadcast, MessageKind, ReportedState, SendMessage, SpawnAgent};
 
 fn sh(script: &str, l: &[(&str, &str)]) -> SpawnAgent {
     SpawnAgent {
@@ -313,8 +313,9 @@ fn a_named_target_matches_on_its_current_state() {
     let c1 = Caller::Agent(f.c1);
     let s = spec(Some(vec![f.g]), &[WaitState::Exited, WaitState::Done]);
     assert!(f.node.wait_check(c1, &s, None).unwrap().is_empty());
+    // `fleet report` stores the status and posts it to the parent (ADR 0075/0076).
     f.node
-        .status_changed(f.g, Status::Done, "all green", false)
+        .report(f.g, ReportedState::ReportedDone, "all green")
         .unwrap();
     let m = f.node.wait_check(c1, &s, None).unwrap();
     assert_eq!(m.len(), 1, "{m:?}");
@@ -401,4 +402,43 @@ fn a_restarted_agent_keeps_its_mailbox() {
         .unwrap();
     let new = f.node.restart(quick, 80, 24, None).unwrap().info.id;
     assert_eq!(bodies(&f.inbox(Caller::Agent(new))), ["keep me"]);
+}
+
+/// `fleet report` (ADR 0075) feeds the mailbox (ADR 0076): the parent gets
+/// one `status` message per change, and a wait on the reporter wakes.
+#[test]
+fn a_report_reaches_the_parent_and_wakes_a_named_wait() {
+    let f = Family::new();
+    let c1 = Caller::Agent(f.c1);
+    let mut notices = f.node.notices();
+    let waiting = spec(Some(vec![f.g]), &[WaitState::Waiting]);
+    assert!(f.node.wait_check(c1, &waiting, None).unwrap().is_empty());
+    f.node
+        .report(f.g, ReportedState::ReportedWaiting, "need a review")
+        .unwrap();
+    // The same report again posts nothing new.
+    f.node
+        .report(f.g, ReportedState::ReportedWaiting, "need a review")
+        .unwrap();
+    let got = f.inbox(c1);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].kind, MessageKind::Status as i32);
+    assert_eq!(
+        (got[0].status.as_str(), got[0].body.as_str()),
+        ("waiting", "need a review")
+    );
+    assert_eq!(got[0].sender, Some(f.g));
+    let m = f.node.wait_check(c1, &waiting, None).unwrap();
+    assert_eq!((m[0].agent, m[0].state), (Some(f.g), WaitState::Waiting));
+    let mut seen = Vec::new();
+    while let Ok(n) = notices.try_recv() {
+        seen.push(n);
+    }
+    assert!(
+        seen.contains(&Notice::State {
+            agent: f.g,
+            state: WaitState::Waiting
+        }),
+        "{seen:?}"
+    );
 }

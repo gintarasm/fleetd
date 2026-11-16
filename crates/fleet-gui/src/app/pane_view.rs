@@ -51,7 +51,7 @@ use crate::core::scroll_feedback::{
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
 use crate::core::shortcuts::{EmptyPane, HINT, empty_pane};
-use crate::core::status::AgentStatus;
+use crate::core::status::{AgentStatus, DotFill};
 use crate::core::style::{self, radius, space, text};
 
 /// At most this many lines are scrolled (or reported) per wheel event.
@@ -191,6 +191,8 @@ pub struct PaneChrome {
     pub dims: bool,
     /// The agent's status (ADR 0042); none for a shell or no agent.
     pub status: Option<AgentStatus>,
+    /// How its dot is drawn: solid when reported (ADR 0075).
+    pub status_fill: DotFill,
     /// The agent list arrived and is empty: an empty pane welcomes.
     pub no_agents: bool,
     /// How long the ended agent ran, if known (the summary bar).
@@ -1549,8 +1551,14 @@ impl Render for PaneView {
             })
             .children(chrome.status.map(|s| {
                 let number = chrome.number;
-                status_dot(s, &theme, unix_ms(), (self.reduce_motion)())
-                    .debug_selector(move || format!("pane-{number}-status-{}", s.label()))
+                status_dot(
+                    s,
+                    chrome.status_fill,
+                    &theme,
+                    unix_ms(),
+                    (self.reduce_motion)(),
+                )
+                .debug_selector(move || format!("pane-{number}-status-{}", s.label()))
             }))
             .child(
                 div()

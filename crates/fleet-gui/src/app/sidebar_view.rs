@@ -36,7 +36,7 @@ use crate::core::sidebar::ended;
 pub use crate::core::sidebar::program_name;
 use crate::core::sidebar::{SidebarGroup, StatusFilter, label_chips, program_and_id};
 use crate::core::sidebar_tree::{Disclosure, RowLayout};
-use crate::core::status::AgentStatus;
+use crate::core::status::{AgentStatus, dot_fill};
 use crate::core::style::{chrome, radius, space, text};
 
 /// The state mark of a row: ● running, ○ exited `✕code`, `?` lost.
@@ -299,7 +299,13 @@ fn render_tab(
             .flex_none()
             .items_center()
             .debug_selector(move || format!("status-{id}-{}", s.label()))
-            .child(status_dot(s, theme, data.now_ms, data.reduce_motion)),
+            .child(status_dot(
+                s,
+                dot_fill(&row.info, s),
+                theme,
+                data.now_ms,
+                data.reduce_motion,
+            )),
     };
     let meta = row_meta(row, data.now_ms);
     let preview = preview_line(&row.last_line);

@@ -252,6 +252,53 @@ fn sidebar_lists_and_follows_activity() {
     s.shutdown();
 }
 
+/// An agent's `fleet report` reaches the sidebar's rows at once (the
+/// `AgentReported` event), without waiting for the next list.
+#[test]
+fn sidebar_follows_an_agents_report() {
+    let d = Daemon::start();
+    let (s, events) = start_session(&d);
+    wait_until("the control connection", || {
+        events.has(|e| *e == UiEvent::Connection(ConnState::Connected))
+    });
+    let tok = d.path().join("a.tok");
+    let id = d.spawn(
+        &format!(
+            "printf %s \"$FLEET_AGENT_TOKEN\" > {0}.tmp && mv {0}.tmp {0}; exec sleep 30",
+            tok.display()
+        ),
+        80,
+        24,
+    );
+    wait_until("the agent's token", || tok.exists());
+    let token = std::fs::read_to_string(&tok).unwrap();
+    let sock = d.path().join("fleetd.sock");
+    let mut agent = Connection::unix_as(&sock, "agent", Some(&token)).expect("connect as agent");
+    wait_until("the agent listed", || {
+        s.agents().iter().any(|r| r.info.id == id)
+    });
+    agent
+        .call(request::Kind::Report(fleet_proto::ReportStatus {
+            state: fleet_proto::ReportedState::ReportedWaiting.into(),
+            message: "need a review".into(),
+        }))
+        .expect("report");
+    wait_until("the report in the row", || {
+        s.agents()
+            .iter()
+            .find(|r| r.info.id == id)
+            .and_then(|r| r.info.reported.clone())
+            .is_some_and(|r| r.message == "need a review")
+    });
+    // Its status is the reported one, drawn solid.
+    let row = s.agents().into_iter().find(|r| r.info.id == id).unwrap();
+    assert_eq!(
+        fleet_gui::core::status::agent_status(&row, false, i64::MAX / 2),
+        Some(fleet_gui::core::status::AgentStatus::NeedsYou)
+    );
+    s.shutdown();
+}
+
 /// `Session::start_with` uses the connection it is given (here one to a
 /// daemon in another dir than the session's target, so a fresh connect
 /// could not have listed this agent) and, once it drops, reconnects to

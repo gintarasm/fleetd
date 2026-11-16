@@ -101,13 +101,13 @@ fn spawn_then_ls_shows_running() {
     let mut lines = ls.lines();
     assert_eq!(
         lines.next().unwrap().split_whitespace().collect::<Vec<_>>(),
-        ["ID", "NAME", "STATE", "EXIT", "PROGRAM"]
+        ["ID", "NAME", "STATE", "EXIT", "REPORTED", "PROGRAM"]
     );
     let row: Vec<_> = lines.next().unwrap().split_whitespace().collect();
-    assert_eq!(row.len(), 5, "{row:?}");
+    assert_eq!(row.len(), 6, "{row:?}");
     assert_eq!(
-        [row[0], row[2], row[3], row[4]],
-        [id.as_str(), "running", "-", "cat"]
+        [row[0], row[2], row[3], row[4], row[5]],
+        [id.as_str(), "running", "-", "-", "cat"]
     );
     // The default name: the cwd's basename (no prompt) and an animal.
     assert!(row[1].starts_with("fleetcli-"), "{row:?}");

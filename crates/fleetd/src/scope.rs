@@ -199,6 +199,9 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
         Kind::List(_) => return None,
         // Only drops this connection's own subscription.
         Kind::Detach(_) => return None,
+        // Self only by construction: it names no agent, the node takes the
+        // caller's.
+        Kind::Report(_) => return None,
         // Leases are open to any caller (ADR 0034, 0077): any name, no
         // descendants check. The node answers a release by a non-holder.
         Kind::AcquireLease(_) | Kind::ReleaseLease(_) | Kind::ListLeases(_) => return None,
@@ -231,6 +234,35 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
         }
     }
     None
+}
+
+/// Forwards status reports of agents in its scope to the connection as
+/// `AgentReported` events (a report is screen-adjacent text: it must not
+/// bypass the descendants-only rule, ADR 0072).
+pub(crate) async fn forward_reported(
+    mut reported: broadcast::Receiver<fleet_proto::AgentReported>,
+    outbox: mpsc::Sender<Frame>,
+    scope: Scope,
+) {
+    loop {
+        match reported.recv().await {
+            Ok(ev) => {
+                if !scope.sees(ev.agent_id).await {
+                    continue;
+                }
+                let frame = Frame::Event(Event {
+                    kind: Some(event::Kind::Reported(ev)),
+                });
+                if outbox.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            // The next list (or report) carries the latest; a miss only
+            // delays a dot.
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 /// Forwards refused spawns (in its scope) to the connection as `SpawnRefused` events.

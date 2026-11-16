@@ -4,6 +4,7 @@ mod attach;
 mod history;
 mod lease;
 mod mailbox;
+mod report;
 mod skill;
 mod tree;
 mod upgrade;
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use fleet_proto::status::live_report;
 use fleet_proto::{
     AgentInfo, AgentState, ForgetAgents, KillAgent, ListAgents, RestartAgent, SendInput, SetLabels,
     SpawnAgent,
@@ -85,6 +87,8 @@ enum Command {
         #[arg(long = "label", value_name = "K=V")]
         labels: Vec<String>,
     },
+    /// Report this agent's own status (run inside an agent)
+    Report(report::Args),
     /// Show agents as a spawned-by tree
     Tree(tree::Args),
     /// Hold a named lease while a command runs, or take, release and list leases
@@ -281,6 +285,11 @@ fn print_json(agents: &[AgentInfo]) {
                 "cwd": a.cwd,
                 "created_unix_ms": a.created_unix_ms,
                 "labels": a.labels.iter().collect::<std::collections::BTreeMap<_, _>>(),
+                "reported": live_report(a).map(|r| serde_json::json!({
+                    "state": r.state().name(),
+                    "message": r.message,
+                    "at_unix_ms": r.at_unix_ms,
+                })),
             })
         })
         .collect();
@@ -293,6 +302,7 @@ fn print_table(agents: &[AgentInfo]) {
         "NAME".into(),
         "STATE".into(),
         "EXIT".into(),
+        "REPORTED".into(),
         "PROGRAM".into(),
     ]];
     for a in agents {
@@ -305,15 +315,16 @@ fn print_table(agents: &[AgentInfo]) {
             names::name_of(a).unwrap_or("-").to_owned(),
             state_name(a).into(),
             a.exit_code.map_or("-".into(), |c| c.to_string()),
+            live_report(a).map_or("-", |r| r.state().name()).to_owned(),
             program,
         ]);
     }
     let width = |col: usize| rows.iter().map(|r| r[col].len()).max().unwrap_or(0);
-    let (w0, w1, w2, w3) = (width(0), width(1), width(2), width(3));
+    let (w0, w1, w2, w3, w4) = (width(0), width(1), width(2), width(3), width(4));
     for r in &rows {
         println!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {}",
-            r[0], r[1], r[2], r[3], r[4]
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {}",
+            r[0], r[1], r[2], r[3], r[4], r[5]
         );
     }
 }
@@ -510,6 +521,7 @@ fn run(cli: Cli) -> Result<u8> {
                 _ => return Err(Error::Protocol("unexpected reply to list".into())),
             }
         }
+        Command::Report(args) => return report::run(&mut client, &args),
         Command::Tree(args) => tree::run(&mut client, &args, &parse_labels(&args.labels)?)?,
         Command::Lease(args) => return lease::run(client, &sock, token.as_deref(), args),
         Command::Label { agent, set, remove } => {

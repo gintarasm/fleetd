@@ -1,6 +1,7 @@
 //! Fleet wire protocol: protobuf schema, frame codec and handshake constants.
 
 mod frame;
+pub mod status;
 
 mod pb {
     include!(concat!(env!("OUT_DIR"), "/fleet.v1.rs"));

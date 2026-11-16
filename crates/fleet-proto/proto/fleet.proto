@@ -60,6 +60,8 @@ message Request {
     RestartAgent restart = 13;
     ForgetAgents forget = 14;
     RestartDaemon restart_daemon = 15;
+    // Spec §2 (ADR 0075): the calling agent's own status.
+    ReportStatus report = 50;
     // Leases (ADR 0077, spec §4): any caller may use them (ADR 0034).
     AcquireLease acquire_lease = 65;
     ReleaseLease release_lease = 66;
@@ -104,6 +106,7 @@ message Event {
     AgentResized agent_resized = 6;
     AgentRemoved agent_removed = 7;
     SpawnRefused spawn_refused = 40;
+    AgentReported reported = 50;
   }
 }
 
@@ -179,6 +182,8 @@ message AgentInfo {
   // When an exited agent exited (ADR 0058); unset while running, for a lost
   // agent, and for an exit recorded by a node before it stored the time.
   optional int64 exited_unix_ms = 9;
+  // The agent's own last `fleet report` (ADR 0075); unset until it reports.
+  optional Reported reported = 50;
   // The git checkout holding `cwd`, read on the node's host (ADR 0085);
   // unset when `cwd` is in none, or from a node that does not read it.
   GitInfo git = 10;
@@ -264,6 +269,21 @@ message LogLine { string line = 1; }
 // that asked, `reason` the refusal's text (after "forbidden: ").
 message SpawnRefused { uint64 parent = 1; string reason = 2; }
 
+// What an agent can report about itself (`fleet report`, ADR 0075).
+enum ReportedState {
+  REPORTED_STATE_UNSPECIFIED = 0;
+  REPORTED_WORKING = 1;
+  REPORTED_WAITING = 2;
+  REPORTED_DONE = 3;
+  REPORTED_ERROR = 4;
+}
+// The caller's own status, taken from the caller's identity (no agent id: an
+// agent reports only for itself). `message` is at most 200 characters;
+// answered by `Ack`.
+message ReportStatus { ReportedState state = 1; string message = 2; }
+message Reported { ReportedState state = 1; string message = 2; int64 at_unix_ms = 3; }
+// Pushed when an agent reports; scoped like the other agent events.
+message AgentReported { uint64 agent_id = 1; Reported reported = 2; }
 // Take the lease `name` (ADR 0077). Answered by `LeaseGranted`, or an
 // `Error` starting `busy:` when it is held (or the load is too high) and
 // `wait` is off. With `wait` the answer comes when the lease is granted;

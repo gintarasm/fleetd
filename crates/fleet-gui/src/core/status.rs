@@ -8,52 +8,41 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fleet_proto::{AgentInfo, AgentState};
+use fleet_proto::AgentInfo;
 
 use super::session::AgentRow;
-use super::spawn::{KIND_LABEL, SHELL_KIND};
 
-/// Output this recent means the agent is working. Agent CLIs redraw a
-/// spinner while they work, so a few quiet seconds mean they stopped.
-pub const QUIET_MS: i64 = 3_000;
+use fleet_proto::ReportedState;
+pub use fleet_proto::status::{AgentStatus, QUIET_MS, is_shell, live_report, looks_like_prompt};
 
-/// One agent's status.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AgentStatus {
-    /// Output in the last [`QUIET_MS`].
-    Working,
-    /// Quiet and its last line looks like a prompt, or it rang the bell.
-    NeedsYou,
-    /// Running, quiet, and nothing says it waits for input (or no output
-    /// seen yet).
-    Idle,
-    /// Exited 0.
-    Done,
-    /// Exited non-zero (or with no code), or lost.
-    Failed,
+/// How a status dot is drawn (ADR 0033, 0075): solid for a status the agent
+/// reported (`fleet report`) or that is a fact (it exited), hollow for one
+/// inferred from a running agent's output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DotFill {
+    Solid,
+    #[default]
+    Hollow,
 }
 
-impl AgentStatus {
-    /// For tooltips and menus.
-    pub fn label(self) -> &'static str {
-        match self {
-            AgentStatus::Working => "Working",
-            AgentStatus::NeedsYou => "Needs you",
-            AgentStatus::Idle => "Idle",
-            AgentStatus::Done => "Done",
-            AgentStatus::Failed => "Failed",
-        }
-    }
-
-    /// The agent ended (done or failed).
-    pub fn ended(self) -> bool {
-        matches!(self, AgentStatus::Done | AgentStatus::Failed)
+/// The fill of the dot for `status` of `info`.
+pub fn dot_fill(info: &AgentInfo, status: AgentStatus) -> DotFill {
+    if live_report(info).is_some() || status.ended() {
+        DotFill::Solid
+    } else {
+        DotFill::Hollow
     }
 }
 
-/// A plain login shell from New terminal: no status.
-pub fn is_shell(info: &AgentInfo) -> bool {
-    info.labels.get(KIND_LABEL).map(String::as_str) == Some(SHELL_KIND)
+/// The status an agent's report says (ADR 0075).
+fn reported_status(state: ReportedState) -> Option<AgentStatus> {
+    match state {
+        ReportedState::ReportedWorking => Some(AgentStatus::Working),
+        ReportedState::ReportedWaiting => Some(AgentStatus::NeedsYou),
+        ReportedState::ReportedDone => Some(AgentStatus::Done),
+        ReportedState::ReportedError => Some(AgentStatus::Failed),
+        ReportedState::Unspecified => None,
+    }
 }
 
 /// What a row or pane shows, as the GUI names it to the user: a shell
@@ -92,65 +81,22 @@ impl Subject {
     }
 }
 
-/// The status of `row` at `now_ms`; `rang` is an unseen bell from a pane
+/// The status of `row` at `now_ms`: the agent's own report while it runs,
+/// else inferred (the exit for an ended agent); `rang` is an unseen bell from a pane
 /// showing it. `None` for a shell, or a state the GUI does not know.
 pub fn agent_status(row: &AgentRow, rang: bool, now_ms: i64) -> Option<AgentStatus> {
-    if is_shell(&row.info) {
-        return None;
+    // What the agent said about itself beats a guess (ADR 0075).
+    if let Some(status) = live_report(&row.info).and_then(|r| reported_status(r.state())) {
+        return Some(status);
     }
-    match row.info.state() {
-        AgentState::Exited => Some(match row.info.exit_code {
-            Some(0) => AgentStatus::Done,
-            _ => AgentStatus::Failed,
-        }),
-        AgentState::Lost => Some(AgentStatus::Failed),
-        AgentState::Unspecified => None,
-        AgentState::Running => Some(if rang {
-            AgentStatus::NeedsYou
-        } else {
-            match row.last_output_unix_ms {
-                Some(at) if now_ms - at < QUIET_MS => AgentStatus::Working,
-                Some(_) if looks_like_prompt(&row.last_line) => AgentStatus::NeedsYou,
-                _ => AgentStatus::Idle,
-            }
-        }),
-    }
-}
-
-/// Footer hints agent TUIs show while they wait for you (lowercase).
-const PROMPT_HINTS: [&str; 9] = [
-    "(y/n)",
-    "[y/n]",
-    "(yes/no)",
-    "for shortcuts",
-    "shift+tab to cycle",
-    "esc to cancel",
-    "enter to confirm",
-    "enter to select",
-    "press enter",
-];
-
-/// Characters a prompt line ends with.
-const PROMPT_ENDS: [char; 9] = ['?', '>', '❯', '›', '»', ':', '$', '#', '%'];
-
-/// Whether an agent's last non-blank line looks like it waits for input:
-/// it ends like a prompt (`?`, `>`, `❯`, `:`, `$` …), carries a TUI's
-/// waiting hint ("? for shortcuts", "(y/n)", "esc to cancel" …), or is a
-/// box-drawing rule (the bottom of a TUI's input box).
-pub fn looks_like_prompt(line: &str) -> bool {
-    let line = line.trim();
-    let Some(last) = line.chars().next_back() else {
-        return false;
-    };
-    if PROMPT_ENDS.contains(&last) {
-        return true;
-    }
-    let lower = line.to_lowercase();
-    if PROMPT_HINTS.iter().any(|h| lower.contains(h)) {
-        return true;
-    }
-    line.chars()
-        .all(|c| ('\u{2500}'..='\u{257f}').contains(&c) || c == ' ')
+    fleet_proto::status::inferred_status(
+        &row.info,
+        &row.last_line,
+        row.last_output_unix_ms,
+        rang,
+        now_ms,
+        QUIET_MS,
+    )
 }
 
 /// Every non-shell agent's status; `bells` are agents with an unseen bell.
@@ -259,6 +205,7 @@ pub fn alert_agent(identifier: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_proto::AgentState;
 
     fn row(state: AgentState, code: Option<i32>, line: &str, at: Option<i64>) -> AgentRow {
         let mut info = AgentInfo {
@@ -303,6 +250,61 @@ mod tests {
         // No output seen yet.
         let r = row(AgentState::Running, None, "", None);
         assert_eq!(agent_status(&r, false, NOW), Some(AgentStatus::Idle));
+    }
+
+    fn reported(mut r: AgentRow, state: fleet_proto::ReportedState) -> AgentRow {
+        r.info.reported = Some(fleet_proto::Reported {
+            state: state.into(),
+            message: "m".into(),
+            at_unix_ms: 1,
+        });
+        r
+    }
+
+    #[test]
+    fn a_reported_status_wins_over_the_inferred_one_and_is_solid() {
+        use fleet_proto::ReportedState as R;
+        // Quiet with no prompt would be idle; a bell would need you.
+        let quiet = row(AgentState::Running, None, "compiling", Some(NOW - 60_000));
+        assert_eq!(agent_status(&quiet, false, NOW), Some(AgentStatus::Idle));
+        assert_eq!(dot_fill(&quiet.info, AgentStatus::Idle), DotFill::Hollow);
+        for (state, want) in [
+            (R::ReportedWorking, AgentStatus::Working),
+            (R::ReportedWaiting, AgentStatus::NeedsYou),
+            (R::ReportedDone, AgentStatus::Done),
+            (R::ReportedError, AgentStatus::Failed),
+        ] {
+            let r = reported(quiet.clone(), state);
+            assert_eq!(agent_status(&r, false, NOW), Some(want), "{state:?}");
+            assert_eq!(agent_status(&r, true, NOW), Some(want), "bell, {state:?}");
+            assert_eq!(dot_fill(&r.info, want), DotFill::Solid);
+        }
+        // Counted like any needs-you.
+        let waiting = reported(quiet, R::ReportedWaiting);
+        assert_eq!(
+            needs_you_count(&statuses(&[waiting], &HashSet::new(), NOW)),
+            1
+        );
+    }
+
+    #[test]
+    fn an_ended_agent_ignores_its_last_report_and_is_solid() {
+        let r = reported(
+            row(AgentState::Exited, Some(2), "", None),
+            fleet_proto::ReportedState::ReportedWorking,
+        );
+        assert_eq!(agent_status(&r, false, NOW), Some(AgentStatus::Failed));
+        // The exit is a fact, not an inference.
+        assert_eq!(dot_fill(&r.info, AgentStatus::Failed), DotFill::Solid);
+        let shell = {
+            let mut s = reported(
+                row(AgentState::Running, None, "$", Some(0)),
+                fleet_proto::ReportedState::ReportedWorking,
+            );
+            s.info.labels.insert("kind".into(), "shell".into());
+            s
+        };
+        assert_eq!(agent_status(&shell, false, NOW), None);
     }
 
     #[test]

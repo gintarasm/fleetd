@@ -112,6 +112,18 @@ impl Status {
             _ => return None,
         })
     }
+
+    /// The status `fleet report` (ADR 0075) stored; `None` for unspecified.
+    pub fn of_reported(state: fleet_proto::ReportedState) -> Option<Status> {
+        use fleet_proto::ReportedState as R;
+        Some(match state {
+            R::ReportedWorking => Status::Working,
+            R::ReportedWaiting => Status::Waiting,
+            R::ReportedDone => Status::Done,
+            R::ReportedError => Status::Error,
+            R::Unspecified => return None,
+        })
+    }
 }
 
 /// What `fleet wait` can wait for.

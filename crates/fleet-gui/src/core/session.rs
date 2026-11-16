@@ -1093,6 +1093,13 @@ impl ControlReader {
                             }
                             None => relist = true,
                         },
+                        Some(event::Kind::Reported(r)) => match sb.infos.get_mut(&r.agent_id) {
+                            Some(info) => {
+                                info.reported = r.reported;
+                                changed = true;
+                            }
+                            None => relist = true,
+                        },
                         Some(event::Kind::AgentRemoved(r)) => {
                             sb.infos.remove(&r.agent_id);
                             sb.activity.remove(&r.agent_id);

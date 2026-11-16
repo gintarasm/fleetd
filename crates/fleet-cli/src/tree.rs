@@ -8,6 +8,7 @@ use clap::Args as ClapArgs;
 use fleet_client::names::name_of;
 use fleet_client::tree::{Tree, Visit};
 use fleet_client::{Connection, Error, Result};
+use fleet_proto::status::live_report;
 use fleet_proto::{AgentInfo, AgentState, ListAgents, request, response};
 use serde_json::{Value, json};
 
@@ -91,8 +92,11 @@ impl Selection {
 /// exit 0 is done, anything else failed), a lost one as such. The GUI also
 /// uses the agent's last output to tell working, needs-you and idle; a
 /// one-shot client gets no activity feed, so a running agent is `running`
-/// until reported statuses exist (spec §2).
+/// unless it reported one (ADR 0075: that wins, while it runs).
 pub fn status(info: &AgentInfo) -> &'static str {
+    if let Some(r) = live_report(info) {
+        return r.state().name();
+    }
     let shell = info.labels.get("kind").is_some_and(|k| k == "shell");
     match info.state() {
         AgentState::Running if shell => "shell",
@@ -181,6 +185,9 @@ pub fn text_lines(sel: &Selection, now_ms: i64) -> Vec<String> {
             if let Some(s) = run_secs(info, now_ms) {
                 line.push_str(&format!("  {}", format_run_time(s)));
             }
+            if let Some(r) = live_report(info).filter(|r| !r.message.is_empty()) {
+                line.push_str(&format!("  \"{}\"", r.message));
+            }
             line
         })
         .collect()
@@ -195,6 +202,11 @@ pub fn json_tree(sel: &Selection, now_ms: i64) -> Value {
             "program": info.program,
             "state": status_state(info),
             "status": status(info),
+            "reported": live_report(info).map(|r| json!({
+                "state": r.state().name(),
+                "message": r.message,
+                "at_unix_ms": r.at_unix_ms,
+            })),
             "exit_code": info.exit_code,
             "run_secs": run_secs(info, now_ms),
             "created_unix_ms": info.created_unix_ms,

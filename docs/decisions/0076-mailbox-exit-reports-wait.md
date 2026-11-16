@@ -58,3 +58,9 @@ Additive, in the reserved block: requests `send_message = 55`, `read_inbox = 56`
 - The user's mailbox collects every root agent's exit (up to 10,000). Nothing shows it in the GUI yet.
 - `latest_status` is a stopgap and the inferred `waiting` seam answers no until M3-D merges; the PR for D replaces both.
 - Every exit and loss costs one SQLite insert (and a retention delete) on the exit path, next to the existing `set_exited`; none touch the output path.
+
+## Merged with M3-D (2026-11-17)
+
+- `Node::report` (`fleet report`, ADR 0075) now calls `status_changed(…, inferred = false)` after storing the report, so the parent gets one `status` message per change and waiters wake. The store lock is released first; `status_changed` takes it itself.
+- `fleet wait` reads the current reported state from the agent's stored report (ADR 0075's `reported_*` columns) instead of `Store::latest_status`, which is now used only by tests and the one-per-change check.
+- **Still open:** inferred `waiting`. `Node::inferred_waiting` still answers no, and nothing posts inferred transitions yet. That needs a periodic sweep over running agents (the heuristic is `fleet_proto::status::inferred_status` with `WAITING_QUIET_MS`), because going quiet produces no event to wake a waiter. It is tracked as its own issue.
