@@ -2,7 +2,7 @@
 //! layout, the panes and the saved state. [`AppState`] is a gpui global
 //! entity; the [`Workspace`](super::workspace::Workspace) window draws it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::settings::{Change, save_changes};
 use crate::core::shortcuts::ClosedPanes;
-use crate::core::sidebar::{ended, tilde};
+use crate::core::sidebar::{ended, tilde, toggle_collapsed};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
@@ -541,6 +541,32 @@ impl AppState {
 
     pub fn gui_state(&self) -> &GuiState {
         &self.gui_state
+    }
+
+    /// The sidebar groups this target shows collapsed.
+    pub fn collapsed_groups(&self) -> BTreeSet<String> {
+        self.gui_state
+            .collapsed_groups
+            .get(&self.target_key())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Collapses or expands the sidebar group `title`, remembered per
+    /// target.
+    pub fn toggle_group(&mut self, title: &str, cx: &mut Context<Self>) {
+        let key = self.target_key();
+        let set = self
+            .gui_state
+            .collapsed_groups
+            .entry(key.clone())
+            .or_default();
+        toggle_collapsed(set, title);
+        if set.is_empty() {
+            self.gui_state.collapsed_groups.remove(&key);
+        }
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     pub fn error(&self) -> Option<&str> {

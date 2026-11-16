@@ -1,22 +1,24 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
 //! directory. (New agent and Clear exited live in the unified bar.)
 //! A click shows the agent in the focused pane; a right-click opens the
-//! row's native menu (`core::menus::row_menu`).
+//! row's native menu (`core::menus::row_menu`). Above the tabs, a filter
+//! field and status filters; a click on a group's header collapses it
+//! (issue #40, ADR 0060).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Action, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
+    Action, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::controls;
 use super::keymap::{Kill, Remove, Restart};
 use super::status_dot::status_dot;
 use super::tail_text::{head_text, tail_text};
+use super::text_field::TextField;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
 use crate::core::icons::Icon;
@@ -24,8 +26,8 @@ use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::row_preview::{preview_line, row_meta};
 use crate::core::session::AgentRow;
 use crate::core::sidebar::ended;
-use crate::core::sidebar::group_agents;
 pub use crate::core::sidebar::program_name;
+use crate::core::sidebar::{SidebarGroup, StatusFilter};
 use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
@@ -54,7 +56,6 @@ pub enum TabMark {
 /// What the sidebar draws, gathered from the app state.
 pub struct SidebarData<'a> {
     pub rows: &'a [AgentRow],
-    pub home: &'a Path,
     pub now_ms: i64,
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
@@ -64,6 +65,12 @@ pub struct SidebarData<'a> {
     /// Agents that rang the bell unseen: their row is tinted.
     pub bells: &'a HashSet<u64>,
     pub reduce_motion: bool,
+    /// The groups to draw, filtered and collapsed (`core::sidebar::sidebar_groups`).
+    pub groups: Vec<SidebarGroup>,
+    pub filter_field: Entity<TextField>,
+    pub status_filter: StatusFilter,
+    /// The tabs' focus: a key typed while it has it goes to the filter.
+    pub focus: FocusHandle,
 }
 
 /// A tab's title: the agent's OSC title if a pane knows it, else the
@@ -77,42 +84,29 @@ pub fn tab_title(row: &AgentRow, titles: &HashMap<u64, String>) -> String {
 }
 
 pub fn render_sidebar(
-    data: &SidebarData<'_>,
+    mut data: SidebarData<'_>,
     theme: &Theme,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
-    let groups: Vec<_> = group_agents(data.rows, data.home)
+    let groups: Vec<_> = std::mem::take(&mut data.groups)
         .into_iter()
-        .map(|group| {
-            let tabs: Vec<_> = group
-                .agents
-                .into_iter()
-                .map(|row| render_tab(&row, data, theme, cx))
-                .collect();
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(space::XXS))
-                .child(
-                    div()
-                        .flex()
-                        .px(px(space::SM))
-                        .pt(px(space::MD))
-                        .pb(px(space::XS))
-                        .type_style(text::SECTION)
-                        .text_color(theme.secondary)
-                        .child(tail_text(group.title)),
-                )
-                .children(tabs)
-        })
+        .map(|group| render_group(group, &data, theme, cx))
         .collect();
-    let empty = data.rows.is_empty().then(|| {
+    let empty = if data.rows.is_empty() {
+        Some(("sidebar-empty", "No agents yet. Press ⌘N to start one."))
+    } else if groups.is_empty() {
+        Some(("sidebar-no-match", "No agents match."))
+    } else {
+        None
+    };
+    let empty = empty.map(|(selector, message)| {
         div()
+            .debug_selector(move || selector.to_owned())
             .px(px(space::SM))
             .pt(px(space::MD))
             .type_style(text::CALLOUT)
             .text_color(theme.tertiary)
-            .child("No agents yet. Press ⌘N to start one.")
+            .child(message)
     });
     div()
         .flex()
@@ -122,9 +116,17 @@ pub fn render_sidebar(
         .h_full()
         .text_color(theme.text)
         .type_style(text::BODY)
+        .child(render_filter(&data, theme, cx))
         .child(
             div()
                 .id("tabs")
+                .debug_selector(|| "sidebar".to_owned())
+                .track_focus(&data.focus)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.focus_sidebar(window, cx)),
+                )
+                .on_key_down(cx.listener(Workspace::sidebar_key_down))
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -135,6 +137,106 @@ pub fn render_sidebar(
                 .children(empty)
                 .children(groups),
         )
+}
+
+/// The filter field and, under it, the status filters.
+fn render_filter(
+    data: &SidebarData<'_>,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let chips: Vec<_> = StatusFilter::ALL
+        .into_iter()
+        .map(|f| {
+            let on = f == data.status_filter;
+            div()
+                .id(SharedString::from(format!("status-filter-{}", f.label())))
+                .debug_selector(move || format!("status-filter-{}", f.label()))
+                .px(px(space::XS + space::XXS))
+                .py(px(space::XXS))
+                .rounded(px(radius::SM))
+                .type_style(text::CAPTION)
+                .cursor_pointer()
+                .text_color(if on { theme.text } else { theme.secondary })
+                .when(on, |d| d.bg(theme.selected))
+                .when(!on, |d| d.hover(|d| d.bg(theme.hover)))
+                .child(f.label())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_status_filter(f, cx)))
+        })
+        .collect();
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(space::XS))
+        .px(px(space::SM))
+        .pt(px(space::SM))
+        .child(
+            div()
+                .debug_selector(|| "sidebar-filter".to_owned())
+                .on_key_down(cx.listener(Workspace::filter_key_down))
+                .child(data.filter_field.clone()),
+        )
+        .child(div().flex().flex_row().gap(px(space::XXS)).children(chips))
+}
+
+/// A group's header (a click collapses or expands it), then its tabs.
+fn render_group(
+    group: SidebarGroup,
+    data: &SidebarData<'_>,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let tabs: Vec<_> = group
+        .agents
+        .iter()
+        .map(|row| render_tab(row, data, theme, cx))
+        .collect();
+    let title = group.title.clone();
+    let selector = format!("group-{}", group.title);
+    let count = group.collapsed.then(|| {
+        let selector = format!("group-count-{}", group.title);
+        let exact = format!("{selector}-{}", group.count);
+        div()
+            .flex_none()
+            .debug_selector(move || selector.clone())
+            .child(
+                div()
+                    .debug_selector(move || exact.clone())
+                    .type_style(text::CAPTION)
+                    .text_color(theme.tertiary)
+                    .child(SharedString::from(group.count.to_string())),
+            )
+    });
+    let header = div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::XS))
+        .px(px(space::SM))
+        .pt(px(space::MD))
+        .pb(px(space::XS))
+        .cursor_pointer()
+        .type_style(text::SECTION)
+        .text_color(theme.secondary)
+        .child(
+            div()
+                .flex_none()
+                .w(px(space::SM + space::XXS))
+                .text_color(theme.tertiary)
+                .child(if group.collapsed { "▸" } else { "▾" }),
+        )
+        .child(div().flex_1().min_w_0().child(tail_text(group.title)))
+        .children(count)
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&title, cx)));
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::XXS))
+        .child(header)
+        .children(tabs)
 }
 
 fn render_tab(
