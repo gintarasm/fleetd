@@ -11,6 +11,7 @@ use fleet_gui::core::launch::start_local;
 use fleet_gui::core::pane::{PaneModel, PaneState};
 use fleet_gui::core::session::{ConnState, PaneId, Session, UiEvent};
 use fleet_gui::core::spawn::{KIND_LABEL, SHELL_KIND, SpawnRequest, new_terminal};
+use fleet_gui::core::status::{AgentStatus, QUIET_MS, agent_status};
 use fleet_gui::core::target::{Target, connect};
 use fleet_proto::{
     AgentList, AgentState, Attach, Frame, HelloOk, ListAgents, Response, RestartingDaemon,
@@ -514,6 +515,57 @@ fn close_pane_detaches_without_killing() {
     s.close_pane(pane);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(d.agent_state(id), AgentState::Running);
+    s.shutdown();
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// Issue #32: a real agent's status, from the list and its activity.
+#[test]
+fn status_follows_real_agents() {
+    let d = Daemon::start();
+    let (s, _events) = start_session(&d);
+    let busy = d.spawn("while :; do echo tick; sleep 0.2; done", 80, 24);
+    let asks = d.spawn("printf 'Proceed? '; sleep 30", 80, 24);
+    let quiet = d.spawn("echo compiling; sleep 30", 80, 24);
+    let ok = d.spawn("sleep 0.3; exit 0", 80, 24);
+    let bad = d.spawn("sleep 0.3; exit 3", 80, 24);
+    let status = |id: u64| {
+        s.agents()
+            .into_iter()
+            .find(|r| r.info.id == id)
+            .and_then(|r| agent_status(&r, false, unix_ms()))
+    };
+    wait_until("done and failed", || {
+        status(ok) == Some(AgentStatus::Done) && status(bad) == Some(AgentStatus::Failed)
+    });
+    wait_until("busy to be working", || {
+        status(busy) == Some(AgentStatus::Working)
+    });
+    // Quiet for QUIET_MS after their one line.
+    std::thread::sleep(Duration::from_millis(QUIET_MS as u64));
+    wait_until("the prompt to need you", || {
+        status(asks) == Some(AgentStatus::NeedsYou)
+    });
+    assert_eq!(status(quiet), Some(AgentStatus::Idle));
+    assert_eq!(status(busy), Some(AgentStatus::Working));
+    s.shutdown();
+}
+
+/// Issue #32: a BEL in an attached pane's output reaches its model once.
+#[test]
+fn a_bell_reaches_the_pane_showing_the_agent() {
+    let d = Daemon::start();
+    let (s, _events) = start_session(&d);
+    let id = d.spawn("sleep 0.5; printf 'ding\\a'; sleep 30", 80, 24);
+    let model = s.open_pane(PaneId(1), Some(id));
+    wait_until("the bell", || model.lock().unwrap().take_bell());
+    assert!(!model.lock().unwrap().take_bell());
     s.shutdown();
 }
 

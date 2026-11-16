@@ -10,6 +10,7 @@ use super::connect::switch_fleetd;
 use super::status_item::{install_status_item, set_accessory};
 use super::workspace::open_main_window;
 use crate::core::launch::{install_skill, installed_for, skill_install_command};
+use crate::core::status::AgentStatus;
 use crate::core::status_menu::{StatusEntry, StatusMenuState};
 
 /// Installs the status item and drops the Dock icon when the last window
@@ -20,6 +21,9 @@ pub fn install(cx: &mut App) {
         if cx.windows().is_empty() {
             eprintln!("fleet-gui: window closed; staying in the menu bar");
             set_accessory(true);
+            if let Some(app) = AppState::global(cx) {
+                app.update(cx, |a, cx| a.set_window_active(false, cx));
+            }
         }
     })
     .detach();
@@ -33,7 +37,21 @@ pub fn menu_state(app: &AppState) -> StatusMenuState {
         reconnecting: app.is_reconnecting(),
         agents: app.agents.clone(),
         home: app.home.clone(),
+        needs_you: app
+            .statuses
+            .iter()
+            .filter(|(_, s)| **s == AgentStatus::NeedsYou)
+            .map(|(id, _)| *id)
+            .collect(),
+        notifications: app.config.notifications,
     }
+}
+
+/// Opens (or raises) the window and shows `agent_id` in the focused pane
+/// (a status-menu agent, a clicked notification).
+pub fn show_agent(agent_id: u64, cx: &mut App) {
+    show_window(cx);
+    with_workspace(cx, |ws, window, cx| ws.show_agent(agent_id, window, cx));
 }
 
 /// "Show fleetd", and a Dock click with no window: brings the window
@@ -59,10 +77,7 @@ pub fn handle(entry: StatusEntry, cx: &mut App) {
     match entry {
         StatusEntry::Header(_) | StatusEntry::Separator => {}
         StatusEntry::Show => show(cx),
-        StatusEntry::Agent { id, .. } => {
-            show_window(cx);
-            with_workspace(cx, |ws, window, cx| ws.show_agent(id, window, cx));
-        }
+        StatusEntry::Agent { id, .. } => show_agent(id, cx),
         StatusEntry::NewAgent => {
             show_window(cx);
             with_workspace(cx, |ws, window, cx| ws.open_new_agent(window, cx));
@@ -87,6 +102,11 @@ pub fn handle(entry: StatusEntry, cx: &mut App) {
             }
         }
         StatusEntry::InstallSkill => install_agent_skill(cx),
+        StatusEntry::Notifications(_) => {
+            if let Some(app) = AppState::global(cx) {
+                app.update(cx, |a, cx| a.toggle_notifications(cx));
+            }
+        }
         StatusEntry::Quit => cx.quit(),
     }
 }

@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::config::{DEFAULT_FONT_FAMILY, GuiConfig, save_gui_values};
+use super::glass::GlassChoice;
 use super::theme::Appearance;
 
 /// The window backdrop's default blur radius in points, a little over
@@ -154,6 +155,7 @@ pub enum Change {
     DefaultDir(String),
     FocusMode(bool),
     Celebrate(bool),
+    Glass(GlassChoice),
 }
 
 /// Rounds to two decimals, so repeated steps do not drift.
@@ -199,6 +201,7 @@ impl Change {
             Change::DefaultDir(v) => set(&mut c.default_dir, v.trim().to_owned(), "default_dir"),
             Change::FocusMode(v) => set(&mut c.focus_mode, v, "focus_mode"),
             Change::Celebrate(v) => set(&mut c.celebrate, v, "celebrate"),
+            Change::Glass(v) => set(&mut c.glass, v, "glass"),
         }
     }
 }
@@ -232,6 +235,7 @@ fn value_of(c: &GuiConfig, key: &str) -> Option<toml_edit::Value> {
         "default_dir" => c.default_dir.as_str().into(),
         "focus_mode" => c.focus_mode.into(),
         "celebrate" => c.celebrate.into(),
+        "glass" => c.glass.as_str().into(),
         _ => return None,
     })
 }
@@ -283,6 +287,9 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     row("cmd-alt-down", "Focus the pane below"),
     row("cmd-c", "Copy"),
     row("cmd-v", "Paste"),
+    row("cmd-+", "Bigger font (all panes, not saved)"),
+    row("cmd--", "Smaller font"),
+    row("cmd-0", "Font size from Settings"),
     row("cmd-,", "Settings"),
     row("cmd-q", "Quit (agents keep running)"),
 ];
