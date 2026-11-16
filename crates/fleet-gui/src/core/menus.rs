@@ -36,6 +36,8 @@ pub enum RowMenuItem {
     OpenSplit,
     Rename,
     EditLabels,
+    SaveOutput,
+    OpenOutput,
     Kill,
     Restart,
     Remove,
@@ -47,6 +49,8 @@ impl RowMenuItem {
             RowMenuItem::OpenSplit => "Open in New Split",
             RowMenuItem::Rename => "Rename…",
             RowMenuItem::EditLabels => "Edit Labels…",
+            RowMenuItem::SaveOutput => "Save Output…",
+            RowMenuItem::OpenOutput => "Open Output in Editor",
             // It asks first.
             RowMenuItem::Kill => "Kill…",
             RowMenuItem::Restart => "Restart",
@@ -56,7 +60,8 @@ impl RowMenuItem {
 }
 
 /// A row's menu: Open in New Split (while a pane can be added), Rename…
-/// and Edit Labels…, then Kill for a running agent, or Restart and Remove for one that
+/// and Edit Labels…, Save Output… and Open Output in Editor (ADR 0086),
+/// then Kill for a running agent, or Restart and Remove for one that
 /// exited or is lost.
 pub fn row_menu(can_split: bool, ended: bool) -> Vec<MenuEntry<RowMenuItem>> {
     let mut out = Vec::new();
@@ -66,6 +71,9 @@ pub fn row_menu(can_split: bool, ended: bool) -> Vec<MenuEntry<RowMenuItem>> {
     }
     out.push(MenuEntry::Item(RowMenuItem::Rename));
     out.push(MenuEntry::Item(RowMenuItem::EditLabels));
+    out.push(MenuEntry::Separator);
+    out.push(MenuEntry::Item(RowMenuItem::SaveOutput));
+    out.push(MenuEntry::Item(RowMenuItem::OpenOutput));
     out.push(MenuEntry::Separator);
     if ended {
         out.push(MenuEntry::Item(RowMenuItem::Restart));
@@ -97,6 +105,9 @@ pub enum PaneMenuItem {
     Restore,
     Rename,
     EditLabels,
+    CopyLastOutput,
+    SaveOutput,
+    OpenOutput,
     Restart,
     Kill,
     Close,
@@ -116,6 +127,9 @@ impl PaneMenuItem {
             PaneMenuItem::Restore => "Restore Pane".to_owned(),
             PaneMenuItem::Rename => format!("Rename {what}…"),
             PaneMenuItem::EditLabels => "Edit Labels…".to_owned(),
+            PaneMenuItem::CopyLastOutput => "Copy Last Output".to_owned(),
+            PaneMenuItem::SaveOutput => "Save Output…".to_owned(),
+            PaneMenuItem::OpenOutput => "Open Output in Editor".to_owned(),
             PaneMenuItem::Restart => format!("Restart {what}"),
             // It asks first (unless told not to).
             PaneMenuItem::Kill => format!("Kill {what}…"),
@@ -134,7 +148,11 @@ impl PaneMenuItem {
             PaneMenuItem::Restart => cmd("r"),
             PaneMenuItem::Kill => cmd_shift("w"),
             PaneMenuItem::Close => cmd("w"),
-            PaneMenuItem::Rename | PaneMenuItem::EditLabels => None,
+            PaneMenuItem::SaveOutput => cmd_shift("s"),
+            PaneMenuItem::Rename
+            | PaneMenuItem::EditLabels
+            | PaneMenuItem::CopyLastOutput
+            | PaneMenuItem::OpenOutput => None,
         }
     }
 }
@@ -151,7 +169,8 @@ pub struct PaneMenuState {
     pub maximized: bool,
     /// The pane's agent exited or is gone.
     pub restartable: bool,
-    /// The pane shows an agent (Rename and Edit Labels are offered).
+    /// The pane shows an agent (Rename, Edit Labels and the output items
+    /// are offered).
     pub has_agent: bool,
     /// The pane shows a running agent (Kill Agent is offered).
     pub killable: bool,
@@ -175,6 +194,17 @@ pub fn pane_menu(s: PaneMenuState) -> Vec<MenuEntry<(PaneMenuItem, bool)>> {
         PaneMenuItem::Maximize
     };
     out.push(MenuEntry::Item((size, true)));
+    // Its output (ADR 0086).
+    if s.has_agent {
+        out.push(MenuEntry::Separator);
+        for item in [
+            PaneMenuItem::CopyLastOutput,
+            PaneMenuItem::SaveOutput,
+            PaneMenuItem::OpenOutput,
+        ] {
+            out.push(MenuEntry::Item((item, true)));
+        }
+    }
     // The agent's own items, in one group: Rename and Edit Labels, then
     // Restart (ended) or Kill (running).
     let mut agent = Vec::new();
@@ -228,7 +258,14 @@ mod tests {
     fn row_menu_offers_kill_or_restart_and_remove() {
         assert_eq!(
             items(&row_menu(true, false)),
-            [R::OpenSplit, R::Rename, R::EditLabels, R::Kill]
+            [
+                R::OpenSplit,
+                R::Rename,
+                R::EditLabels,
+                R::SaveOutput,
+                R::OpenOutput,
+                R::Kill
+            ]
         );
         assert_eq!(
             items(&row_menu(true, true)),
@@ -236,14 +273,23 @@ mod tests {
                 R::OpenSplit,
                 R::Rename,
                 R::EditLabels,
+                R::SaveOutput,
+                R::OpenOutput,
                 R::Restart,
                 R::Remove
             ]
         );
         assert_eq!(
             items(&row_menu(false, false)),
-            [R::Rename, R::EditLabels, R::Kill]
+            [
+                R::Rename,
+                R::EditLabels,
+                R::SaveOutput,
+                R::OpenOutput,
+                R::Kill
+            ]
         );
+        assert_eq!(R::SaveOutput.title(), "Save Output…");
         assert_eq!(row_menu(false, true)[0], MenuEntry::Item(R::Rename));
         assert_eq!(R::Kill.title(), "Kill…");
         assert_eq!(R::Rename.title(), "Rename…");
@@ -282,6 +328,9 @@ mod tests {
                 (P::SplitRight, false),
                 (P::SplitDown, false),
                 (P::Maximize, true),
+                (P::CopyLastOutput, true),
+                (P::SaveOutput, true),
+                (P::OpenOutput, true),
                 (P::Rename, true),
                 (P::EditLabels, true),
                 (P::Restart, true),
@@ -296,6 +345,10 @@ mod tests {
         assert_eq!(
             pane_menu(running)[3..],
             [
+                MenuEntry::Separator,
+                MenuEntry::Item((P::CopyLastOutput, true)),
+                MenuEntry::Item((P::SaveOutput, true)),
+                MenuEntry::Item((P::OpenOutput, true)),
                 MenuEntry::Separator,
                 MenuEntry::Item((P::Rename, true)),
                 MenuEntry::Item((P::EditLabels, true)),
@@ -354,5 +407,7 @@ mod tests {
         assert!(P::SplitDown.shortcut().unwrap().shift);
         assert_eq!(P::Restart.shortcut().unwrap().key, "r");
         assert_eq!(P::Restore.shortcut(), P::Maximize.shortcut());
+        assert_eq!(P::SaveOutput.shortcut().unwrap().key, "s");
+        assert!(P::SaveOutput.shortcut().unwrap().shift);
     }
 }

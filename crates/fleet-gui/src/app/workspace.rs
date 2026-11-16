@@ -22,17 +22,18 @@ use super::context_menu::{self, MenuLine};
 use super::controls::{ButtonKind, ReducedMotion, appear, button};
 use super::graph_view::{GraphEvent, GraphView};
 use super::keymap::{
-    ClosePane, CloseTab, CommandPalette, Copy, EditLabelsPane, FocusDown, FocusFilter, FocusLeft,
-    FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent,
-    NewTab, NewTerminal, NextAgent, NextTab, Paste, PrevTab, PreviousAgent, Remove, RemoveExited,
-    RemovePane, RenamePane, ReopenClosedPane, Restart, RestartPane, SelectTab, ShowShortcuts,
-    SplitDown, SplitRight, ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut,
-    ZoomReset,
+    ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, EditLabelsPane, FocusDown,
+    FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp,
+    Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenOutput, Paste, PrevTab,
+    PreviousAgent, Remove, RemoveExited, RemovePane, RenamePane, ReopenClosedPane, Restart,
+    RestartPane, SaveOutput, SelectTab, ShowShortcuts, SplitDown, SplitRight, ToggleGraph,
+    ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::labels_sheet::{LabelsEvent, LabelsSheet};
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
+use super::output;
 use super::palette::{command_action, command_shortcut};
 use super::pane_drag::PaneDrag;
 use super::pane_view::{PaneEvent, PaneView};
@@ -1089,6 +1090,8 @@ impl Workspace {
             RowMenuItem::OpenSplit => self.open_menu_split(agent_id, window, cx),
             RowMenuItem::Rename => self.open_rename(agent_id, window, cx),
             RowMenuItem::EditLabels => self.open_labels(agent_id, window, cx),
+            RowMenuItem::SaveOutput => output::save_output(self.app.clone(), agent_id, cx),
+            RowMenuItem::OpenOutput => output::open_output(self.app.clone(), agent_id, cx),
             RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
             RowMenuItem::Restart => self.restart(&Restart { agent_id }, window, cx),
             RowMenuItem::Remove => self.remove(&Remove { agent_id }, window, cx),
@@ -1168,6 +1171,10 @@ impl Workspace {
             PaneMenuItem::EditLabels => PaneEvent::EditLabels,
             PaneMenuItem::Kill => PaneEvent::Kill,
             PaneMenuItem::Close => PaneEvent::Close,
+            PaneMenuItem::CopyLastOutput | PaneMenuItem::SaveOutput | PaneMenuItem::OpenOutput => {
+                self.output_in_pane(pane, item, cx);
+                return;
+            }
         };
         self.pane_event(pane, event, window, cx);
     }
@@ -1631,7 +1638,9 @@ impl Workspace {
 
     /// Remove Exited Agents (palette, app menu): asks first, naming how
     /// many will go; does nothing while none has ended. fleetd removes what
-    /// has ended when the request lands and never a running agent.
+    /// has ended when the request lands and never a running agent. "Save
+    /// Output First…" saves each one's output into a folder, then removes
+    /// those saved (ADR 0086).
     fn remove_exited(&mut self, _: &RemoveExited, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal() {
             return;
@@ -1644,17 +1653,59 @@ impl Workspace {
             PromptLevel::Warning,
             &question,
             Some("Their history and scrollback are deleted. Running agents are not touched."),
-            &[PromptButton::new("Remove"), PromptButton::cancel("Cancel")],
+            &[
+                PromptButton::new("Remove"),
+                PromptButton::new("Save Output First…"),
+                PromptButton::cancel("Cancel"),
+            ],
             cx,
         );
         let app = self.app.clone();
-        cx.spawn(async move |_, cx| {
-            if answer.await == Ok(0) {
+        cx.spawn(async move |_, cx| match answer.await {
+            Ok(0) => {
                 let _ = app.update(cx, |a, _| a.clear_exited());
             }
+            Ok(1) => {
+                let _ = cx.update(|cx| {
+                    let ids = app.read(cx).ended_ids();
+                    output::save_ended_then_remove(app, ids, cx);
+                });
+            }
+            _ => {}
         })
         .detach();
         cx.notify();
+    }
+
+    /// The agent the focused pane shows, unless a sheet is up.
+    fn focused_agent(&self, cx: &App) -> Option<(PaneId, u64)> {
+        if self.modal() {
+            return None;
+        }
+        let app = self.app.read(cx);
+        let pane = app.focused();
+        Some((pane, app.layout().agent(pane)?))
+    }
+
+    /// Copy Last Output, Save Output… or Open Output in Editor for the
+    /// agent `pane` shows (ADR 0086).
+    fn output_in_pane(&mut self, pane: PaneId, item: PaneMenuItem, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.app.read(cx).layout().agent(pane) else {
+            return;
+        };
+        match item {
+            PaneMenuItem::CopyLastOutput => output::copy_last_output(&self.app, pane, cx),
+            PaneMenuItem::SaveOutput => output::save_output(self.app.clone(), agent_id, cx),
+            PaneMenuItem::OpenOutput => output::open_output(self.app.clone(), agent_id, cx),
+            _ => {}
+        }
+    }
+
+    /// ⇧⌘S and the palette: the focused pane's agent's output.
+    fn output_focused(&mut self, item: PaneMenuItem, cx: &mut Context<Self>) {
+        if let Some((pane, _)) = self.focused_agent(cx) {
+            self.output_in_pane(pane, item, cx);
+        }
     }
 
     /// The sidebar's Clear exited: forgets every ended agent.
@@ -2357,6 +2408,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::remove_exited))
+            .on_action(cx.listener(|this, _: &SaveOutput, _, cx| {
+                this.output_focused(PaneMenuItem::SaveOutput, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenOutput, _, cx| {
+                this.output_focused(PaneMenuItem::OpenOutput, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyLastOutput, _, cx| {
+                this.output_focused(PaneMenuItem::CopyLastOutput, cx)
+            }))
             .on_action(cx.listener(Self::restart_pane))
             .on_action(cx.listener(|this, _: &ZoomIn, w, cx| this.zoom(Zoom::In, w, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, w, cx| this.zoom(Zoom::Out, w, cx)))
@@ -2576,7 +2636,7 @@ pub(super) fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -2644,6 +2704,8 @@ mod tests {
         update_available: std::sync::atomic::AtomicBool,
         daemon_restarts: std::sync::atomic::AtomicUsize,
         restart_pending: std::sync::atomic::AtomicBool,
+        /// What `read_output` gives per agent (unset: an error).
+        outputs: Mutex<HashMap<u64, Result<String, String>>>,
     }
 
     impl Fake {
@@ -2737,6 +2799,11 @@ mod tests {
 
         fn forget(&self, ids: Vec<u64>) {
             self.calls.lock().unwrap().push(Call::Forget(ids));
+        }
+
+        fn read_output(&self, agent_id: u64) -> crate::app::app_state::OutputJob {
+            let out = self.outputs.lock().unwrap().get(&agent_id).cloned();
+            Box::new(move || out.unwrap_or_else(|| Err("no such agent".into())))
         }
 
         fn rename(&self, agent_id: u64, name: String) {
@@ -4527,6 +4594,8 @@ mod tests {
                 RowMenuItem::OpenSplit,
                 RowMenuItem::Rename,
                 RowMenuItem::EditLabels,
+                RowMenuItem::SaveOutput,
+                RowMenuItem::OpenOutput,
                 RowMenuItem::Kill
             ]
         );
@@ -4537,6 +4606,8 @@ mod tests {
                     RowMenuItem::OpenSplit,
                     RowMenuItem::Rename,
                     RowMenuItem::EditLabels,
+                    RowMenuItem::SaveOutput,
+                    RowMenuItem::OpenOutput,
                     RowMenuItem::Restart,
                     RowMenuItem::Remove
                 ]
@@ -4568,6 +4639,8 @@ mod tests {
             [
                 RowMenuItem::Rename,
                 RowMenuItem::EditLabels,
+                RowMenuItem::SaveOutput,
+                RowMenuItem::OpenOutput,
                 RowMenuItem::Kill
             ]
         );
@@ -6079,5 +6152,168 @@ mod tests {
             assert_eq!(selected(&mut s), Some(80));
             assert!(drawn(&mut s, 80) && !drawn(&mut s, 1));
         }
+    }
+
+    /// Agent 5 in pane 1, running, with `text` on screen; `read_output`
+    /// gives its history.
+    fn output_setup<'a>(cx: &'a mut TestAppContext, fake: &Arc<Fake>, dir: &Path) -> Setup<'a> {
+        let mut s = setup(cx, fake, dir);
+        let mut named = row(5, "/w", 1);
+        named.info.labels.insert("name".into(), "otter".into());
+        agents(&mut s, fake, vec![named]);
+        click(&mut s, "tab-5");
+        attach_model(fake, PaneId(1), 5);
+        fake.model(PaneId(1))
+            .lock()
+            .unwrap()
+            .on_output(b"\x1b[31merror\x1b[0m: boom   \r\n");
+        fake.outputs
+            .lock()
+            .unwrap()
+            .insert(5, Ok("old line\nerror: boom\n".into()));
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        s
+    }
+
+    fn pick_pane(s: &mut Setup<'_>, item: PaneMenuItem) {
+        s.ws.update_in(s.cx, |ws, window, cx| {
+            let epoch = ws.epoch;
+            ws.pane_menu_pick(PaneId(1), item, epoch, window, cx);
+        });
+        s.cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn save_output_writes_the_history_where_the_panel_says(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = output_setup(cx, &fake, dir.path());
+        let file = dir.path().join("out.txt");
+        // ⇧⌘S asks where, for the focused pane's agent.
+        s.cx.simulate_keystrokes("cmd-shift-s");
+        assert!(s.cx.did_prompt_for_new_path());
+        let to = file.clone();
+        s.cx.simulate_new_path_selection(|_| Some(to));
+        s.cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "old line\nerror: boom\n"
+        );
+        let notice = s.app.read_with(s.cx, |a, _| a.notice().map(str::to_owned));
+        assert!(notice.unwrap().starts_with("Saved output to "));
+
+        // Cancelled: nothing written.
+        std::fs::remove_file(&file).unwrap();
+        pick_pane(&mut s, PaneMenuItem::SaveOutput);
+        s.cx.simulate_new_path_selection(|_| None);
+        s.cx.run_until_parked();
+        assert!(!file.exists());
+
+        // Exited agents too, from the row menu; a failed read is shown.
+        fake.model(PaneId(1)).lock().unwrap().on_exited(1);
+        agents(&mut s, &fake, vec![ended(5, "/w", 1, AgentState::Exited)]);
+        pick_row(&mut s, 5, RowMenuItem::SaveOutput);
+        let to = file.clone();
+        s.cx.simulate_new_path_selection(|_| Some(to));
+        s.cx.run_until_parked();
+        assert!(file.exists());
+        fake.outputs.lock().unwrap().clear();
+        pick_row(&mut s, 5, RowMenuItem::SaveOutput);
+        let to = dir.path().join("other.txt");
+        s.cx.simulate_new_path_selection(|_| Some(to));
+        s.cx.run_until_parked();
+        let error = s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
+        assert_eq!(
+            error.as_deref(),
+            Some("Cannot save the output of sh: no such agent")
+        );
+        assert!(!dir.path().join("other.txt").exists());
+    }
+
+    #[gpui::test]
+    fn open_output_writes_a_temp_file_and_opens_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = output_setup(cx, &fake, dir.path());
+        let opened: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let seen = opened.clone();
+        s.cx.update(|_, cx| {
+            cx.set_global(crate::app::output::Opener(Arc::new(move |p: &Path| {
+                seen.lock().unwrap().push(p.to_owned());
+                Ok(())
+            })))
+        });
+        pick_pane(&mut s, PaneMenuItem::OpenOutput);
+        let opened = opened.lock().unwrap().clone();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].ends_with(format!(
+            "fleet-output/otter-{}.txt",
+            crate::core::output::today()
+        )));
+        assert_eq!(
+            std::fs::read_to_string(&opened[0]).unwrap(),
+            "old line\nerror: boom\n"
+        );
+    }
+
+    #[gpui::test]
+    fn copy_last_output_copies_the_screen_as_text(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = output_setup(cx, &fake, dir.path());
+        s.cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+        pick_pane(&mut s, PaneMenuItem::CopyLastOutput);
+        let clip = s.cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(clip.as_deref(), Some("error: boom"));
+    }
+
+    #[gpui::test]
+    fn save_output_first_removes_only_what_was_saved(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                ended(8, "/w", 2, AgentState::Exited),
+                ended(9, "/w", 3, AgentState::Lost),
+                ended(10, "/w", 4, AgentState::Exited),
+            ],
+        );
+        fake.outputs.lock().unwrap().insert(8, Ok("eight\n".into()));
+        fake.outputs.lock().unwrap().insert(10, Ok("ten\n".into()));
+        // The question offers it.
+        s.cx.dispatch_action(RemoveExited);
+        let (_, detail) = s.cx.pending_prompt().unwrap();
+        assert!(detail.contains("deleted"));
+        s.cx.simulate_prompt_answer("Cancel");
+        s.cx.run_until_parked();
+
+        let out = dir.path().join("saved");
+        std::fs::create_dir(&out).unwrap();
+        let ids = s.app.read_with(s.cx, |a, _| a.ended_ids());
+        assert_eq!(ids, [8, 9, 10]);
+        let app = s.app.clone();
+        let to = out.clone();
+        s.cx.update(|_, cx| crate::app::output::save_all_then_remove(app, ids, to, cx));
+        s.cx.run_until_parked();
+        // All three are "sh": numbered, never overwritten.
+        let date = crate::core::output::today();
+        assert_eq!(
+            std::fs::read_to_string(out.join(format!("sh-{date}.txt"))).unwrap(),
+            "eight\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join(format!("sh-{date}-2.txt"))).unwrap(),
+            "ten\n"
+        );
+        assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![8, 10])));
+        let error = s.app.read_with(s.cx, |a, _| a.error().map(str::to_owned));
+        assert_eq!(
+            error.as_deref(),
+            Some("Cannot save the output of sh: no such agent. It was not removed.")
+        );
     }
 }

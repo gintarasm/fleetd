@@ -40,6 +40,9 @@ pub enum Command {
     FindPrevious,
     Copy,
     Paste,
+    CopyLastOutput,
+    SaveOutput,
+    OpenOutput,
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -106,6 +109,9 @@ impl Command {
         Command::FindPrevious,
         Command::Copy,
         Command::Paste,
+        Command::CopyLastOutput,
+        Command::SaveOutput,
+        Command::OpenOutput,
         Command::FocusLeft,
         Command::FocusRight,
         Command::FocusUp,
@@ -162,6 +168,9 @@ impl Command {
             Command::FindPrevious => "Find Previous",
             Command::Copy => "Copy",
             Command::Paste => "Paste",
+            Command::CopyLastOutput => "Copy Last Output",
+            Command::SaveOutput => "Save Output…",
+            Command::OpenOutput => "Open Output in Editor",
             Command::FocusLeft => "Focus Pane on the Left",
             Command::FocusRight => "Focus Pane on the Right",
             Command::FocusUp => "Focus Pane Above",
@@ -217,6 +226,9 @@ impl Command {
             Command::ZoomIn => "bigger font larger",
             Command::ZoomOut => "smaller font",
             Command::ZoomReset => "actual size font",
+            Command::CopyLastOutput => "screen clipboard",
+            Command::SaveOutput => "history transcript export file",
+            Command::OpenOutput => "history transcript text edit",
             Command::RemoveExited => "clear forget rm lost",
             Command::ShowShortcuts => "cheat sheet keys help",
             Command::OpenSettings => "preferences config",
@@ -242,6 +254,9 @@ impl Command {
             Command::FocusPane4 => s.panes >= 4,
             Command::RenamePane
             | Command::EditLabelsPane
+            | Command::CopyLastOutput
+            | Command::SaveOutput
+            | Command::OpenOutput
             | Command::Find
             | Command::FindNext
             | Command::FindPrevious => s.has_agent,
@@ -553,6 +568,9 @@ mod tests {
             Command::RestartPane,
             Command::RemovePane,
             Command::Copy,
+            Command::CopyLastOutput,
+            Command::SaveOutput,
+            Command::OpenOutput,
         ];
         // An empty pane: none of them.
         let empty = PaletteState {

@@ -18,6 +18,7 @@ use fleet_proto::{
 };
 use tokio_util::codec::{Decoder, Encoder};
 
+pub mod history;
 pub mod names;
 mod restart;
 pub mod tree;

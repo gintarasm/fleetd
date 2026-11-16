@@ -8,12 +8,12 @@
 use gpui::{Action, Window};
 
 use super::keymap::{
-    ClosePane, CloseTab, Copy, EditLabelsPane, Find, FindNext, FindPrevious, FocusDown,
-    FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp,
-    InstallSkill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenSettings, Paste,
-    PrevTab, PreviousAgent, Quit, RemoveExited, RemovePane, RenamePane, ReopenClosedPane,
-    RestartPane, SelectTab, ShowShortcuts, SplitDown, SplitRight, SwitchFleetd, ToggleGraph,
-    ToggleMaximize, ZoomIn, ZoomOut, ZoomReset,
+    ClosePane, CloseTab, Copy, CopyLastOutput, EditLabelsPane, Find, FindNext, FindPrevious,
+    FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
+    FocusUp, InstallSkill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenOutput,
+    OpenSettings, Paste, PrevTab, PreviousAgent, Quit, RemoveExited, RemovePane, RenamePane,
+    ReopenClosedPane, RestartPane, SaveOutput, SelectTab, ShowShortcuts, SplitDown, SplitRight,
+    SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn, ZoomOut, ZoomReset,
 };
 use crate::core::palette::{Command, Mods, shortcut_text};
 
@@ -55,6 +55,9 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::FindPrevious => Box::new(FindPrevious),
         Command::Copy => Box::new(Copy),
         Command::Paste => Box::new(Paste),
+        Command::CopyLastOutput => Box::new(CopyLastOutput),
+        Command::SaveOutput => Box::new(SaveOutput),
+        Command::OpenOutput => Box::new(OpenOutput),
         Command::FocusLeft => Box::new(FocusLeft),
         Command::FocusRight => Box::new(FocusRight),
         Command::FocusUp => Box::new(FocusUp),

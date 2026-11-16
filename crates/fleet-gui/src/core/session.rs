@@ -32,6 +32,8 @@ use super::target::{Connected, Target, connect};
 
 /// How the control connection introduces itself.
 pub const CLIENT_NAME: &str = "gui";
+/// How a [`Session::read_output`] connection introduces itself.
+const OUTPUT_CLIENT_NAME: &str = "gui-output";
 
 /// What an old daemon answers a request it does not know with.
 const UNKNOWN_REQUEST: &str = "empty request";
@@ -629,6 +631,24 @@ impl Session {
     /// Forgets these exited agents (running ones are refused by fleetd).
     pub fn forget(&self, ids: Vec<u64>) {
         self.control(ControlCmd::Forget(ids));
+    }
+
+    /// A job that reads `agent_id`'s whole output (its fleetd history,
+    /// then its screen) as plain text, over a connection of its own, as
+    /// `fleet history --plain` does (ADR 0086). It blocks: run it off the
+    /// UI thread. Running and exited agents alike.
+    pub fn read_output(
+        &self,
+        agent_id: u64,
+    ) -> impl FnOnce() -> Result<String, String> + Send + use<> {
+        let ctx = Arc::clone(&self.inner.ctx);
+        move || {
+            let mut c = connect(&ctx.target, &ctx.state_dir, OUTPUT_CLIENT_NAME)
+                .map_err(|e| e.to_string())?;
+            let read = fleet_client::history::read(&mut c.conn, agent_id, None);
+            drop(c);
+            read.map(|t| t.plain_text()).map_err(|e| e.to_string())
+        }
     }
 
     /// Restarts fleetd into the binary on disk, agents kept: the local

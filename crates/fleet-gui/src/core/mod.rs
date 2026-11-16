@@ -21,6 +21,7 @@ pub mod layout;
 pub mod links;
 pub mod menus;
 pub mod mouse;
+pub mod output;
 pub mod palette;
 pub mod pane;
 mod pane_link;
