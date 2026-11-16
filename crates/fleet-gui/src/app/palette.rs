@@ -6,7 +6,7 @@ use gpui::{Action, Window};
 use super::keymap::{
     ClosePane, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
     FocusUp, InstallSkill, NewAgent, NewTerminal, Quit, RemoveExited, RestartPane, SplitDown,
-    SplitRight, SwitchFleetd, ToggleMaximize,
+    SplitRight, SwitchFleetd, ToggleGraph, ToggleMaximize,
 };
 use crate::core::palette::{Command, Mods, shortcut_text};
 
@@ -32,6 +32,7 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::InstallSkill => Box::new(InstallSkill),
         Command::Quit => Box::new(Quit),
         Command::RemoveExited => Box::new(RemoveExited),
+        Command::ToggleGraph => Box::new(ToggleGraph),
     }
 }
 

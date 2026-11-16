@@ -30,6 +30,7 @@ pub enum Command {
     FocusPane3,
     FocusPane4,
     RemoveExited,
+    ToggleGraph,
     SwitchFleetd,
     InstallSkill,
     Quit,
@@ -37,7 +38,7 @@ pub enum Command {
 
 impl Command {
     /// Every command, in the palette's order.
-    pub const ALL: [Command; 19] = [
+    pub const ALL: [Command; 20] = [
         Command::NewAgent,
         Command::NewTerminal,
         Command::SplitRight,
@@ -54,6 +55,7 @@ impl Command {
         Command::FocusPane3,
         Command::FocusPane4,
         Command::RemoveExited,
+        Command::ToggleGraph,
         Command::SwitchFleetd,
         Command::InstallSkill,
         Command::Quit,
@@ -77,6 +79,7 @@ impl Command {
             Command::FocusPane3 => "Focus Pane 3",
             Command::FocusPane4 => "Focus Pane 4",
             Command::RemoveExited => "Remove Exited Agents…",
+            Command::ToggleGraph => "Show or Hide the Agent Graph",
             Command::SwitchFleetd => "Switch fleetd…",
             Command::InstallSkill => "Install Agent Skill",
             Command::Quit => "Quit fleet",
@@ -93,6 +96,7 @@ impl Command {
             Command::ToggleMaximize => "zoom",
             Command::RemoveExited => "clear forget rm lost",
             Command::SwitchFleetd => "connect target",
+            Command::ToggleGraph => "tree spawned children satellite",
             _ => "",
         }
     }

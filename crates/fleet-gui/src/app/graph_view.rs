@@ -82,6 +82,8 @@ pub struct GraphView {
     drag: Option<Point<Pixels>>,
     /// Layouts computed so far (tests check activity does not lay out).
     pub(super) layouts: usize,
+    /// The cards the last frame built (tests check culling).
+    pub(super) built: Vec<u64>,
     _subs: Vec<Subscription>,
 }
 
@@ -109,6 +111,7 @@ impl GraphView {
             git_roots: HashMap::new(),
             drag: None,
             layouts: 0,
+            built: Vec::new(),
             _subs: subs,
         }
     }
@@ -706,6 +709,7 @@ impl Render for GraphView {
                 Some((card.clone(), content))
             })
             .collect();
+        self.built = contents.iter().map(|(c, _)| c.id).collect();
         let empty = layout.is_empty();
         let filtering = !self.filter.read(cx).text().trim().is_empty();
         let cards: Vec<AnyElement> = contents

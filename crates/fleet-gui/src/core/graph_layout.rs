@@ -409,9 +409,8 @@ impl Viewport {
         let view = self.world_rect(size);
         let pad = REVEAL_PAD / self.zoom;
         let axis = |origin: f32, len: f32, lo: f32, hi: f32| {
-            if hi - lo + 2.0 * pad > len {
-                lo - pad
-            } else if lo - pad < origin {
+            // Too big to fit, or above / left of the view: align its start.
+            if hi - lo + 2.0 * pad > len || lo - pad < origin {
                 lo - pad
             } else if hi + pad > origin + len {
                 hi + pad - len
