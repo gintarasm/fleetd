@@ -59,7 +59,15 @@ fn filter_status_and_collapse_together() {
     let name = |r: &AgentRow| format!("tab {}", r.info.id);
     let mut collapsed = BTreeSet::new();
 
-    let all = sidebar_groups(&rows, home, &Filter::default(), &name, &st, &collapsed);
+    let all = sidebar_groups(
+        &rows,
+        home,
+        &Filter::default(),
+        &name,
+        &st,
+        &collapsed,
+        &HashMap::new(),
+    );
     assert_eq!(
         shown(&all),
         [("fleetd", false, 2, vec![1, 2]), ("web", false, 1, vec![3])]
@@ -69,11 +77,19 @@ fn filter_status_and_collapse_together() {
         query: String::new(),
         status: StatusFilter::NeedsYou,
     };
-    let g = sidebar_groups(&rows, home, &needs, &name, &st, &collapsed);
+    let g = sidebar_groups(&rows, home, &needs, &name, &st, &collapsed, &HashMap::new());
     assert_eq!(shown(&g), [("web", false, 1, vec![3])]);
 
     toggle_collapsed(&mut collapsed, "fleetd");
-    let g = sidebar_groups(&rows, home, &Filter::default(), &name, &st, &collapsed);
+    let g = sidebar_groups(
+        &rows,
+        home,
+        &Filter::default(),
+        &name,
+        &st,
+        &collapsed,
+        &HashMap::new(),
+    );
     assert_eq!(
         shown(&g),
         [("fleetd", true, 2, vec![]), ("web", false, 1, vec![3])]
@@ -84,10 +100,68 @@ fn filter_status_and_collapse_together() {
         query: "~/fleetd tab 2".into(),
         status: StatusFilter::All,
     };
-    let g = sidebar_groups(&rows, home, &typed, &name, &st, &collapsed);
+    let g = sidebar_groups(&rows, home, &typed, &name, &st, &collapsed, &HashMap::new());
     assert_eq!(shown(&g), [("fleetd", false, 1, vec![2])]);
 
     let none: HashMap<u64, AgentStatus> = HashMap::new();
-    let g = sidebar_groups(&rows, home, &needs, &name, &none, &collapsed);
+    let g = sidebar_groups(
+        &rows,
+        home,
+        &needs,
+        &name,
+        &none,
+        &collapsed,
+        &HashMap::new(),
+    );
     assert!(g.is_empty());
+}
+
+fn child_of(mut r: AgentRow, parent: u64) -> AgentRow {
+    r.info
+        .labels
+        .insert("fleet.parent".into(), parent.to_string());
+    r
+}
+
+#[test]
+fn children_nest_under_parents_and_the_filter_keeps_ancestors() {
+    let home = Path::new("/Users/me");
+    let rows = vec![
+        agent(1, "/w", "fleetd", AgentState::Exited),
+        child_of(agent(2, "/w", "fleetd", AgentState::Running), 1),
+        child_of(agent(3, "/w", "fleetd", AgentState::Running), 1),
+        agent(4, "/w", "fleetd", AgentState::Running),
+    ];
+    let st = HashMap::new();
+    let name = |r: &AgentRow| format!("tab {}", r.info.id);
+    let g = sidebar_groups(
+        &rows,
+        home,
+        &Filter::default(),
+        &name,
+        &st,
+        &BTreeSet::new(),
+        &HashMap::new(),
+    );
+    // Running roots first; the ended parent stays, its children under it.
+    assert_eq!(shown(&g)[0].3, [4, 1, 2, 3]);
+    let depth: Vec<usize> = g[0].layout.iter().map(|l| l.depth).collect();
+    assert_eq!(depth, [0, 0, 1, 1]);
+    // Typing a child's name keeps its ended parent, greyed as context.
+    let typed = Filter {
+        query: "tab 3".into(),
+        ..Default::default()
+    };
+    let g = sidebar_groups(
+        &rows,
+        home,
+        &typed,
+        &name,
+        &st,
+        &BTreeSet::new(),
+        &HashMap::new(),
+    );
+    assert_eq!(shown(&g)[0].3, [1, 3]);
+    assert_eq!(shown(&g)[0].2, 1, "only the match counts");
+    assert!(g[0].layout[0].context && !g[0].layout[1].context);
 }

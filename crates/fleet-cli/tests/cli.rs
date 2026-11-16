@@ -114,6 +114,42 @@ fn spawn_then_ls_shows_running() {
     assert!(lines.next().is_none());
 }
 
+/// Until the node writes `fleet.parent` (M3-A) every agent is a root: the
+/// parent label cannot be set by a client.
+#[test]
+fn tree_lists_roots_and_hides_ended_unless_all() {
+    let d = Daemon::start();
+    assert_eq!(d.ok(&["tree"]), "");
+    let a = d
+        .ok(&["spawn", "--name", "alpha", "--", "cat"])
+        .trim()
+        .to_string();
+    let b = d
+        .ok(&["spawn", "--name", "beta", "--", "cat"])
+        .trim()
+        .to_string();
+    let tree = d.ok(&["tree"]);
+    let lines: Vec<&str> = tree.lines().collect();
+    assert_eq!(lines.len(), 2, "{tree}");
+    assert!(
+        lines[0].starts_with(&format!("{a} alpha  cat  running")),
+        "{tree}"
+    );
+    assert!(
+        lines[1].starts_with(&format!("{b} beta  cat  running")),
+        "{tree}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&d.ok(&["tree", "--json"])).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 2);
+    assert_eq!(json[0]["name"], "alpha");
+    assert_eq!(json[0]["children"], serde_json::json!([]));
+    d.ok(&["kill", &a]);
+    wait_for("exited", || d.ok(&["ls"]).contains("exited"));
+    assert_eq!(d.ok(&["tree"]).lines().count(), 1);
+    assert_eq!(d.ok(&["tree", "--all"]).lines().count(), 2);
+    assert_eq!(d.ok(&["tree", "--label", "name=beta"]).lines().count(), 1);
+}
+
 #[test]
 fn kill_then_ls_shows_exited() {
     let d = Daemon::start();

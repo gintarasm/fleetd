@@ -8,6 +8,7 @@ use fleet_client::names::{NAME_LABEL, name_of};
 use fleet_proto::{AgentInfo, AgentState};
 
 use super::session::AgentRow;
+use super::sidebar_tree::{RowLayout, arrange};
 use super::status::AgentStatus;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,13 +188,18 @@ pub struct SidebarGroup {
     pub collapsed: bool,
     /// How many of its agents pass the filter.
     pub count: usize,
+    /// The rows to draw, children after their parent (ADR 0074).
     pub agents: Vec<AgentRow>,
+    /// How each of `agents` sits in the tree.
+    pub layout: Vec<RowLayout>,
 }
 
 /// [`group_agents`] narrowed by `filter`: groups with no agent passing it
 /// are left out. Groups titled in `collapsed` draw collapsed, except while
 /// text is typed (to show what matched; `collapsed` is not changed).
-/// `name` is the name the row shows.
+/// `name` is the name the row shows. Within a group, agents nest under
+/// their parent and a filter keeps the ancestors of what passes it;
+/// `disclosure` is what the user opened or closed (ADR 0074).
 pub fn sidebar_groups(
     rows: &[AgentRow],
     home: &Path,
@@ -201,25 +207,25 @@ pub fn sidebar_groups(
     name: &dyn Fn(&AgentRow) -> String,
     statuses: &HashMap<u64, AgentStatus>,
     collapsed: &BTreeSet<String>,
+    disclosure: &HashMap<u64, bool>,
 ) -> Vec<SidebarGroup> {
     group_agents(rows, home)
         .into_iter()
         .filter_map(|g| {
-            let agents: Vec<AgentRow> = g
-                .agents
-                .into_iter()
-                .filter(|r| {
-                    filter.status.matches(r, statuses.get(&r.info.id).copied())
-                        && query_matches(&filter.query, r, &name(r), home)
-                })
-                .collect();
+            let passes = |r: &AgentRow| {
+                filter.status.matches(r, statuses.get(&r.info.id).copied())
+                    && query_matches(&filter.query, r, &name(r), home)
+            };
+            let count = g.agents.iter().filter(|r| passes(r)).count();
+            let (agents, layout) = arrange(&g.agents, &passes, filter.is_active(), disclosure);
             if agents.is_empty() && filter.is_active() {
                 return None;
             }
             let is_collapsed = collapsed.contains(&g.title) && !filter.has_query();
             Some(SidebarGroup {
-                count: agents.len(),
+                count,
                 agents: if is_collapsed { Vec::new() } else { agents },
+                layout: if is_collapsed { Vec::new() } else { layout },
                 collapsed: is_collapsed,
                 title: g.title,
             })
@@ -433,7 +439,15 @@ mod tests {
                 })
                 .collect()
         };
-        let all = sidebar_groups(&rows, home, &Filter::default(), &name_of, &statuses, &none);
+        let all = sidebar_groups(
+            &rows,
+            home,
+            &Filter::default(),
+            &name_of,
+            &statuses,
+            &none,
+            &HashMap::new(),
+        );
         assert_eq!(
             ids(&all),
             [("alpha".into(), vec![1, 2]), ("beta".into(), vec![3])]
@@ -444,14 +458,30 @@ mod tests {
             query: "coder".into(),
             status: StatusFilter::All,
         };
-        let g = sidebar_groups(&rows, home, &coder, &name_of, &statuses, &none);
+        let g = sidebar_groups(
+            &rows,
+            home,
+            &coder,
+            &name_of,
+            &statuses,
+            &none,
+            &HashMap::new(),
+        );
         assert_eq!(ids(&g), [("alpha".into(), vec![1])]);
 
         let exited = Filter {
             query: String::new(),
             status: StatusFilter::Exited,
         };
-        let g = sidebar_groups(&rows, home, &exited, &name_of, &statuses, &none);
+        let g = sidebar_groups(
+            &rows,
+            home,
+            &exited,
+            &name_of,
+            &statuses,
+            &none,
+            &HashMap::new(),
+        );
         assert_eq!(ids(&g), [("alpha".into(), vec![2])]);
 
         // The name matches too.
@@ -459,7 +489,15 @@ mod tests {
             query: "agent-3".into(),
             status: StatusFilter::Running,
         };
-        let g = sidebar_groups(&rows, home, &named, &name_of, &statuses, &none);
+        let g = sidebar_groups(
+            &rows,
+            home,
+            &named,
+            &name_of,
+            &statuses,
+            &none,
+            &HashMap::new(),
+        );
         assert_eq!(ids(&g), [("beta".into(), vec![3])]);
         assert!(!Filter::default().is_active());
         assert!(named.is_active());
@@ -482,6 +520,7 @@ mod tests {
             &name_of,
             &statuses,
             &collapsed,
+            &HashMap::new(),
         );
         assert_eq!(g[0].title, "alpha");
         assert!(g[0].collapsed);
@@ -495,7 +534,15 @@ mod tests {
             query: String::new(),
             status: StatusFilter::Running,
         };
-        let g = sidebar_groups(&rows, home, &running, &name_of, &statuses, &collapsed);
+        let g = sidebar_groups(
+            &rows,
+            home,
+            &running,
+            &name_of,
+            &statuses,
+            &collapsed,
+            &HashMap::new(),
+        );
         assert!(g[0].collapsed);
         assert_eq!(g[0].count, 1);
 
@@ -505,7 +552,15 @@ mod tests {
             query: "/a".into(),
             status: StatusFilter::All,
         };
-        let g = sidebar_groups(&rows, home, &typed, &name_of, &statuses, &collapsed);
+        let g = sidebar_groups(
+            &rows,
+            home,
+            &typed,
+            &name_of,
+            &statuses,
+            &collapsed,
+            &HashMap::new(),
+        );
         assert_eq!(g.len(), 1);
         assert!(!g[0].collapsed);
         assert_eq!(g[0].agents.len(), 2);

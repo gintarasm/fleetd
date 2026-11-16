@@ -3,6 +3,7 @@
 mod attach;
 mod history;
 mod skill;
+mod tree;
 mod upgrade;
 
 use std::collections::HashMap;
@@ -82,6 +83,8 @@ enum Command {
         #[arg(long = "label", value_name = "K=V")]
         labels: Vec<String>,
     },
+    /// Show agents as a spawned-by tree
+    Tree(tree::Args),
     /// Set or remove labels on an agent
     Label {
         /// Agent id or name
@@ -486,6 +489,7 @@ fn run(cli: Cli) -> Result<u8> {
                 _ => return Err(Error::Protocol("unexpected reply to list".into())),
             }
         }
+        Command::Tree(args) => tree::run(&mut client, &args, &parse_labels(&args.labels)?)?,
         Command::Label { agent, set, remove } => {
             let set = parse_labels(&set)?;
             if let Some(n) = set.get(NAME_LABEL) {

@@ -29,6 +29,7 @@ pub mod session;
 pub mod settings;
 pub mod shortcuts;
 pub mod sidebar;
+pub mod sidebar_tree;
 pub mod spawn;
 pub mod split_chooser;
 pub mod state;
