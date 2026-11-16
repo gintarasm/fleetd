@@ -998,7 +998,7 @@ fn skill_print_has_frontmatter() {
     }
     assert_eq!(lines.len(), 2, "{front}");
     assert!(!body.trim().is_empty());
-    assert!(SKILL.lines().count() < 120);
+    assert!(SKILL.lines().count() < 220);
     for needle in ["$FLEET_AGENT_ID", "--lines"] {
         assert!(SKILL.contains(needle), "skill lacks {needle}");
     }
@@ -1056,6 +1056,12 @@ fn skill_examples_run() {
         ("spawn", "--cwd"),
         ("spawn", "--name"),
         ("kill", ""),
+        ("tree", ""),
+        ("inbox", ""),
+        ("message", ""),
+        ("wait", "--timeout"),
+        ("report", ""),
+        ("lease", "--wait"),
     ] {
         assert!(
             examples
@@ -1075,6 +1081,12 @@ fn skill_examples_run() {
     let d = Daemon::start();
     let work = TempDir::new().unwrap();
     for example in &examples {
+        // These need an agent's identity or block until something happens;
+        // their own tests run them (`report`, `mailbox`, `lease`), and
+        // `skill::tests::fenced_commands_exist` checks their flags.
+        if matches!(example[1].as_str(), "report" | "wait" | "lease") {
+            continue;
+        }
         let id = if matches!(example[1].as_str(), "restart" | "rm") {
             spawn_exited(&d)
         } else {
