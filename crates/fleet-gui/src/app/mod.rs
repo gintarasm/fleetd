@@ -5,15 +5,19 @@ mod bench;
 mod connect;
 mod context_menu;
 mod controls;
+mod ended_view;
 mod fonts;
 mod icons;
 mod keymap;
 mod kill_sheet;
 mod native;
 mod new_agent;
+mod palette;
 mod pane_view;
+mod picker_view;
 mod resident;
 mod sidebar_view;
+mod split_dividers;
 mod status_item;
 mod tail_text;
 mod terminal_element;
@@ -32,8 +36,9 @@ pub use connect::{
     Backend, ConnectSheet, RealBackend, StartupAttempt, show_connect_sheet, startup_work,
     switch_fleetd, switch_target,
 };
-pub use keymap::to_key;
+pub use keymap::{CommandPalette, bind_keys, to_key};
 pub use pane_view::{InputSink, PaneChrome, PaneView, grid_size};
+pub use picker_view::{PickerEvent, PickerView};
 pub use terminal_element::TerminalElement;
 pub use theme::Theme;
 pub use workspace::{Workspace, open_main_window};
@@ -78,6 +83,8 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
             Menu {
                 name: "fleet".into(),
                 items: vec![
+                    MenuItem::action("Command Palette…", keymap::CommandPalette),
+                    MenuItem::separator(),
                     MenuItem::action("Switch fleetd…", keymap::SwitchFleetd),
                     MenuItem::action("Install agent skill", keymap::InstallSkill),
                     MenuItem::separator(),
@@ -95,7 +102,18 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Copy", keymap::Copy),
                     MenuItem::action("Paste", keymap::Paste),
                     MenuItem::action("Select All", keymap::SelectAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Find…", keymap::Find),
+                    MenuItem::action("Find Next", keymap::FindNext),
+                    MenuItem::action("Find Previous", keymap::FindPrevious),
                 ],
+            },
+            Menu {
+                name: "Help".into(),
+                items: vec![MenuItem::action(
+                    "Keyboard Shortcuts",
+                    keymap::ShowShortcuts,
+                )],
             },
         ]);
         connect::install_backend(backend, cx);

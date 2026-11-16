@@ -7,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Action, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowOptions, deferred, div, point, px, relative, size,
+    IntoElement, ModifiersChangedEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px, relative,
+    size,
 };
 
 use super::app_state::AppState;
@@ -17,26 +18,36 @@ use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, swit
 use super::context_menu::{self, MenuLine};
 use super::controls::appear;
 use super::keymap::{
-    ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
-    FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTerminal, Paste, Remove, Restart,
-    RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    ClosePane, CommandPalette, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
+    FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTerminal, NextAgent, Paste,
+    PreviousAgent, Remove, ReopenClosedPane, Restart, RestartPane, ShowShortcuts, SplitDown,
+    SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
+use super::palette::{command_action, command_shortcut};
 use super::pane_view::{PaneEvent, PaneView};
+use super::picker_view::{PickerEvent, PickerView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
+use super::split_dividers::SplitDrag;
 use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
+use super::{controls, keymap};
 use crate::core::config::{save_confirm_kill, save_connection};
 use crate::core::kill::{KillFlow, kill_flow};
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
 };
+use crate::core::palette::{Command, Entry, palette_items};
+use crate::core::picker::Recents;
 use crate::core::session::PaneId;
+use crate::core::shortcuts::Section;
 use crate::core::sidebar::ended;
+use crate::core::spawn::SpawnRequest;
 use crate::core::style::{chrome, motion, radius, space, text};
+use crate::core::switcher::{AgentMru, start_row, switcher_items};
 use crate::core::target::Target;
 use crate::core::titlebar::{Link, bar_title, window_title};
 
@@ -105,12 +116,28 @@ fn blur_within(window: &mut Window, frames: u32) {
     });
 }
 
+/// The open agent switcher.
+struct Switcher {
+    view: Entity<PickerView>,
+    /// ⌃ was seen down: its release picks.
+    held: bool,
+    _sub: Subscription,
+}
+
 /// The window's root view, over [`AppState`].
 pub struct Workspace {
     app: Entity<AppState>,
     sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
     /// The question before a kill (issue #27).
     kill: Option<(Entity<KillSheet>, Subscription)>,
+    /// The command palette (⌘P) and what its rows stand for.
+    palette: Option<(Entity<PickerView>, Vec<Entry>, Subscription)>,
+    /// The palette's recent picks, most recent first.
+    palette_recents: Recents,
+    /// The agent switcher (⌃Tab), while it is open.
+    switcher: Option<Switcher>,
+    /// The agents the focused pane showed, most recent first.
+    agent_mru: AgentMru,
     /// The connect sheet, over everything else.
     connect: Option<(Entity<ConnectSheet>, [Subscription; 2])>,
     /// The [`AppState::session_epoch`] last seen; a change closes the
@@ -122,10 +149,14 @@ pub struct Workspace {
     pane_focus: HashMap<PaneId, (EntityId, FocusHandle, [Subscription; 2])>,
     /// The panes drawn by the last render.
     drawn: Vec<PaneId>,
+    /// The ⌘/ cheat sheet while shown, and its focus (for Escape).
+    shortcuts: Option<(Vec<Section>, FocusHandle)>,
     /// The window title last set.
     window_title: String,
     /// Reduce Motion is on (read at launch and on appearance changes).
     reduce_motion: bool,
+    /// A split divider being dragged.
+    split_drag: SplitDrag,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -138,8 +169,11 @@ impl Workspace {
             let epoch = app.read(cx).session_epoch();
             if epoch != this.epoch {
                 this.epoch = epoch;
-                let closed = this.sheet.take().is_some() | this.kill.take().is_some();
-                if closed {
+                if this.sheet.take().is_some()
+                    | this.kill.take().is_some()
+                    | this.palette.take().is_some()
+                    | this.switcher.take().is_some()
+                {
                     this.focus_current(window, cx);
                 }
             }
@@ -188,12 +222,18 @@ impl Workspace {
             _ticker: ticker,
             sheet: None,
             kill: None,
+            palette: None,
+            palette_recents: Recents::default(),
+            switcher: None,
+            agent_mru: AgentMru::default(),
             connect: None,
             epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
+            shortcuts: None,
             window_title: String::new(),
             reduce_motion: native::reduce_motion(),
+            split_drag: SplitDrag::default(),
             _subscriptions: vec![observe, appearance, activation],
         };
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
@@ -213,6 +253,16 @@ impl Workspace {
         self.sheet.as_ref().map(|(s, _)| s)
     }
 
+    /// The command palette, while it is open.
+    pub fn palette(&self) -> Option<&Entity<PickerView>> {
+        self.palette.as_ref().map(|(p, _, _)| p)
+    }
+
+    /// The agent switcher, while it is open.
+    pub fn switcher(&self) -> Option<&Entity<PickerView>> {
+        self.switcher.as_ref().map(|s| &s.view)
+    }
+
     pub fn connect_sheet(&self) -> Option<&Entity<ConnectSheet>> {
         self.connect.as_ref().map(|(s, _)| s)
     }
@@ -226,11 +276,43 @@ impl Workspace {
 
     /// A sheet is open over the panes.
     fn modal(&self) -> bool {
-        self.sheet.is_some() || self.kill.is_some() || self.connect.is_some()
+        self.sheet.is_some()
+            || self.kill.is_some()
+            || self.connect.is_some()
+            || self.shortcuts.is_some()
+            || self.palette.is_some()
+            || self.switcher.is_some()
     }
 
     pub fn kill_sheet(&self) -> Option<&Entity<KillSheet>> {
         self.kill.as_ref().map(|(s, _)| s)
+    }
+
+    /// ⌘/: shows the cheat sheet of every key binding, or hides it.
+    pub fn toggle_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shortcuts.take().is_some() {
+            self.focus_current(window, cx);
+        } else if !self.modal() {
+            let handle = cx.focus_handle();
+            window.focus(&handle);
+            self.shortcuts = Some((keymap::cheat_sheet(cx), handle));
+        }
+        cx.notify();
+    }
+
+    /// ⌘⇧T: the pane closed last, with its agent.
+    fn reopen_closed_pane(
+        &mut self,
+        _: &ReopenClosedPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal() {
+            return;
+        }
+        if self.app.update(cx, |a, cx| a.reopen_closed(cx)).is_some() {
+            self.focus_current(window, cx);
+        }
     }
 
     /// Opens the connect sheet (or brings it up), showing `reason`.
@@ -242,6 +324,8 @@ impl Workspace {
     ) {
         self.sheet = None;
         self.kill = None;
+        self.palette = None;
+        self.switcher = None;
         if let Some((sheet, _)) = &self.connect {
             let sheet = sheet.clone();
             sheet.update(cx, |s, cx| {
@@ -578,6 +662,179 @@ impl Workspace {
         cx.notify();
     }
 
+    /// ⌘P: opens the command palette (actions, agents, recent folders),
+    /// or closes it if open. Not over a sheet.
+    pub fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            self.focus_current(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.modal() {
+            return;
+        }
+        let app = self.app.read(cx);
+        let (entries, items): (Vec<Entry>, Vec<_>) = palette_items(
+            |c| command_shortcut(c, window),
+            &app.agents,
+            &app.dir_choices(),
+            &app.home,
+        )
+        .into_iter()
+        .unzip();
+        let recents = self.palette_recents.clone();
+        let palette =
+            cx.new(|cx| PickerView::new(items, recents, "Search actions, agents and folders", cx));
+        let sub = cx.subscribe_in(&palette, window, Self::palette_event);
+        palette.read(cx).focus(window, cx);
+        self.palette = Some((palette, entries, sub));
+        cx.notify();
+    }
+
+    fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_palette(window, cx);
+    }
+
+    /// A palette pick: an action is performed, an agent shown in the
+    /// focused pane, a folder gets the default command.
+    fn palette_event(
+        &mut self,
+        _palette: &Entity<PickerView>,
+        event: &PickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, entries, _)) = self.palette.take() else {
+            return;
+        };
+        self.focus_current(window, cx);
+        cx.notify();
+        let PickerEvent::Pick(key) = event else {
+            return;
+        };
+        let Some(entry) = entries.into_iter().find(|e| e.key() == *key) else {
+            return;
+        };
+        self.palette_recents.touch(key);
+        match entry {
+            Entry::Command(Command::ClearExited) => self.clear_exited(cx),
+            Entry::Command(c) => {
+                if let Some(action) = command_action(c) {
+                    window.dispatch_action(action, cx);
+                }
+            }
+            Entry::Agent(id) => self.show_agent(id, window, cx),
+            Entry::Folder(dir) => self.spawn_default_in(dir, window, cx),
+        }
+    }
+
+    /// ⌃Tab (⌃⇧Tab, `backward`): opens the agent switcher on the agent
+    /// used before the current one (on the least recent), or moves its
+    /// selection while open. Not over a sheet or the palette.
+    pub fn switch_agent(&mut self, backward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let delta = if backward { -1 } else { 1 };
+        if let Some(s) = &self.switcher {
+            s.view.update(cx, |v, cx| v.move_selection(delta, cx));
+            return;
+        }
+        if self.modal() {
+            return;
+        }
+        let app = self.app.read(cx);
+        let current = app.layout.agent(app.focused());
+        self.agent_mru.observe(current);
+        let items: Vec<_> = switcher_items(&app.agents, &app.home)
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let recents = self.agent_mru.recents();
+        let view = cx.new(|cx| PickerView::list(items, recents, cx));
+        view.update(cx, |v, cx| {
+            let p = v.picker();
+            let current_first = current.is_some_and(|id| {
+                p.selected_item()
+                    .is_some_and(|i| i.key == Entry::Agent(id).key())
+            });
+            let row = start_row(p.ranked().len(), current_first, backward);
+            v.select(row, cx);
+        });
+        let sub = cx.subscribe_in(&view, window, Self::switcher_event);
+        view.read(cx).focus(window, cx);
+        self.switcher = Some(Switcher {
+            view,
+            held: window.modifiers().control,
+            _sub: sub,
+        });
+        cx.notify();
+    }
+
+    /// ⌃ released after a ⌃Tab: the selected agent is shown.
+    fn switcher_modifiers(
+        &mut self,
+        ev: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(s) = &mut self.switcher else {
+            return;
+        };
+        if ev.modifiers.control {
+            s.held = true;
+        } else if s.held {
+            let view = s.view.clone();
+            view.update(cx, |v, cx| v.confirm(cx));
+        }
+    }
+
+    /// A switcher pick shows the agent in the focused pane.
+    fn switcher_event(
+        &mut self,
+        _view: &Entity<PickerView>,
+        event: &PickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switcher.take().is_none() {
+            return;
+        }
+        self.focus_current(window, cx);
+        cx.notify();
+        let PickerEvent::Pick(key) = event else {
+            return;
+        };
+        let id = key
+            .strip_prefix("agent:")
+            .and_then(|id| id.parse::<u64>().ok());
+        if let Some(id) = id {
+            self.show_agent(id, window, cx);
+        }
+    }
+
+    /// A new agent running `[gui] default_command` in `dir`, in the
+    /// focused pane.
+    fn spawn_default_in(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let command = self.app.read(cx).config.default_command.clone();
+        let result = match command.split_first() {
+            Some((program, args)) => {
+                let req = SpawnRequest {
+                    program: program.clone(),
+                    args: args.to_vec(),
+                    cwd: dir,
+                    labels: Default::default(),
+                };
+                self.app.update(cx, |a, cx| a.spawn(req, cx))
+            }
+            None => Err("set [gui] default_command to start an agent from a folder".to_owned()),
+        };
+        if let Err(e) = result {
+            self.app.update(cx, |a, cx| a.show_error(e, cx));
+        }
+        self.focus_current(window, cx);
+    }
+
     /// Asks before killing (only the question's Kill kills), unless
     /// `[gui] confirm_kill` is off.
     fn kill(&mut self, action: &Kill, window: &mut Window, cx: &mut Context<Self>) {
@@ -730,17 +987,17 @@ impl Workspace {
         }
         self.focus_pane(pane, window, cx);
         match event {
+            PaneEvent::NewAgent => self.open_new_agent(window, cx),
+            PaneEvent::NewTerminal => self.open_new_terminal(window, cx),
+            PaneEvent::InstallSkill => super::resident::install_agent_skill(cx),
+            PaneEvent::ShowShortcuts => self.toggle_shortcuts(window, cx),
             PaneEvent::SplitRight => self.split(Axis::Horizontal, window, cx),
             PaneEvent::SplitDown => self.split(Axis::Vertical, window, cx),
             PaneEvent::ToggleMaximize => self.toggle_maximize(&ToggleMaximize, window, cx),
             PaneEvent::Close => self.close_pane(&ClosePane, window, cx),
             PaneEvent::Restart => self.restart_pane(&RestartPane, window, cx),
             PaneEvent::Kill => self.kill_in_pane(pane, window, cx),
-            PaneEvent::Remove => {
-                if let Some(agent_id) = self.app.read(cx).layout.agent(pane) {
-                    self.remove(&Remove { agent_id }, window, cx);
-                }
-            }
+            PaneEvent::Remove => self.app.read(cx).remove_in_pane(pane, cx),
             PaneEvent::ContextMenu { on_grid } => self.open_pane_menu(pane, on_grid, cx),
         }
     }
@@ -755,7 +1012,7 @@ impl Workspace {
 
     /// The pane cards, [`chrome::PANE_GAP`] apart and from the edges;
     /// only the maximized one when a pane is maximized (the others stay
-    /// attached).
+    /// attached); then the split dividers' strips over the gaps.
     fn render_panes(&mut self, cx: &App) -> impl IntoElement + use<> {
         let app = self.app.read(cx);
         let rects = match app.maximized {
@@ -771,6 +1028,10 @@ impl Workspace {
             None => app.layout.rects(1.0, 1.0),
         };
         self.drawn = rects.iter().map(|(p, _)| *p).collect();
+        let dividers = match app.maximized {
+            Some(_) => Vec::new(),
+            None => self.split_drag.render(&app.layout, &self.app),
+        };
         let children: Vec<_> = rects
             .into_iter()
             .filter_map(|(pane, r)| {
@@ -792,7 +1053,8 @@ impl Workspace {
             div()
                 .absolute()
                 .inset(px(chrome::PANE_GAP / 2.0))
-                .children(children),
+                .children(children)
+                .children(dividers),
         )
     }
 
@@ -809,6 +1071,10 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
+        {
+            let app = self.app.read(cx);
+            self.agent_mru.observe(app.layout.agent(app.focused()));
+        }
         let theme = self.app.read(cx).theme;
         let (rows, home, error, notice, titles, marks, update) = {
             let app = self.app.read(cx);
@@ -924,6 +1190,69 @@ impl Render for Workspace {
                 )
                 .with_priority(3)
             });
+        let shortcuts = self.shortcuts.as_ref().map(|(sections, handle)| {
+            render_shortcuts(sections, handle, &theme, reduce_motion, cx)
+        });
+        let palette = self.palette.as_ref().map(|(palette, _, _)| {
+            // A click beside it closes it, never reaching the panes.
+            deferred(
+                div()
+                    .id("palette-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt(px(chrome::BAR_HEIGHT + space::XL))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.palette.is_some() {
+                                this.toggle_palette(window, cx);
+                            }
+                        }),
+                    )
+                    .child(appear(
+                        div().child(palette.clone()),
+                        "palette-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
+        let switcher = self.switcher.as_ref().map(|s| {
+            // Centred, like ⌘Tab; a click beside it cancels.
+            deferred(
+                div()
+                    .id("switcher-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.switcher.take().is_some() {
+                                this.focus_current(window, cx);
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(appear(
+                        div().child(s.view.clone()),
+                        "switcher-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
         let sheet = self.sheet.as_ref().map(|(sheet, _)| {
             // The backdrop takes every click and wheel event over the panes.
             deferred(
@@ -978,6 +1307,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
+            .on_action(cx.listener(Self::reopen_closed_pane))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_shortcuts(w, cx)))
+            .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(|this, _: &NextAgent, w, cx| this.switch_agent(false, w, cx)))
+            .on_action(cx.listener(|this, _: &PreviousAgent, w, cx| this.switch_agent(true, w, cx)))
+            .on_modifiers_changed(cx.listener(Self::switcher_modifiers))
             .child(bar)
             .child(
                 div()
@@ -989,14 +1324,98 @@ impl Render for Workspace {
                     .child(panes),
             )
             .children(toast)
+            .children(palette)
+            .children(switcher)
             .children(sheet)
             .children(
                 self.kill
                     .as_ref()
                     .map(|(sheet, _)| kill_sheet::render_over(sheet, reduce_motion)),
             )
+            .children(shortcuts)
             .children(connect)
     }
+}
+
+/// The ⌘/ cheat sheet over the window: Escape, ⌘/ or a click outside
+/// closes it.
+fn render_shortcuts(
+    sections: &[Section],
+    handle: &FocusHandle,
+    theme: &Theme,
+    reduce_motion: bool,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let columns = sections.iter().map(|section| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::XS))
+            .min_w(px(220.))
+            .child(
+                div()
+                    .type_style(text::SECTION)
+                    .text_color(theme.secondary)
+                    .pb(px(space::XXS))
+                    .child(SharedString::from(section.title.clone())),
+            )
+            .children(section.rows.iter().map(|row| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .gap(px(space::LG))
+                    .type_style(text::CALLOUT)
+                    .child(SharedString::from(row.title.clone()))
+                    .child(
+                        div()
+                            .text_color(theme.secondary)
+                            .child(SharedString::from(row.keys.clone())),
+                    )
+            }))
+    });
+    let card = controls::sheet_card("shortcuts-card", 760.0, theme)
+        .debug_selector(|| "shortcuts-sheet".to_owned())
+        .max_h(relative(0.8))
+        .overflow_y_scroll()
+        // A click on the card is not one outside it.
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(controls::sheet_title("Keyboard Shortcuts"))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(space::XL))
+                .children(columns),
+        );
+    deferred(
+        div()
+            .id("shortcuts-backdrop")
+            .track_focus(handle)
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" {
+                    this.toggle_shortcuts(window, cx);
+                }
+            }))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_shortcuts(window, cx)))
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_start()
+            .justify_center()
+            .pt(px(chrome::BAR_HEIGHT + space::SM))
+            .child(sheet_drag_strip("shortcuts-drag-strip"))
+            .child(appear(
+                div().child(card),
+                "shortcuts-appear",
+                -motion::SHEET_OFFSET,
+                motion::SHEET_MS,
+                reduce_motion,
+            )),
+    )
+    .with_priority(2)
 }
 
 /// The theme for the window's appearance, in the user's accent colour.
@@ -1034,12 +1453,13 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use fleet_proto::{AgentInfo, AgentState, AttachOk};
     use fleet_term::Palette;
     use gpui::{
-        AppContext, Entity, Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent,
-        TestAppContext, TouchPhase, VisualTestContext, point,
+        AppContext, ClipboardItem, Entity, Modifiers, MouseButton, Point, ScrollDelta,
+        ScrollWheelEvent, TestAppContext, TouchPhase, VisualTestContext, point,
     };
 
     use super::Workspace;
@@ -1053,6 +1473,7 @@ mod tests {
     use crate::core::menus::{MenuEntry, PaneMenuItem, RowMenuItem};
     use crate::core::pane::PaneModel;
     use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
+    use crate::core::shortcuts::{EmptyPane, key_glyphs};
     use crate::core::spawn::SpawnRequest;
     use crate::core::state::GuiState;
     use crate::core::target::Target;
@@ -1877,6 +2298,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn file_links_resolve_in_a_local_agents_directory_only(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        s.cx.run_until_parked();
+        let chrome = |s: &mut Setup<'_>| {
+            s.app.read_with(s.cx, |a, cx| {
+                let c = a.pane_view(PaneId(1)).unwrap().read(cx).chrome.clone();
+                (c.cwd, c.link_dir)
+            })
+        };
+        assert_eq!(chrome(&mut s), (Some("/w".into()), Some("/w".into())));
+
+        // On another machine the agent's paths are not here.
+        let other = Arc::new(Fake::default());
+        let session: Arc<dyn SessionApi> = other.clone();
+        let (_tx, rx) = async_channel::unbounded();
+        let target = Target::Ssh {
+            dest: "me@box".into(),
+        };
+        *other.agents.lock().unwrap() = vec![row(5, "/w", 1)];
+        s.app
+            .update(s.cx, |a, cx| a.replace_session(session, rx, target, cx));
+        click(&mut s, "tab-5");
+        attach_model(&other, PaneId(1), 5);
+        s.cx.run_until_parked();
+        assert_eq!(chrome(&mut s), (Some("/w".into()), None));
+    }
+
+    #[gpui::test]
     fn requested_attach_is_not_reverted_by_the_old_agent(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let fake = Arc::new(Fake::default());
@@ -2512,6 +2966,44 @@ mod tests {
         assert_eq!(shown(&mut s, PaneId(1)), Some(9));
     }
 
+    #[gpui::test]
+    fn ended_pane_summary_copies_its_last_output_and_removes_its_agent(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(5, "/w", 1)]);
+        click(&mut s, "tab-5");
+        attach_model(&fake, PaneId(1), 5);
+        fake.model(PaneId(1))
+            .lock()
+            .unwrap()
+            .on_output(b"$ make\r\nbuild failed   \r\n");
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        // Running: no summary.
+        assert!(!drawn(&mut s, "pane-1-ended"));
+        assert!(!drawn(&mut s, "pane-1-remove"));
+
+        fake.model(PaneId(1)).lock().unwrap().on_exited(3);
+        let mut exited = ended(5, "/w", 1_000, AgentState::Exited);
+        exited.info.exited_unix_ms = Some(193_000);
+        agents(&mut s, &fake, vec![exited]);
+        assert!(drawn(&mut s, "pane-1-ended"));
+        // The bar is told how long the agent ran.
+        let run_time = s.app.read_with(s.cx, |a, cx| {
+            a.pane_view(PaneId(1)).unwrap().read(cx).chrome.run_time
+        });
+        assert_eq!(run_time, Some(Duration::from_secs(192)));
+
+        s.cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+        click(&mut s, "pane-1-copy-output");
+        let clip = s.cx.read_from_clipboard().and_then(|c| c.text());
+        assert_eq!(clip.as_deref(), Some("$ make\nbuild failed"));
+
+        click(&mut s, "pane-1-remove");
+        assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![5])));
+    }
+
     /// Pane 1 shows agent 5, exited, and cmd-r restarts it in place.
     fn restart_in_pane_1(s: &mut Setup<'_>, fake: &Fake) {
         agents(s, fake, vec![ended(5, "/w", 1, AgentState::Exited)]);
@@ -2783,5 +3275,160 @@ mod tests {
         click(&mut s, "clear-exited");
         assert!(!s.cx.has_pending_prompt());
         assert_eq!(fake.calls().last(), Some(&Call::ClearExited));
+    }
+
+    // Issue #46: reopen closed pane, shortcut cheat sheet, first-run welcome.
+
+    // gpui keeps the debug bounds of earlier frames: what went away is
+    // checked on the state, not with `drawn`.
+    fn shortcuts_shown(s: &mut Setup<'_>) -> bool {
+        s.cx.run_until_parked();
+        s.ws.read_with(s.cx, |ws, _| ws.shortcuts.is_some())
+    }
+
+    fn welcomes(s: &mut Setup<'_>) -> bool {
+        s.cx.run_until_parked();
+        s.app.read_with(s.cx, |a, cx| {
+            a.layout().panes().iter().any(|p| {
+                let chrome = &a.pane_view(*p).unwrap().read(cx).chrome;
+                crate::app::pane_view::empty_state(chrome) == EmptyPane::Welcome
+            })
+        })
+    }
+
+    fn listed(s: &mut Setup<'_>, fake: &Fake, rows: Vec<AgentRow>) {
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        agents(s, fake, rows);
+    }
+
+    #[gpui::test]
+    fn cmd_shift_t_reopens_the_last_closed_pane_with_its_agent(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        listed(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        click(&mut s, "tab-1");
+        s.cx.simulate_keystrokes("cmd-d");
+        click(&mut s, "tab-2");
+        s.cx.simulate_keystrokes("cmd-w");
+        assert_eq!(panes(&mut s), [PaneId(1)]);
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s).len(), 2);
+        let new = focused(&mut s);
+        assert_eq!(shown(&mut s, new), Some(2));
+        // Nothing more to reopen.
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s).len(), 2);
+        // Closing the last pane leaves it empty; ⌘⇧T fills it again.
+        s.cx.simulate_keystrokes("cmd-w cmd-w");
+        assert_eq!(panes(&mut s).len(), 1);
+        let only = focused(&mut s);
+        assert_eq!(shown(&mut s, only), None);
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s).len(), 1);
+        assert_eq!(shown(&mut s, only), Some(1));
+    }
+
+    #[gpui::test]
+    fn cmd_shift_t_skips_agents_that_are_gone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        listed(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        click(&mut s, "tab-1");
+        s.cx.simulate_keystrokes("cmd-d");
+        click(&mut s, "tab-2");
+        s.cx.simulate_keystrokes("cmd-w");
+        // Agent 2 was removed meanwhile.
+        listed(&mut s, &fake, vec![row(1, "/a", 1)]);
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s), [PaneId(1)]);
+    }
+
+    #[gpui::test]
+    fn cmd_slash_shows_every_key_binding_and_escape_closes_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        assert!(!shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("cmd-/");
+        assert!(drawn(&mut s, "shortcuts-sheet"));
+        // Generated from the keymap: every binding's keys are on it.
+        let (keys, sheet) = s.cx.update(|_, cx| {
+            let keys: Vec<String> = cx
+                .key_bindings()
+                .borrow()
+                .bindings()
+                .map(|b| {
+                    let strokes: Vec<String> = b.keystrokes().iter().map(|k| k.unparse()).collect();
+                    key_glyphs(&strokes.join(" "))
+                })
+                .collect();
+            (keys, super::super::keymap::cheat_sheet(cx))
+        });
+        assert!(keys.len() > 20, "{keys:?}");
+        for k in &keys {
+            assert!(
+                sheet
+                    .iter()
+                    .any(|sec| sec.rows.iter().any(|r| &r.keys == k)),
+                "{k} is missing from {sheet:?}"
+            );
+        }
+        let window = &sheet[0];
+        assert!(
+            window
+                .rows
+                .iter()
+                .any(|r| r.keys == "⇧⌘T" && r.title == "Reopen Closed Pane")
+        );
+        assert!(
+            window
+                .rows
+                .iter()
+                .any(|r| r.keys == "⌘/" && r.title == "Show Shortcuts")
+        );
+        // Panes ignore the keys meanwhile.
+        s.cx.simulate_keystrokes("cmd-d");
+        assert_eq!(panes(&mut s).len(), 1);
+        s.cx.simulate_keystrokes("escape");
+        assert!(!shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("cmd-/");
+        assert!(shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("cmd-/");
+        assert!(!shortcuts_shown(&mut s));
+        // The keyboard is back in the pane.
+        s.cx.simulate_keystrokes("cmd-d");
+        assert_eq!(panes(&mut s).len(), 2);
+    }
+
+    #[gpui::test]
+    fn first_run_welcome_offers_new_agent_terminal_and_shortcuts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        // Before the list arrives: no welcome yet.
+        assert!(!welcomes(&mut s));
+        listed(&mut s, &fake, vec![]);
+        assert!(welcomes(&mut s));
+        assert!(drawn(&mut s, "welcome"));
+        assert!(drawn(&mut s, "welcome-install-skill"));
+        click(&mut s, "welcome-shortcuts");
+        assert!(shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("escape");
+        assert!(!shortcuts_shown(&mut s));
+        click(&mut s, "welcome-new-agent");
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
+        s.cx.simulate_keystrokes("escape");
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_none()));
+        click(&mut s, "welcome-terminal");
+        assert!(
+            fake.calls().iter().any(|c| matches!(c, Call::Spawn { .. })),
+            "{:?}",
+            fake.calls()
+        );
+        // With an agent, an empty pane shows the hint only.
+        listed(&mut s, &fake, vec![row(1, "/a", 1)]);
+        assert!(!welcomes(&mut s));
     }
 }

@@ -101,6 +101,12 @@ impl TextField {
         self.changed(cx);
     }
 
+    /// Selects all the text (a find field reopened: typing replaces it).
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        self.edit.select_all();
+        self.changed(cx);
+    }
+
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
     }
