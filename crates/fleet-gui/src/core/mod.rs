@@ -14,6 +14,7 @@ pub mod palette;
 pub mod pane;
 mod pane_link;
 pub mod picker;
+pub mod scroll_feedback;
 pub mod scrollback;
 pub mod selection;
 pub mod session;
