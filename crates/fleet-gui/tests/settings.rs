@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use fleet_gui::core::config::{GuiConfig, load_config};
+use fleet_gui::core::glass::GlassChoice;
 use fleet_gui::core::settings::{
     BLUR_MAX, BLUR_MIN, Change, FONT_SIZE_MAX, FONT_SIZE_MIN, MotionChoice, OPACITY_MAX,
     OPACITY_MIN, SHORTCUTS, Section, ThemeChoice, key_label, parse_command_line, save_changes,
@@ -28,6 +29,7 @@ fn defaults_follow_the_system_and_keep_todays_look() {
     assert!(c.confirm_kill);
     assert!(!c.notifications, "off unless asked for (ADR 0042)");
     assert_eq!(c.default_dir, "");
+    assert_eq!(c.glass, GlassChoice::Off, "glass stays off until decided");
 }
 
 #[test]
@@ -220,4 +222,20 @@ fn shortcuts_are_listed_with_mac_symbols() {
     assert_eq!(key_label("cmd-,"), "⌘,");
     assert!(SHORTCUTS.iter().any(|s| s.keys == "cmd-,"));
     assert!(SHORTCUTS.iter().all(|s| !s.what.is_empty()));
+}
+
+#[test]
+fn glass_is_read_written_and_rejects_unknown_values() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "[gui]\nglass = \"chrome\"\n");
+    assert_eq!(load_config(dir.path()).unwrap().glass, GlassChoice::Chrome);
+    let mut c = GuiConfig::default();
+    assert_eq!(Change::Glass(GlassChoice::Off).apply(&mut c), None);
+    let key = Change::Glass(GlassChoice::Window).apply(&mut c).unwrap();
+    assert_eq!(key, "glass");
+    save_changes(dir.path(), &c, &[key]).unwrap();
+    assert!(read(dir.path()).contains("glass = \"window\""));
+    assert_eq!(load_config(dir.path()).unwrap().glass, GlassChoice::Window);
+    write(dir.path(), "[gui]\nglass = \"frosted\"\n");
+    assert!(load_config(dir.path()).is_err());
 }

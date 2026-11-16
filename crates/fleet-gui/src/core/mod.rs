@@ -6,6 +6,7 @@ pub mod drag_drop;
 pub mod ended;
 pub mod find;
 pub mod fuzzy;
+pub mod glass;
 pub mod icons;
 pub mod keys;
 pub mod kill;

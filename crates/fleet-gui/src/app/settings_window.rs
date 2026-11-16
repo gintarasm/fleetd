@@ -20,6 +20,7 @@ use super::native;
 use super::status_item::set_accessory;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
+use crate::core::glass::GlassChoice;
 use crate::core::settings::{
     BLUR_MAX, BLUR_MIN, BLUR_STEP, Change, FONT_SIZE_MAX, FONT_SIZE_MIN, FONT_SIZE_STEP,
     MotionChoice, OPACITY_MAX, OPACITY_MIN, OPACITY_STEP, SHORTCUTS, Section, ThemeChoice,
@@ -324,6 +325,33 @@ impl SettingsWindow {
                 this.change(Change::WindowOpacity(opacity + OPACITY_STEP), cx);
             }),
         );
+        // Liquid glass (ADR 0049): macOS 26 only, and not under Reduce
+        // Transparency.
+        let has_glass = native::glass_available();
+        let glass_hint = if solid {
+            "Off while Reduce Transparency is on in System Settings"
+        } else if !has_glass {
+            "Needs macOS 26; the blur is used instead"
+        } else {
+            "Liquid glass behind the window or only its sidebar and bar"
+        };
+        let mut glass = segmented();
+        for choice in GlassChoice::ALL {
+            let pill = pill(
+                ("glass", choice as usize),
+                choice.title(),
+                c.glass == choice,
+                theme,
+            )
+            .debug_selector(move || format!("glass-{}", choice.title()));
+            glass = glass.child(if solid || !has_glass {
+                pill.opacity(0.5)
+            } else {
+                pill.on_click(cx.listener(move |this, _, _, cx| {
+                    this.change(Change::Glass(choice), cx);
+                }))
+            });
+        }
         let size = c.font_size;
         let font_size = stepper(
             "font-size",
@@ -340,6 +368,7 @@ impl SettingsWindow {
         );
         section_body()
             .child(setting_row("Theme", None, themes, theme))
+            .child(setting_row("Liquid glass", Some(glass_hint), glass, theme))
             .child(setting_row("Blur strength", solid_hint, blur, theme))
             .child(setting_row(
                 "Window opacity",

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::glass::GlassChoice;
 use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, ThemeChoice};
 use super::state::write_atomic;
 use super::target::Target;
@@ -77,6 +78,8 @@ pub struct GuiConfig {
     pub notifications: bool,
     /// The New agent sheet's directory; empty: the most recent one.
     pub default_dir: String,
+    /// Liquid glass behind the window or its chrome (macOS 26; ADR 0049).
+    pub glass: GlassChoice,
     /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
     /// blank means `$VISUAL`, then `$EDITOR` (ADR 0046).
     pub editor: String,
@@ -97,6 +100,7 @@ impl Default for GuiConfig {
             confirm_kill: true,
             notifications: false,
             default_dir: String::new(),
+            glass: GlassChoice::Off,
             editor: String::new(),
         }
     }
