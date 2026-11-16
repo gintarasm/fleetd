@@ -93,7 +93,9 @@ fn the_user_lists_message_edges_and_an_agent_is_refused() {
         agent_ids: vec![b],
         ..Default::default()
     };
-    agent.call(request::Kind::SendMessage(Box::new(msg))).unwrap();
+    agent
+        .call(request::Kind::SendMessage(Box::new(msg)))
+        .unwrap();
 
     let ask = || request::Kind::ListMessageEdges(ListMessageEdges::default());
     match user.call(ask()) {

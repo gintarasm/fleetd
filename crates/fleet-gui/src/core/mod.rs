@@ -22,6 +22,7 @@ pub mod launch;
 pub mod layout;
 pub mod links;
 pub mod menus;
+pub mod message_lines;
 pub mod mouse;
 pub mod output;
 pub mod palette;

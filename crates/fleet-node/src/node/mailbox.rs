@@ -284,25 +284,35 @@ impl Node {
     /// [`EDGES_MAX`]: [`EDGES_MAX`]), oldest first: the GUI's message lines
     /// (ADR 0089). Bodies stay out. Not scoped: the server lets only the
     /// user ask.
-    pub fn message_edges(&self, since_ms: i64, max: usize) -> io::Result<fleet_proto::MessageEdges> {
+    pub fn message_edges(
+        &self,
+        since_ms: i64,
+        max: usize,
+    ) -> io::Result<fleet_proto::MessageEdges> {
         use fleet_proto::MessageKind as K;
-        let max = if max == 0 { EDGES_MAX } else { max.min(EDGES_MAX) };
+        let max = if max == 0 {
+            EDGES_MAX
+        } else {
+            max.min(EDGES_MAX)
+        };
         let rows = lock(&self.store)
             .message_edges(since_ms, max)
             .map_err(store_err)?;
         let edges = rows
             .into_iter()
-            .map(|(id, sender, recipient, kind, created_unix_ms)| fleet_proto::MessageEdge {
-                id,
-                sender,
-                recipient,
-                kind: match kind {
-                    MessageKind::Question => K::Question,
-                    MessageKind::Answer => K::Answer,
-                    _ => K::Message,
-                } as i32,
-                created_unix_ms,
-            })
+            .map(
+                |(id, sender, recipient, kind, created_unix_ms)| fleet_proto::MessageEdge {
+                    id,
+                    sender,
+                    recipient,
+                    kind: match kind {
+                        MessageKind::Question => K::Question,
+                        MessageKind::Answer => K::Answer,
+                        _ => K::Message,
+                    } as i32,
+                    created_unix_ms,
+                },
+            )
             .collect();
         Ok(fleet_proto::MessageEdges { edges })
     }
