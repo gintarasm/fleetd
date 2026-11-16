@@ -252,6 +252,8 @@ impl Render for PickerView {
             .id("picker")
             .debug_selector(|| "picker".to_owned())
             .w(px(PICKER_WIDTH))
+            // Narrower inside a small pane (the split chooser's list).
+            .max_w_full()
             .flex()
             .flex_col()
             .gap(px(space::XS))

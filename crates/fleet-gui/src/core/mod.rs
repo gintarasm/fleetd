@@ -25,6 +25,7 @@ pub mod settings;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod spawn;
+pub mod split_chooser;
 pub mod state;
 pub mod status;
 pub mod status_menu;

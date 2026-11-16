@@ -1173,7 +1173,27 @@ impl AppState {
     /// and that pane is focused.
     pub fn new_terminal(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let focused_agent = self.layout.agent(self.focused);
-        let focused_cwd = focused_agent
+        let cwd = self.start_dir(self.focused);
+        let req = self.terminal_request(cwd);
+        if focused_agent.is_some() {
+            self.split(Axis::Horizontal, cx);
+        }
+        self.spawn(req, cx)
+    }
+
+    /// New terminal's request: a login shell in `cwd`.
+    pub(super) fn terminal_request(&self, cwd: String) -> SpawnRequest {
+        let shell = std::env::var("SHELL").ok();
+        new_terminal(&self.target, shell.as_deref(), cwd)
+    }
+
+    /// Where something started next to `pane` runs: its agent's folder,
+    /// else the last-used one, else home (a remote daemon's own directory,
+    /// as it is unknown here).
+    pub(super) fn start_dir(&self, pane: PaneId) -> String {
+        let cwd = self
+            .layout
+            .agent(pane)
             .and_then(|id| self.agents.iter().find(|r| r.info.id == id))
             .map(|r| r.info.cwd.as_str());
         let recent = self
@@ -1185,13 +1205,21 @@ impl AppState {
             Target::Local => self.home.to_string_lossy().into_owned(),
             Target::Ssh { .. } => String::new(),
         };
-        let cwd = terminal_dir(focused_cwd, recent, &home);
-        let shell = std::env::var("SHELL").ok();
-        let req = new_terminal(&self.target, shell.as_deref(), cwd);
-        if focused_agent.is_some() {
-            self.split(Axis::Horizontal, cx);
-        }
-        self.spawn(req, cx)
+        terminal_dir(cwd, recent, &home)
+    }
+
+    /// `pane` shows an agent, or a spawn is on its way into it.
+    pub(super) fn pane_filled(&self, pane: PaneId) -> bool {
+        self.layout.agent(pane).is_some() || self.starting.contains(&pane)
+    }
+
+    /// The agents some pane shows.
+    pub(super) fn on_screen(&self) -> HashSet<u64> {
+        self.layout
+            .panes()
+            .into_iter()
+            .filter_map(|p| self.layout.agent(p))
+            .collect()
     }
 
     /// `~` is the home directory for a local daemon; remote paths are the

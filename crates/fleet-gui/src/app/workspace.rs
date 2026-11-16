@@ -30,6 +30,7 @@ use super::palette::{command_action, command_shortcut};
 use super::pane_view::{PaneEvent, PaneView};
 use super::picker_view::{PickerEvent, PickerView};
 use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
+use super::split_chooser::{ChooserEvent, SplitChooserView};
 use super::split_dividers::SplitDrag;
 use super::theme::{Theme, Typography, appearance_of};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
@@ -47,6 +48,7 @@ use crate::core::settings::{MotionChoice, ThemeChoice};
 use crate::core::shortcuts::Section;
 use crate::core::sidebar::ended;
 use crate::core::spawn::SpawnRequest;
+use crate::core::split_chooser::{choice_rows, off_screen_agents};
 use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::switcher::{AgentMru, start_row, switcher_items};
 use crate::core::target::Target;
@@ -154,6 +156,12 @@ pub struct Workspace {
     palette: Option<(Entity<PickerView>, Vec<Entry>, Subscription)>,
     /// The palette's recent picks, most recent first.
     palette_recents: Recents,
+    /// The split chooser of each pane a split opened that is still empty,
+    /// with the folder its choices start in.
+    choosers: HashMap<PaneId, (Entity<SplitChooserView>, String, Subscription)>,
+    /// Some pane view may still hold a chooser (the per-frame sync is
+    /// skipped otherwise).
+    choosers_drawn: bool,
     /// The agent switcher (⌃Tab), while it is open.
     switcher: Option<Switcher>,
     /// The agents the focused pane showed, most recent first.
@@ -192,6 +200,8 @@ impl Workspace {
             let epoch = app.read(cx).session_epoch();
             if epoch != this.epoch {
                 this.epoch = epoch;
+                // The choosers' pane ids name panes of the old layout.
+                this.choosers.clear();
                 if this.sheet.take().is_some()
                     | this.kill.take().is_some()
                     | this.palette.take().is_some()
@@ -255,6 +265,8 @@ impl Workspace {
             kill: None,
             palette: None,
             palette_recents: Recents::default(),
+            choosers: HashMap::new(),
+            choosers_drawn: false,
             switcher: None,
             agent_mru: AgentMru::default(),
             connect: None,
@@ -303,6 +315,11 @@ impl Workspace {
     /// The command palette, while it is open.
     pub fn palette(&self) -> Option<&Entity<PickerView>> {
         self.palette.as_ref().map(|(p, _, _)| p)
+    }
+
+    /// `pane`'s split chooser, while it asks what to start there.
+    pub fn chooser(&self, pane: PaneId) -> Option<&Entity<SplitChooserView>> {
+        self.choosers.get(&pane).map(|(c, _, _)| c)
     }
 
     /// The agent switcher, while it is open.
@@ -467,7 +484,9 @@ impl Workspace {
 
     fn focus_pane(&self, pane: PaneId, window: &mut Window, cx: &mut App) {
         self.app.update(cx, |a, cx| a.set_focused(pane, cx));
-        if let Some(handle) = self.pane_focus_handle(pane, cx) {
+        if let Some((chooser, _, _)) = self.choosers.get(&pane) {
+            chooser.read(cx).focus(window, cx);
+        } else if let Some(handle) = self.pane_focus_handle(pane, cx) {
             window.focus(&handle);
         }
     }
@@ -477,19 +496,115 @@ impl Workspace {
         self.focus_pane(pane, window, cx);
     }
 
+    /// Splits the focused pane; the new pane asks what to start in it.
     fn split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal() {
             return;
         }
-        if self.app.update(cx, |a, cx| a.split(axis, cx)).is_some() {
+        let origin = self.app.read(cx).focused();
+        if let Some(pane) = self.app.update(cx, |a, cx| a.split(axis, cx)) {
+            self.open_chooser(pane, origin, window, cx);
             self.focus_current(window, cx);
         }
+    }
+
+    /// The split chooser in `pane`: its choices start in `origin`'s
+    /// folder, and its list leaves out the agents on screen.
+    fn open_chooser(
+        &mut self,
+        pane: PaneId,
+        origin: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let app = self.app.read(cx);
+        let dir = app.start_dir(origin);
+        let agents = off_screen_agents(&app.agents, &app.on_screen(), &app.home);
+        let rows = choice_rows(&app.config.default_command, &dir, &app.home, agents.len());
+        let chooser = cx.new(|cx| SplitChooserView::new(rows, agents, cx));
+        let sub = cx.subscribe_in(&chooser, window, move |this, _, event, window, cx| {
+            this.chooser_event(pane, *event, window, cx);
+        });
+        self.choosers.insert(pane, (chooser, dir, sub));
+        self.follow_choosers(window, cx);
+    }
+
+    /// A choice: the chooser goes, and its pane starts what was picked,
+    /// shows the agent, or closes.
+    fn chooser_event(
+        &mut self,
+        pane: PaneId,
+        event: ChooserEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, dir, _)) = self.choosers.remove(&pane) else {
+            return;
+        };
+        self.follow_choosers(window, cx);
+        self.app.update(cx, |a, cx| a.set_focused(pane, cx));
+        if self.app.read(cx).focused() != pane {
+            return;
+        }
+        match event {
+            ChooserEvent::NewAgent if self.app.read(cx).config.default_command.is_empty() => {
+                self.open_new_agent(window, cx);
+                return;
+            }
+            ChooserEvent::NewAgent => self.spawn_default_in(dir, window, cx),
+            ChooserEvent::Terminal => {
+                let result = self.app.update(cx, |a, cx| {
+                    let req = a.terminal_request(dir);
+                    a.spawn(req, cx)
+                });
+                if let Err(e) = result {
+                    self.app.update(cx, |a, cx| a.show_error(e, cx));
+                }
+            }
+            ChooserEvent::Agent(id) => self.show_agent(id, window, cx),
+            ChooserEvent::Cancel => {
+                self.app.update(cx, |a, cx| a.close_focused(cx));
+            }
+        }
+        self.focus_current(window, cx);
+        cx.notify();
+    }
+
+    /// Choosers go once their pane is gone or gets an agent; each pane
+    /// view draws its own (a pane id can get a new view).
+    fn follow_choosers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.choosers.is_empty() && !self.choosers_drawn {
+            return;
+        }
+        let app = self.app.read(cx);
+        let panes = app.layout.panes();
+        let mut refocus = false;
+        self.choosers.retain(|pane, (chooser, _, _)| {
+            let kept = panes.contains(pane) && !app.pane_filled(*pane);
+            // The keyboard goes back to the pane the chooser was in.
+            refocus |= !kept && chooser.read(cx).contains_focus(window, cx);
+            kept
+        });
+        let views: Vec<(PaneId, Entity<PaneView>)> = panes
+            .into_iter()
+            .filter_map(|p| Some((p, app.pane_view(p)?.clone())))
+            .collect();
+        if refocus {
+            cx.defer_in(window, |this, window, cx| this.focus_current(window, cx));
+        }
+        for (pane, view) in views {
+            let chooser = self.choosers.get(&pane).map(|(c, _, _)| c.clone().into());
+            view.update(cx, |v, cx| v.set_chooser(chooser, cx));
+        }
+        self.choosers_drawn = !self.choosers.is_empty();
     }
 
     fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal() {
             return;
         }
+        let pane = self.app.read(cx).focused();
+        self.choosers.remove(&pane);
         self.app.update(cx, |a, cx| a.close_focused(cx));
         self.focus_current(window, cx);
     }
@@ -1018,8 +1133,14 @@ impl Workspace {
                 continue;
             }
             let handle = view.read(cx).focus_handle().clone();
-            let focus = cx.on_focus_in(&handle, window, move |this, _, cx| {
+            let focus = cx.on_focus_in(&handle, window, move |this, window, cx| {
                 this.app.update(cx, |a, cx| a.set_focused(pane, cx));
+                // A click into the pane leaves the keys with its chooser.
+                if let Some((chooser, _, _)) = this.choosers.get(&pane)
+                    && !chooser.read(cx).contains_focus(window, cx)
+                {
+                    chooser.read(cx).focus(window, cx);
+                }
             });
             let events = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
                 this.pane_event(pane, *event, window, cx);
@@ -1126,6 +1247,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
+        self.follow_choosers(window, cx);
         {
             let app = self.app.read(cx);
             self.agent_mru.observe(app.layout.agent(app.focused()));
@@ -1869,9 +1991,10 @@ mod tests {
             s.cx.simulate_keystrokes(&format!("cmd-{}", n + 1));
             assert_eq!(focused(&mut s), *pane);
             let app = s.app.clone();
+            // Within the pane: the new ones' split choosers have it.
             let has_focus = s.cx.update(|window, cx| {
                 let view = app.read(cx).pane_view(*pane).unwrap().clone();
-                view.read(cx).focus_handle().is_focused(window)
+                view.read(cx).focus_handle().contains_focused(window, cx)
             });
             assert!(has_focus, "pane {n} has keyboard focus");
         }

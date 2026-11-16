@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 use fleet_term::CursorShape;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AnyWindowHandle, AppContext, Bounds, BoxShadow, ClipboardItem,
-    Context, Entity, EventEmitter, FocusHandle, Font, InteractiveElement, IntoElement,
-    KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size,
-    StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection, Window, div, point, px,
-    size,
+    Animation, AnimationExt, AnyView, AnyWindowHandle, AppContext, Bounds, BoxShadow,
+    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Font, InteractiveElement,
+    IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection,
+    Window, div, point, px, size,
 };
 
 use super::controls::{self, ButtonKind};
@@ -298,6 +298,9 @@ pub struct PaneView {
     /// The window whose activation the cursor follows, and that
     /// subscription (renewed when the view moves to a new window).
     activation: Option<(AnyWindowHandle, Subscription)>,
+    /// What to start here, while the pane a split opened is empty (the
+    /// split chooser); drawn in place of [`empty_message`].
+    chooser: Option<AnyView>,
     /// The bell flash being drawn (its number, so each restarts the fade),
     /// and the task that ends it.
     flash: Option<(u32, Task<()>)>,
@@ -387,6 +390,16 @@ impl PaneView {
             find_query: String::new(),
             find_case: false,
             find_task: None,
+            chooser: None,
+        }
+    }
+
+    /// Draws `chooser` while the pane has no agent (or no longer).
+    pub fn set_chooser(&mut self, chooser: Option<AnyView>, cx: &mut Context<Self>) {
+        if self.chooser.as_ref().map(AnyView::entity_id) != chooser.as_ref().map(AnyView::entity_id)
+        {
+            self.chooser = chooser;
+            cx.notify();
         }
     }
 
@@ -1393,10 +1406,13 @@ impl Render for PaneView {
                     .child(SharedString::from(text)),
             );
         }
-        if empty_state(chrome) == EmptyPane::Welcome {
+        let chooser = self.chooser.clone().filter(|_| !chrome.has_agent);
+        if chooser.is_none() && empty_state(chrome) == EmptyPane::Welcome {
             grid = grid.child(welcome(&theme, cx));
         }
-        if let Some(text) = empty_message(chrome) {
+        if let Some(chooser) = chooser {
+            grid = grid.child(chooser);
+        } else if let Some(text) = empty_message(chrome) {
             grid = grid.child(
                 div()
                     .absolute()
