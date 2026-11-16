@@ -14,9 +14,9 @@ use fleet_client::names::name_of;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Action, AppContext, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    div, px,
+    Action, AppContext, Context, Div, Entity, ExternalPaths, FocusHandle, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::agent_mark::{MARK_SLOT, agent_mark};
@@ -503,6 +503,15 @@ fn render_tab(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
+        // Files from Finder: tinted while over the row (stronger than a
+        // picked row's tint), typed into its agent when dropped (ADR 0081).
+        .drag_over::<ExternalPaths>({
+            let tint = theme.accent.opacity(0.34);
+            move |s, _, _, _| s.bg(tint)
+        })
+        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+            this.drop_paths_on_agent(id, paths, cx);
+        }))
 }
 
 /// A label chip: the value, with `key=value` as its tooltip. A click

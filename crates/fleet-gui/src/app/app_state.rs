@@ -19,6 +19,7 @@ use super::workspace::Workspace;
 use crate::core::broadcast::{RETURN, RETURN_DELAY_MS, SendPlan, encode_text};
 use crate::core::config::{GuiConfig, load_config};
 use crate::core::drag_drop::DropAction;
+use crate::core::drop_paste::{DROP_NEEDS_LOCAL, dropped_text};
 use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::git;
@@ -1092,6 +1093,7 @@ impl AppState {
                 status: agent.and_then(|id| self.statuses.get(&id).copied()),
                 agent,
                 agent_emoji: self.config.agent_emoji,
+                local: self.target == Target::Local,
                 no_agents,
                 run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
             };
@@ -1703,6 +1705,35 @@ impl AppState {
         if available != self.update_available {
             self.update_available = available;
             cx.notify();
+        }
+    }
+
+    /// Files dropped from Finder on `agent`'s sidebar row: their quoted
+    /// paths are typed into it (ADR 0081), through a pane of the shown
+    /// tab showing it (the focused one first: bracketed paste as it
+    /// asked), else on the control connection, unbracketed
+    /// (as Send to Agents…, so a refusal shows an error). Not for an
+    /// ended agent; on a remote target, a notice instead.
+    pub fn drop_paths_on_agent(&mut self, agent: u64, paths: &[String], cx: &mut Context<Self>) {
+        if self.target != Target::Local {
+            self.show_notice(DROP_NEEDS_LOCAL.to_owned(), cx);
+            return;
+        }
+        let running = self.agents.iter().any(|r| r.info.id == agent && !ended(r));
+        let Some(text) = dropped_text(paths).filter(|_| running) else {
+            return;
+        };
+        let focused = self.tabs.focused();
+        let pane = self
+            .tabs
+            .layout()
+            .panes()
+            .into_iter()
+            .filter(|p| self.tabs.agent(*p) == Some(agent))
+            .min_by_key(|p| *p != focused);
+        match pane.and_then(|p| self.panes.get(&p)) {
+            Some(view) => view.update(cx, |v, cx| v.paste_text(&text, cx)),
+            None => self.session.send_input(agent, text.into_bytes()),
         }
     }
 
