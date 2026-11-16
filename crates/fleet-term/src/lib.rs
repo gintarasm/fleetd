@@ -48,6 +48,7 @@ use recorder::Recorder;
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -112,6 +113,8 @@ struct ClientState {
 struct Replies {
     buf: Arc<Mutex<Vec<u8>>>,
     title: Arc<Mutex<Option<String>>>,
+    /// A BEL arrived since [`Terminal::take_bell`] last looked.
+    bell: Arc<AtomicBool>,
     client: Option<Arc<ClientState>>,
 }
 
@@ -162,6 +165,7 @@ impl EventListener for Replies {
             Event::ResetTitle => {
                 *self.title.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
+            Event::Bell => self.bell.store(true, Ordering::Relaxed),
             _ => {}
         }
     }
@@ -259,6 +263,31 @@ impl Terminal {
         view::push_row(&grid[Line(i32::from(row))], out);
     }
 
+    /// The OSC 8 hyperlink of visible cell `(row, col)`: its URI and the
+    /// columns `start..end` of the run of cells on that row carrying the same
+    /// link. `None` off the grid or on a cell without one. Links are kept only
+    /// on cells written live, not in snapshots or history (see the crate docs).
+    pub fn hyperlink_at(&self, row: u16, col: u16) -> Option<(String, u16, u16)> {
+        let term = self.term.borrow();
+        let grid = term.grid();
+        let (row, col) = (usize::from(row), usize::from(col));
+        if row >= grid.screen_lines() || col >= grid.columns() {
+            return None;
+        }
+        let cells = &grid[Line(row as i32)];
+        let link = cells[Column(col)].hyperlink()?;
+        let same = |c: usize| cells[Column(c)].hyperlink().as_ref() == Some(&link);
+        let start = (0..col)
+            .rev()
+            .take_while(|&c| same(c))
+            .last()
+            .unwrap_or(col);
+        let end = (col + 1..grid.columns())
+            .find(|&c| !same(c))
+            .unwrap_or(grid.columns());
+        Some((link.uri().to_owned(), to_u16(start), to_u16(end)))
+    }
+
     /// Window title set by OSC 0/2, `None` if unset or reset.
     pub fn title(&self) -> Option<String> {
         self.replies
@@ -266,6 +295,11 @@ impl Terminal {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Whether a BEL arrived since the last call (clears it).
+    pub fn take_bell(&self) -> bool {
+        self.replies.bell.swap(false, Ordering::Relaxed)
     }
 
     /// Feeds raw PTY output through the VT parser.
@@ -696,6 +730,24 @@ mod tests {
     const QUERIES: &[u8] = b"\x1b[>1u\x1b[?u\x1b]11;?\x1b\\\x1b[6n";
 
     #[test]
+    fn hyperlink_at_gives_the_osc8_uri_and_its_columns() {
+        let mut t = Terminal::new_client(40, 4, palette());
+        t.feed(b"see \x1b]8;;https://a.io/pr/1\x1b\\the PR\x1b]8;;\x1b\\ now\r\n");
+        t.feed(b"\x1b]8;id=x;https://b.io\x07\xe7\x95\x8cb\x1b]8;;\x07");
+        assert_eq!(t.hyperlink_at(0, 3), None);
+        let want = Some(("https://a.io/pr/1".to_owned(), 4, 10));
+        assert_eq!(t.hyperlink_at(0, 4), want);
+        assert_eq!(t.hyperlink_at(0, 9), want);
+        assert_eq!(t.hyperlink_at(0, 10), None);
+        // A wide cell and its spacer.
+        let want = Some(("https://b.io".to_owned(), 0, 3));
+        assert_eq!(t.hyperlink_at(1, 1), want);
+        assert_eq!(t.hyperlink_at(1, 2), want);
+        assert_eq!(t.hyperlink_at(9, 0), None);
+        assert_eq!(t.hyperlink_at(0, 99), None);
+    }
+
+    #[test]
     fn client_terminal_answers_kitty_and_color_queries() {
         let mut t = Terminal::new_client(80, 24, palette());
         t.feed(QUERIES);
@@ -826,6 +878,18 @@ mod tests {
         let mut cells = vec![Cell::default()];
         parse_history_line(b"a\x1b[2Kb\x1b]0;t\x07c", &mut cells);
         assert_eq!(cells_text(&cells), "abc");
+    }
+
+    #[test]
+    fn take_bell_reports_a_bel_once() {
+        let mut t = Terminal::new(80, 24);
+        assert!(!t.take_bell());
+        t.feed(b"done\x07");
+        assert!(t.take_bell());
+        assert!(!t.take_bell());
+        // BEL ending an OSC string is a terminator, not a bell.
+        t.feed(b"\x1b]2;title\x07");
+        assert!(!t.take_bell());
     }
 
     #[test]

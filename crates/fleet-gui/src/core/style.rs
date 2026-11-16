@@ -121,6 +121,11 @@ pub mod chrome {
     pub const SIDEBAR_WIDTH: f32 = grid(60);
     /// Between pane cards and around them.
     pub const PANE_GAP: f32 = grid(2);
+    /// The least a pane may be dragged to, across or down, its share of
+    /// the gaps included.
+    pub const PANE_MIN: f32 = grid(30);
+    /// The width of a split divider's hit strip, centred on the gap.
+    pub const DIVIDER_HIT: f32 = PANE_GAP + 4.0;
     /// The pane card's header.
     pub const PANE_HEADER_HEIGHT: f32 = grid(8);
     /// A square icon button, and the icon in it.
@@ -143,6 +148,12 @@ pub mod motion {
     pub const SHEET_MS: u64 = 160;
     /// The error toast sliding in.
     pub const TOAST_MS: u64 = 200;
+    /// The overlay scrollbar fading in when scrolling starts.
+    pub const SCROLLBAR_FADE_IN_MS: u64 = 100;
+    /// How long the scrollbar stays after the last scroll.
+    pub const SCROLLBAR_HOLD_MS: u64 = 800;
+    /// The scrollbar fading out after that.
+    pub const SCROLLBAR_FADE_OUT_MS: u64 = 300;
     /// How far a sheet slides while it fades in.
     pub const SHEET_OFFSET: f32 = super::grid(2);
 

@@ -25,7 +25,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
@@ -41,7 +41,15 @@ pub struct CommandSpec {
     pub env: Vec<(String, String)>,
     pub cols: u16,
     pub rows: u16,
+    /// How much lower than the daemon the agent runs, as `nice -n` (ADR
+    /// 0066): 0 keeps the daemon's priority, and the result is capped at
+    /// [`MAX_NICE`].
+    pub nice: u8,
 }
+
+/// The highest nice value an agent is given: Linux's maximum (macOS allows
+/// 20).
+pub const MAX_NICE: i32 = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AgentId(pub u64);
@@ -565,6 +573,105 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Where `nice(1)` lives on macOS and Linux.
+const NICE_PATHS: [&str; 2] = ["/usr/bin/nice", "/bin/nice"];
+
+/// The `nice -n` increment that takes an agent from the daemon's own nice
+/// value to the daemon's plus `nice`, capped at [`MAX_NICE`]; `None` when
+/// that changes nothing.
+fn nice_increment(nice: u8) -> Option<u8> {
+    if nice == 0 {
+        return None;
+    }
+    // SAFETY: no memory effects; cannot fail for the calling process.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let increment = i32::from(nice).min(MAX_NICE - own);
+    u8::try_from(increment).ok().filter(|&n| n > 0)
+}
+
+/// The command that runs `spec.program` lowered by `increment` (ADR 0066):
+/// `nice -n <increment> -- <program> <args>`, so the agent lowers itself
+/// before its `exec` and everything it forks inherits it. Setting the value
+/// from here after the spawn is not reliable: on macOS a `setpriority` right
+/// after portable-pty's spawn returns reads back, then is lost a few
+/// milliseconds later (likely because the spawn returns before the child's
+/// `execve` completes; see ADR 0066).
+///
+/// `nice` finds the program itself (on the agent's `PATH`, or relative to
+/// its cwd), and would only report a missing one by exiting 127. So it is
+/// looked up here first, the way portable-pty does, to fail the spawn as
+/// before. `None` without a `nice` binary: the agent then runs unlowered.
+fn niced_command(
+    spec: &CommandSpec,
+    base: Option<&[(OsString, OsString)]>,
+    increment: u8,
+) -> io::Result<Option<CommandBuilder>> {
+    let Some(nice) = NICE_PATHS.iter().find(|p| is_executable(Path::new(p))) else {
+        return Ok(None);
+    };
+    find_program(spec, base)?;
+    let mut cmd = CommandBuilder::new(nice);
+    cmd.args(["-n", &increment.to_string(), "--"]);
+    cmd.arg(&spec.program);
+    Ok(Some(cmd))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Checks that `spec.program` names an executable file: as a path (relative
+/// to the agent's cwd) when it has a `/`, else on the `PATH` the agent gets
+/// (`spec.env`'s, else `base`'s, else the daemon's).
+fn find_program(spec: &CommandSpec, base: Option<&[(OsString, OsString)]>) -> io::Result<()> {
+    let program = spec.program.as_path();
+    let not_found = || {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("program {} not found", program.display()),
+        )
+    };
+    if program.as_os_str().as_encoded_bytes().contains(&b'/') {
+        let cwd = match &spec.cwd {
+            Some(cwd) => cwd.clone(),
+            None => std::env::current_dir()?,
+        };
+        return if is_executable(&cwd.join(program)) {
+            Ok(())
+        } else {
+            Err(not_found())
+        };
+    }
+    let path = match spec.env.iter().rev().find(|(k, _)| k == "PATH") {
+        Some((_, v)) => Some(OsString::from(v)),
+        None => match base {
+            Some(base) => base
+                .iter()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.clone()),
+            None => std::env::var_os("PATH"),
+        },
+    };
+    let found = path
+        .iter()
+        .flat_map(std::env::split_paths)
+        .any(|dir| is_executable(&dir.join(program)));
+    if found { Ok(()) } else { Err(not_found()) }
+}
+
+/// On Linux with autogroup on, CFS shares the CPU between sessions before
+/// nice orders processes within one, and every agent is a session of its
+/// own: the agent's autogroup gets its nice value too. Best effort: the file
+/// is absent without autogroup.
+#[cfg(target_os = "linux")]
+fn lower_autogroup(pid: u32, increment: u8) {
+    // SAFETY: no memory effects; cannot fail for the calling process.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let target = (own + i32::from(increment)).min(MAX_NICE);
+    let _ = std::fs::write(format!("/proc/{pid}/autogroup"), target.to_string());
+}
+
 /// Serialises `openpty` process-wide: macOS `ptsname` (used inside it) is not
 /// reentrant, so `PtyHost::spawn` is safe to call from any thread.
 static OPEN_PTY: Mutex<()> = Mutex::new(());
@@ -631,7 +738,12 @@ impl PtyHost {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let mut cmd = CommandBuilder::new(&spec.program);
+        let increment = nice_increment(spec.nice);
+        let niced = match increment {
+            Some(n) => niced_command(&spec, base, n)?,
+            None => None,
+        };
+        let mut cmd = niced.unwrap_or_else(|| CommandBuilder::new(&spec.program));
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
             cmd.cwd(cwd);
@@ -654,6 +766,10 @@ impl PtyHost {
         let (input, reader) =
             AgentInput::new(unsafe { BorrowedFd::borrow_raw(master_fd) }, &self.freeze)?;
         let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        if let (Some(pid), Some(n)) = (child.process_id(), increment) {
+            lower_autogroup(pid, n);
+        }
         // Close our copy of the slave so readers see EOF once the child exits.
         drop(pair.slave);
 
@@ -971,7 +1087,118 @@ mod tests {
             env: vec![],
             cols: 80,
             rows: 24,
+            nice: 0,
         }
+    }
+
+    /// The nice value of process `pid`.
+    fn nice_of(pid: u32) -> i32 {
+        // SAFETY: getpriority has no memory effects. -1 is a valid value,
+        // so errno tells a failure apart.
+        unsafe {
+            *errno() = 0;
+            let n = libc::getpriority(libc::PRIO_PROCESS, pid as _);
+            assert_eq!(*errno(), 0, "getpriority({pid}) failed");
+            n
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe fn errno() -> *mut i32 {
+        unsafe { libc::__error() }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    unsafe fn errno() -> *mut i32 {
+        unsafe { libc::__errno_location() }
+    }
+
+    #[test]
+    fn spawn_lowers_the_agent_by_its_nice() {
+        let host = PtyHost::new();
+        let own = nice_of(std::process::id());
+        let id = host.spawn(CommandSpec { nice: 5, ..cat() }).unwrap();
+        let pid = host.agent(id).unwrap().pid.unwrap();
+        let want = (own + 5).min(MAX_NICE);
+        // `nice` lowers itself and execs the agent right after the spawn.
+        eventually("the agent lowered", || nice_of(pid) == want);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(nice_of(pid), want, "the lowering did not stick");
+        host.kill(id).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn a_lowered_spawn_of_a_missing_program_fails() {
+        let host = PtyHost::new();
+        for program in ["/nonexistent/agent", "no-such-agent-program"] {
+            let spec = CommandSpec {
+                nice: 5,
+                program: PathBuf::from(program),
+                ..cat()
+            };
+            let e = host.spawn(spec).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotFound, "{program}");
+        }
+    }
+
+    #[test]
+    fn a_lowered_spawn_finds_the_program_on_the_agents_path() {
+        let host = PtyHost::new();
+        let out = Collect::default();
+        let spec = CommandSpec {
+            nice: 5,
+            program: PathBuf::from("sh"),
+            args: vec![
+                "-c".into(),
+                "echo found-$1".into(),
+                "sh".into(),
+                "--x".into(),
+            ],
+            env: vec![("PATH".into(), "/bin:/usr/bin".into())],
+            ..cat()
+        };
+        host.spawn_with_sink(spec, Box::new(out.clone())).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+        assert!(out.contains(b"found---x"));
+        assert_eq!(out.exit_code(), Some(0));
+    }
+
+    #[test]
+    fn spawn_with_zero_nice_keeps_the_daemons_priority() {
+        let host = PtyHost::new();
+        let own = nice_of(std::process::id());
+        let id = host.spawn(cat()).unwrap();
+        let pid = host.agent(id).unwrap().pid.unwrap();
+        assert_eq!(nice_of(pid), own);
+        host.kill(id).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn a_lowered_agents_children_are_lowered_too() {
+        // The child is forked after the spawn returned: it inherits.
+        let host = PtyHost::new();
+        let own = nice_of(std::process::id());
+        let out = Collect::default();
+        let id = host
+            .spawn_with_sink(
+                CommandSpec {
+                    nice: 3,
+                    ..sh("sleep 0.2; ps -o nice= -p $$; /bin/sh -c 'ps -o nice= -p $$'")
+                },
+                Box::new(out.clone()),
+            )
+            .unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+        let text = String::from_utf8_lossy(&lock(&out.0)).into_owned();
+        let nices: Vec<i32> = text
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .collect();
+        let want = (own + 3).min(MAX_NICE);
+        assert_eq!(nices, vec![want, want], "output: {text:?}");
+        let _ = id;
     }
 
     /// Collects an agent's output and its exit code.
