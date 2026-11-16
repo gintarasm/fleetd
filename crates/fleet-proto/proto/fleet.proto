@@ -62,6 +62,8 @@ message Request {
     RestartDaemon restart_daemon = 15;
     // Spec §2 (ADR 0075): the calling agent's own status.
     ReportStatus report = 50;
+    // Questions (ADR 0078, spec §5): 70-74. The user's answer.
+    AnswerQuestion answer = 70;
     // Leases (ADR 0077, spec §4): any caller may use them (ADR 0034).
     AcquireLease acquire_lease = 65;
     ReleaseLease release_lease = 66;
@@ -280,8 +282,37 @@ enum ReportedState {
 // The caller's own status, taken from the caller's identity (no agent id: an
 // agent reports only for itself). `message` is at most 200 characters;
 // answered by `Ack`.
-message ReportStatus { ReportedState state = 1; string message = 2; }
-message Reported { ReportedState state = 1; string message = 2; int64 at_unix_ms = 3; }
+message ReportStatus {
+  ReportedState state = 1;
+  string message = 2;
+  // A question for the user (ADR 0078): only with `waiting`, at most 500
+  // characters. `choices` (at most 6, each at most 60 characters) need one.
+  optional string question = 70;
+  repeated string choices = 71;
+}
+message Reported {
+  ReportedState state = 1;
+  string message = 2;
+  int64 at_unix_ms = 3;
+  // Set while the question the report asked is open: until it is answered
+  // or the agent reports again (ADR 0078).
+  optional Question question = 70;
+}
+message Question {
+  // The id of the `question` message in the user's mailbox.
+  uint64 id = 1;
+  string text = 2;
+  repeated string choices = 3;
+}
+// The user's answer to agent `agent_id`'s open question (`fleet answer`, the
+// GUI). Refused for an agent caller (`forbidden:`). With `question_id` the
+// answer applies only to that question: a later one means it was closed and
+// the answer is refused. Answered by `Ack`.
+message AnswerQuestion {
+  uint64 agent_id = 1;
+  string text = 2;
+  optional uint64 question_id = 3;
+}
 // Pushed when an agent reports; scoped like the other agent events.
 message AgentReported { uint64 agent_id = 1; Reported reported = 2; }
 // Take the lease `name` (ADR 0077). Answered by `LeaseGranted`, or an
@@ -357,6 +388,8 @@ message Message {
   string status = 8;
   // For `exit`.
   optional int32 exit_code = 9;
+  // For `question`: the offered choices (ADR 0078).
+  repeated string choices = 70;
 }
 
 enum Broadcast {

@@ -81,6 +81,8 @@ pub struct Message {
     pub status: Option<String>,
     pub exit_code: Option<i32>,
     pub created_unix_ms: i64,
+    /// For `question`: the offered choices.
+    pub choices: Vec<String>,
 }
 
 /// A reported status (spec §2). `fleet report` (M3-D) and the inferred
