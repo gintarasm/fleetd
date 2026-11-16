@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fleet_proto::{AgentInfo, AgentState};
+use fleet_proto::AgentInfo;
 
 use super::session::AgentRow;
 
@@ -169,6 +169,7 @@ pub fn alert_agent(identifier: &str) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_proto::AgentState;
 
     fn row(state: AgentState, code: Option<i32>, line: &str, at: Option<i64>) -> AgentRow {
         let mut info = AgentInfo {
