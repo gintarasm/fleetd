@@ -10,7 +10,7 @@ use objc2::runtime::AnyObject;
 use objc2::{ClassType, MainThreadMarker, msg_send};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSColor,
-    NSColorSpace, NSEventType, NSView, NSVisualEffectView, NSWorkspace,
+    NSColorSpace, NSEventType, NSSound, NSView, NSVisualEffectView, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSString};
 
@@ -81,6 +81,21 @@ pub fn reduce_transparency() -> bool {
 pub fn reduce_motion() -> bool {
     MainThreadMarker::new().is_some()
         && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+/// The celebration's sound (`[gui] celebrate`): one of the soft system
+/// sounds in `/System/Library/Sounds`.
+pub const CELEBRATION_SOUND: &str = "Pop";
+
+/// Plays a system sound by name, at the user's alert volume; nothing if
+/// it is missing.
+pub fn play_sound(name: &str) {
+    if MainThreadMarker::new().is_none() {
+        return;
+    }
+    if let Some(sound) = NSSound::soundNamed(&NSString::from_str(name)) {
+        sound.play();
+    }
 }
 
 /// Sets the blur radius, in points, of the window's blurred backdrop.

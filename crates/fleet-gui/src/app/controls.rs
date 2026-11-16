@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Div, ElementId, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
-    Window, div, px,
+    Animation, AnimationExt, AnyElement, App, Context, Div, ElementId, Global, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, div, px,
 };
 
 use super::icons;
@@ -202,10 +202,29 @@ pub fn icon_button(id: &'static str, icon: Icon, theme: &Theme, enabled: bool) -
 /// The hover group of an icon button (the icon brightens with its button).
 const ICON_BUTTON_GROUP: &str = "icon-button";
 
+/// Motion is reduced, app-wide: System Settings' Reduce Motion unless
+/// `[gui] reduce_motion` overrides it. The workspace keeps it current;
+/// panes read it for their own motion (#44).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReducedMotion(pub bool);
+
+impl Global for ReducedMotion {}
+
+/// Motion is reduced (see [`ReducedMotion`]); false until set.
+pub fn reduces_motion(cx: &App) -> bool {
+    cx.try_global::<ReducedMotion>().is_some_and(|m| m.0)
+}
+
 /// `el` fading in while it slides `from` px (down if negative) into place,
 /// over `ms` milliseconds, easing out; as is when `reduce_motion`.
 /// Restarts each time `id` first appears.
-pub fn appear(el: Div, id: &'static str, from: f32, ms: u64, reduce_motion: bool) -> AnyElement {
+pub fn appear(
+    el: Div,
+    id: impl Into<ElementId>,
+    from: f32,
+    ms: u64,
+    reduce_motion: bool,
+) -> AnyElement {
     if reduce_motion {
         return el.into_any_element();
     }

@@ -37,6 +37,8 @@ pub struct TerminalElement {
     /// Draw the cursor at all (not in an empty pane or after the agent exited).
     pub(crate) show_cursor: bool,
     pub(crate) marked: Option<String>,
+    /// The selection's glow after a copy, 0..=1 (0: none).
+    pub(crate) selection_glow: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -451,10 +453,14 @@ impl Element for TerminalElement {
                     .map(|c| c.col);
                 self.paint_row(row, origin, m, block_col, window, cx);
                 if let Some((from, to)) = row.selected {
-                    window.paint_quad(fill(
-                        cell_bounds(origin, m, from, to - from),
-                        self.theme.selection,
-                    ));
+                    let cells = cell_bounds(origin, m, from, to - from);
+                    window.paint_quad(fill(cells, self.theme.selection));
+                    if self.selection_glow > 0.0 {
+                        window.paint_quad(fill(
+                            cells,
+                            self.theme.accent.opacity(0.35 * self.selection_glow),
+                        ));
+                    }
                 }
             }
             if let Some(cursor) = snap.cursor {
