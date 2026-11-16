@@ -1,7 +1,7 @@
 //! Shared controls in the macOS style: push buttons, sheet cards, field
 //! labels and list rows, drawn with the theme's tokens.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -252,4 +252,42 @@ pub fn appear(
         move |el, t| el.opacity(t).mt(px(from * (1.0 - t))),
     )
     .into_any_element()
+}
+
+/// Keeps a view redrawn while something changes over time: the next
+/// frame for a fade, one timer for a later change, nothing once idle.
+#[derive(Default)]
+pub struct RedrawTimer(Option<(Instant, gpui::Task<()>)>);
+
+impl RedrawTimer {
+    /// `next`: when the view next changes (`Some(ZERO)`: it is animating),
+    /// `None` when it no longer does.
+    pub fn schedule<V: 'static>(
+        &mut self,
+        next: Option<Duration>,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<V>,
+    ) {
+        let Some(d) = next else {
+            self.0 = None;
+            return;
+        };
+        if d.is_zero() {
+            self.0 = None;
+            window.request_animation_frame();
+            return;
+        }
+        let due = Instant::now() + d;
+        // The same change asked for again (within a few ms) keeps its timer.
+        let close =
+            |at: &Instant| at.max(&due).duration_since(*at.min(&due)) < Duration::from_millis(5);
+        if self.0.as_ref().is_some_and(|(at, _)| close(at)) {
+            return;
+        }
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(d).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        });
+        self.0 = Some((due, task));
+    }
 }

@@ -18,9 +18,9 @@ use fleet_client::{
     TOO_OLD, did_not_come_back, restart_failed, restart_outcome,
 };
 use fleet_proto::{
-    AgentInfo, AgentState, BinaryIdentity, ForgetAgents, Frame, HelloOk, KillAgent, ListAgents,
-    Response, RestartAgent, RestartDaemon, SendInput, SetLabels, SpawnAgent, event, request,
-    response,
+    AgentInfo, AgentState, BinaryIdentity, DecideSpawn, ForgetAgents, Frame, HelloOk, KillAgent,
+    ListAgents, ListPendingSpawns, PendingSpawn, Response, RestartAgent, RestartDaemon, SendInput,
+    SetLabels, SpawnAgent, event, request, response,
 };
 use fleet_term::Palette;
 
@@ -38,6 +38,8 @@ const OUTPUT_CLIENT_NAME: &str = "gui-output";
 
 /// What an old daemon answers a request it does not know with.
 const UNKNOWN_REQUEST: &str = "empty request";
+/// The verb tracking the pending-spawns list asked for on connect.
+const LIST_PENDING_SPAWNS: &str = "list spawn requests";
 /// Shown instead of [`UNKNOWN_REQUEST`]: the only requests the GUI sends
 /// that an older fleetd lacks are restart and forget. [`error_text`] maps
 /// "empty request" for every reply, whatever the request was: revisit this
@@ -350,6 +352,8 @@ struct Sidebar {
     listed: bool,
     /// How many `ListAgents` replies arrived.
     lists: u64,
+    /// Agents' spawns waiting for the user's approval (ADR 0079), by id.
+    pending_spawns: BTreeMap<u64, PendingSpawn>,
 }
 
 impl Sidebar {
@@ -408,6 +412,8 @@ enum ControlCmd {
     Input(u64, Vec<u8>),
     ClearExited,
     RestartDaemon(String),
+    /// Approves or denies a pending spawn (ADR 0079).
+    DecideSpawn(u64, bool),
     Stop,
 }
 
@@ -516,6 +522,22 @@ impl Session {
     /// How many `ListAgents` replies arrived (on any connection).
     pub fn lists(&self) -> u64 {
         lock(&self.inner.sidebar).lists
+    }
+
+    /// Agents' spawns waiting for the user's approval (ADR 0079), oldest
+    /// first.
+    pub fn pending_spawns(&self) -> Vec<PendingSpawn> {
+        lock(&self.inner.sidebar)
+            .pending_spawns
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Approves or denies pending spawn `id`; the change arrives as an
+    /// event, a failure (it was no longer pending) as [`UiEvent::Error`].
+    pub fn decide_spawn(&self, id: u64, approve: bool) {
+        self.control(ControlCmd::DecideSpawn(id, approve));
     }
 
     /// A snapshot of the sidebar rows, by agent id.
@@ -1024,6 +1046,19 @@ impl ControlReader {
                         changed = true;
                     }
                     Frame::Response(Response {
+                        kind: Some(response::Kind::PendingSpawns(p)),
+                        ..
+                    }) => {
+                        sb.pending_spawns = p.pending.into_iter().map(|p| (p.id, p)).collect();
+                        changed = true;
+                    }
+                    // A daemon from before spawn approval (ADR 0079) has
+                    // none to list: nothing to say.
+                    Frame::Response(Response {
+                        kind: Some(response::Kind::Error(_)),
+                        ..
+                    }) if verb == Some(LIST_PENDING_SPAWNS) => {}
+                    Frame::Response(Response {
                         kind: Some(response::Kind::RestartingDaemon(r)),
                         ..
                     }) => {
@@ -1100,6 +1135,13 @@ impl ControlReader {
                             }
                             None => relist = true,
                         },
+                        Some(event::Kind::SpawnPending(p)) => {
+                            sb.pending_spawns.insert(p.id, p);
+                            changed = true;
+                        }
+                        Some(event::Kind::SpawnDecided(d)) => {
+                            changed |= sb.pending_spawns.remove(&d.id).is_some();
+                        }
                         Some(event::Kind::AgentRemoved(r)) => {
                             sb.infos.remove(&r.agent_id);
                             sb.activity.remove(&r.agent_id);
@@ -1178,6 +1220,12 @@ fn control_writer(
                 lock(pending).clear();
                 sender = Some(s);
                 list(&mut sender, &mut next_list);
+                // Events keep the pending spawns current from here on.
+                send_tracked(
+                    &mut sender,
+                    LIST_PENDING_SPAWNS,
+                    request::Kind::ListPendingSpawns(ListPendingSpawns {}),
+                );
             }
             Some(ControlCmd::Disconnected) => sender = None,
             Some(ControlCmd::Kill(agent_id)) => {
@@ -1236,6 +1284,11 @@ fn control_writer(
                     "remove",
                     request::Kind::Forget(Box::new(forget)),
                 );
+            }
+            Some(ControlCmd::DecideSpawn(id, approve)) => {
+                let verb = if approve { "approve" } else { "deny" };
+                let decide = DecideSpawn { id, approve };
+                send_tracked(&mut sender, verb, request::Kind::DecideSpawn(decide));
             }
             Some(ControlCmd::Stop) => return,
         }
@@ -1396,6 +1449,52 @@ mod tests {
             id: 1,
             kind: Some(response::Kind::Agents(AgentList { agents, replaced })),
         })
+    }
+
+    #[test]
+    fn pending_spawns_follow_the_list_and_events() {
+        use fleet_proto::{PendingSpawns, SpawnDecided};
+        let (r, events) = reader();
+        let p = |id| PendingSpawn {
+            id,
+            parent: 1,
+            ..Default::default()
+        };
+        let ids = |r: &ControlReader| {
+            lock(&r.sidebar)
+                .pending_spawns
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        r.apply(vec![Frame::Response(Response {
+            id: 2,
+            kind: Some(response::Kind::PendingSpawns(PendingSpawns {
+                pending: vec![p(1), p(2)],
+            })),
+        })]);
+        assert_eq!(ids(&r), [1, 2]);
+        r.apply(vec![Frame::Event(Event {
+            kind: Some(event::Kind::SpawnPending(p(3))),
+        })]);
+        drain(&events);
+        r.apply(vec![Frame::Event(Event {
+            kind: Some(event::Kind::SpawnDecided(SpawnDecided {
+                id: 1,
+                decision: 1,
+            })),
+        })]);
+        assert_eq!(ids(&r), [2, 3]);
+        assert_eq!(drain(&events), [UiEvent::AgentsChanged]);
+        // An old daemon's refusal of the list is not shown.
+        lock(&r.pending).push_back((7, LIST_PENDING_SPAWNS));
+        r.apply(vec![Frame::Response(Response {
+            id: 7,
+            kind: Some(response::Kind::Error(fleet_proto::Error {
+                message: UNKNOWN_REQUEST.into(),
+            })),
+        })]);
+        assert!(drain(&events).is_empty());
     }
 
     #[test]

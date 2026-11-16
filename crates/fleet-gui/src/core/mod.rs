@@ -1,5 +1,6 @@
 //! Platform-neutral GUI logic: no gpui, no AppKit.
 
+pub mod approval;
 pub mod backoff;
 pub mod broadcast;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod layout;
 pub mod links;
 pub mod menus;
 pub mod mouse;
+pub mod new_children;
 pub mod output;
 pub mod palette;
 pub mod pane;

@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 
 use fleet_client::tree::Tree;
 use gpui::prelude::FluentBuilder as _;
@@ -23,6 +24,7 @@ use gpui::{
 };
 
 use super::app_state::AppState;
+use super::controls;
 use super::icons;
 use super::sidebar_view::tab_title;
 use super::status_dot::dot_color;
@@ -85,6 +87,8 @@ pub struct GraphView {
     pub(super) layouts: usize,
     /// The cards the last frame built (tests check culling).
     pub(super) built: Vec<u64>,
+    /// Redraws while a new child's highlight shows (ADR 0079).
+    new_child_timer: controls::RedrawTimer,
     _subs: Vec<Subscription>,
 }
 
@@ -113,6 +117,7 @@ impl GraphView {
             drag: None,
             layouts: 0,
             built: Vec::new(),
+            new_child_timer: controls::RedrawTimer::default(),
             _subs: subs,
         }
     }
@@ -441,10 +446,12 @@ impl GraphView {
         cx.stop_propagation();
     }
 
+    /// `fresh`: the new-child highlight's strength, 0 to 1 (ADR 0079).
     fn render_card(
         &self,
         card: &Card,
         c: CardContent,
+        fresh: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -456,6 +463,8 @@ impl GraphView {
         let compact = z < COMPACT_ZOOM;
         let border = if selected {
             theme.accent
+        } else if fresh > 0.0 {
+            theme.accent.opacity(0.4 + 0.6 * fresh)
         } else if c.waiting {
             theme.warning
         } else {
@@ -532,10 +541,15 @@ impl GraphView {
             .p(size(space::SM))
             .rounded(size(radius::LG))
             .overflow_hidden()
-            .bg(if c.waiting {
+            .bg(if fresh > 0.0 {
+                theme.card.blend(theme.accent.opacity(0.22 * fresh))
+            } else if c.waiting {
                 theme.card.blend(theme.warning.opacity(0.12))
             } else {
                 theme.card
+            })
+            .when(fresh > 0.0, |d| {
+                d.debug_selector(move || format!("graph-card-{id}-new"))
             })
             .border_color(border)
             .when(selected, |d| d.border_2())
@@ -713,9 +727,23 @@ impl Render for GraphView {
         self.built = contents.iter().map(|(c, _)| c.id).collect();
         let empty = layout.is_empty();
         let filtering = !self.filter.read(cx).text().trim().is_empty();
+        let (fresh, next) = {
+            let app = self.app.read(cx);
+            let (at, reduce) = (Instant::now(), controls::reduces_motion(cx));
+            (
+                app.new_children.strengths(at, reduce),
+                app.new_children.next_change(at, reduce),
+            )
+        };
+        let mut timer = std::mem::take(&mut self.new_child_timer);
+        timer.schedule(next, window, cx);
+        self.new_child_timer = timer;
         let cards: Vec<AnyElement> = contents
             .into_iter()
-            .map(|(card, content)| self.render_card(&card, content, &theme, cx))
+            .map(|(card, content)| {
+                let f = fresh.get(&card.id).copied().unwrap_or(0.0);
+                self.render_card(&card, content, f, &theme, cx)
+            })
             .collect();
         let placeholder = empty.then(|| {
             div()
