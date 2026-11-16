@@ -231,6 +231,11 @@ impl Restart {
         let Some(_stopped) = self.restarts.stop_requests(deadline) else {
             return "agents are starting; try again".into();
         };
+        // Pending spawns survive nothing (ADR 0079): refused, even if the
+        // restart then fails.
+        self.node
+            .approvals()
+            .refuse_all(fleet_proto::SpawnDecision::SpawnRestarting);
         let agents = match self.node.prepare_handoff(deadline) {
             Ok(agents) => agents,
             // Nothing stays frozen (see `prepare_handoff`).
