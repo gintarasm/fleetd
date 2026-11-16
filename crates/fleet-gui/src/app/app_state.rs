@@ -15,14 +15,18 @@ use super::pane_view::{InputSink, PaneChrome, PaneView};
 use super::sidebar_view::{TabMark, program_name};
 use super::theme::Theme;
 use super::workspace::Workspace;
-use crate::core::config::GuiConfig;
+use crate::core::config::{GuiConfig, load_config};
 use crate::core::drag_drop::DropAction;
+use crate::core::ended::run_time;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
+use crate::core::settings::{Change, save_changes};
+use crate::core::shortcuts::ClosedPanes;
 use crate::core::sidebar::{ended, tilde};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
+use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
 use crate::core::style::chrome;
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
@@ -265,12 +269,23 @@ pub struct AppState {
     pub(super) layout: Layout,
     panes: HashMap<PaneId, Entity<PaneView>>,
     focused: PaneId,
+    /// The agents of panes closed lately, for ⌘⇧T (not saved).
+    closed: ClosedPanes,
     /// The pane filling the pane area, if any (not saved).
     pub(super) maximized: Option<PaneId>,
     /// OSC titles of the agents shown in panes.
     pub(super) titles: HashMap<u64, String>,
     pub(super) theme: Theme,
     pub(super) agents: Vec<AgentRow>,
+    /// Each non-shell agent's status (ADR 0042), as of the last
+    /// [`AppState::refresh_status`].
+    pub(super) statuses: HashMap<u64, AgentStatus>,
+    /// Agents whose pane rang the bell where you were not looking; cleared
+    /// once a pane showing it is focused in the active window.
+    pub(super) bells: HashSet<u64>,
+    alerts: Alerts,
+    /// The window is open and has focus: no notifications then.
+    window_active: bool,
     /// The last error, shown until dismissed or replaced.
     pub(super) error: Option<String>,
     /// A neutral message (a successful restart), shown when there is no
@@ -340,9 +355,14 @@ impl AppState {
             layout,
             panes: HashMap::new(),
             focused,
+            closed: ClosedPanes::default(),
             maximized: None,
             titles: HashMap::new(),
             theme,
+            statuses: HashMap::new(),
+            bells: HashSet::new(),
+            alerts: Alerts::default(),
+            window_active: false,
             error: None,
             error_is_connection: false,
             config_error: None,
@@ -417,7 +437,12 @@ impl AppState {
         self.panes.clear();
         self.focused = self.layout.panes()[0];
         self.maximized = None;
+        self.closed.clear();
         self.titles.clear();
+        // The new target's waiting and ended agents are not news.
+        self.statuses.clear();
+        self.bells.clear();
+        self.alerts = Alerts::default();
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
         self.error_is_connection = false;
@@ -520,12 +545,17 @@ impl AppState {
     }
 
     fn apply_events(&mut self, batch: Vec<UiEvent>, cx: &mut Context<Self>) {
+        let mut status = false;
         let mut chrome = false;
         let mut layout = false;
         for event in batch {
             match event {
                 UiEvent::AgentsChanged => {
                     self.agents = self.session.agents();
+                    let agents = &self.agents;
+                    self.bells
+                        .retain(|id| agents.iter().any(|r| r.info.id == *id));
+                    status = true;
                     if self.live {
                         super::bench::agents_listed();
                         if self.session.listed() {
@@ -540,10 +570,18 @@ impl AppState {
                         continue;
                     };
                     layout |= self.adopt_shown_agent(pane, &view, cx);
-                    let (agent, title) = {
-                        let model = lock(view.read(cx).model_handle());
-                        (model.agent_id(), model.title())
+                    let (agent, title, rang) = {
+                        let mut model = lock(view.read(cx).model_handle());
+                        (model.agent_id(), model.title(), model.take_bell())
                     };
+                    if rang {
+                        view.update(cx, |v, cx| v.flash(cx));
+                        if let Some(id) = agent
+                            && !(self.window_active && pane == self.focused)
+                        {
+                            status |= self.bells.insert(id);
+                        }
+                    }
                     if let Some(id) = agent {
                         let changed = match title {
                             Some(t) => self.titles.insert(id, t.clone()).as_ref() != Some(&t),
@@ -615,6 +653,9 @@ impl AppState {
                     cx.notify();
                 }
             }
+        }
+        if status {
+            self.refresh_status(cx);
         }
         if layout {
             self.layout_changed(cx);
@@ -781,11 +822,83 @@ impl AppState {
         !self.agents.is_empty()
     }
 
-    /// Once a second: the reconnect countdown.
+    /// Once a second: the reconnect countdown, and statuses that age
+    /// (working turns quiet).
     pub fn tick(&mut self, cx: &mut Context<Self>) {
         if self.reconnect_at.is_some() {
             self.refresh_chrome(cx);
         }
+        self.refresh_status(cx);
+    }
+
+    /// Recomputes the statuses (ADR 0042); on a change redraws, and sends
+    /// the notifications it calls for while the window is not focused (if
+    /// they are on).
+    pub fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        let now = statuses(&self.agents, &self.bells, unix_ms());
+        let alerts = self.alerts.update(&now);
+        if now != self.statuses {
+            self.statuses = now;
+            self.refresh_chrome(cx);
+            cx.notify();
+        }
+        if !self.config.notifications || (self.window_active && self.window.is_some()) {
+            return;
+        }
+        for (id, status) in alerts {
+            let Some(row) = self.agents.iter().find(|r| r.info.id == id) else {
+                continue;
+            };
+            let name = self
+                .titles
+                .get(&id)
+                .filter(|t| !t.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| program_name(&row.info.program));
+            let cwd = tilde(&row.info.cwd, &self.home);
+            let detail = match status {
+                AgentStatus::NeedsYou if !row.last_line.trim().is_empty() => row.last_line.trim(),
+                _ => cwd.as_str(),
+            };
+            let (title, body) = alert_text(&name, status, row.info.exit_code, detail);
+            super::attention::post(self.session_epoch, id, &title, &body, cx);
+        }
+    }
+
+    /// Agents that need you, for the Dock badge and the menu bar.
+    pub fn needs_you_count(&self) -> usize {
+        crate::core::status::needs_you_count(&self.statuses)
+    }
+
+    /// The window gained or lost focus (or closed).
+    pub fn set_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.window_active = active;
+        self.see_focused(cx);
+    }
+
+    /// A bell in the focused pane is seen once the window is active.
+    fn see_focused(&mut self, cx: &mut Context<Self>) {
+        if !self.window_active {
+            return;
+        }
+        if let Some(id) = self.layout.agent(self.focused)
+            && self.bells.remove(&id)
+        {
+            self.refresh_status(cx);
+        }
+    }
+
+    /// Turns notifications on or off and saves it to `config.toml`.
+    pub fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        let on = !self.config.notifications;
+        self.config.notifications = on;
+        if let Err(e) = crate::core::config::save_notifications(&self.state_dir, on) {
+            self.error = Some(format!("cannot save notifications setting: {e}"));
+        }
+        if on {
+            super::attention::request_permission(cx);
+        }
+        cx.notify();
     }
 
     /// Tells each pane its number, agent and connection facts.
@@ -793,6 +906,7 @@ impl AppState {
         let reconnect_in = self
             .reconnect_at
             .map(|at| at.saturating_duration_since(Instant::now()));
+        let no_agents = self.live && self.session.listed() && self.agents.is_empty();
         for (i, pane) in self.layout.panes().into_iter().enumerate() {
             let agent = self.layout.agent(pane);
             let row = agent.and_then(|id| self.agents.iter().find(|r| r.info.id == id));
@@ -806,10 +920,16 @@ impl AppState {
                     (None, None) => None,
                 },
                 cwd: row.map(|r| tilde(&r.info.cwd, &self.home)),
+                link_dir: row
+                    .filter(|_| self.target == Target::Local)
+                    .map(|r| r.info.cwd.clone()),
                 starting: self.starting.contains(&pane),
                 reconnect_in,
                 focused: pane == self.focused,
                 maximized: self.maximized == Some(pane),
+                status: agent.and_then(|id| self.statuses.get(&id).copied()),
+                no_agents,
+                run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));
@@ -826,6 +946,7 @@ impl AppState {
             self.schedule_save(cx);
         }
         self.refresh_chrome(cx);
+        self.see_focused(cx);
         cx.notify();
     }
 
@@ -855,6 +976,7 @@ impl AppState {
                 self.maximized = None;
             }
             self.refresh_chrome(cx);
+            self.see_focused(cx);
             cx.notify();
         }
     }
@@ -929,9 +1051,13 @@ impl AppState {
     /// The last pane stays, empty.
     pub fn close_focused(&mut self, cx: &mut Context<Self>) {
         let pane = self.focused;
+        let agent = self.layout.agent(pane);
         let Some(next) = self.layout.close(pane) else {
             return;
         };
+        if let Some(id) = agent {
+            self.closed.push(id);
+        }
         self.session.close_pane(pane);
         self.panes.remove(&pane);
         self.maximized = None;
@@ -942,6 +1068,29 @@ impl AppState {
         }
         self.focused = next;
         self.layout_changed(cx);
+    }
+
+    /// ⌘⇧T: the agent of the pane closed last that is still listed, in
+    /// the focused pane if it is empty, else in a new split. `None` when
+    /// there is none or no pane fits (it then stays to reopen).
+    pub fn reopen_closed(&mut self, cx: &mut Context<Self>) -> Option<PaneId> {
+        if !self.session.listed() {
+            return None;
+        }
+        let agents = &self.agents;
+        let id = self
+            .closed
+            .pop(|id| agents.iter().any(|r| r.info.id == id))?;
+        let pane = self.focused;
+        if self.layout.agent(pane).is_none() && !self.starting.contains(&pane) {
+            self.show_agent(id, cx);
+            return Some(pane);
+        }
+        let new = self.open_in_new_split(id, cx);
+        if new.is_none() {
+            self.closed.push(id);
+        }
+        new
     }
 
     /// The pane `n` (1-based, reading order).
@@ -1069,7 +1218,27 @@ impl AppState {
     /// and that pane is focused.
     pub fn new_terminal(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let focused_agent = self.layout.agent(self.focused);
-        let focused_cwd = focused_agent
+        let cwd = self.start_dir(self.focused);
+        let req = self.terminal_request(cwd);
+        if focused_agent.is_some() {
+            self.split(Axis::Horizontal, cx);
+        }
+        self.spawn(req, cx)
+    }
+
+    /// New terminal's request: a login shell in `cwd`.
+    pub(super) fn terminal_request(&self, cwd: String) -> SpawnRequest {
+        let shell = std::env::var("SHELL").ok();
+        new_terminal(&self.target, shell.as_deref(), cwd)
+    }
+
+    /// Where something started next to `pane` runs: its agent's folder,
+    /// else the last-used one, else home (a remote daemon's own directory,
+    /// as it is unknown here).
+    pub(super) fn start_dir(&self, pane: PaneId) -> String {
+        let cwd = self
+            .layout
+            .agent(pane)
             .and_then(|id| self.agents.iter().find(|r| r.info.id == id))
             .map(|r| r.info.cwd.as_str());
         let recent = self
@@ -1081,13 +1250,21 @@ impl AppState {
             Target::Local => self.home.to_string_lossy().into_owned(),
             Target::Ssh { .. } => String::new(),
         };
-        let cwd = terminal_dir(focused_cwd, recent, &home);
-        let shell = std::env::var("SHELL").ok();
-        let req = new_terminal(&self.target, shell.as_deref(), cwd);
-        if focused_agent.is_some() {
-            self.split(Axis::Horizontal, cx);
-        }
-        self.spawn(req, cx)
+        terminal_dir(cwd, recent, &home)
+    }
+
+    /// `pane` shows an agent, or a spawn is on its way into it.
+    pub(super) fn pane_filled(&self, pane: PaneId) -> bool {
+        self.layout.agent(pane).is_some() || self.starting.contains(&pane)
+    }
+
+    /// The agents some pane shows.
+    pub(super) fn on_screen(&self) -> HashSet<u64> {
+        self.layout
+            .panes()
+            .into_iter()
+            .filter_map(|p| self.layout.agent(p))
+            .collect()
     }
 
     /// `~` is the home directory for a local daemon; remote paths are the
@@ -1116,6 +1293,31 @@ impl AppState {
 
     pub fn forget(&self, agent_id: u64) {
         self.session.forget(vec![agent_id]);
+    }
+
+    /// The summary bar's Remove: forgets the agent `pane` shows if it
+    /// exited or is lost; otherwise does nothing. The pane empties when the
+    /// node announces the removal.
+    pub fn remove_in_pane(&self, pane: PaneId, cx: &App) {
+        if let Some(agent) = self.ended_agent(pane, cx) {
+            self.forget(agent);
+        }
+    }
+
+    /// The agent `pane` shows, if it exited or is lost.
+    fn ended_agent(&self, pane: PaneId, cx: &App) -> Option<u64> {
+        let view = self.panes.get(&pane)?;
+        let (state, shown) = {
+            let m = lock(view.read(cx).model_handle());
+            (m.state(), m.agent_id())
+        };
+        match state {
+            // The final screen on show is that agent's.
+            PaneState::Exited(_) => shown,
+            // The attach failed: the agent is the one the layout names.
+            PaneState::Lost => self.layout.agent(pane).or(shown),
+            _ => None,
+        }
     }
 
     pub fn clear_exited(&self) {
@@ -1166,21 +1368,10 @@ impl AppState {
     /// size, if it exited or is lost; otherwise does nothing.
     pub fn restart_focused(&mut self, cx: &mut Context<Self>) {
         let pane = self.focused;
-        let Some(view) = self.panes.get(&pane) else {
+        let Some(agent) = self.ended_agent(pane, cx) else {
             return;
         };
-        let (state, shown) = {
-            let m = lock(view.read(cx).model_handle());
-            (m.state(), m.agent_id())
-        };
-        let agent = match state {
-            // The final screen on show is that agent's.
-            PaneState::Exited(_) => shown,
-            // The attach failed: the agent is the one the layout names.
-            PaneState::Lost => self.layout.agent(pane).or(shown),
-            _ => None,
-        };
-        let Some(agent) = agent else {
+        let Some(view) = self.panes.get(&pane) else {
             return;
         };
         let (cols, rows) = view.read(cx).grid().unwrap_or((80, 24));
@@ -1207,6 +1398,64 @@ impl AppState {
         dir_choices(recent, &self.agents)
     }
 
+    pub fn config(&self) -> &GuiConfig {
+        &self.config
+    }
+
+    /// The theme the windows draw with.
+    pub fn theme(&self) -> Theme {
+        self.theme
+    }
+
+    /// Settings changes: the changed keys are written to `config.toml`,
+    /// then take effect at once (the panes' font and Option as Meta here;
+    /// the window's look and motion follow through its observer). Nothing
+    /// changes if the file cannot be written.
+    pub fn change_settings(
+        &mut self,
+        changes: Vec<Change>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let mut next = self.config.clone();
+        let keys: Vec<&str> = changes
+            .into_iter()
+            .filter_map(|c| c.apply(&mut next))
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        save_changes(&self.state_dir, &next, &keys)
+            .map_err(|e| format!("cannot save the settings: {e}"))?;
+        if keys.contains(&"theme") {
+            super::native::set_app_appearance(next.theme);
+        }
+        self.set_config(next, cx);
+        Ok(())
+    }
+
+    /// Reads `config.toml` again (the Settings window opening): edits made
+    /// to the file meanwhile take effect. A malformed file is left for the
+    /// next launch to report; the settings in use stay.
+    pub fn reload_config(&mut self, cx: &mut Context<Self>) {
+        if let Ok(c) = load_config(&self.state_dir)
+            && c != self.config
+        {
+            if c.theme != self.config.theme {
+                super::native::set_app_appearance(c.theme);
+            }
+            self.set_config(c, cx);
+        }
+    }
+
+    fn set_config(&mut self, config: GuiConfig, cx: &mut Context<Self>) {
+        self.config = config;
+        for view in self.panes.values() {
+            let config = &self.config;
+            view.update(cx, |v, cx| v.apply_config(config, cx));
+        }
+        cx.notify();
+    }
+
     pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
         if self.theme == theme {
             return;
@@ -1231,15 +1480,10 @@ impl AppState {
         self.error_is_connection = false;
         cx.notify();
     }
+}
 
-    pub(super) fn label(&self, agent_id: u64) -> String {
-        match self.agents.iter().find(|r| r.info.id == agent_id) {
-            Some(r) => format!(
-                "{} in {}",
-                program_name(&r.info.program),
-                tilde(&r.info.cwd, &self.home)
-            ),
-            None => format!("agent {agent_id}"),
-        }
-    }
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }

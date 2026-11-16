@@ -11,6 +11,8 @@ use crate::core::theme::{Appearance, Rgba, Tokens};
 /// Every colour of [`Tokens`], ready to draw with.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Theme {
+    /// What this theme was made from (for [`Theme::with_accent`]).
+    tokens: Tokens,
     pub appearance: Appearance,
     pub palette: Palette,
     pub window: Hsla,
@@ -30,8 +32,12 @@ pub struct Theme {
     pub selection: Hsla,
     /// Background of the IME's marked (uncommitted) text.
     pub marked: Hsla,
+    /// Translucent fills over find matches and the current one.
+    pub find_match: Hsla,
+    pub find_current: Hsla,
     pub danger: Hsla,
     pub success: Hsla,
+    pub warning: Hsla,
     pub shadow: Hsla,
 }
 
@@ -40,6 +46,7 @@ impl Global for Theme {}
 impl Theme {
     pub fn from_tokens(t: &Tokens) -> Self {
         Theme {
+            tokens: *t,
             appearance: t.appearance,
             palette: t.palette,
             window: hsla(t.window),
@@ -57,8 +64,11 @@ impl Theme {
             accent: hsla(t.accent),
             selection: hsla(t.selection),
             marked: hsla(t.marked),
+            find_match: hsla(t.find_match),
+            find_current: hsla(t.find_current),
             danger: hsla(t.danger),
             success: hsla(t.success),
+            warning: hsla(t.warning),
             shadow: hsla(t.shadow),
         }
     }
@@ -81,14 +91,18 @@ impl Theme {
     }
 
     /// This theme with `accent` (the user's system accent colour) for
-    /// the accent and the selection tint.
-    pub fn with_accent(mut self, accent: Hsla) -> Self {
-        self.accent = accent;
-        self.selection = Hsla {
-            a: self.selection.a,
-            ..accent
+    /// the accent and the selection tint; in light, darkened until it
+    /// reads as text ([`Tokens::legible_accent`]).
+    pub fn with_accent(self, accent: Hsla) -> Self {
+        let c = accent.to_rgb();
+        let u8_of = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let accent = Rgba {
+            r: u8_of(c.r),
+            g: u8_of(c.g),
+            b: u8_of(c.b),
+            a: 1.0,
         };
-        self
+        Theme::from_tokens(&self.tokens.with_accent(accent))
     }
 
     pub fn is_dark(&self) -> bool {
@@ -203,5 +217,18 @@ mod tests {
         assert_eq!(t.accent, accent);
         assert_eq!(t.selection.h, accent.h);
         assert_eq!(t.selection.a, Theme::dark().selection.a);
+    }
+
+    #[test]
+    fn a_pale_accent_is_darkened_in_light() {
+        use crate::core::theme::{Tokens, rgb};
+        let yellow = super::rgb((0xff, 0xc6, 0x00));
+        let t = Theme::light().with_accent(yellow);
+        let want = Tokens::light().legible_accent(rgb(0xffc600));
+        assert_eq!(t.accent, super::hsla(want));
+        assert_ne!(t.accent, yellow);
+        // Only the accent and the selection change.
+        assert_eq!(t.text, Theme::light().text);
+        assert_eq!(t.window, Theme::light().window);
     }
 }

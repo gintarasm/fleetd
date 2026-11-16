@@ -148,6 +148,12 @@ pub mod motion {
     pub const SHEET_MS: u64 = 160;
     /// The error toast sliding in.
     pub const TOAST_MS: u64 = 200;
+    /// The overlay scrollbar fading in when scrolling starts.
+    pub const SCROLLBAR_FADE_IN_MS: u64 = 100;
+    /// How long the scrollbar stays after the last scroll.
+    pub const SCROLLBAR_HOLD_MS: u64 = 800;
+    /// The scrollbar fading out after that.
+    pub const SCROLLBAR_FADE_OUT_MS: u64 = 300;
     /// How far a sheet slides while it fades in.
     pub const SHEET_OFFSET: f32 = super::grid(2);
 
