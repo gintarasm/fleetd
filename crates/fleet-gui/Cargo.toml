@@ -37,6 +37,19 @@ gpui = "=0.2.2"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "bitflags",
+    "UNNotification",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
+block2 = "0.6"
 raw-window-handle = "0.6.2"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

@@ -1,6 +1,7 @@
 //! The menu-bar status menu, as data: the shell turns it into an `NSMenu`
 //! each time the menu opens.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use fleet_proto::AgentState;
@@ -22,6 +23,10 @@ pub struct StatusMenuState {
     pub reconnecting: bool,
     pub agents: Vec<AgentRow>,
     pub home: PathBuf,
+    /// Agents that need you (ADR 0042): their lines say so.
+    pub needs_you: HashSet<u64>,
+    /// Notifications are on (`[gui] notifications`).
+    pub notifications: bool,
 }
 
 /// One menu line.
@@ -46,6 +51,8 @@ pub enum StatusEntry {
     /// running. Listed for local and ssh targets alike.
     RestartFleetd,
     InstallSkill,
+    /// Toggles macOS notifications (checked while on).
+    Notifications(bool),
     Separator,
     Quit,
 }
@@ -62,6 +69,7 @@ impl StatusEntry {
             StatusEntry::SwitchFleetd => "Switch fleetd…",
             StatusEntry::RestartFleetd => "Restart fleetd",
             StatusEntry::InstallSkill => "Install agent skill",
+            StatusEntry::Notifications(_) => "Notify when agents need you",
             StatusEntry::Separator => "",
             StatusEntry::Quit => "Quit fleet",
         }
@@ -99,9 +107,14 @@ pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
                 .map(|r| StatusEntry::Agent {
                     id: r.info.id,
                     label: format!(
-                        "{} · {}",
+                        "{} · {}{}",
                         program_name(&r.info.program),
-                        tilde(&r.info.cwd, &state.home)
+                        tilde(&r.info.cwd, &state.home),
+                        if state.needs_you.contains(&r.info.id) {
+                            " — needs you"
+                        } else {
+                            ""
+                        }
                     ),
                 }),
         );
@@ -118,6 +131,7 @@ pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
         StatusEntry::SwitchFleetd,
         StatusEntry::RestartFleetd,
         StatusEntry::InstallSkill,
+        StatusEntry::Notifications(state.notifications),
         StatusEntry::Separator,
         StatusEntry::Quit,
     ]);
@@ -152,6 +166,8 @@ mod tests {
             reconnecting: false,
             agents,
             home: PathBuf::from("/Users/me"),
+            needs_you: HashSet::new(),
+            notifications: false,
         }
     }
 
@@ -205,6 +221,7 @@ mod tests {
                 StatusEntry::SwitchFleetd,
                 StatusEntry::RestartFleetd,
                 StatusEntry::InstallSkill,
+                StatusEntry::Notifications(false),
                 StatusEntry::Separator,
                 StatusEntry::Quit,
             ]
@@ -305,6 +322,38 @@ mod tests {
         assert_eq!(
             status_menu(&s)[0],
             StatusEntry::Header("fleetd: me@box (reconnecting)".into())
+        );
+    }
+
+    #[test]
+    fn agents_that_need_you_say_so_and_notifications_toggle() {
+        let mut s = state(
+            Target::Local,
+            vec![
+                row(1, "claude", "/tmp", AgentState::Running),
+                row(2, "claude", "/tmp", AgentState::Running),
+            ],
+        );
+        s.needs_you.insert(2);
+        s.notifications = true;
+        let menu = status_menu(&s);
+        assert_eq!(
+            agents(&menu),
+            vec![
+                StatusEntry::Agent {
+                    id: 1,
+                    label: "claude · /tmp".into()
+                },
+                StatusEntry::Agent {
+                    id: 2,
+                    label: "claude · /tmp — needs you".into()
+                },
+            ]
+        );
+        assert!(menu.contains(&StatusEntry::Notifications(true)));
+        assert_eq!(
+            StatusEntry::Notifications(true).title(),
+            "Notify when agents need you"
         );
     }
 }

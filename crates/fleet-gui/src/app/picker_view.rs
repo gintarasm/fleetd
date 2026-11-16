@@ -1,13 +1,15 @@
 //! A fuzzy picker: a query field over a floating list, drawn from
 //! [`core::picker::Picker`](crate::core::picker::Picker). ↑/↓ (or ⌃P/⌃N)
 //! move the selection, Enter or a click picks, Esc dismisses. The
-//! command palette is one; any chooser can be another.
+//! command palette is one; the agent switcher is another, without the
+//! query field ([`PickerView::list`]).
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FontWeight, HighlightStyle, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, Subscription, Window, div, px,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, FontWeight, HighlightStyle,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription,
+    Window, div, px,
 };
 
 use super::text_field::TextField;
@@ -31,6 +33,9 @@ pub struct PickerView {
     picker: Picker,
     scroll: ScrollHandle,
     empty_text: SharedString,
+    /// The query field is drawn and has the keyboard; else the list has.
+    show_query: bool,
+    focus: FocusHandle,
     _query_changed: Subscription,
 }
 
@@ -58,13 +63,28 @@ impl PickerView {
             picker: Picker::new(items, recents),
             scroll: ScrollHandle::new(),
             empty_text: "No matches".into(),
+            show_query: true,
+            focus: cx.focus_handle(),
             _query_changed: sub,
         }
     }
 
-    /// Focus goes to the query field.
+    /// A list without a query field: the keys move and pick, typing does
+    /// nothing.
+    pub fn list(items: Vec<PickerItem>, recents: Recents, cx: &mut Context<Self>) -> Self {
+        PickerView {
+            show_query: false,
+            ..PickerView::new(items, recents, "", cx)
+        }
+    }
+
+    /// Focus goes to the query field (or the list, without one).
     pub fn focus(&self, window: &mut Window, cx: &App) {
-        window.focus(self.query.read(cx).focus_handle());
+        if self.show_query {
+            window.focus(self.query.read(cx).focus_handle());
+        } else {
+            window.focus(&self.focus);
+        }
     }
 
     pub fn picker(&self) -> &Picker {
@@ -78,8 +98,16 @@ impl PickerView {
         }
     }
 
-    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+    /// Moves the selection by `delta` rows, wrapping around.
+    pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.picker.move_selection(delta);
+        self.scroll.scroll_to_item(self.picker.selected());
+        cx.notify();
+    }
+
+    /// Selects row `row` of the ranked list.
+    pub fn select(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.picker.select(row);
         self.scroll.scroll_to_item(self.picker.selected());
         cx.notify();
     }
@@ -130,20 +158,11 @@ impl PickerView {
             (t.text, t.secondary)
         };
         let theme = *t;
-        div()
-            .id(("picker-row", row))
-            .debug_selector(move || format!("picker-row-{row}"))
+        let line = div()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(space::SM))
-            .px(px(space::SM))
-            .py(px(space::XS + space::XXS))
-            .rounded(px(radius::MD))
-            .cursor_pointer()
-            .text_color(fg)
-            .when(selected, |r| r.bg(theme.accent))
-            .when(!selected, |r| r.hover(move |s| s.bg(theme.hover)))
             .child(
                 div()
                     .flex_none()
@@ -166,7 +185,29 @@ impl PickerView {
                     .type_style(text::CALLOUT)
                     .text_color(dim)
                     .child(SharedString::from(s))
-            }))
+            }));
+        let preview = (!item.preview.is_empty()).then(|| {
+            div()
+                .debug_selector(move || format!("picker-preview-{row}"))
+                .truncate()
+                .type_style(text::CALLOUT)
+                .text_color(dim)
+                .child(SharedString::from(item.preview.clone()))
+        });
+        div()
+            .id(("picker-row", row))
+            .debug_selector(move || format!("picker-row-{row}"))
+            .flex()
+            .flex_col()
+            .px(px(space::SM))
+            .py(px(space::XS + space::XXS))
+            .rounded(px(radius::MD))
+            .cursor_pointer()
+            .text_color(fg)
+            .when(selected, |r| r.bg(theme.accent))
+            .when(!selected, |r| r.hover(move |s| s.bg(theme.hover)))
+            .child(line)
+            .children(preview)
             .on_mouse_move(cx.listener(move |this, _, _, cx| {
                 if this.picker.selected() != row {
                     this.picker.select(row);
@@ -224,12 +265,15 @@ impl Render for PickerView {
             .shadow_lg()
             .text_color(t.text)
             .type_style(text::BODY)
+            .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::key_down))
             // Clicks and the wheel stop here, never reaching the panes.
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(self.query.clone())
-            .child(div().h(px(1.)).bg(t.separator))
+            .when(self.show_query, |card| {
+                card.child(self.query.clone())
+                    .child(div().h(px(1.)).bg(t.separator))
+            })
             .child(list)
     }
 }

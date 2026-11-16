@@ -4,6 +4,7 @@
 use gpui::{Action, App, KeyBinding, Keystroke, actions};
 
 use crate::core::keys::{Key, KeyCode, KeyMods};
+use crate::core::shortcuts::{self, Binding, Section};
 
 actions!(
     fleet,
@@ -28,11 +29,20 @@ actions!(
         SwitchFleetd,
         InstallSkill,
         RestartPane,
+        KillPane,
         SelectAll,
         Cut,
         Undo,
         Redo,
+        OpenSettings,
+        ReopenClosedPane,
+        ShowShortcuts,
+        Find,
+        FindNext,
+        FindPrevious,
         CommandPalette,
+        NextAgent,
+        PreviousAgent,
     ]
 );
 
@@ -80,10 +90,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-n", NewAgent, None),
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-p", CommandPalette, None),
+        KeyBinding::new("ctrl-tab", NextAgent, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
+        // Kills the focused pane's agent (asking first); ⌘W only detaches.
+        KeyBinding::new("cmd-shift-w", KillPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
+        // Also from the pane's find field, inside the terminal's context.
+        KeyBinding::new("cmd-f", Find, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-g", FindNext, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-shift-g", FindPrevious, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(TEXT_FIELD_CONTEXT)),
@@ -91,7 +109,33 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-z", Undo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-shift-z", Redo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("cmd-shift-t", ReopenClosedPane, None),
+        KeyBinding::new("cmd-/", ShowShortcuts, None),
     ]);
+}
+
+/// The ⌘/ cheat sheet: every key binding registered now, whoever bound it.
+pub fn cheat_sheet(cx: &App) -> Vec<Section> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let bindings: Vec<(String, &'static str, Option<String>)> = keymap
+        .bindings()
+        .filter(|b| !gpui::is_no_action(b.action()))
+        .map(|b| {
+            let strokes: Vec<String> = b.keystrokes().iter().map(|k| k.unparse()).collect();
+            (
+                strokes.join(" "),
+                b.action().name(),
+                b.predicate().map(|p| p.to_string()),
+            )
+        })
+        .collect();
+    shortcuts::cheat_sheet(bindings.iter().map(|(keys, action, context)| Binding {
+        keys,
+        action,
+        context: context.as_deref(),
+    }))
 }
 
 /// The key a keystroke encodes; `None` for cmd-keys (app shortcuts) and
