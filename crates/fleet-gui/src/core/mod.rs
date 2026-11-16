@@ -7,6 +7,7 @@ pub mod ended;
 pub mod feedback;
 pub mod find;
 pub mod fuzzy;
+pub mod git;
 pub mod glass;
 pub mod graph;
 pub mod graph_layout;

@@ -20,13 +20,14 @@ use crate::core::config::{GuiConfig, load_config};
 use crate::core::drag_drop::DropAction;
 use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
+use crate::core::git;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::settings::{Change, save_changes};
 use crate::core::shortcuts::ClosedPanes;
-use crate::core::sidebar::{ended, tilde, toggle_collapsed};
+use crate::core::sidebar::{GroupBy, ended, tilde, toggle_collapsed};
 use crate::core::sidebar_tree::{removable_ended, toggle_disclosure};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
@@ -592,6 +593,22 @@ impl AppState {
         cx.notify();
     }
 
+    /// What the sidebar groups by (ADR 0085).
+    pub fn group_by(&self) -> GroupBy {
+        self.gui_state.sidebar_group_by
+    }
+
+    /// Groups the sidebar `by` folder or repository, remembered for
+    /// every target.
+    pub fn set_group_by(&mut self, by: GroupBy, cx: &mut Context<Self>) {
+        if self.gui_state.sidebar_group_by == by {
+            return;
+        }
+        self.gui_state.sidebar_group_by = by;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -1015,6 +1032,7 @@ impl AppState {
                     (None, None) => None,
                 },
                 cwd: row.map(|r| tilde(&r.info.cwd, &self.home)),
+                git: row.and_then(|r| git::header_text(&r.info)),
                 name: row.and_then(|r| name_of(&r.info)).map(str::to_owned),
                 link_dir: row
                     .filter(|_| self.target == Target::Local)

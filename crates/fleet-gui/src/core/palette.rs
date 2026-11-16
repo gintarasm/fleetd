@@ -12,6 +12,7 @@ use std::path::Path;
 
 use fleet_proto::AgentState;
 
+use super::git;
 use super::layout::MAX_PANES;
 use super::picker::PickerItem;
 use super::session::AgentRow;
@@ -282,7 +283,8 @@ pub fn status_text(row: &AgentRow) -> String {
 }
 
 /// An agent's row: its `name` label (else program and folder), then the
-/// folder and status; its labels are matched too.
+/// folder, git checkout (ADR 0085) and status; its labels, repository,
+/// worktree and branch are matched too.
 pub fn agent_item(row: &AgentRow, home: &Path) -> PickerItem {
     let info = &row.info;
     let cwd = tilde(&info.cwd, home);
@@ -299,8 +301,16 @@ pub fn agent_item(row: &AgentRow, home: &Path) -> PickerItem {
     PickerItem {
         key: Entry::Agent(info.id).key(),
         title,
-        detail: format!("{cwd} · {}", status_text(row)),
-        keywords: format!("agent {} {}", program_name(&info.program), labels.join(" ")),
+        detail: match git::row_subtitle(info) {
+            Some(g) => format!("{cwd} · {g} · {}", status_text(row)),
+            None => format!("{cwd} · {}", status_text(row)),
+        },
+        keywords: format!(
+            "agent {} {} {}",
+            program_name(&info.program),
+            labels.join(" "),
+            git::search_terms(info).join(" ")
+        ),
         shortcut: None,
         preview: String::new(),
     }
@@ -690,6 +700,35 @@ mod tests {
         assert_eq!(first("src/fleetd").as_deref(), Some("agent:7"));
         assert_eq!(first("project=fleetd").as_deref(), Some("agent:7"));
         assert_eq!(first("exited 2").as_deref(), Some("agent:8"));
+    }
+
+    /// ADR 0085: the git checkout is shown and matched.
+    #[test]
+    fn an_agent_is_found_by_its_branch_and_worktree() {
+        let mut a = row(7, "claude", "/Users/me/wt/issue-97", 1, AgentState::Running);
+        a.info.git = Some(fleet_proto::GitInfo {
+            repo: "fleetd".into(),
+            worktree: "issue-97".into(),
+            branch: "fix/freeze-timeout".into(),
+            detached: false,
+        });
+        let b = row(8, "claude", "/Users/me/other", 2, AgentState::Running);
+        let item = agent_item(&a, home());
+        assert_eq!(
+            item.detail,
+            "~/wt/issue-97 · issue-97 · fix/freeze-timeout · running"
+        );
+        let items: Vec<PickerItem> = palette_items(|_| None, &everything(), &[a, b], &[], home())
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect();
+        let first = |q: &str| {
+            let mut p = Picker::new(items.clone(), Recents::default());
+            p.set_query(q);
+            p.selected_item().map(|i| i.key.clone())
+        };
+        assert_eq!(first("frzetimeout").as_deref(), Some("agent:7"));
+        assert_eq!(first("issue-97").as_deref(), Some("agent:7"));
     }
 
     #[test]

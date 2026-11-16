@@ -16,7 +16,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSEvent, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSView,
+    NSApplication, NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSEventType, NSMenu,
+    NSMenuItem, NSView,
 };
 use objc2_foundation::{NSObject, NSObjectNSDelayedPerforming, NSObjectProtocol, NSString};
 
@@ -28,6 +29,8 @@ pub struct MenuLine {
     pub title: String,
     pub enabled: bool,
     pub shortcut: Option<Shortcut>,
+    /// Drawn with a check mark (the current choice).
+    pub checked: bool,
 }
 
 /// A menu waiting for its run-loop turn.
@@ -198,6 +201,9 @@ pub fn show(
                 unsafe { item.setTarget(Some(receiver)) };
                 item.setTag(i as isize);
                 item.setEnabled(line.enabled);
+                if line.checked {
+                    item.setState(NSControlStateValueOn);
+                }
                 item
             }
         };

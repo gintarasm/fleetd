@@ -164,6 +164,9 @@ pub struct PaneChrome {
     pub program: Option<String>,
     /// The agent's directory, with `~`.
     pub cwd: Option<String>,
+    /// The git checkout the directory is in, as the header shows it
+    /// (`core::git::header_text`, ADR 0085).
+    pub git: Option<String>,
     /// The agent's name (ADR 0052), if it has one.
     pub name: Option<String>,
     /// The agent's directory when it is on this machine: file paths in the
@@ -265,6 +268,8 @@ pub struct HeaderParts {
     pub title: String,
     /// `program · id` once the agent is listed; else empty.
     pub detail: String,
+    /// The git repository and branch (ADR 0085); else empty.
+    pub git: String,
     /// The directory, with `~`.
     pub path: String,
 }
@@ -288,6 +293,7 @@ pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> HeaderParts
     HeaderParts {
         title,
         detail,
+        git: chrome.git.clone().unwrap_or_default(),
         path: chrome.cwd.clone().unwrap_or_default(),
     }
 }
@@ -1301,6 +1307,7 @@ impl Render for PaneView {
         let HeaderParts {
             title: title_text,
             detail,
+            git,
             path,
         } = header_parts(chrome, title.as_deref());
         let icon_button = |id: &'static str, icon: Icon, event: PaneEvent| {
@@ -1408,6 +1415,25 @@ impl Render for PaneView {
                             .flex_none()
                             .text_color(theme.tertiary)
                             .child(SharedString::from(detail))
+                    }))
+                    .children((!git.is_empty()).then(|| {
+                        let number = chrome.number;
+                        let shown = git.clone();
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_shrink()
+                            .min_w_0()
+                            .gap(px(space::XS))
+                            .text_color(theme.secondary)
+                            .child(div().flex_none().text_color(theme.tertiary).child("·"))
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("pane-{number}-git-{shown}"))
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(git)),
+                            )
                     }))
                     .children((!path.is_empty()).then(|| {
                         div()
@@ -2792,6 +2818,7 @@ mod tests {
         let parts = |title: &str| HeaderParts {
             title: title.into(),
             detail: "claude · 4".into(),
+            git: String::new(),
             path: "~/dev".into(),
         };
         assert_eq!(header_parts(&chrome, None), parts("claude"));
@@ -2809,6 +2836,15 @@ mod tests {
             ..PaneChrome::default()
         };
         assert_eq!(header_parts(&unlisted, None).detail, "");
+        // In a git checkout: its repository and branch (ADR 0085).
+        let in_repo = PaneChrome {
+            git: Some("fleetd (issue-97) · feat/x".into()),
+            ..chrome.clone()
+        };
+        assert_eq!(
+            header_parts(&in_repo, None).git,
+            "fleetd (issue-97) · feat/x"
+        );
     }
 
     /// Issue #33: the focused pane's ring is its agent's colour; with no

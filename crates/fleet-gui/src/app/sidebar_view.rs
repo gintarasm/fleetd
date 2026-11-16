@@ -3,7 +3,9 @@
 //! A click shows the agent in the focused pane; a right-click opens the
 //! row's native menu (`core::menus::row_menu`). Above the tabs, a filter
 //! field and status filters; a click on a group's header collapses it
-//! (issue #40, ADR 0060).
+//! (issue #40, ADR 0060), and a right-click offers grouping by folder or
+//! by git repository (ADR 0085). A row's second line shows its git
+//! checkout and branch when the node reports one.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +26,7 @@ use super::tail_text::{head_text, tail_text};
 use super::text_field::TextField;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
+use crate::core::git;
 use crate::core::icons::Icon;
 use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::row_preview::{preview_line, row_meta};
@@ -247,7 +250,12 @@ fn render_group(
         )
         .child(div().flex_1().min_w_0().child(tail_text(group.title)))
         .children(count)
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&title, cx)));
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&title, cx)))
+        // Group by folder or repository (ADR 0085).
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, _, _, cx| this.open_group_menu(cx)),
+        );
     div()
         .flex()
         .flex_col()
@@ -376,6 +384,8 @@ fn render_tab(
                 )
                 .children(row_buttons(buttons, id, theme, cx))
         });
+    // The git checkout and branch (ADR 0085), else `program · id`.
+    let git = git::row_subtitle(&row.info);
     let line2 = div()
         .flex()
         .flex_row()
@@ -386,9 +396,26 @@ fn render_tab(
         .child(
             div()
                 .debug_selector(move || format!("tab-{id}-detail"))
-                .flex_none()
                 .text_color(theme.tertiary)
-                .child(SharedString::from(program_and_id(&row.info))),
+                .map(|d| match git {
+                    // Long branch names give way to the last line, up to
+                    // a point.
+                    Some(git) => {
+                        let shown = git.clone();
+                        d.flex_shrink()
+                            .min_w_0()
+                            .max_w(px(chrome::SIDEBAR_WIDTH * 0.6))
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("tab-{id}-git-{shown}"))
+                                    .truncate()
+                                    .child(SharedString::from(git)),
+                            )
+                    }
+                    None => d
+                        .flex_none()
+                        .child(SharedString::from(program_and_id(&row.info))),
+                }),
         )
         .child(
             div()
