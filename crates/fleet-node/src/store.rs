@@ -2,11 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -43,6 +43,9 @@ pub struct AgentRecord {
     pub scrollback_path: String,
     pub labels: Labels,
     pub priority: i32,
+    /// When the agent exited; `None` while running, for a lost agent, and
+    /// for an exit recorded before schema v5.
+    pub exited_unix_ms: Option<i64>,
 }
 
 pub struct Store {
@@ -73,7 +76,13 @@ fn conversion_err(col: usize, e: Box<dyn std::error::Error + Send + Sync>) -> ru
 }
 
 const AGENT_COLUMNS: &str = "SELECT id, program, args_json, cwd, state, exit_code, \
-     created_unix_ms, scrollback_path, priority FROM agents";
+     created_unix_ms, scrollback_path, priority, exited_unix_ms FROM agents";
+
+fn unix_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
 
 /// Decodes an `AGENT_COLUMNS` row, taking its labels out of `labels`.
 fn decode_agent(
@@ -95,12 +104,13 @@ fn decode_agent(
         scrollback_path: r.get(7)?,
         labels: labels.remove(&id).unwrap_or_default(),
         priority: r.get(8)?,
+        exited_unix_ms: r.get(9)?,
     })
 }
 
 impl Store {
     /// Opens (creating with mode 0600 if new) the DB, enables WAL and
-    /// migrates to schema v4. Fails on a DB written by a newer schema.
+    /// migrates to the latest schema. Fails on a DB written by a newer schema.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if !path.exists() {
             use std::os::unix::fs::OpenOptionsExt;
@@ -138,10 +148,10 @@ impl Store {
             ));
         }
         if version == 0 {
-            // A new DB gets the v4 schema at once: replaying v1 -> v2 -> v3
-            // (a table rebuild) leaves ~1 MB of SQLite heap behind, which
+            // A new DB gets the latest schema at once: replaying v1 -> v2 ->
+            // v3 (a table rebuild) leaves ~1 MB of SQLite heap behind, which
             // shows in the daemon's idle RSS.
-            return self.create_v4();
+            return self.create_latest();
         }
         // An existing DB is at v1 or later here (v1 created the `agents`
         // table); it migrates in place.
@@ -163,7 +173,7 @@ impl Store {
         }
         if version < 4 {
             // v4: the agent's CPU priority (ADR 0066). The column DDL must
-            // match `create_v4`'s (the schema-equality test compares them).
+            // match `create_latest`'s (the schema-equality test compares them).
             self.conn.execute_batch(
                 "BEGIN;
                  ALTER TABLE agents ADD COLUMN priority INTEGER NOT NULL DEFAULT 0;
@@ -171,12 +181,21 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 5 {
+            // v5: when an exited agent exited (ADR 0058). Old rows keep NULL.
+            self.conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE agents ADD COLUMN exited_unix_ms INTEGER;
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
-    /// The v4 schema for a new DB; the same tables the v1 -> ... -> v4
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v5
     /// migrations produce.
-    fn create_v4(&self) -> rusqlite::Result<()> {
+    fn create_latest(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "BEGIN;
              CREATE TABLE agents (
@@ -187,7 +206,7 @@ impl Store {
                  state TEXT NOT NULL CHECK(state IN ('running','exited','lost')),
                  exit_code INTEGER,
                  created_unix_ms INTEGER NOT NULL,
-                 scrollback_path TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0
+                 scrollback_path TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, exited_unix_ms INTEGER
              );
              CREATE TABLE agent_labels (
                  agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -199,7 +218,7 @@ impl Store {
                  old_id INTEGER PRIMARY KEY,
                  new_id INTEGER NOT NULL
              );
-             PRAGMA user_version = 4;
+             PRAGMA user_version = 5;
              COMMIT;",
         )
     }
@@ -217,7 +236,7 @@ impl Store {
     }
 
     /// The `agents_v3` and `agent_replacements` DDL here must stay in sync
-    /// with `create_v4` before its v4 column (the schema-equality test
+    /// with `create_latest` before its v4 and v5 columns (the schema-equality test
     /// compares the two).
     fn rebuild_agents_v3(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch("BEGIN")?;
@@ -422,11 +441,13 @@ impl Store {
         Ok(Some(rec))
     }
 
-    /// running -> exited. Errors if the agent is unknown or not running.
+    /// running -> exited, recording the exit time. Errors if the agent is
+    /// unknown or not running.
     pub fn set_exited(&self, id: u64, code: i32) -> rusqlite::Result<()> {
         let n = self.conn.execute(
-            "UPDATE agents SET state = 'exited', exit_code = ?2 WHERE id = ?1 AND state = 'running'",
-            (id as i64, code),
+            "UPDATE agents SET state = 'exited', exit_code = ?2, exited_unix_ms = ?3
+             WHERE id = ?1 AND state = 'running'",
+            (id as i64, code, unix_ms_now()),
         )?;
         if n == 1 {
             Ok(())
@@ -568,8 +589,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v4() {
-        assert_eq!(SCHEMA_VERSION, 4);
+    fn schema_is_v5() {
+        assert_eq!(SCHEMA_VERSION, 5);
     }
 
     #[test]
@@ -610,11 +631,15 @@ mod tests {
         drop(s);
         // Back to v3: what a v3 store left behind.
         let conn = Connection::open(&p).unwrap();
-        conn.execute_batch("ALTER TABLE agents DROP COLUMN priority; PRAGMA user_version = 3;")
-            .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE agents DROP COLUMN exited_unix_ms;
+             ALTER TABLE agents DROP COLUMN priority;
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
         drop(conn);
         let s = Store::open(&p).unwrap();
-        assert_eq!(user_version(&p), 4);
+        assert_eq!(user_version(&p), SCHEMA_VERSION);
         let rec = s.agent(a).unwrap().unwrap();
         assert_eq!((rec.program.as_str(), rec.priority), ("claude", 0));
     }
@@ -655,14 +680,23 @@ mod tests {
     fn exit_updates_state_and_code() {
         let (_d, _p, s) = open_tmp();
         let a = s.insert_agent(&new_agent(1)).unwrap();
+        assert_eq!(s.list_agents().unwrap()[0].exited_unix_ms, None);
+        let before = unix_ms_now();
         s.set_exited(a, 3).unwrap();
+        let after = unix_ms_now();
         let l = s.list_agents().unwrap();
         assert_eq!(l[0].state, AgentState::Exited);
         assert_eq!(l[0].exit_code, Some(3));
+        let at = l[0].exited_unix_ms.expect("the exit time is recorded");
+        assert!(
+            (before..=after).contains(&at),
+            "{before} <= {at} <= {after}"
+        );
         // unknown id and double exit are errors; nothing is overwritten
         assert!(s.set_exited(999, 0).is_err());
         assert!(s.set_exited(a, 9).is_err());
         assert_eq!(s.list_agents().unwrap()[0].exit_code, Some(3));
+        assert_eq!(s.list_agents().unwrap()[0].exited_unix_ms, Some(at));
     }
 
     #[test]
@@ -903,7 +937,8 @@ mod tests {
             .unwrap();
         out.push(format!("agents autoincrement {autoinc}"));
         // The full DDL (covers the CHECK constraint), normalised: SQLite
-        // quotes the name of a renamed table and keeps the original spacing.
+        // quotes the name of a renamed table, keeps the original spacing and
+        // puts an added column after the last one's trailing space.
         for table in ["agents", "agent_labels", "agent_replacements"] {
             let sql: String = conn
                 .query_row(
@@ -936,7 +971,7 @@ mod tests {
         assert_eq!(s.replacements().unwrap(), HashMap::from([(b, c)]));
         drop(s);
 
-        // A v1 DB migrated through v2 to v3 has the same schema.
+        // A v1 DB migrated through v2, v3 and v4 to v5 has the same schema.
         let dir = tempfile::tempdir().unwrap();
         let migrated = dir.path().join("state.db");
         Connection::open(&migrated)
@@ -1015,6 +1050,29 @@ mod tests {
         s.set_exited(next, 0).unwrap();
         assert!(s.forget_agent(next).unwrap());
         assert_eq!(s.insert_agent(&new_agent(2)).unwrap(), 9);
+    }
+
+    #[test]
+    fn v3_database_migrates_to_v4_keeping_rows_without_an_exit_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.db");
+        let s = Store::open(&p).unwrap();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        drop(s);
+        let conn = Connection::open(&p).unwrap();
+        // Back to the v4 shape: no exit time column.
+        conn.execute_batch(
+            "ALTER TABLE agents DROP COLUMN exited_unix_ms;
+             UPDATE agents SET state = 'exited', exit_code = 2;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+        drop(conn);
+        let s = Store::open(&p).unwrap();
+        assert_eq!(user_version(&p), SCHEMA_VERSION);
+        let rec = s.agent(a).unwrap().unwrap();
+        assert_eq!(rec.exit_code, Some(2));
+        assert_eq!(rec.exited_unix_ms, None);
     }
 
     #[test]

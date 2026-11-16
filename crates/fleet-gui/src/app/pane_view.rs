@@ -15,6 +15,7 @@ use gpui::{
 };
 
 use super::controls;
+use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
 use super::keymap::{Copy, Paste, TERMINAL_CONTEXT, to_key};
@@ -156,6 +157,8 @@ pub struct PaneChrome {
     pub focused: bool,
     /// The pane fills the window (its button offers Restore).
     pub maximized: bool,
+    /// How long the ended agent ran, if known (the summary bar).
+    pub run_time: Option<Duration>,
 }
 
 /// The line drawn over the grid, if any.
@@ -170,14 +173,13 @@ pub fn banner(chrome: &PaneChrome, state: PaneState) -> Option<String> {
     match state {
         PaneState::Disconnected => Some(disconnected()),
         _ if !chrome.has_agent => None,
-        PaneState::Exited(code) => Some(format!("exited ({code})")),
         PaneState::Attaching => Some("attaching…".to_owned()),
-        PaneState::Lost => Some("the agent is gone".to_owned()),
-        PaneState::Live => None,
+        // The summary bar at the bottom says how it ended.
+        PaneState::Exited(_) | PaneState::Lost | PaneState::Live => None,
     }
 }
 
-/// The exit banner offers Restart (as ⌘R does): the pane's agent exited
+/// The summary bar offers Restart (as ⌘R does): the pane's agent exited
 /// or is gone.
 pub fn restartable(chrome: &PaneChrome, state: PaneState) -> bool {
     chrome.has_agent && matches!(state, PaneState::Exited(_) | PaneState::Lost)
@@ -218,8 +220,10 @@ pub enum PaneEvent {
     SplitDown,
     ToggleMaximize,
     Close,
-    /// The exit banner's Restart: the ended agent again, in this pane.
+    /// The summary bar's Restart: the ended agent again, in this pane.
     Restart,
+    /// The summary bar's Remove: forgets the ended agent.
+    Remove,
     /// A right-click asks for the pane's context menu: on the header, or
     /// on the grid (`on_grid`) while the agent does not take the mouse.
     ContextMenu {
@@ -1044,28 +1048,6 @@ impl Render for PaneView {
             .overflow_hidden()
             .child(element);
         if let Some(text) = banner(chrome, state) {
-            let number = chrome.number;
-            let restart = restartable(chrome, state).then(|| {
-                div()
-                    .id("restart")
-                    .debug_selector(move || format!("pane-{number}-restart"))
-                    .px(px(space::SM))
-                    .py(px(space::XXS))
-                    .rounded(px(radius::SM))
-                    .bg(theme.accent)
-                    .text_color(gpui::white())
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .active(|s| s.opacity(0.8))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::XS))
-                    .child(icons::sized(Icon::Restart, 12.0).text_color(gpui::white()))
-                    .child("Restart")
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Restart)))
-            });
             grid = grid.child(
                 div()
                     .absolute()
@@ -1075,12 +1057,7 @@ impl Render for PaneView {
                     .flex_row()
                     .items_center()
                     .gap(px(space::SM))
-                    .pl(px(space::MD))
-                    .pr(px(if restart.is_some() {
-                        space::XS
-                    } else {
-                        space::MD
-                    }))
+                    .px(px(space::MD))
                     .py(px(space::XS))
                     .rounded(px(radius::MD))
                     .border_1()
@@ -1089,8 +1066,7 @@ impl Render for PaneView {
                     .shadow_md()
                     .text_color(theme.text)
                     .type_style(text::CALLOUT)
-                    .child(SharedString::from(text))
-                    .children(restart),
+                    .child(SharedString::from(text)),
             );
         }
         if let Some(text) = empty_message(chrome) {
@@ -1138,6 +1114,7 @@ impl Render for PaneView {
             .bg(theme.card)
             .child(header)
             .child(grid)
+            .children(ended_bar(self, state, &theme, cx))
     }
 }
 
@@ -1955,10 +1932,9 @@ mod tests {
             banner(&shown, PaneState::Attaching).as_deref(),
             Some("attaching…")
         );
-        assert_eq!(
-            banner(&shown, PaneState::Exited(3)).as_deref(),
-            Some("exited (3)")
-        );
+        // The summary bar says how it ended, not a banner.
+        assert_eq!(banner(&shown, PaneState::Exited(3)), None);
+        assert_eq!(banner(&shown, PaneState::Lost), None);
         assert_eq!(banner(&shown, PaneState::Live), None);
         assert_eq!(
             banner(&shown, PaneState::Disconnected).as_deref(),

@@ -5,6 +5,7 @@ mod bench;
 mod connect;
 mod context_menu;
 mod controls;
+mod ended_view;
 mod fonts;
 mod icons;
 mod keymap;

@@ -155,6 +155,9 @@ message AgentInfo {
   optional int32 exit_code = 6;
   int64 created_unix_ms = 7;
   map<string, string> labels = 8;
+  // When an exited agent exited (ADR 0058); unset while running, for a lost
+  // agent, and for an exit recorded by a node before it stored the time.
+  optional int64 exited_unix_ms = 9;
 }
 
 // With `observe`, a read-only attach (ADR 0022): it never takes or changes
