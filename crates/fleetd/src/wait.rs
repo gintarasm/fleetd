@@ -21,6 +21,10 @@ use fleet_node::scope::Caller;
 use fleet_proto::{Frame, Inbox, ReadInbox, Response, SendMessage, Wait, response};
 use tokio::sync::{broadcast, mpsc};
 
+/// Waits one connection may run at once; more are refused (exit 2 in the
+/// CLI). Each re-reads the store on every notice.
+pub(crate) const MAX_WAITS_PER_CONNECTION: usize = 16;
+
 /// The longest wait one request may ask for.
 pub(crate) const MAX_WAIT: Duration = Duration::from_secs(24 * 3600);
 

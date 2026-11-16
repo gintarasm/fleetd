@@ -638,18 +638,26 @@ impl Connection {
             Some(request::Kind::ReadInbox(r)) => {
                 Box::pin(wait::read_inbox(&self.node, self.caller, r)).await
             }
-            Some(request::Kind::Wait(w)) => {
-                self.start_wait(req.id, *w);
-                return true;
-            }
+            Some(request::Kind::Wait(w)) => match self.start_wait(req.id, *w) {
+                Ok(()) => return true,
+                Err(message) => error(message),
+            },
         };
         self.respond(req.id, kind).await
     }
 
     /// Starts a `Wait` on its own task (see [`wait`]); it answers when it
     /// matches or times out, while this connection serves other requests.
-    fn start_wait(&mut self, id: u64, req: fleet_proto::Wait) {
+    /// At most [`wait::MAX_WAITS_PER_CONNECTION`] at a time: each re-reads
+    /// the store on every notice, so a looping client must not pile them up.
+    fn start_wait(&mut self, id: u64, req: fleet_proto::Wait) -> Result<(), String> {
         self.waits.retain(|t| !t.is_finished());
+        if self.waits.len() >= wait::MAX_WAITS_PER_CONNECTION {
+            return Err(format!(
+                "too many waits on this connection (at most {})",
+                wait::MAX_WAITS_PER_CONNECTION
+            ));
+        }
         let notices = self.node.notices();
         self.waits.push(tokio::spawn(wait::run(
             Arc::clone(&self.node),
@@ -659,6 +667,7 @@ impl Connection {
             notices,
             self.outbox.clone(),
         )));
+        Ok(())
     }
 
     /// Hands a restart to the serve loop and answers with its outcome. One
@@ -1503,6 +1512,30 @@ mod tests {
             panic!("no wait result");
         };
         assert!(r.matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn waits_per_connection_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut conn, mut rx) = test_conn(Arc::new(Node::open(dir.path()).unwrap()));
+        for id in 0..wait::MAX_WAITS_PER_CONNECTION as u64 {
+            let kind = Some(wait_req(60_000, &[]));
+            assert!(conn.handle(Request { id, kind }).await);
+        }
+        let kind = Some(wait_req(60_000, &[]));
+        assert!(conn.handle(Request { id: 99, kind }).await);
+        let refused = next_response(&mut rx).await;
+        assert_eq!(refused.id, 99);
+        assert!(
+            matches!(&refused.kind, Some(response::Kind::Error(e)) if e.message.starts_with("too many waits")),
+            "{refused:?}"
+        );
+        // A finished wait frees its slot.
+        conn.waits[0].abort();
+        wait_until(|| conn.waits[0].is_finished()).await;
+        let kind = Some(wait_req(60_000, &[]));
+        assert!(conn.handle(Request { id: 100, kind }).await);
+        assert_eq!(conn.waits.len(), wait::MAX_WAITS_PER_CONNECTION);
     }
 
     #[tokio::test]
