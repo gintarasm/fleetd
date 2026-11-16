@@ -10,9 +10,9 @@ use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{ClassType, MainThreadMarker, Message, msg_send};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
-    NSAutoresizingMaskOptions, NSColor, NSColorSpace, NSEventType, NSGlassEffectView,
-    NSGlassEffectViewStyle, NSSound, NSUserInterfaceItemIdentification, NSView, NSVisualEffectView,
-    NSWindowOrderingMode, NSWorkspace,
+    NSAutoresizingMaskOptions, NSColor, NSColorSpace, NSEvent, NSEventMask, NSEventType,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSSound, NSUserInterfaceItemIdentification, NSView,
+    NSVisualEffectView, NSWindowOrderingMode, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -302,4 +302,41 @@ fn blur_in_layers(layer: &AnyObject, radius: f64, set: &mut usize) {
             }
         }
     }
+}
+
+/// A local monitor for trackpad pinches, which gpui 0.2.2 does not
+/// deliver (the graph view zooms with them, ADR 0073). Removed on drop.
+pub struct MagnifyMonitor(Retained<AnyObject>);
+
+impl Drop for MagnifyMonitor {
+    fn drop(&mut self) {
+        // SAFETY: the object is the monitor AppKit returned when adding it.
+        unsafe { NSEvent::removeMonitor(&self.0) };
+    }
+}
+
+/// Calls `f(magnification, (x, y))` for every pinch in a window of the
+/// app, `(x, y)` in the window's content from its top-left corner
+/// (points); the event then goes on as usual. `None` off the main thread.
+pub fn monitor_magnify(f: impl Fn(f32, (f32, f32)) + 'static) -> Option<MagnifyMonitor> {
+    MainThreadMarker::new()?;
+    let block = block2::RcBlock::new(move |event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
+        // SAFETY: AppKit passes a live event for the duration of the call.
+        let e = unsafe { event.as_ref() };
+        let p = e.locationInWindow();
+        let height = MainThreadMarker::new()
+            .and_then(|mtm| e.window(mtm))
+            .and_then(|w| w.contentView())
+            .map_or(0.0, |v| v.frame().size.height);
+        f(
+            e.magnification() as f32,
+            (p.x as f32, (height - p.y) as f32),
+        );
+        event.as_ptr()
+    });
+    // SAFETY: the block returns the event it was given (a valid pointer).
+    let monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::Magnify, &block)
+    }?;
+    Some(MagnifyMonitor(monitor))
 }

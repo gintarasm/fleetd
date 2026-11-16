@@ -1279,6 +1279,20 @@ impl AppState {
         self.layout_changed(cx);
     }
 
+    /// The graph's ⏎ or click (spec §7): focuses a pane already showing
+    /// `agent_id` (in any tab, selecting it), else shows it in the focused
+    /// pane.
+    pub fn reveal_agent(&mut self, agent_id: u64, cx: &mut Context<Self>) {
+        match crate::core::graph::pane_showing(&self.tabs, agent_id) {
+            Some((tab, pane)) => {
+                self.select_tab(tab, cx);
+                self.set_focused(pane, cx);
+                self.show_agent(agent_id, cx);
+            }
+            None => self.show_agent(agent_id, cx),
+        }
+    }
+
     /// `pane`'s grid shows `agent_id`, live or exited.
     fn pane_shows(&self, pane: PaneId, agent_id: u64, cx: &App) -> bool {
         self.panes.get(&pane).is_some_and(|v| {
@@ -1459,6 +1473,13 @@ impl AppState {
 
     pub fn forget(&self, agent_id: u64) {
         self.session.forget(vec![agent_id]);
+    }
+
+    /// Remove subtree (graph): one `ForgetAgents` with every id.
+    pub fn forget_many(&self, ids: Vec<u64>) {
+        if !ids.is_empty() {
+            self.session.forget(ids);
+        }
     }
 
     pub fn rename(&self, agent_id: u64, name: String) {

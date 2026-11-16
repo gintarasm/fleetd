@@ -8,8 +8,11 @@ use std::path::Path;
 
 use fleet_proto::AgentInfo;
 
-use super::session::AgentRow;
-use super::sidebar::{ended, query_matches, tilde};
+use super::ended::{format_run_time, run_time};
+use super::session::{AgentRow, PaneId};
+use super::sidebar::{ended, program_name, query_matches, tilde};
+use super::status::AgentStatus;
+use super::tabs::Tabs;
 
 /// The reserved label fleetd writes on an agent another agent spawned
 /// (ADR 0033): the parent's id, local now and `node/id` from M6.
@@ -236,6 +239,122 @@ pub fn filter_shown(
     Some(forest.with_ancestors(matches.map(|r| r.info.id)))
 }
 
+/// How a status dot is drawn (ADR 0033): solid for a status the agent
+/// reported (`fleet report`), hollow for one inferred from its output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DotFill {
+    Solid,
+    Hollow,
+}
+
+/// A card's status dot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardDot {
+    pub status: AgentStatus,
+    pub fill: DotFill,
+}
+
+/// The dot for an agent with the `inferred` status (ADR 0042; `None` for a
+/// shell). Only inferred statuses exist until M3-D adds reported ones
+/// (`AgentInfo.reported`): that is the one place a reported status wins and
+/// is drawn [`DotFill::Solid`].
+pub fn card_dot(_info: &AgentInfo, inferred: Option<AgentStatus>) -> Option<CardDot> {
+    inferred.map(|status| CardDot {
+        status,
+        fill: DotFill::Hollow,
+    })
+}
+
+/// What a card shows (spec §7), gpui-free.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardContent {
+    /// Its name, else program (as the sidebar names it).
+    pub name: String,
+    pub program: String,
+    /// Its project or folder.
+    pub project: String,
+    pub dot: Option<CardDot>,
+    /// The last output line, trimmed.
+    pub activity: String,
+    /// How long it has run (until its exit once ended).
+    pub run_time: Option<String>,
+    /// Exited or lost: the card is greyed.
+    pub ended: bool,
+    /// Needs you: the card gets the accent highlight.
+    pub waiting: bool,
+    /// While collapsed: "3 children".
+    pub hidden: Option<String>,
+}
+
+/// The card of `row`; `children` is its shown child count when collapsed.
+pub fn card_content(
+    row: &AgentRow,
+    name: String,
+    project: String,
+    inferred: Option<AgentStatus>,
+    collapsed_children: Option<usize>,
+    now_ms: i64,
+) -> CardContent {
+    let is_ended = ended(row);
+    let until = if is_ended {
+        row.info.exited_unix_ms
+    } else {
+        Some(now_ms)
+    };
+    let dot = card_dot(&row.info, inferred);
+    CardContent {
+        name,
+        program: program_name(&row.info.program),
+        project,
+        dot,
+        activity: row.last_line.trim().to_owned(),
+        run_time: run_time(row.info.created_unix_ms, until).map(format_run_time),
+        ended: is_ended,
+        waiting: dot.is_some_and(|d| d.status == AgentStatus::NeedsYou),
+        hidden: collapsed_children.map(|n| match n {
+            1 => "1 child".to_owned(),
+            n => format!("{n} children"),
+        }),
+    }
+}
+
+/// The pane already showing `agent`, as `(tab, pane)`: the shown tab's
+/// focused pane first, then the shown tab's others, then other tabs'.
+/// ⏎ in the graph focuses it instead of replacing what a pane shows.
+pub fn pane_showing(tabs: &Tabs, agent: u64) -> Option<(usize, PaneId)> {
+    if tabs.agent(tabs.focused()) == Some(agent) {
+        return Some((tabs.active(), tabs.focused()));
+    }
+    let order =
+        std::iter::once(tabs.active()).chain((0..tabs.len()).filter(|&i| i != tabs.active()));
+    for i in order {
+        let layout = tabs.tab_layout(i)?;
+        if let Some(p) = layout
+            .panes()
+            .into_iter()
+            .find(|&p| layout.agent(p) == Some(agent))
+        {
+            return Some((i, p));
+        }
+    }
+    None
+}
+
+/// The question before Stop subtree; `running` counts `name`'s subtree.
+pub fn stop_question(name: &str, running: usize) -> String {
+    match running {
+        0 | 1 => format!("Stop {name}?"),
+        2 => format!("Stop {name} and the agent it started?"),
+        n => format!("Stop {name} and the {} agents below it?", n - 1),
+    }
+}
+
+/// The question before Remove subtree of `count` ended agents; `None`
+/// for one (a single Remove asks nothing, like the row menu's).
+pub fn remove_question(name: &str, count: usize) -> Option<String> {
+    (count > 1).then(|| format!("Remove {name} and the {} agents below it?", count - 1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +496,80 @@ mod tests {
         let by_id: HashMap<u64, &AgentRow> = rows.iter().map(|r| (r.info.id, r)).collect();
         assert_eq!(running_in(&f, 1, &by_id), 2);
         assert_eq!(running_in(&f, 2, &by_id), 1);
+    }
+
+    #[test]
+    fn card_shows_run_time_activity_and_a_hollow_inferred_dot() {
+        let mut r = row(4, None);
+        r.info.program = "/usr/bin/claude".into();
+        r.info.created_unix_ms = 1_000;
+        r.last_line = "  ? for shortcuts ".into();
+        let c = card_content(
+            &r,
+            "rev".into(),
+            "~/p".into(),
+            Some(AgentStatus::NeedsYou),
+            None,
+            63_000,
+        );
+        assert_eq!(c.program, "claude");
+        assert_eq!(c.activity, "? for shortcuts");
+        assert_eq!(c.run_time.as_deref(), Some("1m 2s"));
+        assert_eq!(
+            c.dot,
+            Some(CardDot {
+                status: AgentStatus::NeedsYou,
+                fill: DotFill::Hollow
+            })
+        );
+        assert!(c.waiting && !c.ended && c.hidden.is_none());
+        r.info.set_state(AgentState::Exited);
+        r.info.exited_unix_ms = Some(4_000);
+        let c = card_content(
+            &r,
+            "rev".into(),
+            "~/p".into(),
+            Some(AgentStatus::Done),
+            Some(1),
+            99_000,
+        );
+        assert_eq!(c.run_time.as_deref(), Some("3s"));
+        assert!(c.ended && !c.waiting);
+        assert_eq!(c.hidden.as_deref(), Some("1 child"));
+        let shell = card_content(&r, "sh".into(), "~".into(), None, Some(3), 0);
+        assert_eq!(shell.dot, None);
+        assert_eq!(shell.hidden.as_deref(), Some("3 children"));
+    }
+
+    #[test]
+    fn questions_name_the_subtree() {
+        assert_eq!(stop_question("lead", 1), "Stop lead?");
+        assert_eq!(
+            stop_question("lead", 2),
+            "Stop lead and the agent it started?"
+        );
+        assert_eq!(
+            stop_question("lead", 5),
+            "Stop lead and the 4 agents below it?"
+        );
+        assert_eq!(remove_question("lead", 1), None);
+        assert_eq!(
+            remove_question("lead", 3).as_deref(),
+            Some("Remove lead and the 2 agents below it?")
+        );
+    }
+
+    #[test]
+    fn pane_showing_prefers_the_focused_pane_then_the_shown_tab() {
+        let mut tabs = Tabs::single();
+        let first = tabs.focused();
+        tabs.set_agent(first, Some(7));
+        assert_eq!(pane_showing(&tabs, 7), Some((0, first)));
+        assert_eq!(pane_showing(&tabs, 8), None);
+        let second = tabs.new_tab().unwrap();
+        tabs.set_agent(second, Some(8));
+        // Tab 1 (0-based) is shown; 7 is in tab 0.
+        assert_eq!(pane_showing(&tabs, 7), Some((0, first)));
+        assert_eq!(pane_showing(&tabs, 8), Some((1, second)));
     }
 }

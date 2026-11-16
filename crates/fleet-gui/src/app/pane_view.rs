@@ -10,10 +10,10 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt, AnyView, AnyWindowHandle, AppContext, Bounds, BoxShadow,
     ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Font, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task, UTF16Selection,
-    Window, div, point, px, size,
+    IntoElement, KeyContext, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task,
+    UTF16Selection, Window, div, point, px, size,
 };
 
 use super::agent_mark::{self, agent_color};
@@ -21,7 +21,7 @@ use super::controls::{self, ButtonKind};
 use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
-use super::keymap::{Copy, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
+use super::keymap::{Copy, FINDING, Find, FindNext, FindPrevious, Paste, TERMINAL_CONTEXT, to_key};
 use super::native;
 use super::status_dot::status_dot;
 use super::tail_text::tail_text;
@@ -1610,7 +1610,15 @@ impl Render for PaneView {
         }
         grid = grid.children(find_bar);
         div()
-            .key_context(TERMINAL_CONTEXT)
+            .key_context({
+                // ⌘⇧G is Find Previous only while finding (ADR 0073).
+                let mut kc = KeyContext::new_with_defaults();
+                kc.add(TERMINAL_CONTEXT);
+                if self.find.is_some() {
+                    kc.add(FINDING);
+                }
+                kc
+            })
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
             // Keyboard focus path only: ⌘ pressed over an unfocused pane shows

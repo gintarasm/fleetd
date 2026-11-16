@@ -20,12 +20,13 @@ use super::app_state::AppState;
 use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
 use super::context_menu::{self, MenuLine};
 use super::controls::{ButtonKind, ReducedMotion, appear, button};
+use super::graph_view::{GraphEvent, GraphView};
 use super::keymap::{
     ClosePane, CloseTab, CommandPalette, Copy, FocusDown, FocusFilter, FocusLeft, FocusPane1,
     FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTab,
     NewTerminal, NextAgent, NextTab, Paste, PrevTab, PreviousAgent, Remove, RemoveExited,
     ReopenClosedPane, Restart, RestartPane, SelectTab, ShowShortcuts, SplitDown, SplitRight,
-    ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+    ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::native;
@@ -237,6 +238,13 @@ pub struct Workspace {
     split_drag: SplitDrag,
     /// A sidebar row or a pane header being dragged (ADR 0059).
     pub(super) pane_drag: PaneDrag,
+    /// The graph view (⌘⇧G, ADR 0073), kept while hidden so its collapse,
+    /// selection and viewport last the session; and whether it is shown
+    /// in place of the sidebar and panes.
+    graph: (Entity<GraphView>, Subscription),
+    graph_shown: bool,
+    /// Pinches reach the graph through it (gpui has no pinch event).
+    _magnify: Option<native::MagnifyMonitor>,
     _subscriptions: Vec<Subscription>,
     _ticker: Task<()>,
 }
@@ -249,6 +257,8 @@ impl Workspace {
             let epoch = app.read(cx).session_epoch();
             if epoch != this.epoch {
                 this.epoch = epoch;
+                // The graph's collapse and selection name the old agents.
+                this.graph = new_graph(&this.app, window, cx);
                 // The choosers' pane ids name panes of the old layout.
                 this.choosers.clear();
                 if this.sheet.take().is_some()
@@ -318,6 +328,8 @@ impl Workspace {
         let epoch = app.read(cx).session_epoch();
         let filter_field = cx.new(|cx| TextField::new(String::new(), "Filter", cx));
         let filtered = cx.observe(&filter_field, |_, _, cx| cx.notify());
+        let graph = new_graph(&app, window, cx);
+        let magnify = pinch_to_graph(window, cx);
         let ws = Workspace {
             app,
             _ticker: ticker,
@@ -347,6 +359,9 @@ impl Workspace {
             sidebar_focus: cx.focus_handle(),
             #[cfg(test)]
             drawn_sidebar: Vec::new(),
+            graph,
+            graph_shown: false,
+            _magnify: magnify,
             _subscriptions: vec![observe, appearance, activation, filtered],
         };
         cx.set_global(ReducedMotion(ws.reduce_motion));
@@ -356,6 +371,48 @@ impl Workspace {
 
     pub fn app(&self) -> &Entity<AppState> {
         &self.app
+    }
+
+    pub fn graph(&self) -> &Entity<GraphView> {
+        &self.graph.0
+    }
+
+    /// The graph view is shown in place of the sidebar and panes.
+    pub fn graph_shown(&self) -> bool {
+        self.graph_shown
+    }
+
+    /// ⌘⇧G or the titlebar's graph button: switches between the panes and
+    /// the graph view.
+    pub fn toggle_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        self.graph_shown = !self.graph_shown;
+        if self.graph_shown {
+            self.graph.0.read(cx).focus(window);
+        } else {
+            self.focus_current(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn graph_event(
+        &mut self,
+        _: &Entity<GraphView>,
+        event: &GraphEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.graph_shown {
+            return;
+        }
+        self.graph_shown = false;
+        if let GraphEvent::Open(id) = *event {
+            self.app.update(cx, |a, cx| a.reveal_agent(id, cx));
+        }
+        self.focus_current(window, cx);
+        cx.notify();
     }
 
     /// The theme, blur and motion for the system's settings and ours.
@@ -1458,7 +1515,13 @@ impl Workspace {
     }
 
     /// ⌘R: restarts the focused pane's agent in place if it ended.
-    fn zoom(&mut self, zoom: Zoom, cx: &mut Context<Self>) {
+    /// ⌘+ / ⌘− / ⌘0: the terminals' font, or the graph's scale while it
+    /// is shown.
+    fn zoom(&mut self, zoom: Zoom, window: &mut Window, cx: &mut Context<Self>) {
+        if self.graph_shown {
+            self.graph.0.update(cx, |g, cx| g.zoom(zoom, window, cx));
+            return;
+        }
         self.app.update(cx, |a, cx| a.zoom(zoom, cx));
     }
 
@@ -1795,6 +1858,7 @@ fn celebration(agent_id: u64, theme: &Theme, reduce_motion: bool) -> gpui::AnyEl
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        super::bench::frame_started();
         self.follow_pane_focus(window, cx);
         self.follow_choosers(window, cx);
         {
@@ -1870,6 +1934,7 @@ impl Render for Workspace {
                 update,
                 tabs: self.tab_labels(cx),
                 active_tab: app.tabs().active(),
+                graph: self.graph_shown,
             }
         };
         let bar = render_bar(&bar, &theme, cx);
@@ -2113,9 +2178,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::remove_exited))
             .on_action(cx.listener(Self::restart_pane))
-            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(Zoom::In, cx)))
-            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(Zoom::Out, cx)))
-            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(Zoom::Reset, cx)))
+            .on_action(cx.listener(|this, _: &ZoomIn, w, cx| this.zoom(Zoom::In, w, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, w, cx| this.zoom(Zoom::Out, w, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, w, cx| this.zoom(Zoom::Reset, w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleGraph, w, cx| this.toggle_graph(w, cx)))
             .on_action(cx.listener(Self::reopen_closed_pane))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_shortcuts(w, cx)))
             .on_action(cx.listener(Self::command_palette))
@@ -2128,15 +2194,20 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::select_numbered_tab))
             .child(bar)
-            .child(
+            .child(if self.graph_shown {
+                fill_content(
+                    div().flex().flex_1().min_h_0().child(self.graph.0.clone()),
+                    (tint.content && !tint.everywhere()).then_some(theme.window),
+                )
+            } else {
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .min_h_0()
                     .child(sidebar)
-                    .child(panes),
-            )
+                    .child(panes)
+            })
             .children(exits)
             .children(toast)
             .children(palette)
@@ -2268,7 +2339,54 @@ fn with_workspace(
     }
 }
 
-fn now_ms() -> i64 {
+/// The graph view and its event subscription.
+fn new_graph(
+    app: &Entity<AppState>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> (Entity<GraphView>, Subscription) {
+    let graph = cx.new(|cx| GraphView::new(app.clone(), cx));
+    let sub = cx.subscribe_in(&graph, window, Workspace::graph_event);
+    (graph, sub)
+}
+
+/// Pinches over the window zoom the graph while it is shown.
+fn pinch_to_graph(
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<native::MagnifyMonitor> {
+    let (tx, rx) = async_channel::unbounded::<(f32, (f32, f32))>();
+    let monitor = native::monitor_magnify(move |m, at| {
+        let _ = tx.try_send((m, at));
+    })?;
+    cx.spawn_in(window, async move |this, cx| {
+        while let Ok((m, (x, y))) = rx.recv().await {
+            let alive = this.update_in(cx, |this, window, cx| {
+                if this.graph_shown {
+                    let graph = this.graph.0.clone();
+                    graph.update(cx, |g, cx| {
+                        g.magnify(point(px(x), px(y)), 1.0 + m, window, cx)
+                    });
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+    Some(monitor)
+}
+
+/// `el` filled with `bg` when the content is tinted on its own (glass).
+fn fill_content(el: Div, bg: Option<gpui::Hsla>) -> Div {
+    match bg {
+        Some(bg) => el.bg(bg),
+        None => el,
+    }
+}
+
+pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
