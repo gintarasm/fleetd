@@ -10,6 +10,7 @@ mod icons;
 mod keymap;
 mod native;
 mod new_agent;
+mod pane_drag;
 mod pane_view;
 mod resident;
 mod sidebar_view;
