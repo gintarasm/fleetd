@@ -5,15 +5,14 @@ use gpui::{Action, Window};
 
 use super::keymap::{
     ClosePane, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
-    FocusUp, InstallSkill, NewAgent, NewTerminal, Quit, RestartPane, SplitDown, SplitRight,
-    SwitchFleetd, ToggleMaximize,
+    FocusUp, InstallSkill, NewAgent, NewTerminal, Quit, RemoveExited, RestartPane, SplitDown,
+    SplitRight, SwitchFleetd, ToggleMaximize,
 };
 use crate::core::palette::{Command, Mods, shortcut_text};
 
-/// The action a command dispatches; `None` for one the workspace does
-/// itself (Clear exited has no action).
-pub fn command_action(c: Command) -> Option<Box<dyn Action>> {
-    Some(match c {
+/// The action a command dispatches.
+pub fn command_action(c: Command) -> Box<dyn Action> {
+    match c {
         Command::NewAgent => Box::new(NewAgent),
         Command::NewTerminal => Box::new(NewTerminal),
         Command::SplitRight => Box::new(SplitRight),
@@ -32,13 +31,13 @@ pub fn command_action(c: Command) -> Option<Box<dyn Action>> {
         Command::SwitchFleetd => Box::new(SwitchFleetd),
         Command::InstallSkill => Box::new(InstallSkill),
         Command::Quit => Box::new(Quit),
-        Command::ClearExited => return None,
-    })
+        Command::RemoveExited => Box::new(RemoveExited),
+    }
 }
 
 /// The command's shortcut where the focus is now (`⇧⌘D`), if bound.
 pub fn command_shortcut(c: Command, window: &Window) -> Option<String> {
-    let action = command_action(c)?;
+    let action = command_action(c);
     let binding = window.highest_precedence_binding_for_action(action.as_ref())?;
     let texts: Vec<String> = binding
         .keystrokes()

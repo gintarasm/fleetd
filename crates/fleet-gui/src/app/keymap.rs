@@ -33,6 +33,7 @@ actions!(
         Undo,
         Redo,
         CommandPalette,
+        RemoveExited,
     ]
 );
 

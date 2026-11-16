@@ -1000,18 +1000,7 @@ fn ls_ids(d: &Daemon) -> Vec<String> {
 }
 
 fn spawn_exited(d: &Daemon) -> String {
-    let id = d
-        .ok(&["spawn", "--", "sh", "-c", "exit 0"])
-        .trim()
-        .to_string();
-    wait_for("exited", || {
-        let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
-        v.as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["id"].as_u64().unwrap().to_string() == id && a["state"] == "exited")
-    });
-    id
+    spawn_exited_labelled(d, &[])
 }
 
 #[test]
@@ -1040,13 +1029,80 @@ fn rm_removes_exited_and_refuses_running() {
 }
 
 #[test]
-fn rm_exited_counts() {
+fn rm_exited_prints_removed_ids_and_spares_running() {
     let d = Daemon::start();
-    spawn_exited(&d);
-    spawn_exited(&d);
+    let a = spawn_exited(&d);
+    let b = spawn_exited(&d);
     let live = d.ok(&["spawn", "--", "cat"]).trim().to_string();
-    assert_eq!(d.ok(&["rm", "--exited"]).trim(), "removed 2 agents");
+    let out = d.ok(&["rm", "--exited"]);
+    let mut removed: Vec<&str> = out.lines().collect();
+    removed.sort();
+    let mut want = [a.as_str(), b.as_str()];
+    want.sort();
+    assert_eq!(removed, want);
+    assert_eq!(ls_ids(&d), std::slice::from_ref(&live));
+    // Nothing left to remove: no output, success.
+    assert_eq!(d.ok(&["rm", "--exited"]), "");
     assert_eq!(ls_ids(&d), [live]);
+}
+
+/// Spawns an agent with these labels that exits at once; returns its id.
+fn spawn_exited_labelled(d: &Daemon, labels: &[&str]) -> String {
+    let mut args = vec!["spawn"];
+    for l in labels {
+        args.extend(["--label", l]);
+    }
+    args.extend(["--", "sh", "-c", "exit 0"]);
+    let id = d.ok(&args).trim().to_string();
+    wait_for("exited", || {
+        let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"].as_u64().unwrap().to_string() == id && a["state"] == "exited")
+    });
+    id
+}
+
+#[test]
+fn rm_exited_respects_label_filters() {
+    let d = Daemon::start();
+    let both = spawn_exited_labelled(&d, &["project=a", "role=coder"]);
+    let other_role = spawn_exited_labelled(&d, &["project=a", "role=reviewer"]);
+    let other_project = spawn_exited_labelled(&d, &["project=b"]);
+    let live = d
+        .ok(&[
+            "spawn",
+            "--label",
+            "project=a",
+            "--label",
+            "role=coder",
+            "--",
+            "cat",
+        ])
+        .trim()
+        .to_string();
+    // Repeatable: every pair must match. The running match is spared.
+    let out = d.ok(&[
+        "rm",
+        "--exited",
+        "--label",
+        "project=a",
+        "--label",
+        "role=coder",
+    ]);
+    assert_eq!(out.trim(), both);
+    let mut left = ls_ids(&d);
+    left.sort();
+    let mut want = vec![other_role.clone(), other_project.clone(), live.clone()];
+    want.sort();
+    assert_eq!(left, want);
+    // The old --selector spelling still works.
+    let out = d.ok(&["rm", "--exited", "--selector", "project=a"]);
+    assert_eq!(out.trim(), other_role);
+    // --label needs --exited.
+    let out = d.fleet(&["rm", &other_project, "--label", "project=b"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]

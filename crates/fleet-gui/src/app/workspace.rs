@@ -19,8 +19,8 @@ use super::context_menu::{self, MenuLine};
 use super::controls::appear;
 use super::keymap::{
     ClosePane, CommandPalette, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
-    FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart,
-    RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, RemoveExited,
+    Restart, RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
@@ -36,7 +36,7 @@ use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
     MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, pane_menu, row_menu,
 };
-use crate::core::palette::{Command, Entry, palette_items};
+use crate::core::palette::{Entry, palette_items, remove_exited_prompt};
 use crate::core::picker::Recents;
 use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
@@ -639,12 +639,7 @@ impl Workspace {
         };
         self.palette_recents.touch(key);
         match entry {
-            Entry::Command(Command::ClearExited) => self.clear_exited(cx),
-            Entry::Command(c) => {
-                if let Some(action) = command_action(c) {
-                    window.dispatch_action(action, cx);
-                }
-            }
+            Entry::Command(c) => window.dispatch_action(command_action(c), cx),
             Entry::Agent(id) => self.show_agent(id, window, cx),
             Entry::Folder(dir) => self.spawn_default_in(dir, window, cx),
         }
@@ -702,6 +697,34 @@ impl Workspace {
     /// Forgets an ended agent from the row menu: no confirmation.
     fn remove(&mut self, action: &Remove, _: &mut Window, cx: &mut Context<Self>) {
         self.app.read(cx).forget(action.agent_id);
+        cx.notify();
+    }
+
+    /// Remove Exited Agents (palette, app menu): asks first, naming how
+    /// many will go; does nothing while none has ended. fleetd removes what
+    /// has ended when the request lands and never a running agent.
+    fn remove_exited(&mut self, _: &RemoveExited, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let count = self.app.read(cx).ended_count();
+        let Some(question) = remove_exited_prompt(count) else {
+            return;
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &question,
+            Some("Their history and scrollback are deleted. Running agents are not touched."),
+            &[PromptButton::new("Remove"), PromptButton::cancel("Cancel")],
+            cx,
+        );
+        let app = self.app.clone();
+        cx.spawn(async move |_, cx| {
+            if answer.await == Ok(0) {
+                let _ = app.update(cx, |a, _| a.clear_exited());
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1059,6 +1082,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::kill))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
+            .on_action(cx.listener(Self::remove_exited))
             .on_action(cx.listener(Self::restart_pane))
             .on_action(cx.listener(Self::command_palette))
             .child(bar)
@@ -1123,7 +1147,7 @@ mod tests {
 
     use super::Workspace;
     use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
-    use crate::app::keymap::{Kill, bind_keys};
+    use crate::app::keymap::{Kill, RemoveExited, bind_keys};
     use crate::app::pane_view::InputSink;
     use crate::app::sidebar_view::TabMark;
     use crate::app::theme::Theme;
@@ -2667,6 +2691,53 @@ mod tests {
         s.cx.run_until_parked();
         assert!(!fake.calls().contains(&Call::ClearExited));
         assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
+    }
+
+    #[gpui::test]
+    fn remove_exited_asks_with_the_count_first(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        // Nothing ended: nothing is asked or sent.
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        s.cx.dispatch_action(RemoveExited);
+        assert!(!s.cx.has_pending_prompt());
+        assert!(!fake.calls().contains(&Call::ClearExited));
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                row(7, "/w", 1),
+                ended(8, "/w", 2, AgentState::Exited),
+                ended(9, "/w", 3, AgentState::Lost),
+            ],
+        );
+        s.cx.dispatch_action(RemoveExited);
+        assert!(s.cx.has_pending_prompt());
+        s.cx.simulate_prompt_answer("Cancel");
+        s.cx.run_until_parked();
+        assert!(!fake.calls().contains(&Call::ClearExited));
+        s.cx.dispatch_action(RemoveExited);
+        s.cx.simulate_prompt_answer("Remove");
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::ClearExited));
+        // Never a per-id kill or forget of the running agent.
+        assert!(!fake.calls().iter().any(|c| matches!(c, Call::Forget(_))));
+    }
+
+    #[gpui::test]
+    fn remove_exited_from_the_palette_asks_first(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![ended(8, "/w", 2, AgentState::Exited)]);
+        s.cx.simulate_keystrokes("cmd-p");
+        s.cx.simulate_input("remove exited");
+        s.cx.simulate_keystrokes("enter");
+        assert!(s.cx.has_pending_prompt());
+        s.cx.simulate_prompt_answer("Remove");
+        s.cx.run_until_parked();
+        assert_eq!(fake.calls().last(), Some(&Call::ClearExited));
     }
 
     #[gpui::test]

@@ -92,12 +92,21 @@ enum Command {
     Rm {
         /// Agents to remove (must be exited or lost)
         ids: Vec<u64>,
-        /// Remove every exited or lost agent instead
+        /// Remove every exited or lost agent instead (running ones are never
+        /// touched); prints each removed id
         #[arg(long, conflicts_with = "ids", required_unless_present = "ids")]
         exited: bool,
-        /// With --exited: only agents with this label, as k=v
-        #[arg(long = "selector", value_name = "K=V", requires = "exited")]
-        selector: Vec<String>,
+        /// With --exited: only agents with this label k=v (repeatable)
+        #[arg(
+            long = "label",
+            alias = "selector",
+            value_name = "K=V",
+            requires = "exited",
+            // Else clap drops `requires` when ids are given (they conflict
+            // with --exited) and the filter would be silently ignored.
+            conflicts_with = "ids"
+        )]
+        labels: Vec<String>,
     },
     /// Send text to an agent's terminal
     Send {
@@ -411,12 +420,15 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Rm {
             ids,
             exited,
-            selector,
+            labels,
         } => {
+            // One request: fleetd picks the exited and lost agents under its
+            // agents lock, so one that is running (or restarting) then is
+            // never removed, and the CLI cannot race a list against it.
             let req = ForgetAgents {
                 ids,
                 exited_only: exited,
-                selector: parse_labels(&selector)?,
+                selector: parse_labels(&labels)?,
             };
             match client
                 .call(request::Kind::Forget(Box::new(req)))
@@ -424,7 +436,9 @@ fn run(cli: Cli) -> Result<u8> {
             {
                 response::Kind::Forgotten(f) => {
                     if exited {
-                        println!("removed {} agents", f.ids.len());
+                        for id in &f.ids {
+                            println!("{id}");
+                        }
                     }
                     for id in &f.refused {
                         eprintln!("fleet: agent {id} not removed (running or unknown)");
