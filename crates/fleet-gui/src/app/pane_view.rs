@@ -317,6 +317,9 @@ pub enum PaneEvent {
     Rename,
     /// Edit Labels… in the pane's menu.
     EditLabels,
+    /// The menu's Duplicate Agent…: the New agent sheet, prefilled with
+    /// the pane's agent (ADR 0084).
+    Duplicate,
     /// The header's Stop: kill the pane's running agent (after asking).
     Kill,
     /// Remove, in the header or the summary bar: forgets the ended agent.

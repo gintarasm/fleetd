@@ -22,18 +22,18 @@ use super::context_menu::{self, MenuLine};
 use super::controls::{ButtonKind, ReducedMotion, appear, button};
 use super::graph_view::{GraphEvent, GraphView};
 use super::keymap::{
-    ClearScrollback, ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, EditLabelsPane,
-    FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
-    FocusUp, Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenOutput, Paste,
-    PrevTab, PreviousAgent, Remove, RemoveExited, RemovePane, RenamePane, ReopenClosedPane,
-    Restart, RestartPane, SaveOutput, ScrollToBottom, ScrollToTop, SelectAll, SelectTab,
-    ShowShortcuts, SplitDown, SplitRight, ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn,
-    ZoomOut, ZoomReset,
+    ClearScrollback, ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, DuplicatePane,
+    EditLabelsPane, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
+    FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent,
+    NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove, RemoveExited, RemovePane,
+    RenamePane, ReopenClosedPane, Restart, RestartPane, SaveOutput, ScrollToBottom, ScrollToTop,
+    SelectAll, SelectTab, ShowShortcuts, SplitDown, SplitRight, ToggleGraph, ToggleMaximize,
+    WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::labels_sheet::{LabelsEvent, LabelsSheet};
 use super::native;
-use super::new_agent::{NewAgentSheet, SheetEvent};
+use super::new_agent::{NewAgentSheet, SheetEvent, SheetSetup};
 use super::output;
 use super::palette::{command_action, command_shortcut};
 use super::pane_drag::PaneDrag;
@@ -59,6 +59,7 @@ use crate::core::menus::{
 };
 use crate::core::palette::{Entry, PaletteState, palette_items, remove_exited_prompt};
 use crate::core::picker::Recents;
+use crate::core::presets::{Prefill, preset_request};
 use crate::core::session::PaneId;
 use crate::core::settings::{MotionChoice, ThemeChoice};
 use crate::core::shortcuts::Section;
@@ -699,10 +700,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let presets = self.app.update(cx, |a, _| a.presets());
         let app = self.app.read(cx);
         let dir = app.start_dir(origin);
         let agents = off_screen_agents(&app.agents, &app.on_screen(), &app.home);
-        let rows = choice_rows(&app.config.default_command, &dir, &app.home, agents.len());
+        let rows = choice_rows(
+            &app.config.default_command,
+            &dir,
+            &app.home,
+            agents.len(),
+            &presets,
+        );
         let chooser = cx.new(|cx| SplitChooserView::new(rows, agents, cx));
         let sub = cx.subscribe_in(&chooser, window, move |this, _, event, window, cx| {
             this.chooser_event(pane, *event, window, cx);
@@ -734,6 +742,7 @@ impl Workspace {
                 return;
             }
             ChooserEvent::NewAgent => self.spawn_default_in(dir, window, cx),
+            ChooserEvent::Preset(index) => self.spawn_preset_in(index, dir, cx),
             ChooserEvent::Terminal => {
                 let result = self.app.update(cx, |a, cx| {
                     let req = a.terminal_request(dir);
@@ -1091,6 +1100,7 @@ impl Workspace {
             RowMenuItem::OpenSplit => self.open_menu_split(agent_id, window, cx),
             RowMenuItem::Rename => self.open_rename(agent_id, window, cx),
             RowMenuItem::EditLabels => self.open_labels(agent_id, window, cx),
+            RowMenuItem::Duplicate => self.duplicate_agent(agent_id, window, cx),
             RowMenuItem::SaveOutput => output::save_output(self.app.clone(), agent_id, cx),
             RowMenuItem::OpenOutput => output::open_output(self.app.clone(), agent_id, cx),
             RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
@@ -1184,6 +1194,7 @@ impl Workspace {
             PaneMenuItem::Restart => PaneEvent::Restart,
             PaneMenuItem::Rename => PaneEvent::Rename,
             PaneMenuItem::EditLabels => PaneEvent::EditLabels,
+            PaneMenuItem::Duplicate => PaneEvent::Duplicate,
             PaneMenuItem::Kill => PaneEvent::Kill,
             PaneMenuItem::Close => PaneEvent::Close,
             PaneMenuItem::CopyLastOutput | PaneMenuItem::SaveOutput | PaneMenuItem::OpenOutput => {
@@ -1195,6 +1206,17 @@ impl Workspace {
     }
 
     pub fn open_new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_new_agent_with(Prefill::default(), window, cx);
+    }
+
+    /// The New agent sheet, its fields prefilled from a preset or an agent
+    /// being duplicated (ADR 0084). An open sheet is only focused.
+    pub fn open_new_agent_with(
+        &mut self,
+        mut prefill: Prefill,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.connect.is_some() {
             return;
         }
@@ -1202,20 +1224,22 @@ impl Workspace {
             sheet.read(cx).focus(window, cx);
             return;
         }
+        let presets = self.app.update(cx, |a, _| a.presets());
         let app = self.app.read(cx);
-        let dirs = app.dir_choices();
+        // Settings › Agents: a default folder beats the recent one.
+        if prefill.dir.is_none() && !app.config.default_dir.is_empty() {
+            prefill.dir = Some(app.config.default_dir.clone());
+        }
+        let setup = SheetSetup {
+            default_command: app.config.default_command.clone(),
+            dirs: app.dir_choices(),
+            recent_commands: app.recent_commands(),
+            presets,
+            prefill,
+        };
         let target = app.target.clone();
-        let command = app.config.default_command.clone();
         let taken = app.live_names();
-        let default_dir = app.config.default_dir.clone();
-        let sheet = cx.new(|cx| {
-            let s = NewAgentSheet::new(&command, dirs, &target, taken, cx);
-            // Settings › Agents: a default folder beats the recent one.
-            if !default_dir.is_empty() {
-                s.dir.update(cx, |f, cx| f.set_text(default_dir, cx));
-            }
-            s
-        });
+        let sheet = cx.new(|cx| NewAgentSheet::new(setup, &target, taken, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::sheet_event);
         sheet.read(cx).focus(window, cx);
         self.sheet = Some((sheet, sub));
@@ -1346,8 +1370,10 @@ impl Workspace {
     ) {
         match event {
             SheetEvent::Cancel => {}
-            SheetEvent::Spawn(req) => {
-                let result = self.app.update(cx, |a, cx| a.spawn(req.clone(), cx));
+            SheetEvent::Spawn { req, command } => {
+                let result = self.app.update(cx, |a, cx| {
+                    a.spawn_from_sheet(req.clone(), command.clone(), cx)
+                });
                 if let Err(e) = result {
                     sheet.update(cx, |s, cx| s.set_error(e, cx));
                     return;
@@ -1371,10 +1397,12 @@ impl Workspace {
             return;
         }
         let state = self.palette_state(cx);
+        let presets = self.app.update(cx, |a, _| a.presets());
         let app = self.app.read(cx);
         let (entries, items): (Vec<Entry>, Vec<_>) = palette_items(
             |c| command_shortcut(c, window),
             &state,
+            &presets,
             &app.agents,
             &app.dir_choices(),
             &app.home,
@@ -1436,6 +1464,12 @@ impl Workspace {
             Entry::Command(c) => window.dispatch_action(command_action(c), cx),
             Entry::Agent(id) => self.show_agent(id, window, cx),
             Entry::Folder(dir) => self.spawn_default_in(dir, window, cx),
+            Entry::Preset(index) => {
+                let presets = self.app.update(cx, |a, _| a.presets());
+                if let Some(p) = presets.get(index) {
+                    self.open_new_agent_with(Prefill::preset(p), window, cx);
+                }
+            }
         }
     }
 
@@ -1544,6 +1578,52 @@ impl Workspace {
             self.app.update(cx, |a, cx| a.show_error(e, cx));
         }
         self.focus_current(window, cx);
+    }
+
+    /// A preset (split chooser) started in `dir` in the focused pane, named
+    /// as the sheet would name it.
+    fn spawn_preset_in(&mut self, index: usize, dir: String, cx: &mut Context<Self>) {
+        let presets = self.app.update(cx, |a, _| a.presets());
+        let Some(preset) = presets.get(index) else {
+            return;
+        };
+        let names = self.app.read(cx).live_names();
+        let taken: Vec<&str> = names.iter().map(String::as_str).collect();
+        let result = match preset_request(preset, dir, &taken) {
+            Some(req) => self.app.update(cx, |a, cx| a.spawn(req, cx)),
+            None => Err(format!("preset {:?} has no command", preset.name)),
+        };
+        if let Err(e) = result {
+            self.app.update(cx, |a, cx| a.show_error(e, cx));
+        }
+    }
+
+    /// Duplicate Agent (row and pane menus, palette): the New agent sheet
+    /// with `agent_id`'s command, folder and labels, and a new name. Works
+    /// while it runs.
+    pub fn duplicate_agent(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let Some(prefill) = self
+            .app
+            .read(cx)
+            .agents
+            .iter()
+            .find(|r| r.info.id == agent_id)
+            .map(|r| Prefill::duplicate(&r.info))
+        else {
+            return;
+        };
+        self.open_new_agent_with(prefill, window, cx);
+    }
+
+    /// Duplicate Agent… (palette): the focused pane's agent.
+    fn duplicate_pane(&mut self, _: &DuplicatePane, window: &mut Window, cx: &mut Context<Self>) {
+        let app = self.app.read(cx);
+        if let Some(agent_id) = app.layout().agent(app.focused()) {
+            self.duplicate_agent(agent_id, window, cx);
+        }
     }
 
     /// Asks before killing (only the question's Kill kills), unless
@@ -1835,6 +1915,11 @@ impl Workspace {
             PaneEvent::EditLabels => {
                 if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
                     self.open_labels(agent_id, window, cx);
+                }
+            }
+            PaneEvent::Duplicate => {
+                if let Some(agent_id) = self.app.read(cx).layout().agent(pane) {
+                    self.duplicate_agent(agent_id, window, cx);
                 }
             }
             PaneEvent::Kill => self.kill_in_pane(pane, window, cx),
@@ -2419,6 +2504,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::kill_pane))
             .on_action(cx.listener(Self::rename_pane))
             .on_action(cx.listener(Self::edit_labels_pane))
+            .on_action(cx.listener(Self::duplicate_pane))
             .on_action(cx.listener(Self::remove_pane))
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
@@ -2676,6 +2762,7 @@ mod tests {
     use crate::core::layout::Layout;
     use crate::core::menus::{MenuEntry, PaneMenuItem, RowMenuItem};
     use crate::core::pane::PaneModel;
+    use crate::core::presets::Preset;
     use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
     use crate::core::settings::{Change, MotionChoice};
     use crate::core::shortcuts::{EmptyPane, key_glyphs};
@@ -2926,6 +3013,11 @@ mod tests {
         config: GuiConfig,
     ) -> Setup<'a> {
         cx.update(bind_keys);
+        // No presets unless the test names some: never this Mac's PATH.
+        let config = GuiConfig {
+            presets: config.presets.or(Some(Vec::new())),
+            ..config
+        };
         let (ui, rx) = async_channel::unbounded();
         let session: Arc<dyn SessionApi> = fake.clone();
         let dir = dir.to_owned();
@@ -4609,6 +4701,7 @@ mod tests {
                 RowMenuItem::OpenSplit,
                 RowMenuItem::Rename,
                 RowMenuItem::EditLabels,
+                RowMenuItem::Duplicate,
                 RowMenuItem::SaveOutput,
                 RowMenuItem::OpenOutput,
                 RowMenuItem::Kill
@@ -4621,6 +4714,7 @@ mod tests {
                     RowMenuItem::OpenSplit,
                     RowMenuItem::Rename,
                     RowMenuItem::EditLabels,
+                    RowMenuItem::Duplicate,
                     RowMenuItem::SaveOutput,
                     RowMenuItem::OpenOutput,
                     RowMenuItem::Restart,
@@ -4654,6 +4748,7 @@ mod tests {
             [
                 RowMenuItem::Rename,
                 RowMenuItem::EditLabels,
+                RowMenuItem::Duplicate,
                 RowMenuItem::SaveOutput,
                 RowMenuItem::OpenOutput,
                 RowMenuItem::Kill
@@ -5291,6 +5386,150 @@ mod tests {
         pick_in_palette(&mut s, "remove exited agent in pane");
         assert!(!s.cx.has_pending_prompt());
         assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![3])));
+    }
+
+    fn presets_config() -> GuiConfig {
+        let preset = |name: &str, command: &[&str], labels: &[(&str, &str)]| Preset {
+            name: name.into(),
+            command: command.iter().map(|w| (*w).to_owned()).collect(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        };
+        GuiConfig {
+            presets: Some(vec![
+                preset("Claude", &["claude"], &[]),
+                preset(
+                    "Review",
+                    &["claude", "--model", "opus"],
+                    &[("role", "reviewer")],
+                ),
+            ]),
+            ..GuiConfig::default()
+        }
+    }
+
+    /// A preset's button fills the command and labels; the prompt is the
+    /// last argument and names the agent; the command becomes recent once
+    /// the pane shows the agent.
+    #[gpui::test]
+    fn sheet_presets_prompt_and_recent_commands(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup_with(cx, &fake, dir.path(), presets_config());
+        s.cx.simulate_keystrokes("cmd-n");
+        set_sheet_text(&mut s, |sh| sh.dir.clone(), "/w/fleetd");
+        click(&mut s, "preset-1");
+        assert_eq!(
+            sheet_text(&mut s, |sh| sh.command.clone()),
+            "claude --model opus"
+        );
+        assert_eq!(sheet_text(&mut s, |sh| sh.labels.clone()), "role=reviewer");
+        // The caret is in Prompt: typing goes there.
+        s.cx.simulate_input("fix the SIGTERM race");
+        assert_eq!(
+            sheet_text(&mut s, |sh| sh.prompt.clone()),
+            "fix the SIGTERM race"
+        );
+        let name = sheet_text(&mut s, |sh| sh.name.clone());
+        assert!(name.starts_with("sigterm-"), "{name}");
+        s.cx.simulate_keystrokes("enter");
+        let req = last_spawn(&fake);
+        assert_eq!(req.program, "claude");
+        assert_eq!(req.args, ["--model", "opus", "fix the SIGTERM race"]);
+        assert_eq!(req.labels["role"], "reviewer");
+        assert_eq!(req.labels["name"], name);
+        // Not recent until the pane shows the agent.
+        let recent = |s: &mut Setup<'_>| s.app.read_with(s.cx, |a, _| a.recent_commands());
+        assert!(recent(&mut s).is_empty());
+        attach_model(&fake, PaneId(1), 9);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+        assert_eq!(recent(&mut s), ["claude --model opus"]);
+        // The next sheet offers it.
+        s.cx.simulate_keystrokes("cmd-n");
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
+        let commands = sheet.read_with(s.cx, |sh, _| sh.commands.clone());
+        assert_eq!(commands, ["claude --model opus"]);
+    }
+
+    /// Duplicate in the row and pane menus and the palette: the sheet with
+    /// the agent's command, folder and labels, and a new name.
+    #[gpui::test]
+    fn duplicate_prefills_the_sheet_from_a_running_agent(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let mut agent = named(3, "build-otter", &[("role", "fixer")]);
+        agent.info.program = "claude".into();
+        agent.info.args = vec!["fix the build".into()];
+        agents(&mut s, &fake, vec![agent]);
+        assert!(row_items(&mut s, 3).contains(&RowMenuItem::Duplicate));
+        pick_row(&mut s, 3, RowMenuItem::Duplicate);
+        assert_eq!(
+            sheet_text(&mut s, |sh| sh.command.clone()),
+            "claude 'fix the build'"
+        );
+        assert_eq!(sheet_text(&mut s, |sh| sh.dir.clone()), "/w");
+        assert_eq!(sheet_text(&mut s, |sh| sh.labels.clone()), "role=fixer");
+        let name = sheet_text(&mut s, |sh| sh.name.clone());
+        assert!(!name.is_empty() && name != "build-otter", "{name}");
+        s.cx.simulate_keystrokes("escape");
+        assert!(s.ws.read_with(s.cx, |w, _| w.sheet().is_none()));
+
+        // From the pane's menu, and the palette, on the pane's agent.
+        click(&mut s, "tab-3");
+        let epoch = s.ws.read_with(s.cx, |ws, _| ws.epoch);
+        s.ws.update_in(s.cx, |ws, window, cx| {
+            ws.pane_menu_pick(PaneId(1), PaneMenuItem::Duplicate, epoch, window, cx);
+        });
+        s.cx.run_until_parked();
+        assert_eq!(sheet_text(&mut s, |sh| sh.labels.clone()), "role=fixer");
+        s.cx.simulate_keystrokes("escape");
+        pick_in_palette(&mut s, "duplicate agent");
+        assert_eq!(
+            sheet_text(&mut s, |sh| sh.command.clone()),
+            "claude 'fix the build'"
+        );
+    }
+
+    /// Presets in the palette open the sheet prefilled; in the split
+    /// chooser they start at once in its folder.
+    #[gpui::test]
+    fn presets_in_the_palette_and_the_split_chooser(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup_with(cx, &fake, dir.path(), presets_config());
+        let rows = palette_rows(&mut s);
+        assert!(has_row(&rows, "New Claude…") && has_row(&rows, "New Review…"));
+        pick_in_palette(&mut s, "new review");
+        assert_eq!(
+            sheet_text(&mut s, |sh| sh.command.clone()),
+            "claude --model opus"
+        );
+        s.cx.simulate_keystrokes("escape");
+
+        agents(&mut s, &fake, vec![row(7, "/w/fleetd", 1)]);
+        click(&mut s, "tab-7");
+        s.cx.simulate_keystrokes("cmd-d");
+        let titles = s.ws.read_with(s.cx, |w, cx| {
+            let chooser = w.chooser(PaneId(2)).expect("chooser").read(cx);
+            chooser
+                .chooser()
+                .rows()
+                .iter()
+                .map(|r| r.title.clone())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(titles[3..], ["Claude", "Review"]);
+        s.cx.simulate_keystrokes("5");
+        s.cx.run_until_parked();
+        let req = last_spawn(&fake);
+        assert_eq!(req.cwd, "/w/fleetd");
+        assert_eq!(req.args, ["--model", "opus"]);
+        assert_eq!(req.labels["role"], "reviewer");
+        assert!(req.labels.contains_key("name"));
     }
 
     /// Tab commands show with more than one tab, each with its shortcut.

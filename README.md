@@ -312,8 +312,18 @@ A status item is always present: Show fleetd, the running agents, New agent…, 
 | `option_as_meta` | `true` | Option sends Esc-prefixed keys |
 | `agent_emoji` | `false` | each agent's emoji in place of its colour swatch (row) and terminal icon (pane header) |
 | `confirm_kill` | `true` | ask before killing an agent; the question's "Don't ask again" writes `false` |
+| `presets` | the agents found on `PATH` | one-click commands for New agent, the split chooser and the palette: `[[gui.presets]]` tables with `name`, `command` (an array) and optional `labels`; `[]` for none |
 
-The GUI keeps its own state (recent targets and directories, layouts) in `~/.fleet/gui-state.toml`. `--state-dir` and `--target` override both for one launch.
+For example:
+
+```toml
+[[gui.presets]]
+name = "Claude (continue)"
+command = ["claude", "--continue"]
+labels = { role = "dev" }
+```
+
+The GUI keeps its own state (recent targets, directories and commands, layouts) in `~/.fleet/gui-state.toml`. `--state-dir` and `--target` override both for one launch.
 
 ### Performance
 

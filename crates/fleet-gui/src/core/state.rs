@@ -12,6 +12,7 @@ use super::target::Target;
 
 pub const MAX_RECENT_TARGETS: usize = 10;
 pub const MAX_RECENT_DIRS: usize = 20;
+pub const MAX_RECENT_COMMANDS: usize = 20;
 
 /// `$HOME/.fleet`.
 pub fn default_state_dir() -> PathBuf {
@@ -30,6 +31,9 @@ pub struct GuiState {
     pub recent_targets: Vec<Target>,
     /// Keyed by target string.
     pub recent_dirs: BTreeMap<String, Vec<String>>,
+    /// Keyed by target string: the New agent sheet's commands, as typed
+    /// (without the first prompt), most recent first (ADR 0084).
+    pub recent_commands: BTreeMap<String, Vec<String>>,
     /// Keyed by target string. Entries that do not parse (old or unknown shape) are dropped.
     #[serde(deserialize_with = "lenient_layouts")]
     pub layouts: BTreeMap<String, SavedLayout>,
@@ -174,6 +178,8 @@ mod tests {
         s.recent_targets.push(Target::Local);
         s.recent_dirs
             .insert("local".into(), vec!["/a".into(), "/b".into()]);
+        s.recent_commands
+            .insert("local".into(), vec!["claude --continue".into()]);
         s.layouts.insert("local".into(), SavedLayout::default());
         s.collapsed_groups
             .insert("local".into(), ["fleetd".to_owned()].into());
@@ -202,6 +208,7 @@ mod tests {
         let s = GuiState::load(dir.path());
         assert_eq!(s.recent_targets, [Target::Local]);
         assert!(s.collapsed_groups.is_empty());
+        assert!(s.recent_commands.is_empty());
     }
 
     #[test]
