@@ -1,12 +1,15 @@
 //! Platform-neutral GUI logic: no gpui, no AppKit.
 
 pub mod backoff;
+pub mod broadcast;
 pub mod config;
 pub mod drag_drop;
+pub mod drop_paste;
 pub mod ended;
 pub mod feedback;
 pub mod find;
 pub mod fuzzy;
+pub mod git;
 pub mod glass;
 pub mod graph;
 pub mod graph_layout;
@@ -14,15 +17,18 @@ pub mod icons;
 pub mod identity;
 pub mod keys;
 pub mod kill;
+pub mod labels;
 pub mod launch;
 pub mod layout;
 pub mod links;
 pub mod menus;
 pub mod mouse;
+pub mod output;
 pub mod palette;
 pub mod pane;
 mod pane_link;
 pub mod picker;
+pub mod presets;
 pub mod row_preview;
 pub mod scroll_feedback;
 pub mod scrollback;

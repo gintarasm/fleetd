@@ -545,3 +545,46 @@ fn kill_escalates_to_sigkill_after_the_grace() {
         "never SIGKILLed"
     );
 }
+
+/// ADR 0085: spawn and list carry the git checkout of the agent's cwd,
+/// read on the node; a cwd outside any checkout has none.
+#[test]
+fn spawn_and_list_carry_the_cwd_git_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let repo = work.path().join("fleetd");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feat/x\n").unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    let spawned = node
+        .spawn(SpawnAgent {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            cwd: repo.to_string_lossy().into_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+    let git = spawned.git.clone().expect("spawned in a checkout");
+    assert_eq!(
+        (git.repo.as_str(), git.branch.as_str()),
+        ("fleetd", "feat/x")
+    );
+    assert!(!git.detached);
+    let listed = node
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == spawned.id)
+        .unwrap();
+    assert_eq!(listed.git, spawned.git);
+    let plain = spawn_sh_in(&node, &std::path::PathBuf::from("/"), "sleep 30", &[]);
+    let listed = node
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == plain)
+        .unwrap();
+    assert_eq!(listed.git, None);
+    node.kill(spawned.id).unwrap();
+    node.kill(plain).unwrap();
+}

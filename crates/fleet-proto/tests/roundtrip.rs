@@ -83,7 +83,34 @@ fn info() -> AgentInfo {
         created_unix_ms: 1,
         labels: labels(),
         exited_unix_ms: Some(2),
+        git: Some(fleet_proto::GitInfo {
+            repo: "fleetd".into(),
+            worktree: "issue-97".into(),
+            branch: "feat/gui-git-branch".into(),
+            detached: false,
+        }),
     }
+}
+
+/// ADR 0085: `AgentInfo.git` is additive. A message from an older node
+/// (no field 10) reads as no checkout, and an older client skips it.
+#[test]
+fn agent_info_git_is_optional_and_skippable() {
+    use prost::Message;
+    let mut without = info();
+    without.git = None;
+    let bytes = without.encode_to_vec();
+    assert_eq!(AgentInfo::decode(bytes.as_slice()).unwrap().git, None);
+    // An older client's AgentInfo: fields 1-9 only.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct OldAgentInfo {
+        #[prost(uint64, tag = "1")]
+        id: u64,
+        #[prost(string, tag = "4")]
+        cwd: String,
+    }
+    let old = OldAgentInfo::decode(info().encode_to_vec().as_slice()).unwrap();
+    assert_eq!((old.id, old.cwd.as_str()), (7, "/w"));
 }
 
 fn attach_ok() -> AttachOk {

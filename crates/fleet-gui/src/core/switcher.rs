@@ -128,6 +128,24 @@ mod tests {
         assert_eq!(item.preview, "$ cargo test");
     }
 
+    /// ADR 0085: the switcher finds an agent by its branch.
+    #[test]
+    fn a_branch_name_finds_its_agent() {
+        let mut on_branch = row(2, 2, "");
+        on_branch.info.git = Some(fleet_proto::GitInfo {
+            repo: "fleetd".into(),
+            branch: "feat/gui-git-branch".into(),
+            ..Default::default()
+        });
+        let items = switcher_items(&[row(1, 1, ""), on_branch], home())
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect();
+        let mut p = Picker::new(items, Default::default());
+        p.set_query("gitbranch");
+        assert_eq!(p.selected_item().map(|i| i.key.as_str()), Some("agent:2"));
+    }
+
     #[test]
     fn the_picker_lists_them_most_recent_first_then_newest() {
         let agents = [row(1, 1, ""), row(2, 2, ""), row(3, 3, ""), row(4, 4, "")];

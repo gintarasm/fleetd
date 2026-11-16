@@ -6,6 +6,11 @@
 //! bumps the generation and drops every loaded line, keeping the numbering.
 //! Lines stay raw ANSI; they are parsed only when drawn.
 //!
+//! The user can also clear the loaded history from the view only (⌘K,
+//! [`Scrollback::clear_view`], decision 0082): the node keeps it, the
+//! generation stays, and nothing older than the clear is paged in again
+//! until the history is rebuilt by a re-attach.
+//!
 //! The loaded lines are capped ([`Cap`]): past it the oldest are dropped
 //! from the front. The node keeps them, so the history is not "fully
 //! loaded", but nothing older is paged in until the history is rebuilt (a
@@ -48,6 +53,9 @@ pub struct Scrollback {
     bytes: usize,
     /// The cap was reached: no older page is loaded.
     full: bool,
+    /// Lines older than this were cleared from the view
+    /// ([`Scrollback::clear_view`]); a page never brings them back.
+    floor: u64,
 }
 
 impl Scrollback {
@@ -67,6 +75,7 @@ impl Scrollback {
             cap,
             bytes: 0,
             full: false,
+            floor: 0,
         }
     }
 
@@ -139,11 +148,17 @@ impl Scrollback {
     pub fn prepend_page(
         &mut self,
         generation: u64,
-        first_line: u64,
+        mut first_line: u64,
         mut lines: Vec<Vec<u8>>,
     ) -> bool {
         if generation != self.generation || first_line + (lines.len() as u64) < self.first_line {
             return false;
+        }
+        if first_line < self.floor {
+            // Lines cleared from the view stay cleared.
+            let skip = usize::try_from(self.floor - first_line).unwrap_or(usize::MAX);
+            lines.drain(..skip.min(lines.len()));
+            first_line = self.floor;
         }
         let new = usize::try_from(self.first_line.saturating_sub(first_line)).unwrap_or(usize::MAX);
         lines.truncate(new);
@@ -171,6 +186,20 @@ impl Scrollback {
         self.first_line = end;
         self.oldest_on_node = end;
         self.generation += 1;
+    }
+
+    /// Clears the loaded history from this view only (⌘K): unlike
+    /// [`Scrollback::clear`] the node still has it, so the generation is
+    /// kept (page requests stay valid) and the history counts as fully
+    /// loaded, with nothing older than `end_line` paged in again.
+    pub fn clear_view(&mut self) {
+        let end = self.end_line();
+        self.lines.clear();
+        self.bytes = 0;
+        self.full = false;
+        self.first_line = end;
+        self.oldest_on_node = end;
+        self.floor = end;
     }
 
     /// Oldest line the node holds in this generation.
@@ -300,6 +329,33 @@ mod tests {
         // Lines 0..8 stay on the node, but there is no room for them.
         assert!(!sb.fully_loaded());
         assert!(sb.is_full());
+    }
+
+    #[test]
+    fn clear_view_keeps_the_generation_and_pages_nothing_older_back() {
+        let mut sb = Scrollback::new(3, 10, 0);
+        sb.push_back(b"a".to_vec());
+        sb.push_back(b"b".to_vec());
+        assert!(!sb.fully_loaded());
+        sb.clear_view();
+        assert_eq!(sb.generation(), 3);
+        assert_eq!((sb.first_line(), sb.end_line()), (12, 12));
+        assert!(sb.is_empty());
+        assert!(sb.fully_loaded());
+        // A page that was in flight (lines 2..12) adds nothing.
+        assert!(!sb.prepend_page(3, 2, lines(&["x"; 9])));
+        assert!(sb.prepend_page(3, 2, lines(&["x"; 10])));
+        assert!(sb.is_empty());
+        // New lines still arrive, numbered on.
+        sb.push_back(b"c".to_vec());
+        assert_eq!(texts(&sb), ["c"]);
+        assert_eq!(sb.first_line(), 12);
+        // A page straddling the floor keeps only what is at or after it.
+        let mut sb = Scrollback::new(0, 5, 0);
+        sb.clear_view();
+        sb.push_back(b"f".to_vec());
+        assert!(sb.prepend_page(0, 3, lines(&["d", "e", "x"])));
+        assert_eq!(texts(&sb), ["f"]);
     }
 
     #[test]

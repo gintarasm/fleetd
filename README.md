@@ -186,6 +186,8 @@ fleet send 1 "run the tests"           # types the text
 fleet send 1 "run the tests" --enter   # types it and presses Enter
 ```
 
+In the GUI, **Send to Agents…** (`cmd-shift-m`, ⌘P or the fleet menu) types the same text into one or many running agents, with Return after it unless unchecked. It warns first if a target is working. ⌘-click or ⇧-click sidebar tabs to pick several, then right-click one for **Send to Selected…**.
+
 ### Stop an agent
 
 ```sh
@@ -293,6 +295,7 @@ Not yet verified by hand: connecting to a remote host over ssh, the "Start fleet
 | `cmd-alt-arrows` | move focus between panes |
 | `cmd-1` … `cmd-4` | focus pane 1 to 4 |
 | `cmd-n` | new agent |
+| `cmd-shift-m` | send text to agents |
 | `cmd-c` / `cmd-v` | copy / paste |
 
 ### Menu bar
@@ -312,8 +315,18 @@ A status item is always present: Show fleetd, the running agents, New agent…, 
 | `option_as_meta` | `true` | Option sends Esc-prefixed keys |
 | `agent_emoji` | `false` | each agent's emoji in place of its colour swatch (row) and terminal icon (pane header) |
 | `confirm_kill` | `true` | ask before killing an agent; the question's "Don't ask again" writes `false` |
+| `presets` | the agents found on `PATH` | one-click commands for New agent, the split chooser and the palette: `[[gui.presets]]` tables with `name`, `command` (an array) and optional `labels`; `[]` for none |
 
-The GUI keeps its own state (recent targets and directories, layouts) in `~/.fleet/gui-state.toml`. `--state-dir` and `--target` override both for one launch.
+For example:
+
+```toml
+[[gui.presets]]
+name = "Claude (continue)"
+command = ["claude", "--continue"]
+labels = { role = "dev" }
+```
+
+The GUI keeps its own state (recent targets, directories and commands, layouts) in `~/.fleet/gui-state.toml`. `--state-dir` and `--target` override both for one launch.
 
 ### Performance
 

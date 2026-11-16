@@ -21,6 +21,7 @@ use super::status_item::set_accessory;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::glass::GlassChoice;
+use crate::core::presets::{Preset, presets_note};
 use crate::core::settings::{
     BLUR_MAX, BLUR_MIN, BLUR_STEP, Change, FONT_SIZE_MAX, FONT_SIZE_MIN, FONT_SIZE_STEP,
     MotionChoice, OPACITY_MAX, OPACITY_MIN, OPACITY_STEP, SHORTCUTS, Section, ThemeChoice,
@@ -110,6 +111,11 @@ pub struct SettingsWindow {
     pub(crate) font_family: Entity<TextField>,
     pub(crate) command: Entity<TextField>,
     pub(crate) folder: Entity<TextField>,
+    /// The command presets as of opening (ADR 0084): edited in
+    /// `config.toml`, listed here.
+    pub(crate) presets: Vec<Preset>,
+    /// They were found on `PATH` (no `[gui] presets`).
+    presets_detected: bool,
     /// Why the last change was not applied.
     pub(crate) error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -124,6 +130,8 @@ impl Focusable for SettingsWindow {
 impl SettingsWindow {
     pub fn new(app: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let c = app.read(cx).config().clone();
+        let presets = app.update(cx, |a, _| a.presets());
+        let presets_detected = app.read(cx).presets_detected();
         let font_family = cx.new(|cx| TextField::new(c.font_family.clone(), "SF Mono", cx));
         let command =
             cx.new(|cx| TextField::new(shell_words::join(&c.default_command), "claude", cx));
@@ -148,6 +156,8 @@ impl SettingsWindow {
             font_family,
             command,
             folder,
+            presets,
+            presets_detected,
             error: None,
             _subscriptions: subs,
         }
@@ -488,6 +498,64 @@ impl SettingsWindow {
                 folder,
                 theme,
             ))
+            .child(setting_row(
+                "Presets",
+                Some(presets_note(self.presets_detected)),
+                self.preset_list(theme),
+                theme,
+            ))
+    }
+
+    /// The presets, read-only: name, then command and labels.
+    fn preset_list(&self, theme: &Theme) -> Stateful<Div> {
+        let mut list = div()
+            .id("presets")
+            .debug_selector(|| "settings-presets".to_owned())
+            .w(px(300.))
+            .flex()
+            .flex_col()
+            .p(px(space::XS))
+            .rounded(px(radius::MD))
+            .border_1()
+            .border_color(theme.separator)
+            .bg(theme.field)
+            .max_h(px(180.))
+            .overflow_y_scroll();
+        if self.presets.is_empty() {
+            list = list.child(
+                div()
+                    .px(px(space::SM))
+                    .py(px(space::XS))
+                    .type_style(text::CALLOUT)
+                    .text_color(theme.tertiary)
+                    .child("None"),
+            );
+        }
+        for (i, p) in self.presets.iter().enumerate() {
+            let labels = p.labels_text();
+            let detail = if labels.is_empty() {
+                p.command_line()
+            } else {
+                format!("{} · {labels}", p.command_line())
+            };
+            list = list.child(
+                div()
+                    .id(("preset", i))
+                    .flex()
+                    .flex_col()
+                    .px(px(space::SM))
+                    .py(px(space::XS))
+                    .type_style(text::CALLOUT)
+                    .child(SharedString::from(p.name.clone()))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(theme.secondary)
+                            .child(SharedString::from(detail)),
+                    ),
+            );
+        }
+        list
     }
 
     fn keys(&self, theme: &Theme) -> Div {

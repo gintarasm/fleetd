@@ -1,11 +1,15 @@
 //! Sidebar grouping of agents (ADR 0025: group by `project` label, else
-//! cwd), and its filter and collapsed groups (issue #40, ADR 0060).
+//! cwd; or by git repository, ADR 0085), and its filter and collapsed
+//! groups (issue #40, ADR 0060).
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use fleet_client::names::{NAME_LABEL, name_of};
 use fleet_proto::{AgentInfo, AgentState};
+use serde::{Deserialize, Serialize};
+
+use super::git;
 
 use super::session::AgentRow;
 use super::sidebar_tree::{RowLayout, arrange};
@@ -64,18 +68,52 @@ pub fn label_chips(info: &AgentInfo) -> Vec<(String, String)> {
     chips
 }
 
-fn title_of(row: &AgentRow, home: &Path) -> String {
+/// What the sidebar groups agents by (ADR 0085).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupBy {
+    /// The `project` label, else the cwd (ADR 0025).
+    #[default]
+    Folder,
+    /// The git repository the cwd is in (all its worktrees together);
+    /// agents in none group as by folder.
+    Repo,
+}
+
+impl GroupBy {
+    pub const ALL: [GroupBy; 2] = [GroupBy::Folder, GroupBy::Repo];
+
+    /// Its menu title.
+    pub fn title(self) -> &'static str {
+        match self {
+            GroupBy::Folder => "Group by Folder",
+            GroupBy::Repo => "Group by Repository",
+        }
+    }
+}
+
+fn title_of(row: &AgentRow, home: &Path, by: GroupBy) -> String {
+    if by == GroupBy::Repo
+        && let Some(repo) = git::repo_name(&row.info)
+    {
+        return repo.to_owned();
+    }
     match row.info.labels.get("project") {
         Some(p) if !p.is_empty() => p.clone(),
         _ => tilde(&row.info.cwd, home),
     }
 }
 
-/// Groups sorted by title; within a group running agents first, then newest first.
+/// Groups by folder ([`group_agents_by`]).
 pub fn group_agents(rows: &[AgentRow], home: &Path) -> Vec<Group> {
+    group_agents_by(rows, home, GroupBy::Folder)
+}
+
+/// Groups sorted by title; within a group running agents first, then newest first.
+pub fn group_agents_by(rows: &[AgentRow], home: &Path, by: GroupBy) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     for row in rows {
-        let title = title_of(row, home);
+        let title = title_of(row, home, by);
         match groups.iter_mut().find(|g| g.title == title) {
             Some(g) => g.agents.push(row.clone()),
             None => groups.push(Group {
@@ -157,7 +195,8 @@ impl Filter {
 
 /// Whether every word of `query` (ignoring case) is in the row's `name`
 /// (as the row shows it), its program, its cwd (as stored or with `~`),
-/// or a label (`key=value`), or is its id. An empty query matches
+/// its git repository, worktree or branch (ADR 0085), or a label
+/// (`key=value`), or is its id. An empty query matches
 /// everything. The one match the sidebar filter, the command palette and
 /// the agent switcher share (ADR 0052).
 pub fn query_matches(query: &str, row: &AgentRow, name: &str, home: &Path) -> bool {
@@ -171,6 +210,7 @@ pub fn query_matches(query: &str, row: &AgentRow, name: &str, home: &Path) -> bo
         row.info.cwd.clone(),
         tilde(&row.info.cwd, home),
     ];
+    hay.extend(git::search_terms(&row.info));
     hay.extend(row.info.labels.iter().map(|(k, v)| format!("{k}={v}")));
     let hay: Vec<String> = hay.iter().map(|h| h.to_lowercase()).collect();
     let id = row.info.id.to_string();
@@ -209,7 +249,29 @@ pub fn sidebar_groups(
     collapsed: &BTreeSet<String>,
     disclosure: &HashMap<u64, bool>,
 ) -> Vec<SidebarGroup> {
-    group_agents(rows, home)
+    narrow_groups(
+        group_agents(rows, home),
+        home,
+        filter,
+        name,
+        statuses,
+        collapsed,
+        disclosure,
+    )
+}
+
+/// [`sidebar_groups`] for `groups` already made, as
+/// [`group_agents_by`] groups by folder or repository (ADR 0085).
+pub fn narrow_groups(
+    groups: Vec<Group>,
+    home: &Path,
+    filter: &Filter,
+    name: &dyn Fn(&AgentRow) -> String,
+    statuses: &HashMap<u64, AgentStatus>,
+    collapsed: &BTreeSet<String>,
+    disclosure: &HashMap<u64, bool>,
+) -> Vec<SidebarGroup> {
+    groups
         .into_iter()
         .filter_map(|g| {
             let passes = |r: &AgentRow| {
@@ -564,6 +626,81 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert!(!g[0].collapsed);
         assert_eq!(g[0].agents.len(), 2);
+    }
+
+    fn in_repo(mut r: AgentRow, repo: &str, worktree: &str, branch: &str) -> AgentRow {
+        r.info.git = Some(fleet_proto::GitInfo {
+            repo: repo.into(),
+            worktree: worktree.into(),
+            branch: branch.into(),
+            detached: false,
+        });
+        r
+    }
+
+    #[test]
+    fn grouping_by_repo_joins_worktrees_and_falls_back_to_folder() {
+        let home = Path::new("/h");
+        let rows = [
+            in_repo(
+                row(1, "/h/fleetd", None, AgentState::Running, 1),
+                "fleetd",
+                "",
+                "main",
+            ),
+            in_repo(
+                row(
+                    2,
+                    "/h/fleetd-wt/issue-97",
+                    Some("gui"),
+                    AgentState::Running,
+                    2,
+                ),
+                "fleetd",
+                "issue-97",
+                "feat/git",
+            ),
+            row(3, "/h/notes", None, AgentState::Running, 3),
+        ];
+        let titles = |g: Vec<Group>| -> Vec<(String, Vec<u64>)> {
+            g.into_iter()
+                .map(|g| (g.title, g.agents.iter().map(|r| r.info.id).collect()))
+                .collect()
+        };
+        assert_eq!(
+            titles(group_agents_by(&rows, home, GroupBy::Repo)),
+            [
+                ("fleetd".to_owned(), vec![2, 1]),
+                ("~/notes".to_owned(), vec![3])
+            ]
+        );
+        assert_eq!(
+            titles(group_agents_by(&rows, home, GroupBy::Folder)),
+            [
+                ("gui".to_owned(), vec![2]),
+                ("~/fleetd".to_owned(), vec![1]),
+                ("~/notes".to_owned(), vec![3])
+            ]
+        );
+        assert_eq!(
+            group_agents(&rows, home),
+            group_agents_by(&rows, home, GroupBy::Folder)
+        );
+    }
+
+    #[test]
+    fn the_filter_matches_the_branch_and_worktree() {
+        let home = Path::new("/h");
+        let r = in_repo(
+            row(1, "/h/w", None, AgentState::Running, 1),
+            "fleetd",
+            "issue-97",
+            "fix/freeze-timeout",
+        );
+        for q in ["freeze", "FIX/", "issue-97", "fleetd"] {
+            assert!(query_matches(q, &r, "x", home), "{q}");
+        }
+        assert!(!query_matches("feat/", &r, "x", home));
     }
 
     #[test]
