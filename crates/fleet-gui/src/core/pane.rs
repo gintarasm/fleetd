@@ -229,6 +229,15 @@ impl PaneModel {
         }
     }
 
+    /// Scrolls up by `offset` lines (the dragged scrollbar), clamped to
+    /// the loaded history.
+    pub fn scroll_to(&mut self, offset: u64) {
+        self.scroll_offset = offset.min(self.scrollback.len());
+        if self.scroll_offset == 0 {
+            self.unseen_lines = 0;
+        }
+    }
+
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
         self.unseen_lines = 0;
@@ -238,6 +247,13 @@ impl PaneModel {
     /// was scrolled up; 0 once it follows the grid again.
     pub fn unseen_lines(&self) -> u64 {
         self.unseen_lines
+    }
+
+    /// The "New output" chip shows: the view is scrolled up and output has
+    /// scrolled lines into history below it since. Redraws in place (a
+    /// spinner, a status line) add no lines and show no chip.
+    pub fn new_output(&self) -> bool {
+        self.scroll_offset > 0 && self.unseen_lines > 0
     }
 
     /// History lines the view is scrolled up by; 0 follows the live grid.
