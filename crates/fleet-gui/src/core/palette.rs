@@ -15,6 +15,7 @@ use fleet_proto::AgentState;
 use super::git;
 use super::layout::MAX_PANES;
 use super::picker::PickerItem;
+use super::presets::Preset;
 use super::session::AgentRow;
 use super::sidebar::{program_name, tilde};
 use super::tabs::MAX_TABS;
@@ -34,6 +35,7 @@ pub enum Command {
     KillPane,
     RenamePane,
     EditLabelsPane,
+    DuplicatePane,
     RemovePane,
     Find,
     FindNext,
@@ -109,6 +111,7 @@ impl Command {
         Command::KillPane,
         Command::RenamePane,
         Command::EditLabelsPane,
+        Command::DuplicatePane,
         Command::RemovePane,
         Command::Find,
         Command::FindNext,
@@ -174,6 +177,7 @@ impl Command {
             Command::KillPane => "Kill Agent…",
             Command::RenamePane => "Rename Agent…",
             Command::EditLabelsPane => "Edit Labels…",
+            Command::DuplicatePane => "Duplicate Agent…",
             Command::RemovePane => "Remove Exited Agent in Pane",
             Command::Find => "Find in Scrollback…",
             Command::FindNext => "Find Next",
@@ -231,6 +235,7 @@ impl Command {
             Command::KillPane => "stop terminate",
             Command::RenamePane => "name label",
             Command::EditLabelsPane => "label role project tag",
+            Command::DuplicatePane => "copy clone again spawn",
             Command::RemovePane => "forget rm ended lost",
             Command::Find | Command::FindNext | Command::FindPrevious => "search scrollback",
             Command::Copy | Command::Paste => "clipboard",
@@ -278,6 +283,7 @@ impl Command {
             Command::FocusPane4 => s.panes >= 4,
             Command::RenamePane
             | Command::EditLabelsPane
+            | Command::DuplicatePane
             | Command::CopyLastOutput
             | Command::SaveOutput
             | Command::OpenOutput
@@ -308,6 +314,9 @@ pub enum Entry {
     Agent(u64),
     /// Spawn the default command here.
     Folder(String),
+    /// "New <preset>…": the New agent sheet with the preset at this index
+    /// (ADR 0084).
+    Preset(usize),
 }
 
 impl Entry {
@@ -317,6 +326,7 @@ impl Entry {
             Entry::Command(c) => format!("command:{c:?}"),
             Entry::Agent(id) => format!("agent:{id}"),
             Entry::Folder(dir) => format!("folder:{dir}"),
+            Entry::Preset(i) => format!("preset:{i}"),
         }
     }
 }
@@ -368,11 +378,12 @@ pub fn agent_item(row: &AgentRow, home: &Path) -> PickerItem {
 }
 
 /// The palette's rows: the commands shown in `state` (each with the
-/// shortcut `shortcut` gives it), the agents, newest first, then the
-/// recent folders.
+/// shortcut `shortcut` gives it), "New <preset>…" for each preset, the
+/// agents, newest first, then the recent folders.
 pub fn palette_items(
     shortcut: impl Fn(Command) -> Option<String>,
     state: &PaletteState,
+    presets: &[Preset],
     agents: &[AgentRow],
     folders: &[String],
     home: &Path,
@@ -388,6 +399,20 @@ pub fn palette_items(
                 detail: String::new(),
                 keywords: c.keywords().to_owned(),
                 shortcut: shortcut(c),
+                preview: String::new(),
+            },
+        ));
+    }
+    for (i, p) in presets.iter().enumerate() {
+        let entry = Entry::Preset(i);
+        out.push((
+            entry.clone(),
+            PickerItem {
+                key: entry.key(),
+                title: format!("New {}…", p.name),
+                detail: p.command_line(),
+                keywords: "preset new agent spawn".to_owned(),
+                shortcut: None,
                 preview: String::new(),
             },
         ));
@@ -548,7 +573,7 @@ mod tests {
     }
 
     fn shown(s: &PaletteState) -> Vec<Command> {
-        palette_items(|_| None, s, &[], &[], home())
+        palette_items(|_| None, s, &[], &[], &[], home())
             .into_iter()
             .map(|(e, _)| match e {
                 Entry::Command(c) => c,
@@ -564,6 +589,7 @@ mod tests {
         let items = palette_items(
             |c| (c == Command::SplitRight).then(|| "⌘D".to_owned()),
             &state,
+            &[],
             &[],
             &[],
             home(),
@@ -604,6 +630,7 @@ mod tests {
         let agent_only = [
             Command::RenamePane,
             Command::EditLabelsPane,
+            Command::DuplicatePane,
             Command::Find,
             Command::FindNext,
             Command::FindPrevious,
@@ -707,7 +734,7 @@ mod tests {
 
     #[test]
     fn terminal_commands_are_found_by_what_they_do() {
-        let items: Vec<PickerItem> = palette_items(|_| None, &everything(), &[], &[], home())
+        let items: Vec<PickerItem> = palette_items(|_| None, &everything(), &[], &[], &[], home())
             .into_iter()
             .map(|(_, i)| i)
             .collect();
@@ -738,6 +765,7 @@ mod tests {
         let items = palette_items(
             |_| None,
             &everything(),
+            &[],
             &agents,
             &["/Users/me/a".into(), String::new()],
             home(),
@@ -781,10 +809,11 @@ mod tests {
         assert_eq!(named.title, "sigterm-otter");
         assert_eq!(named.detail, "/tmp · exited 2");
 
-        let items: Vec<PickerItem> = palette_items(|_| None, &everything(), &[a, b], &[], home())
-            .into_iter()
-            .map(|(_, i)| i)
-            .collect();
+        let items: Vec<PickerItem> =
+            palette_items(|_| None, &everything(), &[], &[a, b], &[], home())
+                .into_iter()
+                .map(|(_, i)| i)
+                .collect();
         let first = |q: &str| {
             let mut p = Picker::new(items.clone(), Recents::default());
             p.set_query(q);
@@ -812,10 +841,11 @@ mod tests {
             item.detail,
             "~/wt/issue-97 · issue-97 · fix/freeze-timeout · running"
         );
-        let items: Vec<PickerItem> = palette_items(|_| None, &everything(), &[a, b], &[], home())
-            .into_iter()
-            .map(|(_, i)| i)
-            .collect();
+        let items: Vec<PickerItem> =
+            palette_items(|_| None, &everything(), &[], &[a, b], &[], home())
+                .into_iter()
+                .map(|(_, i)| i)
+                .collect();
         let first = |q: &str| {
             let mut p = Picker::new(items.clone(), Recents::default());
             p.set_query(q);
@@ -823,6 +853,29 @@ mod tests {
         };
         assert_eq!(first("frzetimeout").as_deref(), Some("agent:7"));
         assert_eq!(first("issue-97").as_deref(), Some("agent:7"));
+    }
+
+    #[test]
+    fn presets_are_new_commands_before_the_agents() {
+        let presets = [Preset {
+            name: "Claude (continue)".into(),
+            command: vec!["claude".into(), "--continue".into()],
+            labels: Default::default(),
+        }];
+        let agents = [row(1, "sh", "/Users/me/a", 1, AgentState::Running)];
+        let items = palette_items(|_| None, &everything(), &presets, &agents, &[], home());
+        let n = shown(&everything()).len();
+        assert_eq!(items[n].0, Entry::Preset(0));
+        assert_eq!(items[n].1.title, "New Claude (continue)…");
+        assert_eq!(items[n].1.detail, "claude --continue");
+        assert_eq!(items[n].1.key, "preset:0");
+        assert_eq!(items[n + 1].0, Entry::Agent(1));
+        let mut p = Picker::new(
+            items.into_iter().map(|(_, i)| i).collect(),
+            Recents::default(),
+        );
+        p.set_query("continue");
+        assert_eq!(p.selected_item().map(|i| i.key.as_str()), Some("preset:0"));
     }
 
     #[test]

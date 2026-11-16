@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::glass::GlassChoice;
+use super::presets::Preset;
 use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, ThemeChoice};
 use super::state::write_atomic;
 use super::target::Target;
@@ -90,6 +91,10 @@ pub struct GuiConfig {
     /// Each agent's emoji (ADR 0064) in place of its colour swatch on the
     /// sidebar row and of the terminal icon in its pane header.
     pub agent_emoji: bool,
+    /// `[[gui.presets]]`: the New agent sheet's, split chooser's and
+    /// palette's one-click commands (ADR 0084). Unset: the agents found
+    /// on `PATH`; an empty list: none.
+    pub presets: Option<Vec<Preset>>,
 }
 
 impl Default for GuiConfig {
@@ -112,6 +117,7 @@ impl Default for GuiConfig {
             glass: GlassChoice::Off,
             editor: String::new(),
             agent_emoji: false,
+            presets: None,
         }
     }
 }
@@ -264,6 +270,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "[gui]\neditor = \"zed\"\n");
         assert_eq!(load_config(dir.path()).unwrap().editor, "zed");
+    }
+
+    #[test]
+    fn presets_are_read_from_the_gui_table() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_config(dir.path()).unwrap().presets, None);
+        write(
+            dir.path(),
+            "[gui]\nfont_size = 14\n[[gui.presets]]\nname = \"Claude (continue)\"\n\
+             command = [\"claude\", \"--continue\"]\nlabels = { role = \"dev\" }\n",
+        );
+        let c = load_config(dir.path()).unwrap();
+        let presets = c.presets.unwrap();
+        assert_eq!(presets[0].name, "Claude (continue)");
+        assert_eq!(presets[0].command, ["claude", "--continue"]);
+        assert_eq!(presets[0].labels["role"], "dev");
+        assert_eq!(c.font_size, 14.0);
+        write(dir.path(), "[gui]\npresets = []\n");
+        assert_eq!(load_config(dir.path()).unwrap().presets, Some(vec![]));
     }
 
     #[test]

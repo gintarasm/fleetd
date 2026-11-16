@@ -23,6 +23,7 @@ use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::git;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
+use crate::core::presets::{Preset, detect_presets, usable};
 use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::settings::{Change, save_changes};
@@ -30,7 +31,9 @@ use crate::core::shortcuts::ClosedPanes;
 use crate::core::sidebar::{GroupBy, ended, tilde, toggle_collapsed};
 use crate::core::sidebar_tree::{removable_ended, toggle_disclosure};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
-use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
+use crate::core::state::{
+    GuiState, MAX_RECENT_COMMANDS, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent,
+};
 use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
 use crate::core::style::chrome;
 use crate::core::tabs::Tabs;
@@ -338,6 +341,12 @@ pub struct AppState {
     /// The directory of the spawn on its way into a pane; it becomes a
     /// recent directory once the pane shows the new agent.
     spawn_dirs: HashMap<PaneId, String>,
+    /// The New agent sheet's command line of the spawn on its way into a
+    /// pane; it becomes a recent command with the directory (ADR 0084).
+    spawn_commands: HashMap<PaneId, String>,
+    /// The presets found on `PATH` for this target, once asked for
+    /// (`[gui] presets` unset; ADR 0084).
+    detected_presets: Option<(Target, Vec<Preset>)>,
     /// Agents asked for in a pane (sidebar click) that it does not show
     /// yet; until then the pane's old agent is not adopted back.
     requested: HashMap<PaneId, u64>,
@@ -410,6 +419,8 @@ impl AppState {
             celebrating: None,
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
+            spawn_commands: HashMap::new(),
+            detected_presets: None,
             requested: HashMap::new(),
             restarting: HashMap::new(),
             unlisted: HashMap::new(),
@@ -492,6 +503,7 @@ impl AppState {
         self.celebrating = None;
         self.starting.clear();
         self.spawn_dirs.clear();
+        self.spawn_commands.clear();
         self.requested.clear();
         self.restarting.clear();
         self.unlisted.clear();
@@ -810,6 +822,14 @@ impl AppState {
                 .entry(self.target.to_string())
                 .or_default();
             push_recent(dirs, dir, MAX_RECENT_DIRS);
+        }
+        if let Some(line) = self.spawn_commands.remove(&pane) {
+            let commands = self
+                .gui_state
+                .recent_commands
+                .entry(self.target.to_string())
+                .or_default();
+            push_recent(commands, line, MAX_RECENT_COMMANDS);
         }
         true
     }
@@ -1343,6 +1363,7 @@ impl AppState {
     fn forget_pending(&mut self, pane: PaneId) {
         self.starting.remove(&pane);
         self.spawn_dirs.remove(&pane);
+        self.spawn_commands.remove(&pane);
         self.requested.remove(&pane);
         self.restarting.remove(&pane);
     }
@@ -1422,6 +1443,23 @@ impl AppState {
         self.spawn_dirs.insert(pane, cwd);
         self.refresh_chrome(cx);
         cx.notify();
+        Ok(())
+    }
+
+    /// A spawn from the New agent sheet: as [`AppState::spawn`], and
+    /// `command` (as typed, without the prompt) becomes a recent command
+    /// once the pane shows the new agent.
+    pub fn spawn_from_sheet(
+        &mut self,
+        req: SpawnRequest,
+        command: String,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        self.spawn(req, cx)?;
+        let command = command.trim().to_owned();
+        if !command.is_empty() {
+            self.spawn_commands.insert(self.tabs.focused(), command);
+        }
         Ok(())
     }
 
@@ -1663,6 +1701,39 @@ impl AppState {
             .get(&self.target.to_string())
             .map_or(&[][..], Vec::as_slice);
         dir_choices(recent, &self.agents)
+    }
+
+    /// The New agent sheet's recent commands for the target, most recent
+    /// first.
+    pub fn recent_commands(&self) -> Vec<String> {
+        self.gui_state
+            .recent_commands
+            .get(&self.target.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The command presets (ADR 0084): `[gui] presets`, else the agents
+    /// found on `PATH`, looked for once per target on first use (a few
+    /// `stat`s, never per frame).
+    pub fn presets(&mut self) -> Vec<Preset> {
+        if let Some(presets) = &self.config.presets {
+            return usable(presets);
+        }
+        match &self.detected_presets {
+            Some((target, presets)) if *target == self.target => presets.clone(),
+            _ => {
+                let path = std::env::var_os("PATH").unwrap_or_default();
+                let found = detect_presets(&self.target, &path, &self.home);
+                self.detected_presets = Some((self.target.clone(), found.clone()));
+                found
+            }
+        }
+    }
+
+    /// The presets come from `PATH` (no `[gui] presets`).
+    pub fn presets_detected(&self) -> bool {
+        self.config.presets.is_none()
     }
 
     pub fn config(&self) -> &GuiConfig {

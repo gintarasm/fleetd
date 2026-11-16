@@ -36,6 +36,7 @@ pub enum RowMenuItem {
     OpenSplit,
     Rename,
     EditLabels,
+    Duplicate,
     SaveOutput,
     OpenOutput,
     Kill,
@@ -49,6 +50,8 @@ impl RowMenuItem {
             RowMenuItem::OpenSplit => "Open in New Split",
             RowMenuItem::Rename => "Rename…",
             RowMenuItem::EditLabels => "Edit Labels…",
+            // The New agent sheet, prefilled (ADR 0084).
+            RowMenuItem::Duplicate => "Duplicate…",
             RowMenuItem::SaveOutput => "Save Output…",
             RowMenuItem::OpenOutput => "Open Output in Editor",
             // It asks first.
@@ -60,7 +63,7 @@ impl RowMenuItem {
 }
 
 /// A row's menu: Open in New Split (while a pane can be added), Rename…
-/// and Edit Labels…, Save Output… and Open Output in Editor (ADR 0086),
+/// Edit Labels… and Duplicate…, Save Output… and Open Output in Editor (ADR 0086),
 /// then Kill for a running agent, or Restart and Remove for one that
 /// exited or is lost.
 pub fn row_menu(can_split: bool, ended: bool) -> Vec<MenuEntry<RowMenuItem>> {
@@ -71,6 +74,7 @@ pub fn row_menu(can_split: bool, ended: bool) -> Vec<MenuEntry<RowMenuItem>> {
     }
     out.push(MenuEntry::Item(RowMenuItem::Rename));
     out.push(MenuEntry::Item(RowMenuItem::EditLabels));
+    out.push(MenuEntry::Item(RowMenuItem::Duplicate));
     out.push(MenuEntry::Separator);
     out.push(MenuEntry::Item(RowMenuItem::SaveOutput));
     out.push(MenuEntry::Item(RowMenuItem::OpenOutput));
@@ -109,6 +113,7 @@ pub enum PaneMenuItem {
     Restore,
     Rename,
     EditLabels,
+    Duplicate,
     CopyLastOutput,
     SaveOutput,
     OpenOutput,
@@ -136,6 +141,7 @@ impl PaneMenuItem {
             PaneMenuItem::Restore => "Restore Pane".to_owned(),
             PaneMenuItem::Rename => format!("Rename {what}…"),
             PaneMenuItem::EditLabels => "Edit Labels…".to_owned(),
+            PaneMenuItem::Duplicate => "Duplicate Agent…".to_owned(),
             PaneMenuItem::CopyLastOutput => "Copy Last Output".to_owned(),
             PaneMenuItem::SaveOutput => "Save Output…".to_owned(),
             PaneMenuItem::OpenOutput => "Open Output in Editor".to_owned(),
@@ -164,6 +170,7 @@ impl PaneMenuItem {
             PaneMenuItem::SaveOutput => cmd_shift("s"),
             PaneMenuItem::Rename
             | PaneMenuItem::EditLabels
+            | PaneMenuItem::Duplicate
             | PaneMenuItem::CopyLastOutput
             | PaneMenuItem::OpenOutput => None,
         }
@@ -233,12 +240,13 @@ pub fn pane_menu(s: PaneMenuState) -> Vec<MenuEntry<(PaneMenuItem, bool)>> {
             out.push(MenuEntry::Item((item, true)));
         }
     }
-    // The agent's own items, in one group: Rename and Edit Labels, then
-    // Restart (ended) or Kill (running).
+    // The agent's own items, in one group: Rename, Edit Labels and Duplicate,
+    // then Restart (ended) or Kill (running).
     let mut agent = Vec::new();
     if s.has_agent {
         agent.push(PaneMenuItem::Rename);
         agent.push(PaneMenuItem::EditLabels);
+        agent.push(PaneMenuItem::Duplicate);
     }
     if s.restartable {
         agent.push(PaneMenuItem::Restart);
@@ -290,6 +298,7 @@ mod tests {
                 R::OpenSplit,
                 R::Rename,
                 R::EditLabels,
+                R::Duplicate,
                 R::SaveOutput,
                 R::OpenOutput,
                 R::Kill
@@ -301,6 +310,7 @@ mod tests {
                 R::OpenSplit,
                 R::Rename,
                 R::EditLabels,
+                R::Duplicate,
                 R::SaveOutput,
                 R::OpenOutput,
                 R::Restart,
@@ -312,6 +322,7 @@ mod tests {
             [
                 R::Rename,
                 R::EditLabels,
+                R::Duplicate,
                 R::SaveOutput,
                 R::OpenOutput,
                 R::Kill
@@ -368,6 +379,7 @@ mod tests {
                 (P::OpenOutput, true),
                 (P::Rename, true),
                 (P::EditLabels, true),
+                (P::Duplicate, true),
                 (P::Restart, true),
                 (P::Close, true)
             ]
@@ -387,6 +399,7 @@ mod tests {
                 MenuEntry::Separator,
                 MenuEntry::Item((P::Rename, true)),
                 MenuEntry::Item((P::EditLabels, true)),
+                MenuEntry::Item((P::Duplicate, true)),
                 MenuEntry::Item((P::Kill, true)),
                 MenuEntry::Separator,
                 MenuEntry::Item((P::Close, true))

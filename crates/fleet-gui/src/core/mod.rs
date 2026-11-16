@@ -26,6 +26,7 @@ pub mod palette;
 pub mod pane;
 mod pane_link;
 pub mod picker;
+pub mod presets;
 pub mod row_preview;
 pub mod scroll_feedback;
 pub mod scrollback;
