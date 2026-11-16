@@ -2,9 +2,9 @@
 //! spec §1). The server asks this module at the handshake and for each
 //! request from an agent; the user's requests never get here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fleet_node::node::Node;
 use fleet_node::scope::{Caller, FORBIDDEN_PREFIX, Quotas};
@@ -64,16 +64,133 @@ fn forbidden(what: &str) -> String {
     format!("{FORBIDDEN_PREFIX} {what}")
 }
 
-/// What agent `a` may not do with `kind`: the refusal's message, or `None`
-/// when the request may go on (spec §1's table). `in_scope` caches the
-/// agents already found among `a`'s descendants: an agent never leaves a
-/// subtree (its `fleet.parent` cannot change), so a hit needs no lookup.
-pub(crate) async fn refusal(
-    node: &Arc<Node>,
-    a: u64,
-    in_scope: &mut HashSet<u64>,
-    kind: &Option<request::Kind>,
-) -> Option<String> {
+/// What a connection may see and touch: everything for the user; for agent
+/// `a`, its descendants (`D(a)`, spec §1). Shared by the request loop and
+/// the event forwarders.
+///
+/// Answers are cached per agent id for the connection's life, both ways:
+/// an agent's `fleet.parent` never changes (agents cannot relabel, and a
+/// restart keeps the labels), so whether an id is in `D(a)` never changes
+/// either. A miss (an agent spawned since) re-reads the tree.
+#[derive(Clone)]
+pub(crate) struct Scope(Option<Arc<View>>);
+
+pub(crate) struct View {
+    node: Arc<Node>,
+    agent: u64,
+    known: Mutex<HashMap<u64, bool>>,
+}
+
+impl Scope {
+    /// The user's: everything.
+    #[cfg(test)]
+    pub(crate) fn user() -> Scope {
+        Scope(None)
+    }
+
+    pub(crate) fn new(node: &Arc<Node>, caller: Caller) -> Scope {
+        Scope(match caller {
+            Caller::User => None,
+            Caller::Agent(agent) => Some(Arc::new(View {
+                node: Arc::clone(node),
+                agent,
+                known: Mutex::new(HashMap::new()),
+            })),
+        })
+    }
+
+    fn cached(view: &View, id: u64) -> Option<bool> {
+        view.known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .copied()
+    }
+
+    /// Records a fresh read of the tree: `D(a)` is in, `asked` (if not in
+    /// it) is out. A failed read leaves the cache alone and answers no.
+    fn learn(view: &View, mine: std::io::Result<HashSet<u64>>, asked: Option<u64>) -> bool {
+        let mine = match mine {
+            Ok(mine) => mine,
+            Err(e) => {
+                warn!(agent = view.agent, error = %e, "reading the agent tree failed");
+                return false;
+            }
+        };
+        let mut known = view.known.lock().unwrap_or_else(|e| e.into_inner());
+        for &id in &mine {
+            known.insert(id, true);
+        }
+        match asked {
+            Some(id) => *known.entry(id).or_insert(false),
+            None => true,
+        }
+    }
+
+    /// Reads `D(a)` into the cache (at the handshake, so removals of
+    /// agents already in the subtree are recognised).
+    pub(crate) async fn warm(&self) {
+        if let Some(view) = &self.0 {
+            let v = Arc::clone(view);
+            let mine =
+                tokio::task::spawn_blocking(move || v.node.tree().map(|t| t.descendants(v.agent)))
+                    .await
+                    .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+            Self::learn(view, mine, None);
+        }
+    }
+
+    /// Whether the connection may see agent `id`.
+    pub(crate) async fn sees(&self, id: u64) -> bool {
+        let Some(view) = &self.0 else {
+            return true;
+        };
+        if let Some(known) = Self::cached(view, id) {
+            return known;
+        }
+        let v = Arc::clone(view);
+        let mine =
+            tokio::task::spawn_blocking(move || v.node.tree().map(|t| t.descendants(v.agent)))
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+        Self::learn(view, mine, Some(id))
+    }
+
+    /// [`Scope::sees`] without awaiting, for a caller holding a lock: a
+    /// miss reads the store on this thread (once per new agent id).
+    pub(crate) fn sees_now(&self, id: u64) -> bool {
+        let Some(view) = &self.0 else {
+            return true;
+        };
+        if let Some(known) = Self::cached(view, id) {
+            return known;
+        }
+        let mine = view.node.tree().map(|t| t.descendants(view.agent));
+        Self::learn(view, mine, Some(id))
+    }
+
+    /// The cached answer only (yes for the user): for a forgotten agent,
+    /// whose row can no longer be read.
+    pub(crate) fn sees_now_cached(&self, id: u64) -> bool {
+        match &self.0 {
+            None => true,
+            Some(view) => Self::cached(view, id).unwrap_or(false),
+        }
+    }
+
+    /// Whether a refused spawn of `parent`'s is the connection's business:
+    /// its own, or a descendant's.
+    async fn sees_refusal(&self, parent: u64) -> bool {
+        match &self.0 {
+            Some(view) if view.agent == parent => true,
+            _ => self.sees(parent).await,
+        }
+    }
+}
+
+/// What agent `a` (the scope's) may not do with `kind`: the refusal's
+/// message, or `None` when the request may go on (spec §1's table).
+pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>) -> Option<String> {
     use request::Kind;
     let targets: Vec<u64> = match kind.as_ref()? {
         // Becomes a's child; the node narrows labels and applies quotas.
@@ -96,39 +213,28 @@ pub(crate) async fn refusal(
         // With `exited_only`, the node keeps to a's descendants.
         Kind::Forget(r) => r.ids.clone(),
     };
-    let missing: Vec<u64> = targets
-        .into_iter()
-        .filter(|id| !in_scope.contains(id))
-        .collect();
-    if missing.is_empty() {
-        return None;
+    for id in targets {
+        if !scope.sees(id).await {
+            return Some(forbidden(&format!(
+                "agent {id} is not a descendant of agent {a}"
+            )));
+        }
     }
-    let node = Arc::clone(node);
-    let mine = tokio::task::spawn_blocking(move || node.tree().map(|t| t.descendants(a)))
-        .await
-        .map_err(std::io::Error::other)
-        .and_then(|r| r);
-    let mine = match mine {
-        Ok(mine) => mine,
-        Err(e) => return Some(format!("checking the caller's scope failed: {e}")),
-    };
-    if let Some(id) = missing.iter().find(|id| !mine.contains(id)) {
-        return Some(forbidden(&format!(
-            "agent {id} is not a descendant of agent {a}"
-        )));
-    }
-    in_scope.extend(mine);
     None
 }
 
-/// Forwards refused spawns to the connection as `SpawnRefused` events.
+/// Forwards refused spawns (in its scope) to the connection as `SpawnRefused` events.
 pub(crate) async fn forward_refused(
     mut refused: broadcast::Receiver<SpawnRefused>,
     outbox: mpsc::Sender<Frame>,
+    scope: Scope,
 ) {
     loop {
         match refused.recv().await {
             Ok(ev) => {
+                if !scope.sees_refusal(ev.parent).await {
+                    continue;
+                }
                 let frame = Frame::Event(Event {
                     kind: Some(event::Kind::SpawnRefused(ev)),
                 });

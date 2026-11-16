@@ -114,3 +114,88 @@ fn a_token_identifies_the_connection_and_refusals_are_broadcast() {
         refused.reason
     );
 }
+
+/// Reads `conn`'s frames on a thread of their own.
+fn frames(conn: Connection) -> std::sync::mpsc::Receiver<Frame> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut reader, sender) = conn.split();
+    std::thread::spawn(move || {
+        let _keep = sender;
+        while let Ok(Some(f)) = reader.read_frame() {
+            if tx.send(f).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// The agent an event is about, and what kind it is.
+fn about(f: &Frame) -> Option<(u64, &'static str)> {
+    let Frame::Event(e) = f else { return None };
+    Some(match e.kind.as_ref()? {
+        event::Kind::Activity(a) => (a.agent_id, "activity"),
+        event::Kind::Exited(x) => (x.agent_id, "exited"),
+        event::Kind::AgentRemoved(r) => (r.agent_id, "removed"),
+        event::Kind::SpawnRefused(r) => (r.parent, "refused"),
+        _ => return None,
+    })
+}
+
+#[test]
+fn an_agents_events_are_its_descendants_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let _d = Daemon::start(dir.path());
+    let sock = dir.path().join("fleetd.sock");
+    let mut user = Connection::unix(&sock, "user").unwrap();
+    let tok = dir.path().join("p.tok");
+    let p = spawn(
+        &mut user,
+        &format!(
+            "printf %s \"$FLEET_AGENT_TOKEN\" > {0}.tmp && mv {0}.tmp {0}; exec sleep 600",
+            tok.display()
+        ),
+    );
+    let token = read_when_there(&tok);
+    let mut agent = Connection::unix_as(&sock, "agent", Some(&token)).unwrap();
+    // P's child, and the user's own agent, each print and exit.
+    let child = spawn(&mut agent, "echo child-out; sleep 1; exit 4");
+    let other = spawn(&mut user, "echo user-secret; sleep 1; exit 5");
+    let events = frames(agent);
+
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let wait_for = |seen: &mut Vec<(u64, &'static str)>, want: (u64, &'static str)| {
+        while !seen.contains(&want) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match events.recv_timeout(left) {
+                Ok(f) => seen.extend(about(&f)),
+                Err(_) => panic!("no {want:?}; saw {seen:?}"),
+            }
+        }
+    };
+    wait_for(&mut seen, (child, "activity"));
+    wait_for(&mut seen, (child, "exited"));
+    // Both have exited (the user's started after the child): forget them.
+    let gone = Instant::now() + Duration::from_secs(10);
+    for id in [other, child] {
+        loop {
+            let req = fleet_proto::ForgetAgents {
+                ids: vec![id],
+                ..Default::default()
+            };
+            match user.call(request::Kind::Forget(Box::new(req))).unwrap() {
+                response::Kind::Forgotten(f) if f.refused.is_empty() => break,
+                _ => assert!(Instant::now() < gone, "agent {id} did not exit"),
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    wait_for(&mut seen, (child, "removed"));
+    std::thread::sleep(Duration::from_millis(300));
+    seen.extend(events.try_iter().filter_map(|f| about(&f)));
+    assert!(
+        seen.iter().all(|&(id, _)| id == child),
+        "only the child's events (not {other}'s or {p}'s): {seen:?}"
+    );
+}

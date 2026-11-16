@@ -373,6 +373,7 @@ async fn connection(
     }
     reader.decoder_mut().set_max(MAX_FRAME);
 
+    let node_for_scope = Arc::clone(&node);
     let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
     // Removals other connections caused, for the request loop to drop
     // this connection's state for them.
@@ -388,22 +389,34 @@ async fn connection(
         log_follower: None,
         restarting: None,
         caller,
-        in_scope: HashSet::new(),
+        scope: scope::Scope::new(&node_for_scope, caller),
     };
+    // Boxed: kept out of every connection's future.
+    Box::pin(conn.scope.warm()).await;
     let writer = tokio::spawn(write_frames(id, writer, rx));
     let tasks = Tasks(vec![
         tokio::spawn(forward_exits(
             exits,
             conn.outbox.clone(),
             Arc::clone(&conn.attached),
+            conn.scope.clone(),
         )),
-        tokio::spawn(forward_activity(activity, conn.outbox.clone())),
-        tokio::spawn(scope::forward_refused(refused, conn.outbox.clone())),
+        tokio::spawn(forward_activity(
+            activity,
+            conn.outbox.clone(),
+            conn.scope.clone(),
+        )),
+        tokio::spawn(scope::forward_refused(
+            refused,
+            conn.outbox.clone(),
+            conn.scope.clone(),
+        )),
         tokio::spawn(forward_removed(
             removed,
             conn.outbox.clone(),
             id,
             removed_tx,
+            conn.scope.clone(),
         )),
     ]);
 
@@ -479,9 +492,8 @@ struct Connection {
     restarting: Option<std::sync::mpsc::SyncSender<()>>,
     /// Who this connection is (ADR 0072), fixed at the handshake.
     caller: Caller,
-    /// For an agent caller: agents found among its descendants (see
-    /// [`scope::refusal`]).
-    in_scope: HashSet<u64>,
+    /// What the caller may see and touch (all for the user).
+    scope: scope::Scope,
 }
 
 impl Drop for Connection {
@@ -528,7 +540,7 @@ impl Connection {
         self.sweep_removed().await;
         if let Caller::Agent(a) = self.caller {
             // Boxed: kept out of every request's future.
-            let refused = Box::pin(scope::refusal(&self.node, a, &mut self.in_scope, &req.kind));
+            let refused = Box::pin(scope::refusal(&self.scope, a, &req.kind));
             if let Some(message) = refused.await {
                 return self.respond(req.id, error(message)).await;
             }
@@ -1038,11 +1050,12 @@ async fn forward_exits(
     mut exits: broadcast::Receiver<fleet_proto::AgentExited>,
     outbox: mpsc::Sender<Frame>,
     attached: Arc<Mutex<HashSet<u64>>>,
+    scope: scope::Scope,
 ) {
     loop {
         match exits.recv().await {
             Ok(e) => {
-                if lock(&attached).contains(&e.agent_id) {
+                if lock(&attached).contains(&e.agent_id) || !scope.sees(e.agent_id).await {
                     continue;
                 }
                 if outbox
@@ -1076,11 +1089,23 @@ async fn forward_removed(
     outbox: mpsc::Sender<Frame>,
     own: ConnId,
     local: mpsc::UnboundedSender<u64>,
+    scope: scope::Scope,
 ) {
     loop {
         match removed.recv().await {
             Ok(r) => {
                 if r.origin == Some(own) {
+                    continue;
+                }
+                // A forgotten agent's row is gone: only the cache (warmed
+                // at the handshake, fed by its exit) still places it; a
+                // restarted one is placed by its successor.
+                let seen = scope.sees_now_cached(r.event.agent_id)
+                    || match r.event.replaced_by {
+                        Some(new) => scope.sees(new).await,
+                        None => false,
+                    };
+                if !seen {
                     continue;
                 }
                 let agent_id = r.event.agent_id;
@@ -1105,16 +1130,23 @@ async fn forward_removed(
 /// events wait in the receiver, which keeps only each agent's newest one.
 /// An event is taken only once an outbox slot is reserved, and queued
 /// without waiting, so it never follows that agent's exit event.
-async fn forward_activity(activity: ActivityReceiver, outbox: mpsc::Sender<Frame>) {
+/// An agent caller gets only its descendants' activity.
+async fn forward_activity(
+    activity: ActivityReceiver,
+    outbox: mpsc::Sender<Frame>,
+    scope: scope::Scope,
+) {
     loop {
         loop {
             let Ok(slot) = outbox.reserve().await else {
                 return;
             };
             let delivered = activity.deliver_next(|a| {
-                slot.send(Frame::Event(Event {
-                    kind: Some(event::Kind::Activity(a)),
-                }));
+                if scope.sees_now(a.agent_id) {
+                    slot.send(Frame::Event(Event {
+                        kind: Some(event::Kind::Activity(a)),
+                    }));
+                }
             });
             if !delivered {
                 break;
@@ -1237,7 +1269,7 @@ mod tests {
             log_follower: None,
             restarting: None,
             caller: Caller::User,
-            in_scope: HashSet::new(),
+            scope: scope::Scope::user(),
         };
         (server, conn, rx)
     }
@@ -1371,7 +1403,13 @@ mod tests {
         let (outbox, mut out_rx) = mpsc::channel(OUTBOX_CAPACITY);
         let (local, mut local_rx) = mpsc::unbounded_channel();
         let own = ConnId(1);
-        let task = tokio::spawn(forward_removed(removed, outbox, own, local));
+        let task = tokio::spawn(forward_removed(
+            removed,
+            outbox,
+            own,
+            local,
+            scope::Scope::user(),
+        ));
         let removal = |agent_id, origin| Removed {
             event: AgentRemoved {
                 agent_id,
