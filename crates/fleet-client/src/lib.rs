@@ -19,8 +19,8 @@ use fleet_proto::{
 use tokio_util::codec::{Decoder, Encoder};
 
 pub mod names;
-pub mod tree;
 mod restart;
+pub mod tree;
 pub use restart::{
     RESTART_ANSWER_WAIT, RESTART_WAIT, Restart, RestartOutcome, TOO_OLD, did_not_come_back,
     restart_daemon, restart_failed, restart_outcome,

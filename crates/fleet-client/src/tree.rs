@@ -259,7 +259,13 @@ mod tests {
 
     #[test]
     fn walk_reports_depth_and_last_flags_and_honours_collapse() {
-        let tree = t(&[(1, None), (2, Some(1)), (3, Some(1)), (4, Some(2)), (5, None)]);
+        let tree = t(&[
+            (1, None),
+            (2, Some(1)),
+            (3, Some(1)),
+            (4, Some(2)),
+            (5, None),
+        ]);
         let w = tree.walk(|_| true);
         let ids: Vec<u64> = w.iter().map(|v| v.id).collect();
         assert_eq!(ids, [1, 2, 4, 3, 5]);
