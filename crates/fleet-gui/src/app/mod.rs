@@ -131,6 +131,16 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                 ],
             },
             Menu {
+                name: "Window".into(),
+                items: vec![
+                    MenuItem::action("New Tab", keymap::NewTab),
+                    MenuItem::action("Close Tab", keymap::CloseTab),
+                    MenuItem::separator(),
+                    MenuItem::action("Show Next Tab", keymap::NextTab),
+                    MenuItem::action("Show Previous Tab", keymap::PrevTab),
+                ],
+            },
+            Menu {
                 name: "Help".into(),
                 items: vec![MenuItem::action(
                     "Keyboard Shortcuts",

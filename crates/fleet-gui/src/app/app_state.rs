@@ -30,6 +30,7 @@ use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
 use crate::core::state::{GuiState, MAX_RECENT_DIRS, MAX_RECENT_TARGETS, push_recent};
 use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
 use crate::core::style::chrome;
+use crate::core::tabs::Tabs;
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
 use crate::core::zoom::{FontZoom, Zoom};
@@ -220,14 +221,6 @@ impl SessionApi for NoSession {
     fn set_palette(&self, _palette: Palette) {}
 }
 
-/// `target`'s saved layout, else one empty pane.
-fn saved_layout(state: &GuiState, target: &Target) -> Layout {
-    state
-        .layouts
-        .get(&target.to_string())
-        .map_or_else(Layout::single, Layout::from_saved)
-}
-
 /// Applies the session's events from `ui`, in batches.
 fn follow(ui: async_channel::Receiver<UiEvent>, cx: &mut Context<AppState>) -> Task<()> {
     cx.spawn(async move |this, cx| {
@@ -271,12 +264,13 @@ pub struct AppState {
     /// ⌘+ / ⌘− / ⌘0 (window-wide, not saved).
     zoom: FontZoom,
     gui_state: GuiState,
-    pub(super) layout: Layout,
+    /// The workspace tabs, each a layout with its focused pane (ADR 0061).
+    /// Every tab's panes are open; only the shown tab's are drawn.
+    tabs: Tabs,
     panes: HashMap<PaneId, Entity<PaneView>>,
-    focused: PaneId,
     /// The agents of panes closed lately, for ⌘⇧T (not saved).
     closed: ClosedPanes,
-    /// The pane filling the pane area, if any (not saved).
+    /// The shown tab's pane filling the pane area, if any (not saved).
     pub(super) maximized: Option<PaneId>,
     /// OSC titles of the agents shown in panes.
     pub(super) titles: HashMap<u64, String>,
@@ -349,11 +343,10 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> Self {
         let gui_state = GuiState::load(&state_dir);
-        let layout = saved_layout(&gui_state, &target);
+        let tabs = gui_state.saved_tabs(&target);
         session.set_palette(theme.palette);
         cx.set_global(theme);
         let events = follow(ui, cx);
-        let focused = layout.panes()[0];
         let mut s = AppState {
             agents: session.agents(),
             session,
@@ -364,10 +357,9 @@ impl AppState {
             home: home_dir(),
             config,
             gui_state,
-            layout,
+            tabs,
             panes: HashMap::new(),
             zoom: FontZoom::default(),
-            focused,
             closed: ClosedPanes::default(),
             maximized: None,
             titles: HashMap::new(),
@@ -397,8 +389,8 @@ impl AppState {
             save_task: None,
             _events: events,
         };
-        for pane in s.layout.panes() {
-            let agent = s.layout.agent(pane);
+        for pane in s.tabs.panes() {
+            let agent = s.tabs.agent(pane);
             s.open(pane, agent, cx);
         }
         s.refresh_chrome(cx);
@@ -425,9 +417,9 @@ impl AppState {
         );
         s.live = false;
         s.panes.clear();
-        s.layout = Layout::single();
-        s.focused = s.layout.panes()[0];
-        s.open(s.focused, None, cx);
+        s.tabs = Tabs::single();
+        let pane = s.tabs.focused();
+        s.open(pane, None, cx);
         s.refresh_chrome(cx);
         s
     }
@@ -449,9 +441,8 @@ impl AppState {
         self.target = target;
         self.session.set_palette(self.theme.palette);
         self._events = follow(ui, cx);
-        self.layout = saved_layout(&self.gui_state, &self.target);
+        self.tabs = self.gui_state.saved_tabs(&self.target);
         self.panes.clear();
-        self.focused = self.layout.panes()[0];
         self.maximized = None;
         self.closed.clear();
         self.titles.clear();
@@ -475,8 +466,8 @@ impl AppState {
         self.update_available = self.session.update_available();
         self.updating = false;
         self.agents = self.session.agents();
-        for pane in self.layout.panes() {
-            let agent = self.layout.agent(pane);
+        for pane in self.tabs.panes() {
+            let agent = self.tabs.agent(pane);
             self.open(pane, agent, cx);
         }
         let target = self.target.clone();
@@ -527,12 +518,18 @@ impl AppState {
         cx.try_global::<AppGlobal>().map(|g| g.0.clone())
     }
 
+    /// The shown tab's layout.
     pub fn layout(&self) -> &Layout {
-        &self.layout
+        self.tabs.layout()
     }
 
+    pub fn tabs(&self) -> &Tabs {
+        &self.tabs
+    }
+
+    /// The shown tab's focused pane.
     pub fn focused(&self) -> PaneId {
-        self.focused
+        self.tabs.focused()
     }
 
     pub fn pane_view(&self, pane: PaneId) -> Option<&Entity<PaneView>> {
@@ -633,7 +630,7 @@ impl AppState {
                     if rang {
                         view.update(cx, |v, cx| v.flash(cx));
                         if let Some(id) = agent
-                            && !(self.window_active && pane == self.focused)
+                            && !(self.window_active && pane == self.tabs.focused())
                         {
                             status |= self.bells.insert(id);
                         }
@@ -738,10 +735,10 @@ impl AppState {
             }
             self.requested.remove(&pane);
         }
-        if self.layout.agent(pane) == Some(shown) {
+        if self.tabs.agent(pane) == Some(shown) {
             return false;
         }
-        self.layout.set_agent(pane, Some(shown));
+        self.tabs.set_agent(pane, Some(shown));
         self.starting.remove(&pane);
         self.restarting.remove(&pane);
         if let Some(dir) = self.spawn_dirs.remove(&pane) {
@@ -759,7 +756,7 @@ impl AppState {
     /// shows `new` (attaching unless it started `new` itself) or becomes
     /// empty. True if the layout changed.
     fn follow_removed(&mut self, old: u64, new: Option<u64>, cx: &mut Context<Self>) -> bool {
-        let panes = self.layout.replace_agent(old, new);
+        let panes = self.tabs.replace_agent(old, new);
         for &pane in &panes {
             let restarted_here = self.restarting.get(&pane) == Some(&old);
             self.forget_pending(pane);
@@ -786,7 +783,7 @@ impl AppState {
             return;
         }
         self.forget_pending(pane);
-        if let Some(agent) = self.layout.agent(pane) {
+        if let Some(agent) = self.tabs.agent(pane) {
             self.requested.insert(pane, agent);
             self.session.attach(pane, agent);
         }
@@ -806,8 +803,8 @@ impl AppState {
         let fresh = std::mem::replace(&mut self.last_list, list) != list;
         let mut unlisted = HashMap::new();
         let mut changed = false;
-        for pane in self.layout.panes() {
-            let Some(id) = self.layout.agent(pane) else {
+        for pane in self.tabs.panes() {
+            let Some(id) = self.tabs.agent(pane) else {
                 continue;
             };
             if let Some(&new) = replaced.get(&id) {
@@ -848,7 +845,7 @@ impl AppState {
                 _ => false,
             };
             if gone {
-                self.layout.set_agent(pane, None);
+                self.tabs.set_agent(pane, None);
                 self.forget_pending(pane);
                 self.open(pane, None, cx);
                 changed = true;
@@ -937,7 +934,7 @@ impl AppState {
         if !self.window_active {
             return;
         }
-        if let Some(id) = self.layout.agent(self.focused)
+        if let Some(id) = self.tabs.agent(self.tabs.focused())
             && self.bells.remove(&id)
         {
             self.refresh_status(cx);
@@ -965,12 +962,22 @@ impl AppState {
         let drawn = if self.maximized.is_some() {
             1
         } else {
-            self.layout.panes().len()
+            self.tabs.layout().panes().len()
         };
         let dims = feedback::dims(self.config.focus_mode, drawn);
         let no_agents = self.live && self.session.listed() && self.agents.is_empty();
-        for (i, pane) in self.layout.panes().into_iter().enumerate() {
-            let agent = self.layout.agent(pane);
+        // Every tab's panes: a hidden one is right when its tab is shown.
+        let shown = self.tabs.active();
+        let every_tab: Vec<_> = (0..self.tabs.len())
+            .flat_map(|t| {
+                let layout = self.tabs.tab_layout(t).expect("tab in range");
+                let focused = self.tabs.tab_focused(t);
+                let panes = layout.panes().into_iter().enumerate();
+                panes.map(move |(i, pane)| (t, i, pane, focused == Some(pane)))
+            })
+            .collect();
+        for (t, i, pane, focused) in every_tab {
+            let agent = self.tabs.agent(pane);
             let row = agent.and_then(|id| self.agents.iter().find(|r| r.info.id == id));
             let chrome = PaneChrome {
                 number: i + 1,
@@ -987,8 +994,8 @@ impl AppState {
                     .map(|r| r.info.cwd.clone()),
                 starting: self.starting.contains(&pane),
                 reconnect_in,
-                focused: pane == self.focused,
-                maximized: self.maximized == Some(pane),
+                focused,
+                maximized: t == shown && self.maximized == Some(pane),
                 dims,
                 status: agent.and_then(|id| self.statuses.get(&id).copied()),
                 agent,
@@ -1006,8 +1013,7 @@ impl AppState {
     fn layout_changed(&mut self, cx: &mut Context<Self>) {
         // Unconnected, the layout is a placeholder: the target's saved one stays.
         if self.live {
-            let key = self.target_key();
-            self.gui_state.layouts.insert(key, self.layout.to_saved());
+            self.gui_state.set_tabs(&self.target, &self.tabs);
             self.schedule_save(cx);
         }
         self.refresh_chrome(cx);
@@ -1034,8 +1040,7 @@ impl AppState {
     }
 
     pub fn set_focused(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        if self.focused != pane && self.panes.contains_key(&pane) {
-            self.focused = pane;
+        if self.panes.contains_key(&pane) && self.tabs.set_focused(pane) {
             // Focus moving elsewhere restores the split view.
             if self.maximized.is_some_and(|m| m != pane) {
                 self.maximized = None;
@@ -1054,7 +1059,7 @@ impl AppState {
     pub fn toggle_maximize(&mut self, cx: &mut Context<Self>) {
         self.maximized = match self.maximized {
             Some(_) => None,
-            None if self.layout.panes().len() > 1 => Some(self.focused),
+            None if self.tabs.layout().panes().len() > 1 => Some(self.tabs.focused()),
             None => None,
         };
         cx.notify();
@@ -1063,9 +1068,10 @@ impl AppState {
     /// How each agent's tab relates to the panes.
     pub fn tab_marks(&self) -> HashMap<u64, TabMark> {
         let mut marks = HashMap::new();
-        for pane in self.layout.panes() {
-            if let Some(id) = self.layout.agent(pane) {
-                let mark = if pane == self.focused {
+        let layout = self.tabs.layout();
+        for pane in layout.panes() {
+            if let Some(id) = layout.agent(pane) {
+                let mark = if pane == self.tabs.focused() {
                     TabMark::Focused
                 } else {
                     TabMark::Shown
@@ -1082,10 +1088,9 @@ impl AppState {
     /// Splits the focused pane; the new, empty pane gets the focus. `None`
     /// at [`MAX_PANES`].
     pub fn split(&mut self, axis: Axis, cx: &mut Context<Self>) -> Option<PaneId> {
-        let new = self.layout.split(self.focused, axis)?;
+        let new = self.tabs.split(axis)?;
         self.maximized = None;
         self.open(new, None, cx);
-        self.focused = new;
         self.layout_changed(cx);
         Some(new)
     }
@@ -1100,14 +1105,18 @@ impl AppState {
         h: f32,
         cx: &mut Context<Self>,
     ) {
-        if self.layout.move_divider(split, at, w, h, chrome::PANE_MIN) {
+        if self
+            .tabs
+            .layout_mut()
+            .move_divider(split, at, w, h, chrome::PANE_MIN)
+        {
             self.layout_changed(cx);
         }
     }
 
     /// Evens `split` again (a double-click on its divider).
     pub fn reset_divider(&mut self, split: SplitId, cx: &mut Context<Self>) {
-        if self.layout.reset_divider(split) {
+        if self.tabs.layout_mut().reset_divider(split) {
             self.layout_changed(cx);
         }
     }
@@ -1115,11 +1124,11 @@ impl AppState {
     /// Closes the focused pane, detaching its agent (never killing it).
     /// The last pane stays, empty.
     pub fn close_focused(&mut self, cx: &mut Context<Self>) {
-        let pane = self.focused;
-        let agent = self.layout.agent(pane);
-        let Some(next) = self.layout.close(pane) else {
+        let agent = self.tabs.agent(self.tabs.focused());
+        let Some(pane) = self.tabs.close_focused() else {
             return;
         };
+        let next = self.tabs.focused();
         if let Some(id) = agent {
             self.closed.push(id);
         }
@@ -1131,7 +1140,6 @@ impl AppState {
             // The last pane: a fresh, empty connection in its place.
             self.open(pane, None, cx);
         }
-        self.focused = next;
         self.layout_changed(cx);
     }
 
@@ -1146,8 +1154,8 @@ impl AppState {
         let id = self
             .closed
             .pop(|id| agents.iter().any(|r| r.info.id == id))?;
-        let pane = self.focused;
-        if self.layout.agent(pane).is_none() && !self.starting.contains(&pane) {
+        let pane = self.tabs.focused();
+        if self.tabs.agent(pane).is_none() && !self.starting.contains(&pane) {
             self.show_agent(id, cx);
             return Some(pane);
         }
@@ -1158,25 +1166,88 @@ impl AppState {
         new
     }
 
+    /// A new tab right of the shown one, with one empty pane, shown and
+    /// focused. `None` at [`MAX_TABS`](crate::core::tabs::MAX_TABS).
+    pub fn new_tab(&mut self, cx: &mut Context<Self>) -> Option<PaneId> {
+        let pane = self.tabs.new_tab()?;
+        self.maximized = None;
+        self.open(pane, None, cx);
+        self.layout_changed(cx);
+        Some(pane)
+    }
+
+    /// Closes tab `i`, detaching its panes' agents (never killing them);
+    /// ⌘⇧T reopens them, last pane first. The last tab stays.
+    pub fn close_tab(&mut self, i: usize, cx: &mut Context<Self>) {
+        let shown = i == self.tabs.active();
+        let agents: Vec<u64> = match self.tabs.tab_layout(i) {
+            Some(l) => l.panes().into_iter().filter_map(|p| l.agent(p)).collect(),
+            None => return,
+        };
+        let Some(panes) = self.tabs.close_tab(i) else {
+            return;
+        };
+        for id in agents {
+            self.closed.push(id);
+        }
+        for pane in panes {
+            self.panes.remove(&pane);
+            self.session.close_pane(pane);
+            self.forget_pending(pane);
+        }
+        if shown {
+            self.maximized = None;
+        }
+        self.layout_changed(cx);
+    }
+
+    /// Shows tab `i` (0-based); `true` if that changed the shown tab.
+    pub fn select_tab(&mut self, i: usize, cx: &mut Context<Self>) -> bool {
+        let changed = self.tabs.select(i);
+        self.tab_shown(changed, cx)
+    }
+
+    /// Shows the next tab, wrapping around.
+    pub fn next_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = self.tabs.select_next();
+        self.tab_shown(changed, cx)
+    }
+
+    /// Shows the previous tab, wrapping around.
+    pub fn prev_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        let changed = self.tabs.select_prev();
+        self.tab_shown(changed, cx)
+    }
+
+    /// Another tab is shown: no pane is maximized, and which is shown is saved.
+    fn tab_shown(&mut self, changed: bool, cx: &mut Context<Self>) -> bool {
+        if changed {
+            self.maximized = None;
+            self.layout_changed(cx);
+        }
+        changed
+    }
+
     /// The pane `n` (1-based, reading order).
     pub fn pane_by_number(&self, n: usize) -> Option<PaneId> {
-        self.layout.panes().get(n.checked_sub(1)?).copied()
+        self.tabs.layout().panes().get(n.checked_sub(1)?).copied()
     }
 
     pub fn neighbour(&self, dir: Dir) -> Option<PaneId> {
-        self.layout.neighbour(self.focused, dir, 1.0, 1.0)
+        let tabs = &self.tabs;
+        tabs.layout().neighbour(tabs.focused(), dir, 1.0, 1.0)
     }
 
     /// Shows `agent_id` in the focused pane (attaching again if the pane
     /// is meant to show it but does not, for example after a failed spawn).
     pub fn show_agent(&mut self, agent_id: u64, cx: &mut Context<Self>) {
-        let pane = self.focused;
-        if self.layout.agent(pane) == Some(agent_id) && self.pane_shows(pane, agent_id, cx) {
+        let pane = self.tabs.focused();
+        if self.tabs.agent(pane) == Some(agent_id) && self.pane_shows(pane, agent_id, cx) {
             return;
         }
         self.forget_pending(pane);
         self.requested.insert(pane, agent_id);
-        self.layout.set_agent(pane, Some(agent_id));
+        self.tabs.set_agent(pane, Some(agent_id));
         self.session.attach(pane, agent_id);
         self.layout_changed(cx);
     }
@@ -1200,7 +1271,7 @@ impl AppState {
 
     /// Splits the focused pane to the right and shows `agent_id` there.
     pub fn open_in_new_split(&mut self, agent_id: u64, cx: &mut Context<Self>) -> Option<PaneId> {
-        self.open_beside(self.focused, Dir::Right, agent_id, cx)
+        self.open_beside(self.tabs.focused(), Dir::Right, agent_id, cx)
     }
 
     /// Splits `pane`, the new pane on its `dir` side showing `agent_id`
@@ -1212,11 +1283,10 @@ impl AppState {
         agent_id: u64,
         cx: &mut Context<Self>,
     ) -> Option<PaneId> {
-        let new = self.layout.split_toward(pane, dir)?;
+        let new = self.tabs.split_toward(pane, dir)?;
         self.maximized = None;
-        self.layout.set_agent(new, Some(agent_id));
+        self.tabs.set_agent(new, Some(agent_id));
         self.open(new, Some(agent_id), cx);
-        self.focused = new;
         self.layout_changed(cx);
         Some(new)
     }
@@ -1236,19 +1306,20 @@ impl AppState {
             }
             DropAction::SplitShow { pane, dir, agent } => self.open_beside(pane, dir, agent, cx),
             DropAction::Swap { pane, with } => {
-                self.layout.swap(pane, with).then(|| self.moved(pane, cx))
+                let swapped = self.tabs.layout_mut().swap(pane, with);
+                swapped.then(|| self.moved(pane, cx))
             }
-            DropAction::Move { pane, target, dir } => self
-                .layout
-                .move_pane(pane, target, dir)
-                .then(|| self.moved(pane, cx)),
+            DropAction::Move { pane, target, dir } => {
+                let moved = self.tabs.layout_mut().move_pane(pane, target, dir);
+                moved.then(|| self.moved(pane, cx))
+            }
         }
     }
 
     /// `pane` moved in the layout: it gets the focus, in the split view.
     fn moved(&mut self, pane: PaneId, cx: &mut Context<Self>) -> PaneId {
         self.maximized = None;
-        self.focused = pane;
+        self.tabs.focus(pane);
         self.layout_changed(cx);
         pane
     }
@@ -1256,7 +1327,7 @@ impl AppState {
     /// Spawns into the focused pane at its size. The directory becomes a
     /// recent one once the pane shows the new agent.
     pub fn spawn(&mut self, req: SpawnRequest, cx: &mut Context<Self>) -> Result<(), String> {
-        let pane = self.focused;
+        let pane = self.tabs.focused();
         let (cols, rows) = self
             .panes
             .get(&pane)
@@ -1282,8 +1353,9 @@ impl AppState {
     /// focused pane shows an agent and one fits, else in the focused pane,
     /// and that pane is focused.
     pub fn new_terminal(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
-        let focused_agent = self.layout.agent(self.focused);
-        let cwd = self.start_dir(self.focused);
+        let focused = self.tabs.focused();
+        let focused_agent = self.tabs.agent(focused);
+        let cwd = self.start_dir(focused);
         let req = self.terminal_request(cwd);
         if focused_agent.is_some() {
             self.split(Axis::Horizontal, cx);
@@ -1302,7 +1374,7 @@ impl AppState {
     /// as it is unknown here).
     pub(super) fn start_dir(&self, pane: PaneId) -> String {
         let cwd = self
-            .layout
+            .tabs
             .agent(pane)
             .and_then(|id| self.agents.iter().find(|r| r.info.id == id))
             .map(|r| r.info.cwd.as_str());
@@ -1320,15 +1392,16 @@ impl AppState {
 
     /// `pane` shows an agent, or a spawn is on its way into it.
     pub(super) fn pane_filled(&self, pane: PaneId) -> bool {
-        self.layout.agent(pane).is_some() || self.starting.contains(&pane)
+        self.tabs.agent(pane).is_some() || self.starting.contains(&pane)
     }
 
-    /// The agents some pane shows.
+    /// The agents some pane of the shown tab shows.
     pub(super) fn on_screen(&self) -> HashSet<u64> {
-        self.layout
+        let layout = self.tabs.layout();
+        layout
             .panes()
             .into_iter()
-            .filter_map(|p| self.layout.agent(p))
+            .filter_map(|p| layout.agent(p))
             .collect()
     }
 
@@ -1380,7 +1453,7 @@ impl AppState {
             // The final screen on show is that agent's.
             PaneState::Exited(_) => shown,
             // The attach failed: the agent is the one the layout names.
-            PaneState::Lost => self.layout.agent(pane).or(shown),
+            PaneState::Lost => self.tabs.agent(pane).or(shown),
             _ => None,
         }
     }
@@ -1432,7 +1505,7 @@ impl AppState {
     /// Restarts the agent the focused pane shows, in that pane at its
     /// size, if it exited or is lost; otherwise does nothing.
     pub fn restart_focused(&mut self, cx: &mut Context<Self>) {
-        let pane = self.focused;
+        let pane = self.tabs.focused();
         let Some(agent) = self.ended_agent(pane, cx) else {
             return;
         };
