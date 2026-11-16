@@ -9,12 +9,28 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use fleet_proto::{
     AgentInfo, AgentState, ForgetAgents, KillAgent, ListAgents, RestartAgent, SendInput, SetLabels,
     SpawnAgent,
 };
-use fleet_proto::{request, response};
+use fleet_proto::{AgentPriority, request, response};
+
+/// `fleet spawn --priority` (ADR 0066).
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Priority {
+    Normal,
+    Low,
+}
+
+impl From<Priority> for AgentPriority {
+    fn from(p: Priority) -> Self {
+        match p {
+            Priority::Normal => AgentPriority::Normal,
+            Priority::Low => AgentPriority::Low,
+        }
+    }
+}
 
 use fleet_client::names::{self, NAME_LABEL};
 use fleet_client::{Connection, Error, Restart, Result, TOO_OLD, restart_daemon};
@@ -50,6 +66,10 @@ enum Command {
         /// The agent's name (the `name` label; default: generated from the command)
         #[arg(long)]
         name: Option<String>,
+        /// CPU priority: `normal` is never lowered, `low` always is
+        /// (default: fleetd's FLEETD_AGENT_NICE setting)
+        #[arg(long, value_enum)]
+        priority: Option<Priority>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -112,12 +132,21 @@ enum Command {
     Rm {
         /// Agents to remove, by id or name (must be exited or lost)
         ids: Vec<String>,
-        /// Remove every exited or lost agent instead
+        /// Remove every exited or lost agent instead (running ones are never
+        /// touched); prints each removed id
         #[arg(long, conflicts_with = "ids", required_unless_present = "ids")]
         exited: bool,
-        /// With --exited: only agents with this label, as k=v
-        #[arg(long = "selector", value_name = "K=V", requires = "exited")]
-        selector: Vec<String>,
+        /// With --exited: only agents with this label k=v (repeatable)
+        #[arg(
+            long = "label",
+            alias = "selector",
+            value_name = "K=V",
+            requires = "exited",
+            // Else clap drops `requires` when ids are given (they conflict
+            // with --exited) and the filter would be silently ignored.
+            conflicts_with = "ids"
+        )]
+        labels: Vec<String>,
     },
     /// Send text to an agent's terminal
     Send {
@@ -419,6 +448,7 @@ fn run(cli: Cli) -> Result<u8> {
             cwd,
             labels,
             name,
+            priority,
             mut command,
         } => {
             let (tc, tr) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -440,6 +470,7 @@ fn run(cli: Cli) -> Result<u8> {
                 cols: cols.unwrap_or(u32::from(tc)),
                 rows: rows.unwrap_or(u32::from(tr)),
                 labels,
+                priority: priority.map_or(AgentPriority::Default, AgentPriority::from) as i32,
                 ..Default::default()
             };
             match client.call(request::Kind::Spawn(Box::new(spawn)))? {
@@ -518,16 +549,19 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Rm {
             ids,
             exited,
-            selector,
+            labels,
         } => {
             let ids = ids
                 .iter()
                 .map(|a| agent_id(&mut client, a))
                 .collect::<Result<Vec<_>>>()?;
+            // One request: fleetd picks the exited and lost agents under its
+            // agents lock, so one that is running (or restarting) then is
+            // never removed, and the CLI cannot race a list against it.
             let req = ForgetAgents {
                 ids,
                 exited_only: exited,
-                selector: parse_labels(&selector)?,
+                selector: parse_labels(&labels)?,
             };
             match client
                 .call(request::Kind::Forget(Box::new(req)))
@@ -535,7 +569,9 @@ fn run(cli: Cli) -> Result<u8> {
             {
                 response::Kind::Forgotten(f) => {
                     if exited {
-                        println!("removed {} agents", f.ids.len());
+                        for id in &f.ids {
+                            println!("{id}");
+                        }
                     }
                     for id in &f.refused {
                         eprintln!("fleet: agent {id} not removed (running or unknown)");

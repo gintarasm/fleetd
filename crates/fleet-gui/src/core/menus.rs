@@ -80,6 +80,7 @@ pub enum PaneMenuItem {
     Restore,
     Rename,
     Restart,
+    Kill,
     Close,
 }
 
@@ -94,6 +95,8 @@ impl PaneMenuItem {
             PaneMenuItem::Restore => "Restore Pane",
             PaneMenuItem::Rename => "Rename Agent…",
             PaneMenuItem::Restart => "Restart Agent",
+            // It asks first (unless told not to).
+            PaneMenuItem::Kill => "Kill Agent…",
             PaneMenuItem::Close => "Close Pane",
         }
     }
@@ -107,6 +110,7 @@ impl PaneMenuItem {
             PaneMenuItem::SplitDown => cmd_shift("d"),
             PaneMenuItem::Maximize | PaneMenuItem::Restore => cmd_shift("enter"),
             PaneMenuItem::Restart => cmd("r"),
+            PaneMenuItem::Kill => cmd_shift("w"),
             PaneMenuItem::Close => cmd("w"),
             PaneMenuItem::Rename => None,
         }
@@ -127,6 +131,8 @@ pub struct PaneMenuState {
     pub restartable: bool,
     /// The pane shows an agent (Rename is offered).
     pub has_agent: bool,
+    /// The pane shows a running agent (Kill Agent is offered).
+    pub killable: bool,
 }
 
 /// A pane's menu, with each item's enabled state.
@@ -147,14 +153,20 @@ pub fn pane_menu(s: PaneMenuState) -> Vec<MenuEntry<(PaneMenuItem, bool)>> {
         PaneMenuItem::Maximize
     };
     out.push(MenuEntry::Item((size, true)));
-    if s.has_agent || s.restartable {
-        out.push(MenuEntry::Separator);
-    }
+    // The agent's own items, in one group: Rename, then Restart (ended)
+    // or Kill (running).
+    let mut agent = Vec::new();
     if s.has_agent {
-        out.push(MenuEntry::Item((PaneMenuItem::Rename, true)));
+        agent.push(PaneMenuItem::Rename);
     }
     if s.restartable {
-        out.push(MenuEntry::Item((PaneMenuItem::Restart, true)));
+        agent.push(PaneMenuItem::Restart);
+    } else if s.killable {
+        agent.push(PaneMenuItem::Kill);
+    }
+    if !agent.is_empty() {
+        out.push(MenuEntry::Separator);
+        out.extend(agent.into_iter().map(|i| MenuEntry::Item((i, true))));
     }
     out.push(MenuEntry::Separator);
     out.push(MenuEntry::Item((PaneMenuItem::Close, true)));
@@ -214,6 +226,7 @@ mod tests {
             maximized: false,
             restartable: true,
             has_agent: true,
+            killable: false,
         };
         assert_eq!(
             items(&pane_menu(grid)),
@@ -226,6 +239,21 @@ mod tests {
                 (P::Rename, true),
                 (P::Restart, true),
                 (P::Close, true)
+            ]
+        );
+        let running = PaneMenuState {
+            has_agent: true,
+            killable: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            pane_menu(running)[3..],
+            [
+                MenuEntry::Separator,
+                MenuEntry::Item((P::Rename, true)),
+                MenuEntry::Item((P::Kill, true)),
+                MenuEntry::Separator,
+                MenuEntry::Item((P::Close, true))
             ]
         );
         let maximized = PaneMenuState {
@@ -241,13 +269,14 @@ mod tests {
 
     #[test]
     fn menus_never_start_or_end_with_a_separator_or_double_one() {
-        let states = (0..64u8).map(|bits| PaneMenuState {
+        let states = (0..128u8).map(|bits| PaneMenuState {
             on_grid: bits & 1 != 0,
             has_selection: bits & 2 != 0,
             can_split: bits & 4 != 0,
             maximized: bits & 8 != 0,
             restartable: bits & 16 != 0,
-            has_agent: bits & 32 != 0,
+            killable: bits & 32 != 0,
+            has_agent: bits & 64 != 0,
         });
         let check = |seps: Vec<bool>| {
             assert!(!seps.first().unwrap() && !seps.last().unwrap());

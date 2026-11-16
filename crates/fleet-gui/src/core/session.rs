@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fleet_client::names::NAME_LABEL;
 use fleet_client::{
@@ -168,6 +168,12 @@ pub struct AgentRow {
     pub info: AgentInfo,
     pub last_line: String,
     pub last_output_unix_ms: Option<i64>,
+}
+
+fn unix_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Colours used until [`Session::set_palette`]: xterm's defaults.
@@ -1027,6 +1033,9 @@ impl ControlReader {
                             Some(info) => {
                                 info.set_state(AgentState::Exited);
                                 info.exit_code = Some(e.exit_code);
+                                // Until the next list brings the node's
+                                // (an older node lists none).
+                                info.exited_unix_ms.get_or_insert_with(unix_ms_now);
                                 changed = true;
                             }
                             None => relist = true,

@@ -7,9 +7,9 @@ description: Work with the other agents in the fleet run by fleetd. Use when the
 
 `fleetd` runs coding agents (Claude Code and others) in terminals on this
 machine; `fleet` is its command-line client. Each agent has a numeric id
-and a name (its `name` label, such as `sigterm-otter`); every command that
-takes `<id>` also takes a live agent's name. You may be one of them: `$FLEET_AGENT_ID` holds your own id (it is unset
-when you are not running under fleetd).
+and a name (`sigterm-otter`); every command taking `<id>` takes a name too.
+You may be one of them: `$FLEET_AGENT_ID` holds your own id (unset when
+you are not running under fleetd).
 
 ## Rules
 
@@ -37,8 +37,8 @@ fleet ls --json --label project=fleetd
 
 `ls --json` prints an array of objects with `id`, `state` (`running`,
 `exited` or `lost`), `exit_code`, `program`, `args`, `cwd`,
-`created_unix_ms` and `labels` (the name is `labels.name`). Filter with `--label k=v` (repeatable; all
-must match) rather than reading every agent.
+`created_unix_ms` and `labels` (the name is `labels.name`). Filter with
+`--label k=v` (repeatable; all must match) rather than reading every agent.
 
 ## Read an agent's output
 
@@ -94,18 +94,21 @@ fleet spawn --cwd DIR --name review-otter -- claude "review the diff"
 fleet kill <id>
 fleet restart <id>
 fleet rm <id>
+fleet rm --exited
 ```
 
 - `spawn` prints the new agent's id. Everything after `--` is the command
   and its arguments; `--cwd` is its working directory (default: yours).
-- `--name`: pass a short task-related name, lowercase with dashes (such as
-  `lto-falcon` for a link-time optimisation task). Without it fleetd's
-  client makes one up from the prompt. Never pass `--label`.
+- `--name`: a short task name, lowercase with dashes (`lto-falcon`); without
+  it one is made up from the prompt. Never pass `--label`.
 - `kill` stops the agent (SIGTERM to its process group). Its history stays
   readable afterwards.
 - `restart`: same command/cwd/labels, new id (printed), only after the
   agent exited. The environment is not restored.
 - `rm`: forgets an exited agent and its history. Only when asked.
+- `rm --exited`: forgets every exited or lost agent and prints their ids;
+  never a running one. `--label k=v` (repeatable) narrows it as in `ls`.
+  Only when asked.
 - `fleet daemon restart`: restarts fleetd into its new binary; agents keep running. Only when asked.
 
 ## Errors
@@ -113,5 +116,4 @@ fleet rm <id>
 - `fleetd is not running`: tell the user; do not start the daemon yourself.
 - `agent N is not live on this node`: it has exited; `fleet ls --json`
   shows its exit code, and `fleet history` still works.
-- `agent name "x" is ambiguous` or `no agent named "x"`: use the id from
-  `fleet ls --json` instead.
+- `agent name "x" is ambiguous` or `no agent named "x"`: use the id.
