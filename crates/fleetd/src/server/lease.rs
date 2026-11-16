@@ -67,7 +67,7 @@ async fn view(scope: &Scope, caller: Caller, info: Info) -> LeaseInfo {
 }
 
 fn granted(lease: LeaseInfo) -> response::Kind {
-    response::Kind::LeaseGranted(LeaseGranted { lease: Some(lease) })
+    response::Kind::LeaseGranted(Box::new(LeaseGranted { lease: Some(lease) }))
 }
 
 fn busy(name: &str, held: Option<&LeaseInfo>) -> String {

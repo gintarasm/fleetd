@@ -216,7 +216,7 @@ fn acquire(
 ) -> Result<u8> {
     let req = request_for(name, new_key(), ttl, max_load, wait, false);
     let done = notice_if_slow(name, wait);
-    let reply = client.call(request::Kind::AcquireLease(req));
+    let reply = client.call(request::Kind::AcquireLease(Box::new(req)));
     done.store(true, Ordering::SeqCst);
     let info = granted(reply?)?;
     match info.expires_unix_ms {
@@ -293,7 +293,7 @@ fn hold(mut client: Connection, sock: &Path, token: Option<&str>, h: Hold) -> Re
     // request queues again (at the back: the order is not kept).
     let until = Instant::now() + RECONNECT_FOR;
     let conn = loop {
-        match client.call(request::Kind::AcquireLease(req.clone())) {
+        match client.call(request::Kind::AcquireLease(Box::new(req.clone()))) {
             Ok(r) => {
                 granted(r)?;
                 break client;
@@ -373,7 +373,7 @@ fn watch(
             let mut again = req.clone();
             again.wait = false;
             let reclaimed = reconnect(&sock, token.as_deref()).and_then(|mut c| {
-                granted(c.call(request::Kind::AcquireLease(again)).map_err(|e| e)?)?;
+                granted(c.call(request::Kind::AcquireLease(Box::new(again)))?)?;
                 Ok(c)
             });
             match reclaimed {
