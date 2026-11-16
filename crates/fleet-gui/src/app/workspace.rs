@@ -20,7 +20,8 @@ use super::controls::appear;
 use super::keymap::{
     ClosePane, CommandPalette, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
     FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTerminal, NextAgent, Paste, PreviousAgent,
-    Remove, Restart, RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    Remove, ReopenClosedPane, Restart, RestartPane, ShowShortcuts, SplitDown, SplitRight,
+    ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
@@ -31,6 +32,7 @@ use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
 use super::split_dividers::SplitDrag;
 use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
+use super::{controls, keymap};
 use crate::core::config::save_connection;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
@@ -39,6 +41,7 @@ use crate::core::menus::{
 use crate::core::palette::{Command, Entry, palette_items};
 use crate::core::picker::Recents;
 use crate::core::session::PaneId;
+use crate::core::shortcuts::Section;
 use crate::core::sidebar::ended;
 use crate::core::spawn::SpawnRequest;
 use crate::core::style::{chrome, motion, radius, space, text};
@@ -142,6 +145,8 @@ pub struct Workspace {
     pane_focus: HashMap<PaneId, (EntityId, FocusHandle, [Subscription; 2])>,
     /// The panes drawn by the last render.
     drawn: Vec<PaneId>,
+    /// The ⌘/ cheat sheet while shown, and its focus (for Escape).
+    shortcuts: Option<(Vec<Section>, FocusHandle)>,
     /// The window title last set.
     window_title: String,
     /// Reduce Motion is on (read at launch and on appearance changes).
@@ -219,6 +224,7 @@ impl Workspace {
             epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
+            shortcuts: None,
             window_title: String::new(),
             reduce_motion: native::reduce_motion(),
             split_drag: SplitDrag::default(),
@@ -266,8 +272,36 @@ impl Workspace {
     fn modal(&self) -> bool {
         self.sheet.is_some()
             || self.connect.is_some()
+            || self.shortcuts.is_some()
             || self.palette.is_some()
             || self.switcher.is_some()
+    }
+
+    /// ⌘/: shows the cheat sheet of every key binding, or hides it.
+    pub fn toggle_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shortcuts.take().is_some() {
+            self.focus_current(window, cx);
+        } else if !self.modal() {
+            let handle = cx.focus_handle();
+            window.focus(&handle);
+            self.shortcuts = Some((keymap::cheat_sheet(cx), handle));
+        }
+        cx.notify();
+    }
+
+    /// ⌘⇧T: the pane closed last, with its agent.
+    fn reopen_closed_pane(
+        &mut self,
+        _: &ReopenClosedPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal() {
+            return;
+        }
+        if self.app.update(cx, |a, cx| a.reopen_closed(cx)).is_some() {
+            self.focus_current(window, cx);
+        }
     }
 
     /// Opens the connect sheet (or brings it up), showing `reason`.
@@ -896,6 +930,10 @@ impl Workspace {
         }
         self.focus_pane(pane, window, cx);
         match event {
+            PaneEvent::NewAgent => self.open_new_agent(window, cx),
+            PaneEvent::NewTerminal => self.open_new_terminal(window, cx),
+            PaneEvent::InstallSkill => super::resident::install_agent_skill(cx),
+            PaneEvent::ShowShortcuts => self.toggle_shortcuts(window, cx),
             PaneEvent::SplitRight => self.split(Axis::Horizontal, window, cx),
             PaneEvent::SplitDown => self.split(Axis::Vertical, window, cx),
             PaneEvent::ToggleMaximize => self.toggle_maximize(&ToggleMaximize, window, cx),
@@ -1094,6 +1132,9 @@ impl Render for Workspace {
                 )
                 .with_priority(3)
             });
+        let shortcuts = self.shortcuts.as_ref().map(|(sections, handle)| {
+            render_shortcuts(sections, handle, &theme, reduce_motion, cx)
+        });
         let palette = self.palette.as_ref().map(|(palette, _, _)| {
             // A click beside it closes it, never reaching the panes.
             deferred(
@@ -1207,6 +1248,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
+            .on_action(cx.listener(Self::reopen_closed_pane))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_shortcuts(w, cx)))
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(|this, _: &NextAgent, w, cx| this.switch_agent(false, w, cx)))
             .on_action(cx.listener(|this, _: &PreviousAgent, w, cx| this.switch_agent(true, w, cx)))
@@ -1225,8 +1268,90 @@ impl Render for Workspace {
             .children(palette)
             .children(switcher)
             .children(sheet)
+            .children(shortcuts)
             .children(connect)
     }
+}
+
+/// The ⌘/ cheat sheet over the window: Escape, ⌘/ or a click outside
+/// closes it.
+fn render_shortcuts(
+    sections: &[Section],
+    handle: &FocusHandle,
+    theme: &Theme,
+    reduce_motion: bool,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let columns = sections.iter().map(|section| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::XS))
+            .min_w(px(220.))
+            .child(
+                div()
+                    .type_style(text::SECTION)
+                    .text_color(theme.secondary)
+                    .pb(px(space::XXS))
+                    .child(SharedString::from(section.title.clone())),
+            )
+            .children(section.rows.iter().map(|row| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .gap(px(space::LG))
+                    .type_style(text::CALLOUT)
+                    .child(SharedString::from(row.title.clone()))
+                    .child(
+                        div()
+                            .text_color(theme.secondary)
+                            .child(SharedString::from(row.keys.clone())),
+                    )
+            }))
+    });
+    let card = controls::sheet_card("shortcuts-card", 760.0, theme)
+        .debug_selector(|| "shortcuts-sheet".to_owned())
+        .max_h(relative(0.8))
+        .overflow_y_scroll()
+        // A click on the card is not one outside it.
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .child(controls::sheet_title("Keyboard Shortcuts"))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap(px(space::XL))
+                .children(columns),
+        );
+    deferred(
+        div()
+            .id("shortcuts-backdrop")
+            .track_focus(handle)
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" {
+                    this.toggle_shortcuts(window, cx);
+                }
+            }))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_shortcuts(window, cx)))
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_start()
+            .justify_center()
+            .pt(px(chrome::BAR_HEIGHT + space::SM))
+            .child(sheet_drag_strip("shortcuts-drag-strip"))
+            .child(appear(
+                div().child(card),
+                "shortcuts-appear",
+                -motion::SHEET_OFFSET,
+                motion::SHEET_MS,
+                reduce_motion,
+            )),
+    )
+    .with_priority(2)
 }
 
 /// The theme for the window's appearance, in the user's accent colour.
@@ -1284,6 +1409,7 @@ mod tests {
     use crate::core::menus::{MenuEntry, PaneMenuItem, RowMenuItem};
     use crate::core::pane::PaneModel;
     use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
+    use crate::core::shortcuts::{EmptyPane, key_glyphs};
     use crate::core::spawn::SpawnRequest;
     use crate::core::state::GuiState;
     use crate::core::target::Target;
@@ -2875,5 +3001,160 @@ mod tests {
         click(&mut s, "clear-exited");
         assert!(!s.cx.has_pending_prompt());
         assert_eq!(fake.calls().last(), Some(&Call::ClearExited));
+    }
+
+    // Issue #46: reopen closed pane, shortcut cheat sheet, first-run welcome.
+
+    // gpui keeps the debug bounds of earlier frames: what went away is
+    // checked on the state, not with `drawn`.
+    fn shortcuts_shown(s: &mut Setup<'_>) -> bool {
+        s.cx.run_until_parked();
+        s.ws.read_with(s.cx, |ws, _| ws.shortcuts.is_some())
+    }
+
+    fn welcomes(s: &mut Setup<'_>) -> bool {
+        s.cx.run_until_parked();
+        s.app.read_with(s.cx, |a, cx| {
+            a.layout().panes().iter().any(|p| {
+                let chrome = &a.pane_view(*p).unwrap().read(cx).chrome;
+                crate::app::pane_view::empty_state(chrome) == EmptyPane::Welcome
+            })
+        })
+    }
+
+    fn listed(s: &mut Setup<'_>, fake: &Fake, rows: Vec<AgentRow>) {
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        agents(s, fake, rows);
+    }
+
+    #[gpui::test]
+    fn cmd_shift_t_reopens_the_last_closed_pane_with_its_agent(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        listed(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        click(&mut s, "tab-1");
+        s.cx.simulate_keystrokes("cmd-d");
+        click(&mut s, "tab-2");
+        s.cx.simulate_keystrokes("cmd-w");
+        assert_eq!(panes(&mut s), [PaneId(1)]);
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s).len(), 2);
+        let new = focused(&mut s);
+        assert_eq!(shown(&mut s, new), Some(2));
+        // Nothing more to reopen.
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s).len(), 2);
+        // Closing the last pane leaves it empty; ⌘⇧T fills it again.
+        s.cx.simulate_keystrokes("cmd-w cmd-w");
+        assert_eq!(panes(&mut s).len(), 1);
+        let only = focused(&mut s);
+        assert_eq!(shown(&mut s, only), None);
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s).len(), 1);
+        assert_eq!(shown(&mut s, only), Some(1));
+    }
+
+    #[gpui::test]
+    fn cmd_shift_t_skips_agents_that_are_gone(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        listed(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        click(&mut s, "tab-1");
+        s.cx.simulate_keystrokes("cmd-d");
+        click(&mut s, "tab-2");
+        s.cx.simulate_keystrokes("cmd-w");
+        // Agent 2 was removed meanwhile.
+        listed(&mut s, &fake, vec![row(1, "/a", 1)]);
+        s.cx.simulate_keystrokes("cmd-shift-t");
+        assert_eq!(panes(&mut s), [PaneId(1)]);
+    }
+
+    #[gpui::test]
+    fn cmd_slash_shows_every_key_binding_and_escape_closes_it(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        assert!(!shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("cmd-/");
+        assert!(drawn(&mut s, "shortcuts-sheet"));
+        // Generated from the keymap: every binding's keys are on it.
+        let (keys, sheet) = s.cx.update(|_, cx| {
+            let keys: Vec<String> = cx
+                .key_bindings()
+                .borrow()
+                .bindings()
+                .map(|b| {
+                    let strokes: Vec<String> = b.keystrokes().iter().map(|k| k.unparse()).collect();
+                    key_glyphs(&strokes.join(" "))
+                })
+                .collect();
+            (keys, super::super::keymap::cheat_sheet(cx))
+        });
+        assert!(keys.len() > 20, "{keys:?}");
+        for k in &keys {
+            assert!(
+                sheet
+                    .iter()
+                    .any(|sec| sec.rows.iter().any(|r| &r.keys == k)),
+                "{k} is missing from {sheet:?}"
+            );
+        }
+        let window = &sheet[0];
+        assert!(
+            window
+                .rows
+                .iter()
+                .any(|r| r.keys == "⇧⌘T" && r.title == "Reopen Closed Pane")
+        );
+        assert!(
+            window
+                .rows
+                .iter()
+                .any(|r| r.keys == "⌘/" && r.title == "Show Shortcuts")
+        );
+        // Panes ignore the keys meanwhile.
+        s.cx.simulate_keystrokes("cmd-d");
+        assert_eq!(panes(&mut s).len(), 1);
+        s.cx.simulate_keystrokes("escape");
+        assert!(!shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("cmd-/");
+        assert!(shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("cmd-/");
+        assert!(!shortcuts_shown(&mut s));
+        // The keyboard is back in the pane.
+        s.cx.simulate_keystrokes("cmd-d");
+        assert_eq!(panes(&mut s).len(), 2);
+    }
+
+    #[gpui::test]
+    fn first_run_welcome_offers_new_agent_terminal_and_shortcuts(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        // Before the list arrives: no welcome yet.
+        assert!(!welcomes(&mut s));
+        listed(&mut s, &fake, vec![]);
+        assert!(welcomes(&mut s));
+        assert!(drawn(&mut s, "welcome"));
+        assert!(drawn(&mut s, "welcome-install-skill"));
+        click(&mut s, "welcome-shortcuts");
+        assert!(shortcuts_shown(&mut s));
+        s.cx.simulate_keystrokes("escape");
+        assert!(!shortcuts_shown(&mut s));
+        click(&mut s, "welcome-new-agent");
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
+        s.cx.simulate_keystrokes("escape");
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_none()));
+        click(&mut s, "welcome-terminal");
+        assert!(
+            fake.calls().iter().any(|c| matches!(c, Call::Spawn { .. })),
+            "{:?}",
+            fake.calls()
+        );
+        // With an agent, an empty pane shows the hint only.
+        listed(&mut s, &fake, vec![row(1, "/a", 1)]);
+        assert!(!welcomes(&mut s));
     }
 }

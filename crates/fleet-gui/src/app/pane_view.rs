@@ -14,7 +14,7 @@ use gpui::{
     Styled, Subscription, Task, UTF16Selection, Window, div, point, px, size,
 };
 
-use super::controls;
+use super::controls::{self, ButtonKind};
 use super::ended_view::ended_bar;
 use super::fonts::terminal_font;
 use super::icons;
@@ -23,7 +23,7 @@ use super::native;
 use super::tail_text::tail_text;
 use super::terminal_element::TerminalElement;
 use super::text_field::TextField;
-use super::theme::{Typography, current as theme};
+use super::theme::{Theme, Typography, current as theme};
 use crate::core::config::GuiConfig;
 use crate::core::find::status_label;
 use crate::core::icons::Icon;
@@ -36,6 +36,7 @@ use crate::core::scroll_feedback::{
 };
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
+use crate::core::shortcuts::{EmptyPane, HINT, empty_pane};
 use crate::core::style::{self, radius, space, text};
 
 /// At most this many lines are scrolled (or reported) per wheel event.
@@ -166,6 +167,8 @@ pub struct PaneChrome {
     pub focused: bool,
     /// The pane fills the window (its button offers Restore).
     pub maximized: bool,
+    /// The agent list arrived and is empty: an empty pane welcomes.
+    pub no_agents: bool,
     /// How long the ended agent ran, if known (the summary bar).
     pub run_time: Option<Duration>,
 }
@@ -194,12 +197,17 @@ pub fn restartable(chrome: &PaneChrome, state: PaneState) -> bool {
     chrome.has_agent && matches!(state, PaneState::Exited(_) | PaneState::Lost)
 }
 
-/// The text centred in a pane with no agent.
+/// What a pane with no agent shows.
+pub fn empty_state(chrome: &PaneChrome) -> EmptyPane {
+    empty_pane(chrome.has_agent, chrome.starting, chrome.no_agents)
+}
+
+/// The text centred in a pane with no agent (not the welcome).
 pub fn empty_message(chrome: &PaneChrome) -> Option<&'static str> {
-    match (chrome.has_agent, chrome.starting) {
-        (true, _) => None,
-        (false, true) => Some("starting…"),
-        (false, false) => Some("Select an agent or press ⌘N"),
+    match empty_state(chrome) {
+        EmptyPane::Starting => Some("starting…"),
+        EmptyPane::Hint => Some(HINT),
+        EmptyPane::None | EmptyPane::Welcome => None,
     }
 }
 
@@ -238,6 +246,11 @@ pub enum PaneEvent {
     ContextMenu {
         on_grid: bool,
     },
+    /// The first-run welcome's buttons.
+    NewAgent,
+    NewTerminal,
+    InstallSkill,
+    ShowShortcuts,
 }
 
 impl EventEmitter<PaneEvent> for PaneView {}
@@ -1287,6 +1300,9 @@ impl Render for PaneView {
                     .child(SharedString::from(text)),
             );
         }
+        if empty_state(chrome) == EmptyPane::Welcome {
+            grid = grid.child(welcome(&theme, cx));
+        }
         if let Some(text) = empty_message(chrome) {
             grid = grid.child(
                 div()
@@ -1445,6 +1461,76 @@ impl gpui::EntityInputHandler for PaneView {
     ) -> Option<usize> {
         None
     }
+}
+
+/// The first-run welcome (no agents yet): New agent, Terminal, Install
+/// agent skill and the shortcuts, centred in the empty pane.
+fn welcome(theme: &Theme, cx: &mut Context<PaneView>) -> impl IntoElement {
+    let button = |id: &'static str, label: &'static str, kind, event: PaneEvent| {
+        controls::button(id, label, theme, kind, true)
+            .debug_selector(move || format!("welcome-{id}"))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(event)))
+    };
+    let new_agent = button(
+        "new-agent",
+        "New Agent  ⌘N",
+        ButtonKind::Primary,
+        PaneEvent::NewAgent,
+    );
+    let terminal = button(
+        "terminal",
+        "Terminal  ⌘T",
+        ButtonKind::Secondary,
+        PaneEvent::NewTerminal,
+    );
+    let skill = button(
+        "install-skill",
+        "Install Agent Skill",
+        ButtonKind::Secondary,
+        PaneEvent::InstallSkill,
+    );
+    let shortcuts = div()
+        .id("shortcuts")
+        .debug_selector(|| "welcome-shortcuts".to_owned())
+        .type_style(text::CALLOUT)
+        .text_color(theme.accent)
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.8))
+        .child("Keyboard shortcuts  ⌘/")
+        .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ShowShortcuts)));
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("welcome")
+                .debug_selector(|| "welcome".to_owned())
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(space::MD))
+                .text_color(theme.text)
+                .child(div().type_style(text::TITLE).child("Welcome to fleet"))
+                .child(
+                    div()
+                        .type_style(text::BODY)
+                        .text_color(theme.secondary)
+                        .child("Start an agent, or a plain shell, to get going."),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(space::SM))
+                        .child(new_agent)
+                        .child(terminal)
+                        .child(skill),
+                )
+                .child(shortcuts),
+        )
 }
 
 #[cfg(test)]
