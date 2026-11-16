@@ -2,16 +2,24 @@
 //! recent folders, as [`PickerItem`]s. Picking an action performs it,
 //! an agent is shown in the focused pane, a folder gets a new agent
 //! running the default command.
+//!
+//! Every action the keymap binds has a [`Command`] (ADR 0080; a test in
+//! `app::palette` fails when one has none). A command that needs
+//! something the window lacks, such as an agent in the focused pane, is
+//! left out ([`Command::shown`]).
 
 use std::path::Path;
 
 use fleet_proto::AgentState;
 
+use super::layout::MAX_PANES;
 use super::picker::PickerItem;
 use super::session::AgentRow;
 use super::sidebar::{program_name, tilde};
+use super::tabs::MAX_TABS;
 
-/// A window action the palette offers.
+/// A window action the palette offers. Named after the action it
+/// dispatches (`app::palette::command_action`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
     NewAgent,
@@ -19,8 +27,17 @@ pub enum Command {
     SplitRight,
     SplitDown,
     ClosePane,
+    ReopenClosedPane,
     ToggleMaximize,
     RestartPane,
+    KillPane,
+    RenamePane,
+    RemovePane,
+    Find,
+    FindNext,
+    FindPrevious,
+    Copy,
+    Paste,
     FocusLeft,
     FocusRight,
     FocusUp,
@@ -29,23 +46,63 @@ pub enum Command {
     FocusPane2,
     FocusPane3,
     FocusPane4,
+    NextAgent,
+    PreviousAgent,
+    FocusFilter,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    /// Show workspace tab `n` (1-based).
+    SelectTab(usize),
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
     RemoveExited,
     ToggleGraph,
+    ShowShortcuts,
+    OpenSettings,
     SwitchFleetd,
     InstallSkill,
     Quit,
 }
 
+/// What decides which commands the palette offers now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaletteState {
+    /// Panes in the shown tab.
+    pub panes: usize,
+    /// Workspace tabs.
+    pub tabs: usize,
+    /// The focused pane shows an agent (Rename, Find).
+    pub has_agent: bool,
+    /// The focused pane shows a running agent (Kill, Paste).
+    pub running: bool,
+    /// The focused pane's agent exited or is gone (Restart, Remove).
+    pub restartable: bool,
+    /// Text is selected in the focused pane (Copy).
+    pub has_selection: bool,
+}
+
 impl Command {
     /// Every command, in the palette's order.
-    pub const ALL: [Command; 20] = [
+    pub const ALL: &[Command] = &[
         Command::NewAgent,
         Command::NewTerminal,
         Command::SplitRight,
         Command::SplitDown,
         Command::ClosePane,
+        Command::ReopenClosedPane,
         Command::ToggleMaximize,
         Command::RestartPane,
+        Command::KillPane,
+        Command::RenamePane,
+        Command::RemovePane,
+        Command::Find,
+        Command::FindNext,
+        Command::FindPrevious,
+        Command::Copy,
+        Command::Paste,
         Command::FocusLeft,
         Command::FocusRight,
         Command::FocusUp,
@@ -54,22 +111,53 @@ impl Command {
         Command::FocusPane2,
         Command::FocusPane3,
         Command::FocusPane4,
+        Command::NextAgent,
+        Command::PreviousAgent,
+        Command::FocusFilter,
+        Command::NewTab,
+        Command::CloseTab,
+        Command::NextTab,
+        Command::PrevTab,
+        Command::SelectTab(1),
+        Command::SelectTab(2),
+        Command::SelectTab(3),
+        Command::SelectTab(4),
+        Command::SelectTab(5),
+        Command::SelectTab(6),
+        Command::SelectTab(7),
+        Command::SelectTab(8),
+        Command::SelectTab(9),
+        Command::ZoomIn,
+        Command::ZoomOut,
+        Command::ZoomReset,
         Command::RemoveExited,
         Command::ToggleGraph,
+        Command::ShowShortcuts,
+        Command::OpenSettings,
         Command::SwitchFleetd,
         Command::InstallSkill,
         Command::Quit,
     ];
 
-    pub fn title(self) -> &'static str {
-        match self {
+    pub fn title(self) -> String {
+        let title = match self {
             Command::NewAgent => "New Agent…",
             Command::NewTerminal => "New Terminal",
             Command::SplitRight => "Split Right",
             Command::SplitDown => "Split Down",
             Command::ClosePane => "Close Pane",
+            Command::ReopenClosedPane => "Reopen Closed Pane",
             Command::ToggleMaximize => "Maximize or Restore Pane",
             Command::RestartPane => "Restart Agent in Pane",
+            // It asks first (unless told not to).
+            Command::KillPane => "Kill Agent…",
+            Command::RenamePane => "Rename Agent…",
+            Command::RemovePane => "Remove Exited Agent in Pane",
+            Command::Find => "Find in Scrollback…",
+            Command::FindNext => "Find Next",
+            Command::FindPrevious => "Find Previous",
+            Command::Copy => "Copy",
+            Command::Paste => "Paste",
             Command::FocusLeft => "Focus Pane on the Left",
             Command::FocusRight => "Focus Pane on the Right",
             Command::FocusUp => "Focus Pane Above",
@@ -78,12 +166,26 @@ impl Command {
             Command::FocusPane2 => "Focus Pane 2",
             Command::FocusPane3 => "Focus Pane 3",
             Command::FocusPane4 => "Focus Pane 4",
+            Command::NextAgent => "Switch to Next Agent…",
+            Command::PreviousAgent => "Switch to Previous Agent…",
+            Command::FocusFilter => "Filter Agents",
+            Command::NewTab => "New Tab",
+            Command::CloseTab => "Close Tab",
+            Command::NextTab => "Show Next Tab",
+            Command::PrevTab => "Show Previous Tab",
+            Command::SelectTab(n) => return format!("Go to Tab {n}"),
+            Command::ZoomIn => "Zoom In",
+            Command::ZoomOut => "Zoom Out",
+            Command::ZoomReset => "Reset Zoom",
             Command::RemoveExited => "Remove Exited Agents…",
             Command::ToggleGraph => "Show or Hide the Agent Graph",
+            Command::ShowShortcuts => "Keyboard Shortcuts",
+            Command::OpenSettings => "Settings…",
             Command::SwitchFleetd => "Switch fleetd…",
             Command::InstallSkill => "Install Agent Skill",
             Command::Quit => "Quit fleet",
-        }
+        };
+        title.to_owned()
     }
 
     /// Other words it is found by.
@@ -93,11 +195,56 @@ impl Command {
             Command::NewTerminal => "shell",
             Command::SplitRight | Command::SplitDown => "pane",
             Command::ClosePane => "detach",
+            Command::ReopenClosedPane => "undo restore",
             Command::ToggleMaximize => "zoom",
+            Command::KillPane => "stop terminate",
+            Command::RenamePane => "name label",
+            Command::RemovePane => "forget rm ended lost",
+            Command::Find | Command::FindNext | Command::FindPrevious => "search scrollback",
+            Command::Copy | Command::Paste => "clipboard",
+            Command::NextAgent | Command::PreviousAgent => "switcher recent",
+            Command::FocusFilter => "sidebar search",
+            Command::NewTab
+            | Command::CloseTab
+            | Command::NextTab
+            | Command::PrevTab
+            | Command::SelectTab(_) => "workspace",
+            Command::ZoomIn => "bigger font larger",
+            Command::ZoomOut => "smaller font",
+            Command::ZoomReset => "actual size font",
             Command::RemoveExited => "clear forget rm lost",
+            Command::ShowShortcuts => "cheat sheet keys help",
+            Command::OpenSettings => "preferences config",
             Command::SwitchFleetd => "connect target",
             Command::ToggleGraph => "tree spawned children satellite",
             _ => "",
+        }
+    }
+
+    /// Whether the palette offers it in `s`: what acts on the focused
+    /// pane's agent needs one (in the right state), pane and tab moves
+    /// need somewhere to go, and adding stops at the limit.
+    pub fn shown(self, s: &PaletteState) -> bool {
+        match self {
+            Command::SplitRight | Command::SplitDown => s.panes < MAX_PANES,
+            Command::ToggleMaximize
+            | Command::FocusLeft
+            | Command::FocusRight
+            | Command::FocusUp
+            | Command::FocusDown => s.panes > 1,
+            Command::FocusPane1 | Command::FocusPane2 => s.panes > 1,
+            Command::FocusPane3 => s.panes >= 3,
+            Command::FocusPane4 => s.panes >= 4,
+            Command::RenamePane | Command::Find | Command::FindNext | Command::FindPrevious => {
+                s.has_agent
+            }
+            Command::KillPane | Command::Paste => s.running,
+            Command::RestartPane | Command::RemovePane => s.restartable,
+            Command::Copy => s.has_selection,
+            Command::NewTab => s.tabs < MAX_TABS,
+            Command::CloseTab | Command::NextTab | Command::PrevTab => s.tabs > 1,
+            Command::SelectTab(n) => s.tabs > 1 && n <= s.tabs,
+            _ => true,
         }
     }
 }
@@ -159,22 +306,24 @@ pub fn agent_item(row: &AgentRow, home: &Path) -> PickerItem {
     }
 }
 
-/// The palette's rows: the commands (each with the shortcut `shortcut`
-/// gives it), the agents, newest first, then the recent folders.
+/// The palette's rows: the commands shown in `state` (each with the
+/// shortcut `shortcut` gives it), the agents, newest first, then the
+/// recent folders.
 pub fn palette_items(
     shortcut: impl Fn(Command) -> Option<String>,
+    state: &PaletteState,
     agents: &[AgentRow],
     folders: &[String],
     home: &Path,
 ) -> Vec<(Entry, PickerItem)> {
     let mut out = Vec::new();
-    for c in Command::ALL {
+    for &c in Command::ALL.iter().filter(|c| c.shown(state)) {
         let entry = Entry::Command(c);
         out.push((
             entry.clone(),
             PickerItem {
                 key: entry.key(),
-                title: c.title().to_owned(),
+                title: c.title(),
                 detail: String::new(),
                 keywords: c.keywords().to_owned(),
                 shortcut: shortcut(c),
@@ -311,24 +460,169 @@ mod tests {
         assert_eq!(shortcut_text(Mods::default(), "escape"), "⎋");
     }
 
+    /// Everything there is to act on: every command is shown.
+    fn everything() -> PaletteState {
+        PaletteState {
+            panes: 3,
+            tabs: 3,
+            has_agent: true,
+            running: true,
+            restartable: true,
+            has_selection: true,
+        }
+    }
+
+    fn shown(s: &PaletteState) -> Vec<Command> {
+        palette_items(|_| None, s, &[], &[], home())
+            .into_iter()
+            .map(|(e, _)| match e {
+                Entry::Command(c) => c,
+                other => panic!("{other:?} is not a command"),
+            })
+            .collect()
+    }
+
     #[test]
     fn every_command_is_listed_with_its_shortcut() {
+        let mut state = everything();
+        state.tabs = MAX_TABS;
         let items = palette_items(
             |c| (c == Command::SplitRight).then(|| "⌘D".to_owned()),
+            &state,
             &[],
             &[],
             home(),
         );
-        assert_eq!(items.len(), Command::ALL.len());
+        // At the tab limit with three panes: all but New Tab and Focus
+        // Pane 4.
+        let listed: Vec<_> = items.iter().map(|(e, _)| e.clone()).collect();
+        let expected: Vec<_> = Command::ALL
+            .iter()
+            .filter(|&&c| c != Command::NewTab && c != Command::FocusPane4)
+            .map(|&c| Entry::Command(c))
+            .collect();
+        assert_eq!(listed, expected);
         let (entry, split) = &items[2];
         assert_eq!(*entry, Entry::Command(Command::SplitRight));
         assert_eq!(split.title, "Split Right");
         assert_eq!(split.shortcut.as_deref(), Some("⌘D"));
         assert_eq!(items[0].1.shortcut, None);
-        // Keys are distinct.
-        let mut keys: Vec<_> = items.iter().map(|(_, i)| i.key.clone()).collect();
+        // Keys and titles are distinct.
+        let mut keys: Vec<_> = Command::ALL
+            .iter()
+            .map(|&c| Entry::Command(c).key())
+            .collect();
+        keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), Command::ALL.len());
+        let mut titles: Vec<_> = Command::ALL.iter().map(|c| c.title()).collect();
+        titles.sort();
+        titles.dedup();
+        assert_eq!(titles.len(), Command::ALL.len());
+        let tab = Command::SelectTab(3);
+        assert_eq!(tab.title(), "Go to Tab 3");
+        assert_eq!(Entry::Command(tab).key(), "command:SelectTab(3)");
+    }
+
+    #[test]
+    fn what_acts_on_the_focused_agent_needs_one() {
+        let agent_only = [
+            Command::RenamePane,
+            Command::Find,
+            Command::FindNext,
+            Command::FindPrevious,
+            Command::KillPane,
+            Command::Paste,
+            Command::RestartPane,
+            Command::RemovePane,
+            Command::Copy,
+        ];
+        // An empty pane: none of them.
+        let empty = PaletteState {
+            has_agent: false,
+            running: false,
+            restartable: false,
+            has_selection: false,
+            ..everything()
+        };
+        let listed = shown(&empty);
+        for c in agent_only {
+            assert!(!listed.contains(&c), "{c:?} shown for an empty pane");
+        }
+        // The rest stays.
+        assert!(listed.contains(&Command::NewAgent));
+        assert!(listed.contains(&Command::ZoomIn));
+        assert!(listed.contains(&Command::RemoveExited));
+
+        // A running agent: Kill, not Restart or Remove.
+        let running = PaletteState {
+            restartable: false,
+            has_selection: false,
+            ..everything()
+        };
+        let listed = shown(&running);
+        for c in [
+            Command::KillPane,
+            Command::Paste,
+            Command::RenamePane,
+            Command::Find,
+        ] {
+            assert!(listed.contains(&c), "{c:?}");
+        }
+        for c in [Command::RestartPane, Command::RemovePane, Command::Copy] {
+            assert!(!listed.contains(&c), "{c:?}");
+        }
+
+        // An ended one: Restart and Remove, not Kill.
+        let ended = PaletteState {
+            running: false,
+            ..everything()
+        };
+        let listed = shown(&ended);
+        assert!(listed.contains(&Command::RestartPane));
+        assert!(listed.contains(&Command::RemovePane));
+        assert!(!listed.contains(&Command::KillPane));
+    }
+
+    #[test]
+    fn pane_and_tab_moves_need_somewhere_to_go() {
+        let one = PaletteState {
+            panes: 1,
+            tabs: 1,
+            ..everything()
+        };
+        let listed = shown(&one);
+        for c in [
+            Command::FocusLeft,
+            Command::FocusPane1,
+            Command::ToggleMaximize,
+            Command::CloseTab,
+            Command::NextTab,
+            Command::PrevTab,
+            Command::SelectTab(1),
+        ] {
+            assert!(!listed.contains(&c), "{c:?} shown with one pane and tab");
+        }
+        assert!(listed.contains(&Command::SplitRight));
+        assert!(listed.contains(&Command::NewTab));
+
+        let listed = shown(&everything());
+        assert!(listed.contains(&Command::FocusPane3));
+        assert!(!listed.contains(&Command::FocusPane4));
+        assert!(listed.contains(&Command::SelectTab(3)));
+        assert!(!listed.contains(&Command::SelectTab(4)));
+
+        let full = PaletteState {
+            panes: MAX_PANES,
+            tabs: MAX_TABS,
+            ..everything()
+        };
+        let listed = shown(&full);
+        assert!(!listed.contains(&Command::SplitRight));
+        assert!(!listed.contains(&Command::SplitDown));
+        assert!(!listed.contains(&Command::NewTab));
+        assert!(listed.contains(&Command::FocusPane4));
+        assert!(listed.contains(&Command::SelectTab(MAX_TABS)));
     }
 
     #[test]
@@ -339,11 +633,12 @@ mod tests {
         ];
         let items = palette_items(
             |_| None,
+            &everything(),
             &agents,
             &["/Users/me/a".into(), String::new()],
             home(),
         );
-        let rest: Vec<_> = items[Command::ALL.len()..]
+        let rest: Vec<_> = items[shown(&everything()).len()..]
             .iter()
             .map(|(e, _)| e.clone())
             .collect();
@@ -382,7 +677,7 @@ mod tests {
         assert_eq!(named.title, "sigterm-otter");
         assert_eq!(named.detail, "/tmp · exited 2");
 
-        let items: Vec<PickerItem> = palette_items(|_| None, &[a, b], &[], home())
+        let items: Vec<PickerItem> = palette_items(|_| None, &everything(), &[a, b], &[], home())
             .into_iter()
             .map(|(_, i)| i)
             .collect();
