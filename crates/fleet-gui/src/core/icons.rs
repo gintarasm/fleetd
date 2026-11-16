@@ -22,10 +22,12 @@ pub enum Icon {
     Check,
     ChevronUp,
     ChevronDown,
+    /// The graph view (⌘⇧G).
+    Graph,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 15] = [
+    pub const ALL: [Icon; 16] = [
         Icon::Plus,
         Icon::Close,
         Icon::SplitRight,
@@ -41,6 +43,7 @@ impl Icon {
         Icon::Check,
         Icon::ChevronUp,
         Icon::ChevronDown,
+        Icon::Graph,
     ];
 
     /// The Lucide name, which is the file's stem.
@@ -61,6 +64,7 @@ impl Icon {
             Icon::Check => "check",
             Icon::ChevronUp => "chevron-up",
             Icon::ChevronDown => "chevron-down",
+            Icon::Graph => "network",
         }
     }
 
@@ -82,6 +86,7 @@ impl Icon {
             Icon::Check => "icons/check.svg",
             Icon::ChevronUp => "icons/chevron-up.svg",
             Icon::ChevronDown => "icons/chevron-down.svg",
+            Icon::Graph => "icons/network.svg",
         }
     }
 

@@ -33,6 +33,8 @@ pub struct BarData {
     pub tabs: Vec<String>,
     /// The shown tab (0-based).
     pub active_tab: usize,
+    /// The graph view is shown (its button is drawn pressed).
+    pub graph: bool,
 }
 
 /// The Clear exited button's tooltip; `None` while it is disabled.
@@ -272,6 +274,23 @@ pub fn render_bar(
             })
             .on_click(cx.listener(|this, _, _, cx| this.clear_exited(cx)))
         });
+    let graph_on = data.graph;
+    let graph = icon_button("graph-toggle", Icon::Graph, theme, true)
+        .debug_selector(|| "graph-toggle".to_owned())
+        .when(graph_on, |b| b.bg(theme.selected).text_color(theme.text))
+        .tooltip(move |_, cx| {
+            let theme = tooltip_theme;
+            cx.new(|_| Tooltip {
+                text: if graph_on {
+                    "Back to the panes (⌘⇧G)".into()
+                } else {
+                    "Graph of every agent (⌘⇧G)".into()
+                },
+                theme,
+            })
+            .into()
+        })
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_graph(window, cx)));
     let new_agent = icon_button("new-agent", Icon::Plus, theme, true)
         .debug_selector(|| "new-agent".to_owned())
         .tooltip(move |_, cx| {
@@ -298,6 +317,7 @@ pub fn render_bar(
         .child(target)
         .child(render_tabs(data, theme, cx).unwrap_or_else(|| div().flex_1()))
         .children(update)
+        .child(graph)
         .child(clear)
         .child(new_agent)
 }

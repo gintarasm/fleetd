@@ -23,6 +23,9 @@ use super::daemon::{COLS, Client, Daemon, ROWS, Streams, spawn_fake};
 const COLD_START_AGENTS: usize = 10;
 /// Flood agents the GUI shows in panes next to the `cat` agent.
 const FLOOD_PANES: usize = 3;
+/// Idle agents in the tree `gui_graph_open_ns` opens (the GUI draws them
+/// as a synthetic spawned-by tree, `crates/fleet-gui/src/app/bench.rs`).
+const GRAPH_OPEN_AGENTS: usize = 50;
 /// The GUI's exit status when it cannot connect to fleetd.
 const EXIT_NO_FLEETD: i32 = 3;
 /// The GUI's exit status when its bench did not finish (no frame presented).
@@ -299,13 +302,167 @@ pub(super) fn input_to_render_flood_ns(
     parse_input_ns(&line)
 }
 
+/// The value the GUI printed as `<name> <ns>` (the graph metrics).
+fn parse_ns(line: &str, name: &str) -> Result<f64, String> {
+    line.strip_prefix(name)
+        .and_then(|v| v.strip_prefix(' '))
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or_else(|| format!("fleet-gui printed {line:?}, not `{name} <ns>`"))
+}
+
+/// `gui_graph_open_ns` (ADR 0073): fleetd with [`GRAPH_OPEN_AGENTS`] idle
+/// agents; the GUI's `graph-open` hook toggles the graph view on and times
+/// it to its first presented frame (median of its samples).
+///
+/// Not yet called by [`super::run`]: `wall.rs` is gate code, so wiring the
+/// metric in needs the user's approval (see ADR 0073).
+#[allow(dead_code)]
+pub(super) fn graph_open_ns(fleetd: &Path, gui: &Path) -> Result<f64, String> {
+    let daemon = Daemon::start(fleetd)?;
+    let mut client = Client::connect(&daemon.sock)?;
+    let mut streams = Streams::default();
+    for _ in 0..GRAPH_OPEN_AGENTS {
+        spawn_cat(&mut client, &mut streams)?;
+    }
+    let run = GuiRun {
+        gui,
+        state_dir: daemon.state_dir(),
+        mode: "graph-open",
+        env: vec![],
+    };
+    parse_ns(&run.run("graph_open_ns ")?.0, "graph_open_ns")
+}
+
+/// `gui_graph_frame_flood50_ns` (ADR 0073): the graph view showing
+/// `agents` `fake-agent --ansi --forever` while they flood (spawned and
+/// consumed on their own connection); the GUI's `graph-flood` hook times
+/// window redraws from the workspace's render to the end of the graph's
+/// paint (median). The floods are killed once the GUI has printed; unless
+/// `quick`, it is an error if any exited before.
+///
+/// Not yet called by [`super::run`] (see [`graph_open_ns`]).
+#[allow(dead_code)]
+pub(super) fn graph_frame_flood_ns(
+    fleetd: &Path,
+    gui: &Path,
+    fake_agent: &Path,
+    agents: usize,
+    quick: bool,
+) -> Result<f64, String> {
+    let daemon = Daemon::start(fleetd)?;
+    let mut client = Client::connect(&daemon.sock)?;
+    let mut streams = Streams::default();
+    let flood = ForeverFlood::start(&daemon, fake_agent, agents)?;
+    let run = GuiRun {
+        gui,
+        state_dir: daemon.state_dir(),
+        mode: "graph-flood",
+        env: vec![("FLEET_GUI_BENCH_AGENTS", agents.to_string())],
+    };
+    let result = run.run("graph_frame_ns ");
+    let early = flood.stop(&mut client, &mut streams, "graph frame")?;
+    let line = result?.0;
+    if !early.is_empty() {
+        let msg = format!(
+            "graph frame: {} of {agents} flood agents exited before the GUI \
+             finished its samples (agent id, exit code): {early:?}",
+            early.len()
+        );
+        if !quick {
+            return Err(msg);
+        }
+        eprintln!("fleet-perf: {msg}");
+    }
+    parse_ns(&line, "graph_frame_ns")
+}
+
+/// `agents` `fake-agent --forever` spawned on their own connection, whose
+/// output a thread consumes until they all exit.
+struct ForeverFlood {
+    ids: Vec<u64>,
+    /// Flood agents that have exited so far, with their exit codes.
+    exited: Arc<Mutex<Vec<(u64, i32)>>>,
+    thread: std::thread::JoinHandle<Result<(), String>>,
+    start: Instant,
+}
+
+impl ForeverFlood {
+    fn start(daemon: &Daemon, fake_agent: &Path, agents: usize) -> Result<Self, String> {
+        let mut flood_client = Client::connect(&daemon.sock)?;
+        let mut flood_streams = Streams::default();
+        let mut ids = Vec::with_capacity(agents);
+        let start = Instant::now();
+        for i in 0..agents {
+            ids.push(spawn_fake(
+                &mut flood_client,
+                &mut flood_streams,
+                fake_agent,
+                &["--forever".into()],
+                i,
+            )?);
+        }
+        let exited: Arc<Mutex<Vec<(u64, i32)>>> = Arc::default();
+        let thread = std::thread::spawn({
+            let ids: HashSet<u64> = ids.iter().copied().collect();
+            let exited = Arc::clone(&exited);
+            move || -> Result<(), String> {
+                let mut seen = HashSet::new();
+                while seen.len() < ids.len() {
+                    if let Some(r) = flood_streams.take(flood_client.recv()?)? {
+                        return Err(format!("unexpected response {r:?}"));
+                    }
+                    for (&id, &code) in &flood_streams.exited {
+                        if ids.contains(&id) && seen.insert(id) {
+                            lock(&exited).push((id, code));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        });
+        Ok(ForeverFlood {
+            ids,
+            exited,
+            thread,
+            start,
+        })
+    }
+
+    /// Kills every flood agent (on `client`) and waits for the consumer;
+    /// returns the agents that had exited before.
+    fn stop(
+        self,
+        client: &mut Client,
+        streams: &mut Streams,
+        what: &str,
+    ) -> Result<Vec<(u64, i32)>, String> {
+        let done = self.start.elapsed();
+        let early = lock(&self.exited).clone();
+        for &agent_id in &self.ids {
+            let req = client.request(request::Kind::Kill(KillAgent { agent_id }))?;
+            streams.wait(client, req)?;
+        }
+        self.thread
+            .join()
+            .map_err(|_| "flood thread panicked".to_string())??;
+        eprintln!(
+            "fleet-perf: {what} (flood): GUI done {:.2} s after the first flood spawn, \
+             {} of {} flood agents still running",
+            done.as_secs_f64(),
+            self.ids.len() - early.len(),
+            self.ids.len()
+        );
+        Ok(early)
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{locked_in, parse_input_ns};
+    use super::{locked_in, parse_input_ns, parse_ns};
 
     #[test]
     fn locked_screen_is_read_from_ioreg() {
@@ -327,5 +484,19 @@ mod tests {
         assert_eq!(parse_input_ns("input_ns 4200000"), Ok(4_200_000.0));
         assert!(parse_input_ns("input_ns").is_err());
         assert!(parse_input_ns("ready").is_err());
+    }
+
+    #[test]
+    fn graph_lines_are_parsed() {
+        assert_eq!(
+            parse_ns("graph_open_ns 31000000", "graph_open_ns"),
+            Ok(31e6)
+        );
+        assert_eq!(
+            parse_ns("graph_frame_ns 2500000", "graph_frame_ns"),
+            Ok(2.5e6)
+        );
+        assert!(parse_ns("graph_open_ns_x 1", "graph_open_ns").is_err());
+        assert!(parse_ns("graph_frame_ns 1", "graph_open_ns").is_err());
     }
 }

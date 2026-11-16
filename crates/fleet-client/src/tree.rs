@@ -129,6 +129,11 @@ impl Tree {
         out
     }
 
+    /// The root of the agent's tree (itself for a root or an unknown id).
+    pub fn root_of(&self, id: u64) -> u64 {
+        self.ancestors(id).last().copied().unwrap_or(id)
+    }
+
     /// Everything below the agent, in pre-order.
     pub fn descendants(&self, id: u64) -> Vec<u64> {
         let mut out = Vec::new();
@@ -196,6 +201,16 @@ mod tests {
         assert_eq!(tree.parent(1), None);
         assert_eq!(tree.descendants(1), [2, 4, 3]);
         assert_eq!(tree.ancestors(4), [2, 1]);
+    }
+
+    #[test]
+    fn root_of_follows_the_parents_up() {
+        let tree = t(&[(1, None), (2, Some(1)), (3, Some(2)), (9, Some(8))]);
+        assert_eq!(tree.root_of(3), 1);
+        assert_eq!(tree.root_of(1), 1);
+        // A missing parent: the agent is its own root; so is an unknown id.
+        assert_eq!(tree.root_of(9), 9);
+        assert_eq!(tree.root_of(42), 42);
     }
 
     #[test]

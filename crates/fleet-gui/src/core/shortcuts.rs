@@ -44,7 +44,8 @@ pub fn cheat_sheet<'a>(bindings: impl IntoIterator<Item = Binding<'a>>) -> Vec<S
     for b in bindings {
         let title = match b.context {
             None | Some("Workspace") => "Window".to_owned(),
-            Some("Terminal") => "Terminal".to_owned(),
+            // A terminal binding narrowed further ("Terminal && finding").
+            Some(c) if c == "Terminal" || c.starts_with("Terminal &&") => "Terminal".to_owned(),
             Some("TextField") => "Text Fields".to_owned(),
             Some(other) => humanize(other),
         };

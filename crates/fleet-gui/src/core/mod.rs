@@ -8,6 +8,8 @@ pub mod feedback;
 pub mod find;
 pub mod fuzzy;
 pub mod glass;
+pub mod graph;
+pub mod graph_layout;
 pub mod icons;
 pub mod identity;
 pub mod keys;

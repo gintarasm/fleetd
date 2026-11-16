@@ -52,6 +52,7 @@ actions!(
         RemoveExited,
         NextAgent,
         PreviousAgent,
+        ToggleGraph,
     ]
 );
 
@@ -87,6 +88,11 @@ pub struct Remove {
 pub const WORKSPACE_CONTEXT: &str = "Workspace";
 /// Key context of a terminal pane.
 pub const TERMINAL_CONTEXT: &str = "Terminal";
+/// Key context of a terminal pane whose find bar is open (with
+/// [`TERMINAL_CONTEXT`]).
+pub const FINDING_CONTEXT: &str = "Terminal && finding";
+/// The identifier a pane adds to its key context while its find bar is open.
+pub const FINDING: &str = "finding";
 /// Key context of a text field.
 pub const TEXT_FIELD_CONTEXT: &str = "TextField";
 
@@ -135,7 +141,10 @@ pub fn bind_keys(cx: &mut App) {
         // Also from the pane's find field, inside the terminal's context.
         KeyBinding::new("cmd-f", Find, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-g", FindNext, Some(TERMINAL_CONTEXT)),
-        KeyBinding::new("cmd-shift-g", FindPrevious, Some(TERMINAL_CONTEXT)),
+        // ⌘⇧G is Find Previous only while a terminal's find bar is open;
+        // otherwise it toggles the graph (ADR 0073).
+        KeyBinding::new("cmd-shift-g", FindPrevious, Some(FINDING_CONTEXT)),
+        KeyBinding::new("cmd-shift-g", ToggleGraph, None),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(TEXT_FIELD_CONTEXT)),

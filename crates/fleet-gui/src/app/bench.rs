@@ -10,6 +10,20 @@
 //!   grid holds the echoed `x` is presented; print `input_ns <median>` and
 //!   exit 0.
 //!
+//! - `graph-open`: once the agents are listed, [`OPEN_SAMPLES`] times
+//!   toggle the graph view on (`ToggleGraph`) and time it until its first
+//!   frame is presented, toggling it off in between; print
+//!   `graph_open_ns <median>` and exit 0.
+//! - `graph-flood` (with `FLEET_GUI_BENCH_AGENTS=<n>`, the agents to wait
+//!   for): once `n` agents are listed, show the graph and time
+//!   [`FLOOD_FRAMES`] window redraws, each from the workspace's render to
+//!   the end of the graph's paint (the CPU cost of one frame of the graph);
+//!   print `graph_frame_ns <median>` and exit 0.
+//!
+//! In both graph modes the GUI draws a synthetic spawned-by tree (fan-out
+//! 3, by id) over agents that have no `fleet.parent`: fleetd refuses
+//! `fleet.*` labels from a client, and fleet-perf spawns as the user.
+//!
 //! In bench mode the connect sheet never shows: a failed connect exits
 //! [`EXIT_NO_FLEETD`]; a bench that does not finish within [`WATCHDOG`]
 //! exits [`EXIT_TIMEOUT`]. The window floats above other apps' windows
@@ -26,12 +40,22 @@ use fleet_term::Cell;
 use gpui::{App, AppContext, AsyncApp, Keystroke, Window};
 
 use super::app_state::AppState;
+use super::keymap::ToggleGraph;
 use crate::core::pane::PaneState;
+use crate::core::session::AgentRow;
 use crate::core::session::PaneId;
 
 pub const MODE_ENV: &str = "FLEET_GUI_BENCH";
 pub const AGENT_ENV: &str = "FLEET_GUI_BENCH_AGENT";
 pub const EXTRA_PANES_ENV: &str = "FLEET_GUI_BENCH_EXTRA_PANES";
+pub const AGENTS_ENV: &str = "FLEET_GUI_BENCH_AGENTS";
+/// Graph openings timed by `graph-open` (median taken).
+pub const OPEN_SAMPLES: usize = 20;
+/// Frames timed by `graph-flood` (median taken), after [`FLOOD_WARMUP`].
+pub const FLOOD_FRAMES: usize = 100;
+const FLOOD_WARMUP: usize = 20;
+/// The graph's children per synthetic parent.
+const SYNTHETIC_FAN_OUT: usize = 3;
 /// Keys timed by the `input` bench (median taken), and the pause between them.
 pub const SAMPLES: usize = 50;
 pub const SAMPLE_GAP: Duration = Duration::from_millis(20);
@@ -51,6 +75,8 @@ const KEY: char = 'x';
 pub enum Mode {
     ColdStart,
     Input { agent: u64, extra: Vec<u64> },
+    GraphOpen,
+    GraphFlood { agents: usize },
 }
 
 /// The bench mode from the `FLEET_GUI_BENCH*` values; `None` when off.
@@ -58,6 +84,7 @@ pub fn parse(
     mode: Option<&str>,
     agent: Option<&str>,
     extra: Option<&str>,
+    agents: Option<&str>,
 ) -> Result<Option<Mode>, String> {
     let id = |s: &str, what: &str| {
         s.trim()
@@ -81,8 +108,19 @@ pub fn parse(
             };
             Ok(Some(Mode::Input { agent, extra }))
         }
+        Some("graph-open") => Ok(Some(Mode::GraphOpen)),
+        Some("graph-flood") => {
+            let agents = match agents {
+                None | Some("") => 1,
+                Some(n) => n
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("{AGENTS_ENV}: not a count: {n:?}"))?,
+            };
+            Ok(Some(Mode::GraphFlood { agents }))
+        }
         Some(other) => Err(format!(
-            "{MODE_ENV}: unknown mode {other:?} (cold-start or input)"
+            "{MODE_ENV}: unknown mode {other:?} (cold-start, input, graph-open or graph-flood)"
         )),
     }
 }
@@ -97,6 +135,7 @@ pub fn init() {
         var(MODE_ENV).as_deref(),
         var(AGENT_ENV).as_deref(),
         var(EXTRA_PANES_ENV).as_deref(),
+        var(AGENTS_ENV).as_deref(),
     ) {
         Ok(mode) => mode,
         Err(e) => {
@@ -215,6 +254,13 @@ struct State {
     /// `KEY`s on that pane's grid before the first sample.
     base: usize,
     samples: Vec<Sample>,
+    /// `graph-open`: when the toggle being timed was dispatched.
+    open_t0: Option<Instant>,
+    open_ns: Vec<u128>,
+    /// `graph-flood`: sampling is on, and the frame being timed started.
+    flood_armed: bool,
+    frame_t0: Option<Instant>,
+    frame_ns: Vec<u128>,
 }
 
 thread_local! {
@@ -328,6 +374,11 @@ fn live_count(pane: PaneId, agent: u64, cx: &App) -> Option<usize> {
 /// window is open (the session may start before it) and the caller,
 /// possibly the workspace itself, is done.
 pub fn connected(cx: &mut App) {
+    match mode() {
+        Some(Mode::GraphOpen) => return graph_open(cx),
+        Some(Mode::GraphFlood { agents }) => return graph_flood(*agents, cx),
+        _ => {}
+    }
     let Some(Mode::Input { agent, extra }) = mode() else {
         return;
     };
@@ -387,40 +438,206 @@ pub fn connected(cx: &mut App) {
     .detach();
 }
 
+/// Over agents with no `fleet.parent`, in graph bench modes: each agent
+/// (by id) after the first is a child of the `(i - 1) / 3`-th, a tree of
+/// fan-out [`SYNTHETIC_FAN_OUT`]. `None` otherwise (the real tree).
+pub fn synthetic_parents(rows: &[AgentRow]) -> Option<Vec<(u64, Option<u64>)>> {
+    if !matches!(mode(), Some(Mode::GraphOpen | Mode::GraphFlood { .. })) {
+        return None;
+    }
+    Some(synthetic_tree(rows.iter().map(|r| r.info.id)))
+}
+
+fn synthetic_tree(ids: impl Iterator<Item = u64>) -> Vec<(u64, Option<u64>)> {
+    let mut ids: Vec<u64> = ids.collect();
+    ids.sort_unstable();
+    (0..ids.len())
+        .map(|i| {
+            let parent = i.checked_sub(1).map(|j| ids[j / SYNTHETIC_FAN_OUT]);
+            (ids[i], parent)
+        })
+        .collect()
+}
+
+/// The workspace starts drawing a frame (cheap when off).
+pub fn frame_started() {
+    if matches!(mode(), Some(Mode::GraphFlood { .. })) {
+        STATE.with_borrow_mut(|s| {
+            if s.flood_armed {
+                s.frame_t0 = Some(Instant::now());
+            }
+        });
+    }
+}
+
+/// The graph view rendered: a timed opening ends when this frame is
+/// presented.
+pub fn graph_rendered(window: &Window) {
+    if mode() != Some(&Mode::GraphOpen) {
+        return;
+    }
+    if let Some(t0) = STATE.with_borrow_mut(|s| s.open_t0.take()) {
+        window.on_next_frame(move |_, _| {
+            STATE.with_borrow_mut(|s| s.open_ns.push(t0.elapsed().as_nanos()));
+        });
+    }
+}
+
+/// The graph finished painting a frame: one `graph-flood` sample, and the
+/// next frame is asked for.
+pub fn graph_painted(window: &mut Window) {
+    if !matches!(mode(), Some(Mode::GraphFlood { .. })) {
+        return;
+    }
+    let done = STATE.with_borrow_mut(|s| {
+        if let Some(t0) = s.frame_t0.take() {
+            s.frame_ns.push(t0.elapsed().as_nanos());
+        }
+        (s.frame_ns.len() >= FLOOD_WARMUP + FLOOD_FRAMES)
+            .then(|| s.frame_ns[FLOOD_WARMUP..].to_vec())
+    });
+    match done {
+        Some(ns) => finish(&format!("graph_frame_ns {}", median(ns))),
+        None if STATE.with_borrow(|s| s.flood_armed) => {
+            window.on_next_frame(|window, _| window.refresh());
+        }
+        None => {}
+    }
+}
+
+/// Waits for the workspace window and at least `agents` listed agents.
+async fn window_with_agents(
+    agents: usize,
+    cx: &mut AsyncApp,
+) -> Option<gpui::WindowHandle<super::workspace::Workspace>> {
+    loop {
+        let ready = cx
+            .update(|cx| {
+                let app = AppState::global(cx)?;
+                let app = app.read(cx);
+                (app.agents.len() >= agents).then_some(app.window).flatten()
+            })
+            .ok()?;
+        if let Some(h) = ready {
+            return Some(h);
+        }
+        cx.background_executor().timer(POLL).await;
+    }
+}
+
+fn toggle_graph(
+    handle: gpui::WindowHandle<super::workspace::Workspace>,
+    cx: &mut AsyncApp,
+) -> bool {
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.dispatch_action(Box::new(ToggleGraph), cx);
+    })
+    .is_ok()
+}
+
+fn graph_open(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let Some(handle) = window_with_agents(1, cx).await else {
+            return;
+        };
+        cx.background_executor().timer(SETTLE).await;
+        for i in 0..OPEN_SAMPLES {
+            STATE.with_borrow_mut(|s| s.open_t0 = Some(Instant::now()));
+            if !toggle_graph(handle, cx) {
+                return;
+            }
+            while STATE.with_borrow(|s| s.open_ns.len()) <= i {
+                cx.background_executor().timer(POLL).await;
+            }
+            // Back to the panes, and let that frame go out.
+            if !toggle_graph(handle, cx) {
+                return;
+            }
+            cx.background_executor().timer(SETTLE).await;
+        }
+        let ns = STATE.with_borrow(|s| s.open_ns.clone());
+        finish(&format!("graph_open_ns {}", median(ns)));
+    })
+    .detach();
+}
+
+fn graph_flood(agents: usize, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let Some(handle) = window_with_agents(agents, cx).await else {
+            return;
+        };
+        if !toggle_graph(handle, cx) {
+            return;
+        }
+        cx.background_executor().timer(SETTLE * 5).await;
+        STATE.with_borrow_mut(|s| s.flood_armed = true);
+        let _ = cx.update_window(handle.into(), |_, window, _| window.refresh());
+    })
+    .detach();
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Mode, median, parse};
+    use super::{Mode, median, parse, synthetic_tree};
 
     #[test]
     fn mode_parses_from_the_environment_values() {
-        assert_eq!(parse(None, None, None), Ok(None));
+        assert_eq!(parse(None, None, None, None), Ok(None));
         assert_eq!(
-            parse(Some("cold-start"), None, None),
+            parse(Some("cold-start"), None, None, None),
             Ok(Some(Mode::ColdStart))
         );
         assert_eq!(
-            parse(Some("input"), Some("7"), Some("1,2,3")),
+            parse(Some("input"), Some("7"), Some("1,2,3"), None),
             Ok(Some(Mode::Input {
                 agent: 7,
                 extra: vec![1, 2, 3]
             }))
         );
         assert_eq!(
-            parse(Some("input"), Some("7"), None),
+            parse(Some("input"), Some("7"), None, None),
             Ok(Some(Mode::Input {
                 agent: 7,
                 extra: vec![]
             }))
         );
-        assert!(parse(Some("input"), None, None).is_err());
-        assert!(parse(Some("input"), Some("x"), None).is_err());
-        assert!(parse(Some("input"), Some("7"), Some("1,,2")).is_err());
-        assert!(parse(Some("warm"), None, None).is_err());
+        assert!(parse(Some("input"), None, None, None).is_err());
+        assert!(parse(Some("input"), Some("x"), None, None).is_err());
+        assert!(parse(Some("input"), Some("7"), Some("1,,2"), None).is_err());
+        assert!(parse(Some("warm"), None, None, None).is_err());
+        assert_eq!(
+            parse(Some("graph-open"), None, None, None),
+            Ok(Some(Mode::GraphOpen))
+        );
+        assert_eq!(
+            parse(Some("graph-flood"), None, None, Some("50")),
+            Ok(Some(Mode::GraphFlood { agents: 50 }))
+        );
+        assert_eq!(
+            parse(Some("graph-flood"), None, None, None),
+            Ok(Some(Mode::GraphFlood { agents: 1 }))
+        );
+        assert!(parse(Some("graph-flood"), None, None, Some("x")).is_err());
     }
 
     #[test]
     fn median_of_samples() {
         assert_eq!(median(vec![3, 1, 2]), 2);
         assert_eq!(median(vec![4, 1, 3, 2]), 2);
+    }
+
+    #[test]
+    fn synthetic_tree_fans_out_by_id() {
+        let t = synthetic_tree([9, 3, 5, 7, 4].into_iter());
+        assert_eq!(
+            t,
+            [
+                (3, None),
+                (4, Some(3)),
+                (5, Some(3)),
+                (7, Some(3)),
+                (9, Some(4))
+            ]
+        );
     }
 }
