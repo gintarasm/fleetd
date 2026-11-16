@@ -277,6 +277,9 @@ pub const SHORTCUTS: &[ShortcutRow] = &[
     row("cmd-alt-down", "Focus the pane below"),
     row("cmd-c", "Copy"),
     row("cmd-v", "Paste"),
+    row("cmd-+", "Bigger font (all panes, not saved)"),
+    row("cmd--", "Smaller font"),
+    row("cmd-0", "Font size from Settings"),
     row("cmd-,", "Settings"),
     row("cmd-q", "Quit (agents keep running)"),
 ];

@@ -30,6 +30,7 @@ use crate::core::status::{AgentStatus, Alerts, alert_text, statuses};
 use crate::core::style::chrome;
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
+use crate::core::zoom::{FontZoom, Zoom};
 
 /// Saved state is written once it has been still this long.
 pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -265,6 +266,8 @@ pub struct AppState {
     state_dir: PathBuf,
     pub(super) home: PathBuf,
     pub(super) config: GuiConfig,
+    /// ⌘+ / ⌘− / ⌘0 (window-wide, not saved).
+    zoom: FontZoom,
     gui_state: GuiState,
     pub(super) layout: Layout,
     panes: HashMap<PaneId, Entity<PaneView>>,
@@ -354,6 +357,7 @@ impl AppState {
             gui_state,
             layout,
             panes: HashMap::new(),
+            zoom: FontZoom::default(),
             focused,
             closed: ClosedPanes::default(),
             maximized: None,
@@ -539,8 +543,8 @@ impl AppState {
     fn open(&mut self, pane: PaneId, agent: Option<u64>, cx: &mut Context<Self>) {
         let model = self.session.open_pane(pane, agent);
         let sink: Arc<dyn InputSink> = self.session.clone();
-        let config = &self.config;
-        let view = cx.new(|cx| PaneView::new(pane, model, sink, config, cx));
+        let config = self.pane_config();
+        let view = cx.new(|cx| PaneView::new(pane, model, sink, &config, cx));
         self.panes.insert(pane, view);
     }
 
@@ -1449,11 +1453,37 @@ impl AppState {
 
     fn set_config(&mut self, config: GuiConfig, cx: &mut Context<Self>) {
         self.config = config;
-        for view in self.panes.values() {
-            let config = &self.config;
-            view.update(cx, |v, cx| v.apply_config(config, cx));
-        }
+        self.apply_pane_config(cx);
         cx.notify();
+    }
+
+    /// The config the panes follow: the settings, with the zoomed size.
+    fn pane_config(&self) -> GuiConfig {
+        GuiConfig {
+            font_size: self.zoom.size(self.config.font_size),
+            ..self.config.clone()
+        }
+    }
+
+    fn apply_pane_config(&mut self, cx: &mut Context<Self>) {
+        let config = self.pane_config();
+        for view in self.panes.values() {
+            view.update(cx, |v, cx| v.apply_config(&config, cx));
+        }
+    }
+
+    /// ⌘+ / ⌘− / ⌘0: every pane's font follows at once (the next layout
+    /// reflows the grid and resizes the agents). Not saved.
+    pub fn zoom(&mut self, zoom: Zoom, cx: &mut Context<Self>) {
+        if self.zoom.apply(zoom, self.config.font_size) {
+            self.apply_pane_config(cx);
+            cx.notify();
+        }
+    }
+
+    /// The terminal font size the panes show (the configured one, zoomed).
+    pub fn shown_font_size(&self) -> f32 {
+        self.zoom.size(self.config.font_size)
     }
 
     pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {

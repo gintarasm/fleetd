@@ -21,7 +21,7 @@ use super::keymap::{
     ClosePane, CommandPalette, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
     FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTerminal, NextAgent, Paste,
     PreviousAgent, Remove, ReopenClosedPane, Restart, RestartPane, ShowShortcuts, SplitDown,
-    SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    SplitRight, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::native;
@@ -56,6 +56,7 @@ use crate::core::switcher::{AgentMru, start_row, switcher_items};
 use crate::core::target::Target;
 use crate::core::theme::Tokens;
 use crate::core::titlebar::{Link, bar_title, window_title};
+use crate::core::zoom::Zoom;
 
 /// Opens the workspace window, or brings the open one to the front.
 pub fn open_main_window(cx: &mut App) {
@@ -1096,6 +1097,10 @@ impl Workspace {
     }
 
     /// ⌘R: restarts the focused pane's agent in place if it ended.
+    fn zoom(&mut self, zoom: Zoom, cx: &mut Context<Self>) {
+        self.app.update(cx, |a, cx| a.zoom(zoom, cx));
+    }
+
     fn restart_pane(&mut self, _: &RestartPane, _: &mut Window, cx: &mut Context<Self>) {
         if self.modal() {
             return;
@@ -1517,6 +1522,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(Zoom::In, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(Zoom::Out, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(Zoom::Reset, cx)))
             .on_action(cx.listener(Self::reopen_closed_pane))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_shortcuts(w, cx)))
             .on_action(cx.listener(Self::command_palette))

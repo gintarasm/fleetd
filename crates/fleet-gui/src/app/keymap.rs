@@ -35,6 +35,9 @@ actions!(
         Undo,
         Redo,
         OpenSettings,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         ReopenClosedPane,
         ShowShortcuts,
         Find,
@@ -110,6 +113,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-z", Redo, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        // ⌘+ is ⌘= on most layouts; both zoom in, as in Terminal.
+        KeyBinding::new("cmd-=", ZoomIn, None),
+        KeyBinding::new("cmd-+", ZoomIn, None),
+        KeyBinding::new("cmd--", ZoomOut, None),
+        KeyBinding::new("cmd-0", ZoomReset, None),
         KeyBinding::new("cmd-shift-t", ReopenClosedPane, None),
         KeyBinding::new("cmd-/", ShowShortcuts, None),
     ]);

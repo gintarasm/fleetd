@@ -120,6 +120,14 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                 ],
             },
             Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Bigger", keymap::ZoomIn),
+                    MenuItem::action("Smaller", keymap::ZoomOut),
+                    MenuItem::action("Actual Size", keymap::ZoomReset),
+                ],
+            },
+            Menu {
                 name: "Help".into(),
                 items: vec![MenuItem::action(
                     "Keyboard Shortcuts",
