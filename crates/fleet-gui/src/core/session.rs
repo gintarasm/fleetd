@@ -12,13 +12,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fleet_client::names::NAME_LABEL;
 use fleet_client::{
     Closer, Connection, FrameReader, RESTART_ANSWER_WAIT, RESTART_WAIT, RestartOutcome, Sender,
     TOO_OLD, did_not_come_back, restart_failed, restart_outcome,
 };
 use fleet_proto::{
     AgentInfo, AgentState, BinaryIdentity, ForgetAgents, Frame, HelloOk, KillAgent, ListAgents,
-    Response, RestartAgent, RestartDaemon, SpawnAgent, event, request, response,
+    Response, RestartAgent, RestartDaemon, SetLabels, SpawnAgent, event, request, response,
 };
 use fleet_term::Palette;
 
@@ -385,6 +386,8 @@ enum ControlCmd {
     Kill(u64),
     Restart(u64),
     Forget(Vec<u64>),
+    /// Sets an agent's `name` label (ADR 0052), then lists.
+    Rename(u64, String),
     ClearExited,
     RestartDaemon(String),
     Stop,
@@ -586,6 +589,12 @@ impl Session {
             }
             None => Err(format!("no pane {}", pane.0)),
         }
+    }
+
+    /// Renames an agent (its `name` label, ADR 0052); the sidebar follows
+    /// with the list sent right after it.
+    pub fn rename(&self, agent_id: u64, name: String) {
+        self.control(ControlCmd::Rename(agent_id, name));
     }
 
     /// Forgets these exited agents (running ones are refused by fleetd).
@@ -1122,6 +1131,15 @@ fn control_writer(
                     "remove",
                     request::Kind::Forget(Box::new(forget)),
                 );
+            }
+            Some(ControlCmd::Rename(agent_id, name)) => {
+                let set = SetLabels {
+                    agent_id,
+                    set: HashMap::from([(NAME_LABEL.to_owned(), name)]),
+                    remove: Vec::new(),
+                };
+                send_tracked(&mut sender, "rename", request::Kind::SetLabels(set));
+                list(&mut sender, &mut next_list);
             }
             Some(ControlCmd::RestartDaemon(binary)) => {
                 send_tracked(

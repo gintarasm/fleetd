@@ -21,22 +21,143 @@ pub const ANIMALS: &[&str] = &[
 /// Words that say little about a task: English stopwords, prompt
 /// boilerplate and the most common task verbs.
 const STOPWORDS: &[&str] = &[
-    "about", "after", "again", "agent", "agents", "all", "also", "and", "any", "are", "base",
-    "been", "before", "being", "both", "branch", "but", "can", "change", "check", "code", "commit",
-    "could", "create", "did", "does", "doing", "done", "each", "every", "file", "files", "first",
-    "fix", "fleet", "for", "from", "get", "github", "had", "has", "have", "help", "her", "here",
-    "his", "how", "implement", "into", "issue", "issues", "its", "just", "let", "like", "look",
-    "make", "may", "merge", "might", "more", "most", "must", "need", "new", "not", "now", "off",
-    "once", "one", "only", "open", "other", "our", "out", "over", "please", "pull", "push", "read",
-    "repo", "repository", "request", "run", "same", "see", "she", "should", "some", "such", "sure",
-    "task", "tasks", "than", "that", "the", "their", "them", "then", "there", "these", "they",
-    "this", "those", "too", "two", "under", "update", "use", "used", "using", "very", "want",
-    "was", "were", "what", "when", "where", "which", "who", "why", "will", "with", "work",
-    "working", "worktree", "would", "yes", "you", "your", "yours",
+    "about",
+    "after",
+    "again",
+    "agent",
+    "agents",
+    "all",
+    "also",
+    "and",
+    "any",
+    "are",
+    "base",
+    "been",
+    "before",
+    "being",
+    "both",
+    "branch",
+    "but",
+    "can",
+    "change",
+    "check",
+    "code",
+    "commit",
+    "could",
+    "create",
+    "did",
+    "does",
+    "doing",
+    "done",
+    "each",
+    "every",
+    "file",
+    "files",
+    "first",
+    "fix",
+    "fleet",
+    "for",
+    "from",
+    "get",
+    "github",
+    "had",
+    "has",
+    "have",
+    "help",
+    "her",
+    "here",
+    "his",
+    "how",
+    "implement",
+    "into",
+    "issue",
+    "issues",
+    "its",
+    "just",
+    "let",
+    "like",
+    "look",
+    "make",
+    "may",
+    "merge",
+    "might",
+    "more",
+    "most",
+    "must",
+    "need",
+    "new",
+    "not",
+    "now",
+    "off",
+    "once",
+    "one",
+    "only",
+    "open",
+    "other",
+    "our",
+    "out",
+    "over",
+    "please",
+    "pull",
+    "push",
+    "read",
+    "repo",
+    "repository",
+    "request",
+    "run",
+    "same",
+    "see",
+    "she",
+    "should",
+    "some",
+    "such",
+    "sure",
+    "task",
+    "tasks",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "too",
+    "two",
+    "under",
+    "update",
+    "use",
+    "used",
+    "using",
+    "very",
+    "want",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "work",
+    "working",
+    "worktree",
+    "would",
+    "yes",
+    "you",
+    "your",
+    "yours",
 ];
 
 /// Programs whose plain run is a shell.
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu"];
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "nu",
+];
 
 /// A task word is cut to this many bytes.
 const MAX_WORD_LEN: usize = 16;
@@ -64,7 +185,9 @@ pub fn check_name(name: &str) -> Result<String, String> {
         return Err("a name must not contain control characters".into());
     }
     if name.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("{name:?} reads as an id: a name must not be all digits"));
+        return Err(format!(
+            "{name:?} reads as an id: a name must not be all digits"
+        ));
     }
     Ok(name.to_owned())
 }
@@ -416,11 +539,20 @@ mod tests {
         // A live agent wins over an ended one of the same name.
         assert_eq!(resolve(&agents, "omp-badger"), Ok(3));
         let e = resolve(&agents, "twin").unwrap_err();
-        assert!(e.contains("ambiguous") && e.contains('4') && e.contains('5'), "{e}");
+        assert!(
+            e.contains("ambiguous") && e.contains('4') && e.contains('5'),
+            "{e}"
+        );
         let e = resolve(&agents, "old").unwrap_err();
-        assert!(e.contains("ambiguous") && e.contains('6') && e.contains('7'), "{e}");
+        assert!(
+            e.contains("ambiguous") && e.contains('6') && e.contains('7'),
+            "{e}"
+        );
         let e = resolve(&agents, "falcon").unwrap_err();
-        assert!(e.contains("no agent named") && e.contains("lto-falcon"), "{e}");
+        assert!(
+            e.contains("no agent named") && e.contains("lto-falcon"),
+            "{e}"
+        );
         let e = resolve(&agents, "nobody").unwrap_err();
         assert!(e.contains("no agent named \"nobody\""), "{e}");
     }

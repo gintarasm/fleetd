@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use fleet_proto::AgentState;
+use fleet_client::names::{NAME_LABEL, name_of};
+use fleet_proto::{AgentInfo, AgentState};
 
 use super::session::AgentRow;
 
@@ -32,6 +33,48 @@ pub fn program_name(program: &str) -> String {
     Path::new(program)
         .file_name()
         .map_or_else(|| program.to_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// The agent's main text (ADR 0052): its name, else its program.
+pub fn display_name(info: &AgentInfo) -> String {
+    name_of(info).map_or_else(|| program_name(&info.program), str::to_owned)
+}
+
+/// The agent's secondary text: `program · id`.
+pub fn program_and_id(info: &AgentInfo) -> String {
+    format!("{} · {}", program_name(&info.program), info.id)
+}
+
+/// The labels a row shows as chips, by key: all but the name, `project`
+/// (the group title) and the core's `fleet.*`.
+pub fn label_chips(info: &AgentInfo) -> Vec<(String, String)> {
+    let mut chips: Vec<(String, String)> = info
+        .labels
+        .iter()
+        .filter(|(k, _)| {
+            k.as_str() != NAME_LABEL && k.as_str() != "project" && !k.starts_with("fleet.")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    chips.sort();
+    chips
+}
+
+/// Whether `query` finds the agent, by name, label (`key`, `value` or
+/// `key=value`), program or id, ignoring case: the one match the command
+/// palette, the agent switcher and the sidebar filter share.
+pub fn agent_matches(info: &AgentInfo, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    let has = |s: &str| s.to_lowercase().contains(&q);
+    has(&program_name(&info.program))
+        || info.id.to_string() == q
+        || info
+            .labels
+            .iter()
+            .any(|(k, v)| has(v) || has(&format!("{k}={v}")))
 }
 
 fn title_of(row: &AgentRow, home: &Path) -> String {
@@ -131,6 +174,56 @@ mod tests {
         let g = group_agents(&rows, home);
         let ids: Vec<u64> = g[0].agents.iter().map(|r| r.info.id).collect();
         assert_eq!(ids, vec![3, 2, 1, 4]);
+    }
+
+    fn labelled(labels: &[(&str, &str)]) -> AgentInfo {
+        AgentInfo {
+            id: 7,
+            program: "/usr/bin/claude".into(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn display_name_is_the_name_else_the_program() {
+        let named = labelled(&[("name", "lto-falcon")]);
+        assert_eq!(display_name(&named), "lto-falcon");
+        assert_eq!(display_name(&labelled(&[])), "claude");
+        assert_eq!(display_name(&labelled(&[("name", "")])), "claude");
+        assert_eq!(program_and_id(&named), "claude · 7");
+    }
+
+    #[test]
+    fn chips_hide_the_name_project_and_core_labels() {
+        let info = labelled(&[
+            ("name", "x"),
+            ("project", "fleetd"),
+            ("fleet.parent", "3"),
+            ("role", "reviewer"),
+            ("kind", "shell"),
+        ]);
+        assert_eq!(
+            label_chips(&info),
+            [
+                ("kind".to_owned(), "shell".to_owned()),
+                ("role".to_owned(), "reviewer".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_uses_names_labels_program_and_id() {
+        let info = labelled(&[("name", "LTO-falcon"), ("role", "reviewer")]);
+        for q in ["", "falcon", "lto", "reviewer", "role=rev", "claude", "7"] {
+            assert!(agent_matches(&info, q), "{q}");
+        }
+        for q in ["otter", "role=coder", "77"] {
+            assert!(!agent_matches(&info, q), "{q}");
+        }
     }
 
     #[test]

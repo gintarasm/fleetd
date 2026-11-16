@@ -139,6 +139,10 @@ pub struct PaneChrome {
     pub program: Option<String>,
     /// The agent's directory, with `~`.
     pub cwd: Option<String>,
+    /// The agent's name (ADR 0052), if it has one.
+    pub name: Option<String>,
+    /// The agent the layout puts here.
+    pub agent_id: Option<u64>,
     /// A spawn into this pane is on its way.
     pub starting: bool,
     /// When the control connection retries, while it is down.
@@ -193,15 +197,39 @@ pub fn draws_cursor(chrome: &PaneChrome, state: PaneState) -> bool {
         && !matches!(state, PaneState::Exited(_) | PaneState::Lost)
 }
 
-/// The header's title and path: the OSC title if the agent set one, else
-/// the program; and the directory with `~`.
-pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> (String, String) {
-    let title = osc_title
-        .filter(|t| !t.trim().is_empty())
-        .map(str::to_owned)
+/// The header's parts (ADR 0052).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeaderParts {
+    /// The agent's name, else the OSC title if the agent set one, else the
+    /// program.
+    pub title: String,
+    /// `program · id` once the agent is listed; else empty.
+    pub detail: String,
+    /// The directory, with `~`.
+    pub path: String,
+}
+
+pub fn header_parts(chrome: &PaneChrome, osc_title: Option<&str>) -> HeaderParts {
+    let title = chrome
+        .name
+        .clone()
+        .or_else(|| {
+            osc_title
+                .filter(|t| !t.trim().is_empty())
+                .map(str::to_owned)
+        })
         .or_else(|| chrome.program.clone())
         .unwrap_or_default();
-    (title, chrome.cwd.clone().unwrap_or_default())
+    let detail = match (&chrome.program, chrome.agent_id, &chrome.cwd) {
+        // Listed (the cwd comes with the list): its program and id.
+        (Some(p), Some(id), Some(_)) => format!("{p} · {id}"),
+        _ => String::new(),
+    };
+    HeaderParts {
+        title,
+        detail,
+        path: chrome.cwd.clone().unwrap_or_default(),
+    }
 }
 
 /// A header button, asking the workspace to act on this pane.
@@ -213,6 +241,8 @@ pub enum PaneEvent {
     Close,
     /// The exit banner's Restart: the ended agent again, in this pane.
     Restart,
+    /// A double-click on the name: rename the pane's agent.
+    Rename,
     /// A right-click asks for the pane's context menu: on the header, or
     /// on the grid (`on_grid`) while the agent does not take the mouse.
     ContextMenu {
@@ -675,7 +705,11 @@ impl Render for PaneView {
             marked: self.marked.clone(),
         };
         let chrome = &self.chrome;
-        let (title_text, path) = header_parts(chrome, title.as_deref());
+        let HeaderParts {
+            title: title_text,
+            detail,
+            path,
+        } = header_parts(chrome, title.as_deref());
         let icon_button = |id: &'static str, icon: Icon, event: PaneEvent| {
             controls::icon_button(id, icon, &theme, true)
                 .debug_selector(move || format!("pane-{}-{id}", chrome.number))
@@ -715,8 +749,12 @@ impl Render for PaneView {
                     .gap(px(space::SM - space::XXS))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(
+                    .child({
+                        let number = chrome.number;
+                        let named = chrome.agent_id.is_some();
                         div()
+                            .id("pane-name")
+                            .debug_selector(move || format!("pane-{number}-name"))
                             .flex_none()
                             .type_style(text::HEADLINE)
                             .text_color(if chrome.focused {
@@ -724,8 +762,21 @@ impl Render for PaneView {
                             } else {
                                 theme.secondary
                             })
-                            .child(SharedString::from(title_text)),
-                    )
+                            .child(SharedString::from(title_text))
+                            .on_click(cx.listener(move |_, ev: &gpui::ClickEvent, _, cx| {
+                                if named && ev.click_count() == 2 {
+                                    cx.emit(PaneEvent::Rename);
+                                }
+                            }))
+                    })
+                    .children((!detail.is_empty()).then(|| {
+                        let number = chrome.number;
+                        div()
+                            .debug_selector(move || format!("pane-{number}-detail"))
+                            .flex_none()
+                            .text_color(theme.tertiary)
+                            .child(SharedString::from(detail))
+                    }))
                     .children((!path.is_empty()).then(|| {
                         div()
                             .flex()
@@ -1022,8 +1073,8 @@ mod tests {
     };
 
     use super::{
-        InputSink, PaneChrome, PaneView, banner, draws_cursor, empty_message, grid_size,
-        header_parts, ime_cell, point_to_cell,
+        HeaderParts, InputSink, PaneChrome, PaneView, banner, draws_cursor, empty_message,
+        grid_size, header_parts, ime_cell, point_to_cell,
     };
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::core::config::GuiConfig;
@@ -1528,20 +1579,32 @@ mod tests {
     }
 
     #[test]
-    fn header_prefers_the_osc_title() {
+    fn header_shows_the_name_else_the_osc_title_with_program_and_id() {
         let chrome = PaneChrome {
             program: Some("claude".into()),
             cwd: Some("~/dev".into()),
+            agent_id: Some(4),
             ..PaneChrome::default()
         };
-        assert_eq!(
-            header_parts(&chrome, None),
-            ("claude".into(), "~/dev".into())
-        );
-        assert_eq!(
-            header_parts(&chrome, Some("Refactor")),
-            ("Refactor".into(), "~/dev".into())
-        );
-        assert_eq!(header_parts(&chrome, Some("  ")).0, "claude");
+        let parts = |title: &str| HeaderParts {
+            title: title.into(),
+            detail: "claude · 4".into(),
+            path: "~/dev".into(),
+        };
+        assert_eq!(header_parts(&chrome, None), parts("claude"));
+        assert_eq!(header_parts(&chrome, Some("Refactor")), parts("Refactor"));
+        assert_eq!(header_parts(&chrome, Some("  ")).title, "claude");
+        let named = PaneChrome {
+            name: Some("lto-falcon".into()),
+            ..chrome.clone()
+        };
+        assert_eq!(header_parts(&named, Some("Refactor")), parts("lto-falcon"));
+        // Not listed yet: no detail.
+        let unlisted = PaneChrome {
+            program: Some("agent 4".into()),
+            agent_id: Some(4),
+            ..PaneChrome::default()
+        };
+        assert_eq!(header_parts(&unlisted, None).detail, "");
     }
 }

@@ -12,6 +12,7 @@ mod keymap;
 mod native;
 mod new_agent;
 mod pane_view;
+mod rename;
 mod resident;
 mod sidebar_view;
 mod status_dot;

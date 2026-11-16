@@ -6,20 +6,22 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use fleet_client::names::name_of;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, px,
 };
 
+use super::controls::Tooltip;
 use super::status_dot::status_dot;
 use super::tail_text::tail_text;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
 use crate::core::session::AgentRow;
 pub use crate::core::sidebar::program_name;
-use crate::core::sidebar::{group_agents, since};
+use crate::core::sidebar::{group_agents, label_chips, program_and_id, since};
 use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
@@ -60,9 +62,12 @@ pub struct SidebarData<'a> {
     pub reduce_motion: bool,
 }
 
-/// A tab's title: the agent's OSC title if a pane knows it, else the
-/// program.
+/// A tab's title: the agent's name (ADR 0052), else its OSC title if a
+/// pane knows it, else the program.
 pub fn tab_title(row: &AgentRow, titles: &HashMap<u64, String>) -> String {
+    if let Some(name) = name_of(&row.info) {
+        return name.to_owned();
+    }
     titles
         .get(&row.info.id)
         .filter(|t| !t.trim().is_empty())
@@ -184,6 +189,8 @@ fn render_tab(
         .child(mark_el)
         .child(
             div()
+                .id(("agent-name", id))
+                .debug_selector(move || format!("tab-{id}-name"))
                 .flex_1()
                 .min_w_0()
                 .truncate()
@@ -191,7 +198,15 @@ fn render_tab(
                 .when(mark == TabMark::Focused, |s| {
                     s.font_weight(gpui::FontWeight::MEDIUM)
                 })
-                .child(SharedString::from(tab_title(row, data.titles))),
+                .child(SharedString::from(tab_title(row, data.titles)))
+                // A double-click renames; the row's click still shows it.
+                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                    if ev.click_count() == 2 {
+                        this.open_rename(id, window, cx);
+                        // Not also the row's click, which would focus a pane.
+                        cx.stop_propagation();
+                    }
+                })),
         )
         .child(
             div()
@@ -204,15 +219,40 @@ fn render_tab(
                 ))),
         );
     let line2 = div()
+        .flex()
+        .flex_row()
+        .gap(px(space::XS))
         .pl(px(space::LG))
         .type_style(text::SUBHEADLINE)
-        .text_color(if running {
-            theme.secondary
-        } else {
-            theme.tertiary
-        })
-        .truncate()
-        .child(SharedString::from(one_line(&row.last_line)));
+        .child(
+            div()
+                .debug_selector(move || format!("tab-{id}-detail"))
+                .flex_none()
+                .text_color(theme.tertiary)
+                .child(SharedString::from(program_and_id(&row.info))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(if running {
+                    theme.secondary
+                } else {
+                    theme.tertiary
+                })
+                .truncate()
+                .child(SharedString::from(one_line(&row.last_line))),
+        );
+    let chips = label_chips(&row.info);
+    let line3 = (!chips.is_empty()).then(|| {
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(space::XXS))
+            .pl(px(space::LG))
+            .children(chips.into_iter().map(|(k, v)| chip(id, k, v, theme)))
+    });
     let bar = div()
         .absolute()
         .left_0()
@@ -245,11 +285,37 @@ fn render_tab(
         .child(bar)
         .child(line1)
         .child(line2)
+        .children(line3)
         .on_click(cx.listener(move |this, _, window, cx| this.show_agent(id, window, cx)))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
+}
+
+/// A label chip: the value, with `key=value` as its tooltip.
+fn chip(id: u64, key: String, value: String, theme: &Theme) -> impl IntoElement + use<> {
+    let tip = SharedString::from(format!("{key}={value}"));
+    let tip_theme = *theme;
+    let selector = format!("tab-{id}-chip-{key}");
+    div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .px(px(space::XS))
+        .rounded(px(radius::SM))
+        .bg(theme.hover)
+        .type_style(text::CAPTION)
+        .text_color(theme.secondary)
+        .max_w(px(chrome::SIDEBAR_WIDTH / 2.0))
+        .truncate()
+        .child(SharedString::from(value))
+        .tooltip(move |_, cx| {
+            cx.new(|_| Tooltip {
+                text: tip.clone(),
+                theme: tip_theme,
+            })
+            .into()
+        })
 }
 
 /// The last line, on one line.

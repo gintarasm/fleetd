@@ -105,7 +105,10 @@ fn spawn_then_ls_shows_running() {
     );
     let row: Vec<_> = lines.next().unwrap().split_whitespace().collect();
     assert_eq!(row.len(), 5, "{row:?}");
-    assert_eq!([row[0], row[2], row[3], row[4]], [id.as_str(), "running", "-", "cat"]);
+    assert_eq!(
+        [row[0], row[2], row[3], row[4]],
+        [id.as_str(), "running", "-", "cat"]
+    );
     // The default name: the cwd's basename (no prompt) and an animal.
     assert!(row[1].starts_with("fleetcli-"), "{row:?}");
     assert!(lines.next().is_none());
@@ -1158,6 +1161,10 @@ fn restart_and_rm_against_an_old_daemon_say_so() {
     }
 }
 
+fn id_is(a: &serde_json::Value, id: &str) -> bool {
+    a["id"].as_u64().is_some_and(|n| n.to_string() == id)
+}
+
 fn ls_json(d: &Daemon) -> Vec<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(&d.ok(&["ls", "--json"])).unwrap();
     v.as_array().unwrap().clone()
@@ -1166,7 +1173,7 @@ fn ls_json(d: &Daemon) -> Vec<serde_json::Value> {
 fn name_of(d: &Daemon, id: &str) -> serde_json::Value {
     ls_json(d)
         .into_iter()
-        .find(|a| a["id"].to_string() == id)
+        .find(|a| id_is(a, id))
         .expect("agent listed")["labels"]["name"]
         .clone()
 }
@@ -1251,7 +1258,7 @@ fn commands_take_a_name_and_report_ambiguous_or_unknown_ones() {
     wait_for("exited", || {
         ls_json(&d)
             .iter()
-            .any(|a| a["id"].to_string() == id && a["state"] == "exited")
+            .any(|a| id_is(a, &id) && a["state"] == "exited")
     });
     let new_id = d.ok(&["restart", "lto-falcon"]).trim().to_string();
     assert_ne!(new_id, id);
@@ -1260,8 +1267,8 @@ fn commands_take_a_name_and_report_ambiguous_or_unknown_ones() {
     wait_for("exited again", || {
         ls_json(&d)
             .iter()
-            .any(|a| a["id"].to_string() == new_id && a["state"] == "exited")
+            .any(|a| id_is(a, &new_id) && a["state"] == "exited")
     });
     d.ok(&["rm", "lto-falcon"]);
-    assert!(ls_json(&d).iter().all(|a| a["id"].to_string() != new_id));
+    assert!(ls_json(&d).iter().all(|a| !id_is(a, &new_id)));
 }

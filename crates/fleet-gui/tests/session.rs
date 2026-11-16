@@ -457,7 +457,7 @@ fn new_terminal_spawns_a_labelled_login_shell() {
     let cwd = dir.path().canonicalize().unwrap();
     let cwd = cwd.to_string_lossy().into_owned();
     s.spawn(
-        new_terminal(&Target::Local, Some("/bin/sh"), cwd.clone()),
+        new_terminal(&Target::Local, Some("/bin/sh"), cwd.clone(), &[]),
         80,
         24,
         pane,
@@ -476,6 +476,7 @@ fn new_terminal_spawns_a_labelled_login_shell() {
         info.labels.get(KIND_LABEL).map(String::as_str),
         Some(SHELL_KIND)
     );
+    assert!(info.labels["name"].starts_with("shell-"), "{info:?}");
     wait_until("the pane to show the shell", || {
         model.lock().unwrap().agent_id() == Some(info.id)
     });
@@ -501,6 +502,33 @@ fn new_terminal_spawns_a_labelled_login_shell() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    s.shutdown();
+}
+
+/// Rename sets the `name` label, keeps the others, and the sidebar
+/// shows it without waiting for the periodic list.
+#[test]
+fn rename_sets_the_name_label_and_relists() {
+    let d = Daemon::start();
+    let (s, events) = start_session(&d);
+    wait_until("the control connection", || {
+        events.has(|e| *e == UiEvent::Connection(ConnState::Connected))
+    });
+    let id = d.spawn("sleep 30", 80, 24);
+    wait_until("the agent listed", || {
+        s.agents().iter().any(|r| r.info.id == id)
+    });
+    let started = Instant::now();
+    s.rename(id, "lto-falcon".into());
+    wait_until("the new name", || {
+        s.agents().iter().any(|r| {
+            r.info.id == id && r.info.labels.get("name").map(String::as_str) == Some("lto-falcon")
+        })
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "relisted at once"
+    );
     s.shutdown();
 }
 

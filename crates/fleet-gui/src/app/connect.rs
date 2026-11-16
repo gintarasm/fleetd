@@ -821,6 +821,7 @@ mod tests {
         }
 
         fn forget(&self, _ids: Vec<u64>) {}
+        fn rename(&self, _agent_id: u64, _name: String) {}
         fn clear_exited(&self) {}
 
         fn replaced(&self) -> std::collections::HashMap<u64, u64> {
