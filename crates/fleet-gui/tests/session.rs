@@ -580,6 +580,31 @@ fn rename_sets_the_name_label_and_relists() {
 }
 
 #[test]
+fn read_output_gives_an_exited_agents_whole_history_as_plain_text() {
+    let d = Daemon::start();
+    let (s, events) = start_session(&d);
+    wait_until("the control connection", || {
+        events.has(|e| *e == UiEvent::Connection(ConnState::Connected))
+    });
+    // More lines than the 10-row screen: most of them are history.
+    let id = d.spawn(
+        "i=1; while [ $i -le 40 ]; do printf '\\033[31mline %d\\033[0m\\n' $i; i=$((i+1)); done",
+        80,
+        10,
+    );
+    wait_until("the agent to exit", || {
+        d.agent_state(id) == AgentState::Exited
+    });
+    let text = s.read_output(id)().expect("read output");
+    assert!(!text.contains('\x1b'), "no escapes: {text:?}");
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    let want: Vec<String> = (1..=40).map(|i| format!("line {i}")).collect();
+    assert_eq!(lines, want);
+    assert!(s.read_output(id + 1000)().is_err());
+    s.shutdown();
+}
+
+#[test]
 fn close_pane_detaches_without_killing() {
     let d = Daemon::start();
     let (s, _events) = start_session(&d);

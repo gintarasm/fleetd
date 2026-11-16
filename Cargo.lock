@@ -1930,7 +1930,6 @@ dependencies = [
  "crossterm",
  "fleet-client",
  "fleet-proto",
- "fleet-term",
  "libc",
  "portable-pty",
  "serde_json",
@@ -1945,6 +1944,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "fleet-proto",
+ "fleet-term",
  "tokio-util",
 ]
 

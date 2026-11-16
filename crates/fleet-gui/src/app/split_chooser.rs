@@ -1,6 +1,6 @@
 //! The split chooser's view (issue #30): drawn inside the empty pane a
 //! split opened, in place of its "Select an agent" text. Keys 1/2/3 (or
-//! ↑/↓ and Enter, or a click) pick; Esc closes the pane. Existing agent
+//! ↑/↓ and Enter, or a click) pick, and 4 to 9 a preset's row; Esc closes the pane. Existing agent
 //! swaps the choices for the [`PickerView`] over the agents off screen;
 //! Esc there goes back to the choices.
 
@@ -22,6 +22,9 @@ use crate::core::style::{radius, space, text};
 pub enum ChooserEvent {
     /// `[gui] default_command` in the chooser's folder.
     NewAgent,
+    /// The preset at this index of `AppState::presets`, in the chooser's
+    /// folder (ADR 0084).
+    Preset(usize),
     /// A login shell in the chooser's folder.
     Terminal,
     /// Show this agent.
@@ -80,6 +83,7 @@ impl SplitChooserView {
         match outcome {
             Outcome::Start(Choice::NewAgent) => cx.emit(ChooserEvent::NewAgent),
             Outcome::Start(Choice::Terminal) => cx.emit(ChooserEvent::Terminal),
+            Outcome::Start(Choice::Preset(i)) => cx.emit(ChooserEvent::Preset(i)),
             Outcome::Start(Choice::Agent) | Outcome::Stay => {}
             Outcome::ShowAgents => self.open_list(window, cx),
             Outcome::Back => {
@@ -197,7 +201,11 @@ impl SplitChooserView {
                     .text_color(dim)
                     .child(SharedString::from(number.to_string())),
             )
-            .child(div().flex_none().child(choice.title))
+            .child(
+                div()
+                    .flex_none()
+                    .child(SharedString::from(choice.title.clone())),
+            )
             .child(
                 div()
                     .flex_1()

@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::layout::{Layout, SavedLayout};
+use super::sidebar::GroupBy;
 use super::tabs::{SavedTabs, Tabs};
 use super::target::Target;
 
 pub const MAX_RECENT_TARGETS: usize = 10;
 pub const MAX_RECENT_DIRS: usize = 20;
+pub const MAX_RECENT_COMMANDS: usize = 20;
 
 /// `$HOME/.fleet`.
 pub fn default_state_dir() -> PathBuf {
@@ -29,6 +31,9 @@ pub struct GuiState {
     pub recent_targets: Vec<Target>,
     /// Keyed by target string.
     pub recent_dirs: BTreeMap<String, Vec<String>>,
+    /// Keyed by target string: the New agent sheet's commands, as typed
+    /// (without the first prompt), most recent first (ADR 0084).
+    pub recent_commands: BTreeMap<String, Vec<String>>,
     /// Keyed by target string. Entries that do not parse (old or unknown shape) are dropped.
     #[serde(deserialize_with = "lenient_layouts")]
     pub layouts: BTreeMap<String, SavedLayout>,
@@ -40,6 +45,15 @@ pub struct GuiState {
     /// Keyed by target string: the titles of the sidebar groups shown
     /// collapsed (issue #40).
     pub collapsed_groups: BTreeMap<String, BTreeSet<String>>,
+    /// What the sidebar groups by (ADR 0085), for every target. A value
+    /// this build does not know reads as the default.
+    #[serde(deserialize_with = "lenient_group_by")]
+    pub sidebar_group_by: GroupBy,
+}
+
+fn lenient_group_by<'de, D: Deserializer<'de>>(d: D) -> Result<GroupBy, D::Error> {
+    let raw = toml::Value::deserialize(d)?;
+    Ok(raw.try_into().unwrap_or_default())
 }
 
 fn lenient_targets<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Target>, D::Error> {
@@ -164,6 +178,8 @@ mod tests {
         s.recent_targets.push(Target::Local);
         s.recent_dirs
             .insert("local".into(), vec!["/a".into(), "/b".into()]);
+        s.recent_commands
+            .insert("local".into(), vec!["claude --continue".into()]);
         s.layouts.insert("local".into(), SavedLayout::default());
         s.collapsed_groups
             .insert("local".into(), ["fleetd".to_owned()].into());
@@ -192,6 +208,29 @@ mod tests {
         let s = GuiState::load(dir.path());
         assert_eq!(s.recent_targets, [Target::Local]);
         assert!(s.collapsed_groups.is_empty());
+        assert!(s.recent_commands.is_empty());
+    }
+
+    #[test]
+    fn the_sidebar_grouping_roundtrips_and_an_unknown_one_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(GuiState::load(dir.path()).sidebar_group_by, GroupBy::Folder);
+        let s = GuiState {
+            sidebar_group_by: GroupBy::Repo,
+            ..GuiState::default()
+        };
+        s.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("gui-state.toml")).unwrap();
+        assert!(text.contains("sidebar_group_by = \"repo\""), "{text}");
+        assert_eq!(GuiState::load(dir.path()), s);
+        std::fs::write(
+            dir.path().join("gui-state.toml"),
+            "sidebar_group_by = \"label\"\nrecent_dirs = { local = [\"/w\"] }\n",
+        )
+        .unwrap();
+        let loaded = GuiState::load(dir.path());
+        assert_eq!(loaded.sidebar_group_by, GroupBy::Folder);
+        assert_eq!(loaded.recent_dirs["local"], ["/w"]);
     }
 
     #[test]

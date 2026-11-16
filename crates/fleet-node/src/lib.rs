@@ -1,4 +1,5 @@
 pub mod env;
+pub mod git;
 mod handoff;
 pub mod history;
 pub mod host;

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use fleet_client::names::{NAME_LABEL, check_name, default_name};
 
+use super::labels::parse_label;
 use super::target::Target;
 
 pub use fleet_proto::status::{KIND_LABEL, SHELL_KIND};
@@ -123,14 +124,11 @@ impl NameDraft {
 pub fn parse_label_list(text: &str) -> Result<HashMap<String, String>, String> {
     let mut out = HashMap::new();
     for item in text.split(',').map(str::trim).filter(|i| !i.is_empty()) {
-        let (k, v) = match item.split_once('=') {
-            Some((k, v)) if !k.trim().is_empty() => (k.trim(), v.trim()),
-            _ => return Err(format!("label {item:?}: expected key=value")),
-        };
+        let (k, v) = parse_label(item)?;
         if k == NAME_LABEL {
             return Err("set the name in the Name field".into());
         }
-        out.insert(k.to_owned(), v.to_owned());
+        out.insert(k, v);
     }
     Ok(out)
 }
@@ -239,6 +237,7 @@ mod tests {
         assert!(parse_label_list("role").is_err());
         assert!(parse_label_list("=x").is_err());
         assert!(parse_label_list("name=x").is_err());
+        assert!(parse_label_list("fleet.parent=1").is_err());
     }
 
     #[test]

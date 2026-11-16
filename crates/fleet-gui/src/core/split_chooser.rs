@@ -1,13 +1,15 @@
 //! The split chooser (issue #30): a pane opened by a split asks what to
 //! start in it. 1 a new agent (the default command), 2 an agent not on
-//! screen (from a fuzzy picker), 3 a plain terminal. Esc closes the pane;
-//! in the agent list it goes back to the choices.
+//! screen (from a fuzzy picker), 3 a plain terminal, then 4 to 9 the
+//! command presets (ADR 0084). Esc closes the pane; in the agent list it
+//! goes back to the choices.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use super::palette::agent_item;
 use super::picker::PickerItem;
+use super::presets::{CHOOSER_PRESETS, Preset};
 use super::session::AgentRow;
 use super::sidebar::{program_name, tilde};
 
@@ -17,10 +19,13 @@ pub enum Choice {
     NewAgent,
     Agent,
     Terminal,
+    /// The preset at this index of the list the rows were made from.
+    Preset(usize),
 }
 
 impl Choice {
-    /// The choices, in their keys' order (1, 2, 3).
+    /// The fixed choices, in their keys' order (1, 2, 3); the presets
+    /// follow.
     pub const ALL: [Choice; 3] = [Choice::NewAgent, Choice::Agent, Choice::Terminal];
 
     /// Its key, 1-based.
@@ -29,14 +34,17 @@ impl Choice {
             Choice::NewAgent => 1,
             Choice::Agent => 2,
             Choice::Terminal => 3,
+            Choice::Preset(i) => 4 + i,
         }
     }
 
+    /// A fixed choice's title (a preset's is its name).
     pub fn title(self) -> &'static str {
         match self {
             Choice::NewAgent => "New agent",
             Choice::Agent => "Existing agent…",
             Choice::Terminal => "Terminal",
+            Choice::Preset(_) => "",
         }
     }
 }
@@ -45,21 +53,23 @@ impl Choice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChoiceRow {
     pub choice: Choice,
-    pub title: &'static str,
+    pub title: String,
     /// What it starts, and where (`claude in ~/src`).
     pub detail: String,
     /// It can be picked (Existing agent needs an agent off screen).
     pub enabled: bool,
 }
 
-/// The three rows. `command` is `[gui] default_command` (empty: the New
-/// agent sheet asks); `dir` the folder both start in (`""`: the daemon's
-/// own); `off_screen` how many agents the list would offer.
+/// The three rows, then a row per preset (at most [`CHOOSER_PRESETS`]).
+/// `command` is `[gui] default_command` (empty: the New agent sheet
+/// asks); `dir` the folder they start in (`""`: the daemon's own);
+/// `off_screen` how many agents the list would offer.
 pub fn choice_rows(
     command: &[String],
     dir: &str,
     home: &Path,
     off_screen: usize,
+    presets: &[Preset],
 ) -> Vec<ChoiceRow> {
     let place = if dir.is_empty() {
         String::new()
@@ -80,14 +90,27 @@ pub fn choice_rows(
                     n => (format!("{n} not on screen"), true),
                 },
                 Choice::Terminal => (format!("shell{place}"), true),
+                Choice::Preset(_) => unreachable!("not in Choice::ALL"),
             };
             ChoiceRow {
                 choice,
-                title: choice.title(),
+                title: choice.title().to_owned(),
                 detail,
                 enabled,
             }
         })
+        .chain(
+            presets
+                .iter()
+                .take(CHOOSER_PRESETS)
+                .enumerate()
+                .map(|(i, p)| ChoiceRow {
+                    choice: Choice::Preset(i),
+                    title: p.name.clone(),
+                    detail: format!("{}{place}", p.command_line()),
+                    enabled: true,
+                }),
+        )
         .collect()
 }
 
@@ -193,17 +216,18 @@ impl SplitChooser {
     }
 
     /// A key in the choices (a key name as the keymap writes it, without
-    /// modifiers): 1/2/3 pick, ↑/↓ select (wrapping, skipping a disabled
+    /// modifiers): 1/2/3 and a preset's 4 to 9 pick, ↑/↓ select (wrapping, skipping a disabled
     /// row), Enter picks the selected, Esc cancels. `None`: not the chooser's key.
     pub fn key(&mut self, key: &str) -> Option<Outcome> {
         if self.stage != Stage::Choices {
             return None;
         }
         match key {
-            "1" | "2" | "3" => {
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                 let n: usize = key.parse().ok()?;
+                let choice = self.rows.iter().find(|r| r.choice.number() == n)?.choice;
                 // A disabled choice still takes its key.
-                Some(self.pick(Choice::ALL[n - 1]).unwrap_or(Outcome::Stay))
+                Some(self.pick(choice).unwrap_or(Outcome::Stay))
             }
             "up" => {
                 self.step(-1);
@@ -266,6 +290,7 @@ mod tests {
             "/Users/me/src",
             home(),
             off_screen,
+            &[],
         ))
     }
 
@@ -276,10 +301,18 @@ mod tests {
             "/Users/me/src",
             home(),
             2,
+            &[],
         );
         let got: Vec<_> = rows
             .iter()
-            .map(|r| (r.choice.number(), r.title, r.detail.as_str(), r.enabled))
+            .map(|r| {
+                (
+                    r.choice.number(),
+                    r.title.as_str(),
+                    r.detail.as_str(),
+                    r.enabled,
+                )
+            })
             .collect();
         assert_eq!(
             got,
@@ -293,14 +326,17 @@ mod tests {
 
     #[test]
     fn rows_without_a_command_a_folder_or_agents_off_screen() {
-        let rows = choice_rows(&[], "", home(), 0);
+        let rows = choice_rows(&[], "", home(), 0, &[]);
         assert_eq!(rows[0].detail, "choose a command and folder");
         assert!(rows[0].enabled);
         assert_eq!(rows[1].detail, "every agent is on screen");
         assert!(!rows[1].enabled);
         // A remote daemon's own folder: nothing to name.
         assert_eq!(rows[2].detail, "shell");
-        assert_eq!(choice_rows(&[], "", home(), 1)[1].detail, "1 not on screen");
+        assert_eq!(
+            choice_rows(&[], "", home(), 1, &[])[1].detail,
+            "1 not on screen"
+        );
     }
 
     #[test]
@@ -318,6 +354,38 @@ mod tests {
         assert_eq!(c.back(), Outcome::Back);
         assert_eq!(c.stage(), Stage::Choices);
         assert_eq!(c.selected(), 1);
+    }
+
+    fn preset(name: &str, command: &[&str]) -> Preset {
+        Preset {
+            name: name.into(),
+            command: command.iter().map(|w| (*w).to_owned()).collect(),
+            labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn presets_follow_the_fixed_choices_with_keys_four_to_nine() {
+        let presets: Vec<Preset> = (0..8)
+            .map(|i| preset(&format!("P{i}"), &["omp", "--x"]))
+            .collect();
+        let rows = choice_rows(&["claude".into()], "/Users/me/src", home(), 0, &presets);
+        // Three fixed rows, then six presets.
+        assert_eq!(rows.len(), 3 + CHOOSER_PRESETS);
+        assert_eq!(rows[3].choice, Choice::Preset(0));
+        assert_eq!(rows[3].title, "P0");
+        assert_eq!(rows[3].detail, "omp --x in ~/src");
+        assert_eq!(rows.last().unwrap().choice.number(), 9);
+        let mut c = SplitChooser::new(rows);
+        assert_eq!(c.key("5"), Some(Outcome::Start(Choice::Preset(1))));
+        // Arrows reach them; Enter starts one.
+        let mut c2 = c.clone();
+        c2.select(0);
+        c2.key("up");
+        assert_eq!(c2.key("enter"), Some(Outcome::Start(Choice::Preset(5))));
+        // Without presets, 4 is not the chooser's.
+        let mut plain = chooser(1);
+        assert_eq!(plain.key("4"), None);
     }
 
     #[test]

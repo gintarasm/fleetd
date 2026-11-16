@@ -13,14 +13,17 @@ mod graph_view;
 mod icons;
 mod keymap;
 mod kill_sheet;
+mod labels_sheet;
 mod native;
 mod new_agent;
+mod output;
 mod palette;
 mod pane_drag;
 mod pane_view;
 mod picker_view;
 mod rename;
 mod resident;
+mod send_sheet;
 mod settings_window;
 mod sidebar_view;
 mod split_chooser;
@@ -98,6 +101,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                 items: vec![
                     MenuItem::action("Settings…", keymap::OpenSettings),
                     MenuItem::action("Command Palette…", keymap::CommandPalette),
+                    MenuItem::action("Send to Agents…", keymap::SendToAgents),
                     MenuItem::separator(),
                     MenuItem::action("Remove Exited Agents…", keymap::RemoveExited),
                     MenuItem::separator(),
@@ -118,6 +122,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Copy", keymap::Copy),
                     MenuItem::action("Paste", keymap::Paste),
                     MenuItem::action("Select All", keymap::SelectAll),
+                    MenuItem::action("Clear Scrollback", keymap::ClearScrollback),
                     MenuItem::separator(),
                     MenuItem::action("Find…", keymap::Find),
                     MenuItem::action("Find Next", keymap::FindNext),

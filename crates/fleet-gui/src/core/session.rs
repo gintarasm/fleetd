@@ -19,7 +19,8 @@ use fleet_client::{
 };
 use fleet_proto::{
     AgentInfo, AgentState, BinaryIdentity, ForgetAgents, Frame, HelloOk, KillAgent, ListAgents,
-    Response, RestartAgent, RestartDaemon, SetLabels, SpawnAgent, event, request, response,
+    Response, RestartAgent, RestartDaemon, SendInput, SetLabels, SpawnAgent, event, request,
+    response,
 };
 use fleet_term::Palette;
 
@@ -32,6 +33,8 @@ use super::target::{Connected, Target, connect};
 
 /// How the control connection introduces itself.
 pub const CLIENT_NAME: &str = "gui";
+/// How a [`Session::read_output`] connection introduces itself.
+const OUTPUT_CLIENT_NAME: &str = "gui-output";
 
 /// What an old daemon answers a request it does not know with.
 const UNKNOWN_REQUEST: &str = "empty request";
@@ -392,8 +395,17 @@ enum ControlCmd {
     Kill(u64),
     Restart(u64),
     Forget(Vec<u64>),
-    /// Sets an agent's `name` label (ADR 0052), then lists.
-    Rename(u64, String),
+    /// Sets, then removes, an agent's labels (Rename sets `name`, ADR
+    /// 0052; Edit Labels the rest, ADR 0087), then lists. `verb` names it
+    /// in an error.
+    SetLabels {
+        agent_id: u64,
+        set: HashMap<String, String>,
+        remove: Vec<String>,
+        verb: &'static str,
+    },
+    /// Types into an agent (Send to Agents…, ADR 0083).
+    Input(u64, Vec<u8>),
     ClearExited,
     RestartDaemon(String),
     Stop,
@@ -600,12 +612,53 @@ impl Session {
     /// Renames an agent (its `name` label, ADR 0052); the sidebar follows
     /// with the list sent right after it.
     pub fn rename(&self, agent_id: u64, name: String) {
-        self.control(ControlCmd::Rename(agent_id, name));
+        self.control(ControlCmd::SetLabels {
+            agent_id,
+            set: HashMap::from([(NAME_LABEL.to_owned(), name)]),
+            remove: Vec::new(),
+            verb: "rename",
+        });
+    }
+
+    /// Sets, then removes, an agent's labels (Edit Labels, ADR 0087); the
+    /// sidebar follows with the list sent right after it.
+    pub fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
+        self.control(ControlCmd::SetLabels {
+            agent_id,
+            set,
+            remove,
+            verb: "edit labels",
+        });
+    }
+
+    /// Types `data` into an agent on the control connection, as `fleet
+    /// send` does (Send to Agents…, ADR 0083); a refusal is shown as an
+    /// error.
+    pub fn send_input(&self, agent_id: u64, data: Vec<u8>) {
+        self.control(ControlCmd::Input(agent_id, data));
     }
 
     /// Forgets these exited agents (running ones are refused by fleetd).
     pub fn forget(&self, ids: Vec<u64>) {
         self.control(ControlCmd::Forget(ids));
+    }
+
+    /// A job that reads `agent_id`'s whole output (its fleetd history,
+    /// then its screen) as plain text, over a connection of its own, as
+    /// `fleet history --plain` does (ADR 0086). It blocks: run it off the
+    /// UI thread. Running and exited agents alike.
+    pub fn read_output(
+        &self,
+        agent_id: u64,
+    ) -> impl FnOnce() -> Result<String, String> + Send + use<> {
+        let ctx = Arc::clone(&self.inner.ctx);
+        move || {
+            let mut c = connect(&ctx.target, &ctx.state_dir, OUTPUT_CLIENT_NAME)
+                .map_err(|e| e.to_string())?;
+            let read = fleet_client::history::read(&mut c.conn, agent_id, None);
+            drop(c);
+            read.map(|t| t.plain_text()).map_err(|e| e.to_string())
+        }
     }
 
     /// Restarts fleetd into the binary on disk, agents kept: the local
@@ -1148,14 +1201,23 @@ fn control_writer(
                     request::Kind::Forget(Box::new(forget)),
                 );
             }
-            Some(ControlCmd::Rename(agent_id, name)) => {
+            Some(ControlCmd::SetLabels {
+                agent_id,
+                set,
+                remove,
+                verb,
+            }) => {
                 let set = SetLabels {
                     agent_id,
-                    set: HashMap::from([(NAME_LABEL.to_owned(), name)]),
-                    remove: Vec::new(),
+                    set,
+                    remove,
                 };
-                send_tracked(&mut sender, "rename", request::Kind::SetLabels(set));
+                send_tracked(&mut sender, verb, request::Kind::SetLabels(set));
                 list(&mut sender, &mut next_list);
+            }
+            Some(ControlCmd::Input(agent_id, data)) => {
+                let input = SendInput { agent_id, data };
+                send_tracked(&mut sender, "send", request::Kind::Input(input));
             }
             Some(ControlCmd::RestartDaemon(binary)) => {
                 send_tracked(

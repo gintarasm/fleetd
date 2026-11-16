@@ -1,9 +1,12 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
 //! directory. (New agent and Clear exited live in the unified bar.)
-//! A click shows the agent in the focused pane; a right-click opens the
-//! row's native menu (`core::menus::row_menu`). Above the tabs, a filter
+//! A click shows the agent in the focused pane; ⌘-click and ⇧-click pick
+//! rows for Send to Selected… (ADR 0083); a right-click opens the row's
+//! native menu (`core::menus::row_menu`). Above the tabs, a filter
 //! field and status filters; a click on a group's header collapses it
-//! (issue #40, ADR 0060).
+//! (issue #40, ADR 0060), and a right-click offers grouping by folder or
+//! by git repository (ADR 0085). A row's second line shows its git
+//! checkout and branch when the node reports one.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,9 +14,9 @@ use fleet_client::names::name_of;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Action, AppContext, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
-    div, px,
+    Action, AppContext, Context, Div, Entity, ExternalPaths, FocusHandle, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::agent_mark::{MARK_SLOT, agent_mark};
@@ -24,6 +27,7 @@ use super::tail_text::{head_text, tail_text};
 use super::text_field::TextField;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
+use crate::core::git;
 use crate::core::icons::Icon;
 use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::row_preview::{preview_line, row_meta};
@@ -78,6 +82,8 @@ pub struct SidebarData<'a> {
     pub status_filter: StatusFilter,
     /// The tabs' focus: a key typed while it has it goes to the filter.
     pub focus: FocusHandle,
+    /// The rows picked with ⌘-click and ⇧-click (ADR 0083).
+    pub selected: &'a [u64],
 }
 
 /// A tab's title: the agent's name (ADR 0052), else its OSC title if a
@@ -247,7 +253,12 @@ fn render_group(
         )
         .child(div().flex_1().min_w_0().child(tail_text(group.title)))
         .children(count)
-        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&title, cx)));
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&title, cx)))
+        // Group by folder or repository (ADR 0085).
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, _, _, cx| this.open_group_menu(cx)),
+        );
     div()
         .flex()
         .flex_col()
@@ -299,6 +310,7 @@ fn render_tab(
     let meta = row_meta(row, data.now_ms);
     let preview = preview_line(&row.last_line);
     let rang = data.bells.contains(&id);
+    let picked = data.selected.contains(&id);
     let buttons: Vec<RowButton> = match agent_buttons(true, ended(row)) {
         AgentButtons::None => Vec::new(),
         AgentButtons::Stop => vec![("stop", Icon::Stop, Box::new(Kill { agent_id: id }))],
@@ -382,6 +394,8 @@ fn render_tab(
                 )
                 .children(row_buttons(buttons, id, theme, cx))
         });
+    // The git checkout and branch (ADR 0085), else `program · id`.
+    let git = git::row_subtitle(&row.info);
     let line2 = div()
         .flex()
         .flex_row()
@@ -392,9 +406,26 @@ fn render_tab(
         .child(
             div()
                 .debug_selector(move || format!("tab-{id}-detail"))
-                .flex_none()
                 .text_color(theme.tertiary)
-                .child(SharedString::from(program_and_id(&row.info))),
+                .map(|d| match git {
+                    // Long branch names give way to the last line, up to
+                    // a point.
+                    Some(git) => {
+                        let shown = git.clone();
+                        d.flex_shrink()
+                            .min_w_0()
+                            .max_w(px(chrome::SIDEBAR_WIDTH * 0.6))
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("tab-{id}-git-{shown}"))
+                                    .truncate()
+                                    .child(SharedString::from(git)),
+                            )
+                    }
+                    None => d
+                        .flex_none()
+                        .child(SharedString::from(program_and_id(&row.info))),
+                }),
         )
         .child(
             div()
@@ -419,7 +450,7 @@ fn render_tab(
             .flex_wrap()
             .gap(px(space::XXS))
             .pl(px(ROW_INDENT))
-            .children(chips.into_iter().map(|(k, v)| chip(id, k, v, theme)))
+            .children(chips.into_iter().map(|(k, v)| chip(id, k, v, theme, cx)))
     });
     let bar = div()
         .absolute()
@@ -453,16 +484,19 @@ fn render_tab(
         .when(rang && mark != TabMark::Focused, |s| {
             s.bg(theme.warning.opacity(0.14))
         })
+        // Picked for Send to Selected…: an accent tint over the rest.
+        .when(picked, |s| s.bg(theme.accent.opacity(0.22)))
         .hover(|s| s.bg(theme.hover))
         .active(|s| s.bg(theme.pressed))
         .child(bar)
         .child(line1)
         .child(line2)
         .children(line3)
-        .on_click(cx.listener(move |this, _, window, cx| {
+        .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
             // A drag that ends on its own row is not a click.
             if this.pane_drag.is_click() {
-                this.show_agent(id, window, cx);
+                let m = ev.modifiers();
+                this.row_click(id, m.platform, m.shift, window, cx);
             }
         }))
         .on_mouse_down(
@@ -475,10 +509,26 @@ fn render_tab(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
+        // Files from Finder: tinted while over the row (stronger than a
+        // picked row's tint), typed into its agent when dropped (ADR 0081).
+        .drag_over::<ExternalPaths>({
+            let tint = theme.accent.opacity(0.34);
+            move |s, _, _, _| s.bg(tint)
+        })
+        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+            this.drop_paths_on_agent(id, paths, cx);
+        }))
 }
 
-/// A label chip: the value, with `key=value` as its tooltip.
-fn chip(id: u64, key: String, value: String, theme: &Theme) -> impl IntoElement + use<> {
+/// A label chip: the value, with `key=value` as its tooltip. A click
+/// filters the sidebar by it (ADR 0087).
+fn chip(
+    id: u64,
+    key: String,
+    value: String,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
     let tip = SharedString::from(format!("{key}={value}"));
     let tip_theme = *theme;
     let selector = format!("tab-{id}-chip-{key}");
@@ -492,7 +542,14 @@ fn chip(id: u64, key: String, value: String, theme: &Theme) -> impl IntoElement 
         .text_color(theme.secondary)
         .max_w(px(chrome::SIDEBAR_WIDTH / 2.0))
         .truncate()
-        .child(SharedString::from(value))
+        .cursor_pointer()
+        .hover(move |s| s.bg(tip_theme.pressed).text_color(tip_theme.text))
+        .child(SharedString::from(value.clone()))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.filter_by_label(&key, &value, cx);
+            // Not also the row's click, which would show the agent.
+            cx.stop_propagation();
+        }))
         .tooltip(move |_, cx| {
             cx.new(|_| Tooltip {
                 text: tip.clone(),

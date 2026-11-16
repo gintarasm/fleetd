@@ -184,6 +184,21 @@ message AgentInfo {
   optional int64 exited_unix_ms = 9;
   // The agent's own last `fleet report` (ADR 0075); unset until it reports.
   optional Reported reported = 50;
+  // The git checkout holding `cwd`, read on the node's host (ADR 0085);
+  // unset when `cwd` is in none, or from a node that does not read it.
+  GitInfo git = 10;
+}
+
+// Read from `.git` files, never by running git (ADR 0085). Refreshed at
+// most every few seconds, when the agent list is asked for.
+message GitInfo {
+  // The repository's folder name (a linked worktree's main checkout).
+  string repo = 1;
+  // A linked worktree's folder name; empty for the main checkout.
+  string worktree = 2;
+  // The checked-out branch, else (`detached`) the commit's short hash.
+  string branch = 3;
+  bool detached = 4;
 }
 
 // With `observe`, a read-only attach (ADR 0022): it never takes or changes

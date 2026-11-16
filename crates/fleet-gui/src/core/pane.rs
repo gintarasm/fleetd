@@ -43,6 +43,22 @@ pub enum ViewRow {
     Grid(u16),
 }
 
+/// A keyboard scroll of the view (decision 0082): ⇧PageUp and ⇧PageDown
+/// by a page, ⌘↑ and ⌘↓ (⌘Home, ⌘End) to the top and the bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewScroll {
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+/// Lines a page scroll moves on a grid `rows` high: all but one, so the
+/// line at the edge stays in view for context.
+pub fn page_lines(rows: u16) -> u64 {
+    u64::from(rows.saturating_sub(1).max(1))
+}
+
 pub struct PaneModel {
     palette: Palette,
     term: Terminal,
@@ -246,6 +262,84 @@ impl PaneModel {
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
         self.unseen_lines = 0;
+    }
+
+    /// Scrolls the view from the keyboard. `false` on the alternate screen,
+    /// which has no history: the key is the program's then.
+    pub fn scroll_view(&mut self, scroll: ViewScroll) -> bool {
+        if self.term.modes().alt_screen {
+            return false;
+        }
+        let page = page_lines(self.term.size().1);
+        match scroll {
+            ViewScroll::PageUp => self.scroll_to(self.scroll_offset.saturating_add(page)),
+            ViewScroll::PageDown => self.scroll_to(self.scroll_offset.saturating_sub(page)),
+            ViewScroll::Top => self.scroll_to(self.scrollback.len()),
+            ViewScroll::Bottom => self.scroll_to_bottom(),
+        }
+        true
+    }
+
+    /// Keyboard scrolling applies (not the alternate screen) and there is
+    /// history to scroll through.
+    pub fn can_scroll_view(&self) -> bool {
+        !self.term.modes().alt_screen && !self.scrollback.is_empty()
+    }
+
+    /// Selects the loaded history and the grid down to its last row with
+    /// text (⌘A); `false`, selecting nothing, when there is no text.
+    pub fn select_all(&mut self) -> bool {
+        let mut cells = Vec::new();
+        let rows = self.term.size().1;
+        let last_row = (0..rows).rev().find(|&r| {
+            self.term.row_cells(r, &mut cells);
+            !selection::row_text(&cells, 0, LINE_END).is_empty()
+        });
+        let sb = &self.scrollback;
+        let end = match last_row {
+            Some(r) => LineRef::Grid(r),
+            None if !sb.is_empty() => LineRef::History(sb.end_line() - 1),
+            None => {
+                self.selection = None;
+                return false;
+            }
+        };
+        let start = if sb.is_empty() {
+            LineRef::Grid(0)
+        } else {
+            LineRef::History(sb.first_line())
+        };
+        self.selection = Some(Selection::range(
+            SelUnit::Line,
+            SelPoint {
+                line: start,
+                col: 0,
+            },
+            SelPoint {
+                line: end,
+                col: LINE_END,
+            },
+        ));
+        true
+    }
+
+    /// Clears the loaded history from this view only (⌘K): the agent and
+    /// the node's history are untouched, and a re-attach brings it back.
+    /// The view returns to the grid; a selection in the history is dropped
+    /// and an open find searches again.
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear_view();
+        self.scroll_offset = 0;
+        self.unseen_lines = 0;
+        if self
+            .selection
+            .is_some_and(|s| s.touches_history_before(self.scrollback.first_line()))
+        {
+            self.selection = None;
+        }
+        if let Some(f) = &mut self.find {
+            f.restart(&self.scrollback);
+        }
     }
 
     /// Lines of output that scrolled into history below the view while it
@@ -1157,5 +1251,145 @@ mod tests {
         pane.find_close();
         assert_eq!(pane.find_status(), None);
         assert_eq!(pane.next_page_request(), None);
+    }
+
+    #[test]
+    fn page_lines_keep_one_line_of_context() {
+        assert_eq!(page_lines(24), 23);
+        assert_eq!(page_lines(2), 1);
+        assert_eq!(page_lines(1), 1);
+        assert_eq!(page_lines(0), 1);
+    }
+
+    #[test]
+    fn keyboard_scrolls_by_page_and_to_the_ends() {
+        let mut pane = pane();
+        let tail: Vec<String> = (0..50).map(|i| format!("h{i}")).collect();
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        pane.on_attached(&attach_ok(20, 10, &tail, 0));
+        assert!(pane.can_scroll_view());
+        assert!(pane.scroll_view(ViewScroll::PageUp));
+        assert_eq!(pane.scroll_offset(), 9);
+        pane.scroll_view(ViewScroll::PageUp);
+        assert_eq!(pane.scroll_offset(), 18);
+        pane.scroll_view(ViewScroll::PageDown);
+        assert_eq!(pane.scroll_offset(), 9);
+        pane.scroll_view(ViewScroll::PageDown);
+        pane.scroll_view(ViewScroll::PageDown);
+        assert_eq!(pane.scroll_offset(), 0);
+        pane.scroll_view(ViewScroll::Top);
+        assert_eq!(pane.scroll_offset(), 50);
+        assert_eq!(pane.view_row(0), ViewRow::History(0));
+        // Paging up stops at the oldest loaded line.
+        pane.scroll_view(ViewScroll::PageUp);
+        assert_eq!(pane.scroll_offset(), 50);
+        // Scrolled up, output counts as unseen; the bottom clears it.
+        pane.on_output(b"\r\n".repeat(12).as_slice());
+        assert!(pane.new_output());
+        pane.scroll_view(ViewScroll::Bottom);
+        assert_eq!(pane.scroll_offset(), 0);
+        assert_eq!(pane.unseen_lines(), 0);
+    }
+
+    #[test]
+    fn keyboard_scrolling_leaves_the_alternate_screen_to_the_program() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 4, &["a", "b", "c"], 0));
+        pane.on_output(b"\x1b[?1049h");
+        assert!(!pane.can_scroll_view());
+        for s in [
+            ViewScroll::PageUp,
+            ViewScroll::PageDown,
+            ViewScroll::Top,
+            ViewScroll::Bottom,
+        ] {
+            assert!(!pane.scroll_view(s), "{s:?}");
+        }
+        assert_eq!(pane.scroll_offset(), 0);
+        pane.on_output(b"\x1b[?1049l");
+        assert!(pane.scroll_view(ViewScroll::Top));
+        assert_eq!(pane.scroll_offset(), 3);
+    }
+
+    #[test]
+    fn select_all_takes_the_history_and_the_grid_down_to_its_last_text() {
+        let mut pane = pane();
+        assert!(!pane.select_all(), "nothing to select");
+        assert!(!pane.has_selection());
+        pane.on_attached(&attach_ok(20, 4, &["zero", "one  "], 7));
+        pane.on_output(b"grid a\r\ngrid b");
+        assert!(pane.select_all());
+        assert_eq!(
+            pane.selection_text().as_deref(),
+            Some("zero\none\ngrid a\ngrid b")
+        );
+        assert!(pane.is_selected(LineRef::History(7), 0));
+        assert!(!pane.is_selected(LineRef::Grid(2), 0));
+        // No history: the grid alone.
+        let mut pane = pane_with_grid_only();
+        assert!(pane.select_all());
+        assert_eq!(pane.selection_text().as_deref(), Some("only"));
+        // A blank grid: the history alone.
+        let mut pane = self::pane();
+        pane.on_attached(&attach_ok(20, 3, &["old"], 0));
+        assert!(pane.select_all());
+        assert_eq!(pane.selection_text().as_deref(), Some("old"));
+    }
+
+    fn pane_with_grid_only() -> PaneModel {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 3, &[], 0));
+        pane.on_output(b"only");
+        pane
+    }
+
+    #[test]
+    fn clear_scrollback_empties_the_view_only() {
+        let mut pane = pane();
+        let mut ok = attach_ok(20, 3, &["e1", "x", "e2"], 10);
+        ok.history_first_line = 2;
+        ok.history_generation = 4;
+        pane.on_attached(&ok);
+        pane.on_output(b"e3");
+        pane.scroll_lines(2);
+        pane.select_start(SelPoint {
+            line: LineRef::History(11),
+            col: 0,
+        });
+        pane.select_extend(SelPoint {
+            line: LineRef::History(12),
+            col: 1,
+        });
+        find_all(&mut pane, "e", false);
+        assert_eq!(pane.find_status().unwrap().count, 3);
+        pane.clear_scrollback();
+        assert!(pane.scrollback().is_empty());
+        assert_eq!(pane.scrollback().generation(), 4, "the node's numbering");
+        assert_eq!(pane.scroll_offset(), 0);
+        assert!(!pane.has_selection());
+        assert!(!pane.can_scroll_view());
+        // The grid is the agent's: it stays.
+        assert_eq!(pane.view_row(0), ViewRow::Grid(0));
+        find_all(&mut pane, "e", false);
+        assert_eq!(pane.find_status().unwrap().count, 1);
+        // Nothing older is paged back in.
+        assert_eq!(pane.next_page_request(), None);
+        // Output after the clear is history as usual.
+        pane.on_output(b"\r\n\r\n\r\nnew");
+        assert_eq!(pane.scrollback().len(), 1);
+        // A re-attach rebuilds the history from the node.
+        pane.on_attached(&ok);
+        assert_eq!(pane.scrollback().len(), 3);
+    }
+
+    #[test]
+    fn clear_scrollback_keeps_a_selection_on_the_grid() {
+        let mut pane = pane_with_grid_only();
+        pane.select_word(SelPoint {
+            line: LineRef::Grid(0),
+            col: 1,
+        });
+        pane.clear_scrollback();
+        assert_eq!(pane.selection_text().as_deref(), Some("only"));
     }
 }

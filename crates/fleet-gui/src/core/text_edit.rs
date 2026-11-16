@@ -1,8 +1,9 @@
-//! A one-line text field's editing model: the text, the selection (an
-//! anchor and a caret), the IME's marked text and undo/redo, with the
-//! macOS editing commands (⌥ moves by word, ⌘ to the ends, ⌘⌫ deletes to
-//! the start). Offsets are byte offsets on char boundaries; the IME's
-//! UTF-16 offsets are converted at the edge.
+//! A text field's editing model: the text, the selection (an anchor and
+//! a caret), the IME's marked text and undo/redo, with the macOS editing
+//! commands (⌥ moves by word, ⌘ to the ends, ⌘⌫ deletes to the start).
+//! One line unless made [`TextEdit::multiline`] (the Send sheet's
+//! message, ADR 0083). Offsets are byte offsets on char boundaries; the
+//! IME's UTF-16 offsets are converted at the edge.
 
 use std::ops::Range;
 
@@ -13,8 +14,14 @@ pub enum Movement {
     Right,
     WordLeft,
     WordRight,
+    /// The start of the text.
     Home,
+    /// The end of the text.
     End,
+    /// The start of the caret's line (the text's start in one line).
+    LineStart,
+    /// The end of the caret's line (before its line break).
+    LineEnd,
 }
 
 /// Consecutive edits of one kind undo together.
@@ -48,11 +55,18 @@ pub struct TextEdit {
     redo: Vec<Snapshot>,
     /// The kind of the last edit, while the next one may join it.
     last: Option<EditKind>,
+    /// Line breaks are kept (as `\n`), not dropped.
+    multiline: bool,
 }
 
 /// `text` without line breaks.
 fn one_line(text: &str) -> String {
     text.replace(['\r', '\n'], "")
+}
+
+/// `text` with its line breaks as `\n`.
+fn unix_lines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn is_word(c: char) -> bool {
@@ -72,8 +86,45 @@ impl TextEdit {
         }
     }
 
+    /// `text`, keeping line breaks, with the caret at its end.
+    pub fn multiline(text: impl Into<String>) -> Self {
+        let text = unix_lines(&text.into());
+        TextEdit {
+            multiline: true,
+            ..TextEdit::new(text)
+        }
+    }
+
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Line breaks are kept.
+    pub fn is_multiline(&self) -> bool {
+        self.multiline
+    }
+
+    /// `text` as this field takes it: one line, or with `\n` breaks.
+    fn clean(&self, text: &str) -> String {
+        if self.multiline {
+            unix_lines(text)
+        } else {
+            one_line(text)
+        }
+    }
+
+    /// The start of the line `at` is on.
+    pub fn line_start(&self, at: usize) -> usize {
+        let at = self.floor(at);
+        self.text[..at].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    /// The end of the line `at` is on (before its line break).
+    pub fn line_end(&self, at: usize) -> usize {
+        let at = self.floor(at);
+        self.text[at..]
+            .find('\n')
+            .map_or(self.text.len(), |i| at + i)
     }
 
     /// The selection, start to end (empty: the caret).
@@ -102,7 +153,11 @@ impl TextEdit {
     /// Replaces all the text (a pick from a list); undoable.
     pub fn set_text(&mut self, text: &str) {
         self.checkpoint(EditKind::Other);
-        self.text = text.to_owned();
+        self.text = if self.multiline {
+            unix_lines(text)
+        } else {
+            text.to_owned()
+        };
         self.anchor = self.text.len();
         self.caret = self.anchor;
         self.marked = None;
@@ -172,13 +227,16 @@ impl TextEdit {
             Movement::WordRight => self.next_word(self.caret),
             Movement::Home => 0,
             Movement::End => self.text.len(),
+            Movement::LineStart => self.line_start(self.caret),
+            Movement::LineEnd => self.line_end(self.caret),
         };
         self.set_caret(to, extend);
     }
 
-    /// Types `text` over the selection (line breaks dropped: one line).
+    /// Types `text` over the selection (line breaks dropped unless
+    /// multi-line).
     pub fn insert(&mut self, text: &str) {
-        let text = &one_line(text);
+        let text = &self.clean(text);
         let kind = if text.chars().count() == 1 && !text.contains(char::is_whitespace) {
             EditKind::Typing
         } else {
@@ -222,18 +280,22 @@ impl TextEdit {
         self.delete(range);
     }
 
-    /// ⌘⌫: the selection, else everything before the caret.
+    /// ⌘⌫: the selection, else everything before the caret on its line.
     pub fn delete_to_start(&mut self) {
         let sel = self.selection();
-        let range = if sel.is_empty() { 0..self.caret } else { sel };
+        let range = if sel.is_empty() {
+            self.line_start(self.caret)..self.caret
+        } else {
+            sel
+        };
         self.delete(range);
     }
 
-    /// ⌃K: the selection, else everything after the caret.
+    /// ⌃K: the selection, else everything after the caret on its line.
     pub fn delete_to_end(&mut self) {
         let sel = self.selection();
         let range = if sel.is_empty() {
-            self.caret..self.text.len()
+            self.caret..self.line_end(self.caret)
         } else {
             sel
         };
@@ -330,7 +392,8 @@ impl TextEdit {
         self.marked = None;
         if composing {
             // The composition's start was the undo step.
-            self.splice(target, &one_line(text));
+            let text = self.clean(text);
+            self.splice(target, &text);
             self.redo.clear();
             self.last = Some(EditKind::Other);
             return;
@@ -356,7 +419,7 @@ impl TextEdit {
         if self.marked.is_none() {
             self.checkpoint(EditKind::Other);
         }
-        let text = &one_line(text);
+        let text = &self.clean(text);
         self.splice(target.clone(), text);
         let start = target.start;
         self.marked = (!text.is_empty()).then(|| start..start + text.len());
@@ -592,6 +655,39 @@ mod tests {
         assert_eq!(e.text(), "ab");
         e.replace_and_mark_utf16(None, "c\n", None);
         assert_eq!(e.text(), "abc");
+    }
+
+    #[test]
+    fn a_multiline_field_keeps_line_breaks_and_moves_by_line() {
+        let mut e = TextEdit::multiline("one\r\ntwo");
+        assert!(e.is_multiline());
+        assert_eq!(e.text(), "one\ntwo");
+        e.insert("\rthree");
+        assert_eq!(e.text(), "one\ntwo\nthree");
+        e.move_caret(M::LineStart, false);
+        assert_eq!(e.caret(), 8);
+        e.move_caret(M::Left, false);
+        e.move_caret(M::LineStart, true);
+        assert_eq!(e.selected_text(), "two");
+        e.move_caret(M::LineEnd, false);
+        assert_eq!(e.caret(), 7);
+        // ⌘⌫ and ⌃K stop at the line's ends.
+        e.delete_to_start();
+        assert_eq!(e.text(), "one\n\nthree");
+        e.move_caret(M::End, false);
+        e.move_caret(M::WordLeft, false);
+        e.delete_to_end();
+        assert_eq!(e.text(), "one\n\n");
+        e.set_text("a\r\nb");
+        assert_eq!(e.text(), "a\nb");
+        e.replace_and_mark_utf16(None, "c\n", None);
+        assert_eq!(e.text(), "a\nbc\n");
+        // One line: LineStart and LineEnd are the ends.
+        let mut one = TextEdit::new("abc");
+        one.move_caret(M::LineStart, false);
+        assert_eq!(one.caret(), 0);
+        one.move_caret(M::LineEnd, false);
+        assert_eq!(one.caret(), 3);
     }
 
     #[test]

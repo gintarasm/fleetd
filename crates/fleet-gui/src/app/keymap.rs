@@ -30,6 +30,12 @@ actions!(
         InstallSkill,
         RestartPane,
         KillPane,
+        // Unbound: the palette's Rename Agent…, Edit Labels…, Duplicate
+        // Agent… and Remove Exited Agent in Pane, on the focused pane's agent.
+        RenamePane,
+        EditLabelsPane,
+        DuplicatePane,
+        RemovePane,
         SelectAll,
         Cut,
         Undo,
@@ -53,6 +59,16 @@ actions!(
         NextAgent,
         PreviousAgent,
         ToggleGraph,
+        SaveOutput,
+        OpenOutput,
+        CopyLastOutput,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollToTop,
+        ScrollToBottom,
+        ClearScrollback,
+        // ⇧⌘M: type into one or many agents (ADR 0083).
+        SendToAgents,
     ]
 );
 
@@ -113,17 +129,19 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-shift-f", FocusFilter, None),
         KeyBinding::new("cmd-p", CommandPalette, None),
+        KeyBinding::new("cmd-shift-m", SendToAgents, None),
         KeyBinding::new("ctrl-tab", NextAgent, None),
         KeyBinding::new("ctrl-shift-tab", PreviousAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
         // Workspace tabs (ADR 0061). ⌘⇧] and ⌘⇧[ may arrive as the shifted
-        // characters with shift off, so both spellings are bound.
+        // characters with shift off, so both spellings are bound; the
+        // shifted spelling last, so the palette shows ⇧⌘] (ADR 0080).
         KeyBinding::new("cmd-alt-t", NewTab, None),
         KeyBinding::new("cmd-alt-w", CloseTab, None),
-        KeyBinding::new("cmd-shift-]", NextTab, None),
         KeyBinding::new("cmd-}", NextTab, None),
-        KeyBinding::new("cmd-shift-[", PrevTab, None),
+        KeyBinding::new("cmd-shift-]", NextTab, None),
         KeyBinding::new("cmd-{", PrevTab, None),
+        KeyBinding::new("cmd-shift-[", PrevTab, None),
         KeyBinding::new("cmd-alt-1", SelectTab { number: 1 }, None),
         KeyBinding::new("cmd-alt-2", SelectTab { number: 2 }, None),
         KeyBinding::new("cmd-alt-3", SelectTab { number: 3 }, None),
@@ -136,6 +154,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         // Kills the focused pane's agent (asking first); ⌘W only detaches.
         KeyBinding::new("cmd-shift-w", KillPane, Some(WORKSPACE_CONTEXT)),
+        // Saves the focused pane's agent's output (ADR 0086).
+        KeyBinding::new("cmd-shift-s", SaveOutput, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),
         // Also from the pane's find field, inside the terminal's context.
@@ -145,6 +165,18 @@ pub fn bind_keys(cx: &mut App) {
         // otherwise it toggles the graph (ADR 0073).
         KeyBinding::new("cmd-shift-g", FindPrevious, Some(FINDING_CONTEXT)),
         KeyBinding::new("cmd-shift-g", ToggleGraph, None),
+        // Scrollback from the keyboard (ADR 0082). On the alternate screen
+        // the pane lets these through to the program.
+        KeyBinding::new("shift-pageup", ScrollPageUp, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("shift-pagedown", ScrollPageDown, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-up", ScrollToTop, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-home", ScrollToTop, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-down", ScrollToBottom, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("cmd-end", ScrollToBottom, Some(TERMINAL_CONTEXT)),
+        // The pane's history and grid; a text field's own ⌘A wins inside it.
+        KeyBinding::new("cmd-a", SelectAll, Some(TERMINAL_CONTEXT)),
+        // This view's history only; the agent and the node keep theirs.
+        KeyBinding::new("cmd-k", ClearScrollback, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TEXT_FIELD_CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(TEXT_FIELD_CONTEXT)),

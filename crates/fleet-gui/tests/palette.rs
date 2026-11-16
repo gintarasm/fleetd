@@ -199,14 +199,20 @@ fn cmd_p_lists_actions_with_shortcuts_and_esc_closes(cx: &mut TestAppContext) {
     assert!(s.titles().contains(&"Split Right".to_owned()));
     assert_eq!(s.shortcut("Split Right").as_deref(), Some("⌘D"));
     assert_eq!(s.shortcut("Split Down").as_deref(), Some("⇧⌘D"));
+    assert_eq!(s.shortcut("Keyboard Shortcuts").as_deref(), Some("⌘/"));
+    assert_eq!(s.shortcut("Reset Zoom").as_deref(), Some("⌘0"));
+    assert_eq!(s.shortcut("Remove Exited Agents…"), None);
+    // One pane: nothing to maximize (ADR 0080).
+    assert!(!s.titles().contains(&"Maximize or Restore Pane".to_owned()));
+    s.keys("escape");
+    assert!(!s.palette_open());
+    assert!(s.pane_focused());
+    s.keys("cmd-d");
+    s.keys("cmd-p");
     assert_eq!(
         s.shortcut("Maximize or Restore Pane").as_deref(),
         Some("⇧⌘↩")
     );
-    assert_eq!(s.shortcut("Remove Exited Agents…"), None);
-    s.keys("escape");
-    assert!(!s.palette_open());
-    assert!(s.pane_focused());
 }
 
 #[gpui::test]
