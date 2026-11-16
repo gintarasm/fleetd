@@ -442,6 +442,24 @@ impl Layout {
         }
     }
 
+    /// One empty pane numbered `pane` (a new workspace tab's).
+    pub fn single_with(pane: PaneId) -> Layout {
+        Layout {
+            root: Node::Leaf { pane, agent: None },
+            next_id: pane.0 + 1,
+        }
+    }
+
+    /// The id the next split hands out.
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
+    /// Splits from now on hand out ids from `next` up, at least.
+    pub fn reserve_ids(&mut self, next: u32) {
+        self.next_id = self.next_id.max(next);
+    }
+
     /// Splits `pane`; the new pane goes right / below. `None` at `MAX_PANES` or for an unknown pane.
     pub fn split(&mut self, pane: PaneId, axis: Axis) -> Option<PaneId> {
         if self.panes().len() >= MAX_PANES || !self.panes().contains(&pane) {
@@ -675,6 +693,24 @@ mod tests {
         let c = l.split(a, Axis::Vertical).unwrap();
         let d = l.split(b, Axis::Vertical).unwrap();
         (l, [a, b, c, d])
+    }
+
+    #[test]
+    fn single_with_numbers_its_pane_and_splits_on_from_it() {
+        let mut l = Layout::single_with(PaneId(5));
+        assert_eq!(l.panes(), [PaneId(5)]);
+        assert_eq!(l.next_id(), 6);
+        assert_eq!(l.split(PaneId(5), Axis::Horizontal), Some(PaneId(6)));
+    }
+
+    #[test]
+    fn reserve_ids_only_raises_the_next_id() {
+        let mut l = Layout::single();
+        l.reserve_ids(9);
+        assert_eq!(l.next_id(), 9);
+        l.reserve_ids(3);
+        assert_eq!(l.next_id(), 9);
+        assert_eq!(l.split(PaneId(1), Axis::Vertical), Some(PaneId(9)));
     }
 
     #[test]
