@@ -146,15 +146,33 @@ impl Store {
     /// The seam for M3-D, which stores the reported status on the agent:
     /// this then reads that column instead.
     pub fn latest_status(&self, agent: u64) -> rusqlite::Result<Option<String>> {
+        Ok(self.latest_status_message(agent)?.and_then(|m| m.status))
+    }
+
+    /// The newest `status` message `agent` sent, while it is kept.
+    pub fn latest_status_message(&self, agent: u64) -> rusqlite::Result<Option<Message>> {
         self.conn
             .query_row(
-                "SELECT status FROM messages WHERE sender = ?1 AND kind = 'status'
-                 ORDER BY id DESC LIMIT 1",
+                &format!(
+                    "{MESSAGE_COLUMNS} WHERE sender = ?1 AND kind = 'status'
+                     ORDER BY id DESC LIMIT 1"
+                ),
                 (agent as i64,),
-                |r| r.get(0),
+                decode,
             )
             .optional()
-            .map(Option::flatten)
+    }
+
+    /// Stores each of `ms` (see [`Store::post_message`]) in one
+    /// transaction; their ids.
+    pub fn post_messages(&self, ms: &[NewMessage]) -> rusqlite::Result<Vec<u64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ids = ms
+            .iter()
+            .map(|m| self.insert_message(m))
+            .collect::<rusqlite::Result<_>>()?;
+        tx.commit()?;
+        Ok(ids)
     }
 
     /// Where `agent`'s automatic reports go: `Some(Some(parent))`, or
