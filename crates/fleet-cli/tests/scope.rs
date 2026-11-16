@@ -301,11 +301,21 @@ fn identities_survive_a_daemon_restart() {
     );
     d.ok(&["spawn", "--", "sh", &p]);
     let g: u64 = d.read("g.id").parse().unwrap();
-    let out = d.ok(&["daemon", "restart", "--binary", fleetd_bin().to_str().unwrap()]);
+    let out = d.ok(&[
+        "daemon",
+        "restart",
+        "--binary",
+        fleetd_bin().to_str().unwrap(),
+    ]);
     assert!(out.starts_with("fleetd restarted: 4 agents kept"), "{out}");
     std::fs::write(d.path("go"), "").unwrap();
     for out in ["c.ls", "c.ls.notoken", "c.ls.setsid"] {
-        assert_eq!(d.read(&format!("{out}.code")), "0", "{out}: {}", d.read(&format!("{out}.err")));
+        assert_eq!(
+            d.read(&format!("{out}.code")),
+            "0",
+            "{out}: {}",
+            d.read(&format!("{out}.err"))
+        );
         assert_eq!(ids(&d.read(out)), BTreeSet::from([g]), "{out}");
     }
     assert_eq!(d.read("c.kill.code"), "3");

@@ -56,7 +56,11 @@ fn read_when_there(path: &Path) -> String {
         if let Ok(s) = std::fs::read_to_string(path) {
             return s;
         }
-        assert!(Instant::now() < deadline, "{} never appeared", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -88,9 +92,7 @@ fn a_token_identifies_the_connection_and_refusals_are_broadcast() {
         program: "/bin/sh".into(),
         ..Default::default()
     };
-    let err = agent
-        .call(request::Kind::Spawn(Box::new(req)))
-        .unwrap_err();
+    let err = agent.call(request::Kind::Spawn(Box::new(req))).unwrap_err();
     assert!(err.is_forbidden(), "{err}");
 
     // The user's connection hears of it (other events may come first).
@@ -106,5 +108,9 @@ fn a_token_identifies_the_connection_and_refusals_are_broadcast() {
         }
     };
     assert_eq!(refused.parent, a);
-    assert!(refused.reason.contains("max_children = 0"), "{}", refused.reason);
+    assert!(
+        refused.reason.contains("max_children = 0"),
+        "{}",
+        refused.reason
+    );
 }
