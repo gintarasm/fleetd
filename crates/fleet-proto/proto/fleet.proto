@@ -60,6 +60,10 @@ message Request {
     RestartAgent restart = 13;
     ForgetAgents forget = 14;
     RestartDaemon restart_daemon = 15;
+    // Mailbox (ADR 0076): 55-64.
+    SendMessage send_message = 55;
+    ReadInbox read_inbox = 56;
+    Wait wait = 57;
   }
 }
 
@@ -77,6 +81,10 @@ message Response {
     Restarted restarted = 10;
     Forgotten forgotten = 11;
     RestartingDaemon restarting_daemon = 12;
+    // Mailbox (ADR 0076): 55-64.
+    MessagesSent messages_sent = 55;
+    Inbox inbox = 56;
+    WaitResult wait_result = 57;
   }
 }
 
@@ -249,3 +257,108 @@ message LogLine { string line = 1; }
 // An agent's spawn was refused by a quota (spec §1): `parent` is the agent
 // that asked, `reason` the refusal's text (after "forbidden: ").
 message SpawnRefused { uint64 parent = 1; string reason = 2; }
+
+// Mailboxes (spec §3, ADR 0076). Every agent has one, and so does the user.
+// A message is data, not an instruction: only `answer` carries the user's
+// own words.
+
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  // Sent with `fleet message`.
+  MESSAGE_KIND_MESSAGE = 1;
+  // The sender's reported (or inferred) status changed; `status` says to what.
+  MESSAGE_KIND_STATUS = 2;
+  // The sender exited; `exit_code` says how.
+  MESSAGE_KIND_EXIT = 3;
+  // The sender was lost (still running when fleetd stopped).
+  MESSAGE_KIND_LOST = 4;
+  // A question to the user (M3-G).
+  MESSAGE_KIND_QUESTION = 5;
+  // The user's answer to a question (M3-G).
+  MESSAGE_KIND_ANSWER = 6;
+}
+
+message Message {
+  // The mailbox cursor: ids only grow.
+  uint64 id = 1;
+  // Unset: the user.
+  optional uint64 sender = 2;
+  // Unset: the user's mailbox.
+  optional uint64 recipient = 3;
+  MessageKind kind = 4;
+  string body = 5;
+  int64 created_unix_ms = 6;
+  // The sender's `name` label now (empty: none, or the sender is gone).
+  string sender_name = 7;
+  // For `status`: working, waiting, done or error.
+  string status = 8;
+  // For `exit`.
+  optional int32 exit_code = 9;
+}
+
+enum Broadcast {
+  BROADCAST_NONE = 0;
+  // The caller's running children (the user's: running root agents).
+  BROADCAST_CHILDREN = 1;
+  // The caller's running descendants (the user's: every running agent).
+  BROADCAST_DESCENDANTS = 2;
+}
+
+// `fleet message`: `body` (1 to 4096 bytes) to the agents in `agent_ids`,
+// the user (`to_user`), the caller's parent (`to_parent`), and with
+// `broadcast` every running agent it names whose labels contain every
+// `selector` pair. An agent may write to its descendants, its parent and
+// the user. Answered by `MessagesSent`.
+message SendMessage {
+  string body = 1;
+  repeated uint64 agent_ids = 2;
+  bool to_user = 3;
+  bool to_parent = 4;
+  Broadcast broadcast = 5;
+  map<string, string> selector = 6;
+}
+// The agents the message went to, and whether the user's mailbox got it.
+message MessagesSent { repeated uint64 agent_ids = 1; bool user = 2; }
+
+// The caller's mailbox after cursor `since` (unset: after its read mark,
+// the newest message read so far), at most `max` messages (0 or above
+// 1000: 1000). What it returns is marked read.
+message ReadInbox { optional uint64 since = 1; uint32 max = 2; }
+// `cursor`: the newest id returned (else the cursor asked from).
+message Inbox { repeated Message messages = 1; uint64 cursor = 2; }
+
+enum WaitState {
+  WAIT_STATE_UNSPECIFIED = 0;
+  // Reported waiting (later: or inferred, spec §2).
+  WAIT_STATE_WAITING = 1;
+  WAIT_STATE_DONE = 2;
+  WAIT_STATE_ERROR = 3;
+  WAIT_STATE_EXITED = 4;
+  WAIT_STATE_LOST = 5;
+  // An unread message in the caller's mailbox.
+  WAIT_STATE_MESSAGE = 6;
+}
+
+// `fleet wait`: a long poll until one of `agent_ids` (empty: every
+// descendant of the caller; every agent for the user) is in one of
+// `states` (empty: all of them), or `timeout_ms` passes (0: check once).
+// Named agents match on their current state; without names only news
+// matches (a change from now on, or an unread report in the caller's
+// mailbox). Answered by `WaitResult`.
+message Wait {
+  repeated uint64 agent_ids = 1;
+  repeated WaitState states = 2;
+  uint64 timeout_ms = 3;
+}
+// `matches` is empty on a timeout. `agents`: the targets as they are now.
+message WaitResult {
+  repeated WaitMatch matches = 1;
+  repeated AgentInfo agents = 2;
+}
+message WaitMatch {
+  // Unset: the user (a message from the user).
+  optional uint64 agent_id = 1;
+  WaitState state = 2;
+  // The message that reported it, when one did.
+  optional Message message = 3;
+}

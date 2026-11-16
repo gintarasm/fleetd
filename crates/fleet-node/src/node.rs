@@ -57,8 +57,14 @@ use crate::git::GitCache;
 use crate::handoff::{self, HandoffGate};
 use crate::history::{History, HistoryInfo, Page};
 use crate::host::{AdoptSpec, AgentHost, TerminalHandle};
+use crate::mailbox::Notice;
 use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scope::{self, Caller, Member, Quotas, Tree};
+
+mod mailbox;
+pub use self::mailbox::{
+    INBOX_PAGE_MAX, WaitSpec, mailbox_of, message_proto, wait_state_from_proto, wait_state_proto,
+};
 use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
@@ -1582,6 +1588,7 @@ struct NodeSink {
     histories: Arc<Mutex<Histories>>,
     exits: broadcast::Sender<AgentExited>,
     activity: Arc<ActivityHub>,
+    notices: broadcast::Sender<Notice>,
 }
 
 impl OutputSink for NodeSink {
@@ -1609,6 +1616,8 @@ impl OutputSink for NodeSink {
         if let Err(e) = lock(&self.store).set_exited(self.id, code) {
             warn!(agent = self.id, error = %e, "recording the exit failed");
         }
+        // The parent's report (ADR 0076), after the exit is recorded.
+        mailbox::report_exit(&self.store, &self.notices, self.id, code);
         // No activity for the agent after its exit: pending events are
         // dropped before its stream ends, and none are published after.
         let activity = &self.activity;
@@ -1657,6 +1666,8 @@ pub struct Node {
     /// stored, so two spawns cannot both take the last slot.
     spawn_gate: Mutex<()>,
     refused: broadcast::Sender<SpawnRefused>,
+    /// Mailbox notices for waiters (ADR 0076); never on the output path.
+    notices: broadcast::Sender<Notice>,
     /// Agents' git checkouts, by cwd (ADR 0085).
     git: GitCache,
 }
@@ -1848,6 +1859,7 @@ impl Node {
         let (exits, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (removed, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
         let (refused, _) = broadcast::channel(EXIT_EVENT_CAPACITY);
+        let (notices, _) = broadcast::channel(mailbox::NOTICE_CAPACITY);
         let activity = Arc::new(ActivityHub::new());
         Ok(Node {
             host: Arc::new(PtyHost::new()),
@@ -1868,6 +1880,7 @@ impl Node {
             quotas: Quotas::default(),
             spawn_gate: Mutex::new(()),
             refused,
+            notices,
             git: GitCache::default(),
         })
     }
@@ -2801,6 +2814,7 @@ impl Node {
             histories: Arc::clone(&self.histories),
             exits: self.exits.clone(),
             activity: Arc::clone(&self.activity),
+            notices: self.notices.clone(),
         }
     }
 

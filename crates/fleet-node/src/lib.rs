@@ -3,6 +3,7 @@ pub mod git;
 mod handoff;
 pub mod history;
 pub mod host;
+pub mod mailbox;
 pub mod node;
 pub mod priority;
 pub mod pty;

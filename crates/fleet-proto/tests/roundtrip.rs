@@ -6,6 +6,10 @@ use fleet_proto::{
     ReadHistory, Request, Resize, Response, RestartAgent, Restarted, SendInput, SetLabels,
     SpawnAgent, SpawnedAttached, event, request, response,
 };
+use fleet_proto::{
+    Broadcast, Inbox, Message, MessageKind, MessagesSent, ReadInbox, SendMessage, Wait, WaitMatch,
+    WaitResult, WaitState,
+};
 use tokio_util::codec::{Decoder, Encoder};
 
 fn roundtrip(frame: Frame) -> Frame {
@@ -170,7 +174,35 @@ fn roundtrip_every_kind() {
             exited_only: false,
             selector: labels(),
         })),
+        request::Kind::SendMessage(Box::new(SendMessage {
+            body: "hi".into(),
+            agent_ids: vec![3],
+            to_user: true,
+            to_parent: true,
+            broadcast: Broadcast::Descendants as i32,
+            selector: labels(),
+        })),
+        request::Kind::ReadInbox(ReadInbox {
+            since: Some(0),
+            max: 10,
+        }),
+        request::Kind::Wait(Box::new(Wait {
+            agent_ids: vec![1, 2],
+            states: vec![WaitState::Exited as i32, WaitState::Message as i32],
+            timeout_ms: 600_000,
+        })),
     ];
+    let message = Message {
+        id: 7,
+        sender: Some(3),
+        recipient: None,
+        kind: MessageKind::Exit as i32,
+        body: "exited with code 2".into(),
+        created_unix_ms: 1_700_000_000_000,
+        sender_name: "worker".into(),
+        status: String::new(),
+        exit_code: Some(2),
+    };
     let responses = [
         response::Kind::Spawned(Box::new(info())),
         response::Kind::Agents(AgentList {
@@ -200,6 +232,22 @@ fn roundtrip_every_kind() {
             ids: vec![1],
             refused: vec![2, 3],
         }),
+        response::Kind::MessagesSent(Box::new(MessagesSent {
+            agent_ids: vec![3, 4],
+            user: true,
+        })),
+        response::Kind::Inbox(Box::new(Inbox {
+            messages: vec![message.clone()],
+            cursor: 7,
+        })),
+        response::Kind::WaitResult(Box::new(WaitResult {
+            matches: vec![WaitMatch {
+                agent_id: Some(3),
+                state: WaitState::Exited as i32,
+                message: Some(message),
+            }],
+            agents: vec![info()],
+        })),
     ];
     let events = [
         event::Kind::Exited(AgentExited {
