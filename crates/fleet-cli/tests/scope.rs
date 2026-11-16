@@ -268,3 +268,45 @@ fn an_agents_spawn_past_a_quota_exits_3_but_the_users_does_not() {
     }
     assert_eq!(ids(&d.ok(&["ls", "--json"])).len(), 5, "p {p}");
 }
+
+#[test]
+fn identities_survive_a_daemon_restart() {
+    let d = Daemon::start("");
+    let other = d.ok(&["spawn", "--", "sleep", "600"]);
+    // C waits for the restart, then runs `fleet` with and without its
+    // token, and from outside its session with it.
+    let c = d.script(
+        "c.sh",
+        &[
+            capture("$F spawn -- sleep 600", "g.id"),
+            "while [ ! -f $S/go ]; do sleep 0.05; done".into(),
+            capture("$F ls --json", "c.ls"),
+            capture("env -u FLEET_AGENT_TOKEN $F ls --json", "c.ls.notoken"),
+            capture(
+                "perl -MPOSIX -e 'POSIX::setsid() or die; exec @ARGV' -- $F ls --json",
+                "c.ls.setsid",
+            ),
+            capture(&format!("$F kill {other}"), "c.kill"),
+            "exec sleep 600".into(),
+        ]
+        .join("\n"),
+    );
+    let p = d.script(
+        "p.sh",
+        &[
+            capture(&format!("$F spawn -- sh {c}"), "c.id"),
+            "exec sleep 600".into(),
+        ]
+        .join("\n"),
+    );
+    d.ok(&["spawn", "--", "sh", &p]);
+    let g: u64 = d.read("g.id").parse().unwrap();
+    let out = d.ok(&["daemon", "restart", "--binary", fleetd_bin().to_str().unwrap()]);
+    assert!(out.starts_with("fleetd restarted: 4 agents kept"), "{out}");
+    std::fs::write(d.path("go"), "").unwrap();
+    for out in ["c.ls", "c.ls.notoken", "c.ls.setsid"] {
+        assert_eq!(d.read(&format!("{out}.code")), "0", "{out}: {}", d.read(&format!("{out}.err")));
+        assert_eq!(ids(&d.read(out)), BTreeSet::from([g]), "{out}");
+    }
+    assert_eq!(d.read("c.kill.code"), "3");
+}

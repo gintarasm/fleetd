@@ -305,3 +305,21 @@ fn an_agents_restart_of_its_child_keeps_the_parent_and_counts() {
     assert!(is_forbidden(&e), "{e}");
     node.shutdown();
 }
+
+#[test]
+fn an_agents_forget_exited_keeps_to_its_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(&dir.path().join("state")).unwrap();
+    let p = node.spawn(sleeper()).unwrap().id;
+    let mine = node.spawn_by(Caller::Agent(p), sh("exit 0", &[])).unwrap().id;
+    let theirs = node.spawn(sh("exit 0", &[])).unwrap().id;
+    wait_exit(&node, mine);
+    wait_exit(&node, theirs);
+    let out = node
+        .forget_by(Caller::Agent(p), &[], true, &Labels::new(), None)
+        .unwrap();
+    assert_eq!(out.forgotten, vec![mine]);
+    let left: Vec<u64> = node.list().unwrap().into_iter().map(|a| a.id).collect();
+    assert!(left.contains(&theirs), "{left:?}");
+    node.shutdown();
+}
