@@ -18,14 +18,15 @@ use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, swit
 use super::context_menu::{self, MenuLine};
 use super::controls::appear;
 use super::keymap::{
-    ClosePane, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4,
-    FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart, RestartPane,
-    SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    ClosePane, CloseTab, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
+    FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTab, NewTerminal, NextTab, Paste, PrevTab,
+    Remove, Restart, RestartPane, SelectTab, SplitDown, SplitRight, ToggleMaximize,
+    WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
 use super::pane_view::{PaneEvent, PaneView};
-use super::sidebar_view::{SidebarData, TabMark, render_sidebar};
+use super::sidebar_view::{SidebarData, TabMark, program_name, render_sidebar};
 use super::split_dividers::SplitDrag;
 use super::theme::{Theme, Typography};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
@@ -37,6 +38,7 @@ use crate::core::menus::{
 use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
 use crate::core::style::{chrome, motion, radius, space, text};
+use crate::core::tabs::tab_label;
 use crate::core::target::Target;
 use crate::core::titlebar::{Link, bar_title, window_title};
 
@@ -375,6 +377,80 @@ impl Workspace {
         }
     }
 
+    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_tab(window, cx);
+    }
+
+    /// ⌘⌥T (or the strip's New tab button): a new tab with one empty
+    /// pane, focused.
+    pub fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        if self.app.update(cx, |a, cx| a.new_tab(cx)).is_some() {
+            self.focus_current(window, cx);
+        }
+    }
+
+    /// ⌘⌥W: closes the shown tab, detaching its agents.
+    fn close_shown_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.app.read(cx).tabs().active();
+        self.close_tab(shown, window, cx);
+    }
+
+    /// Closes tab `i` (0-based; its close button), detaching its agents.
+    pub fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        self.app.update(cx, |a, cx| a.close_tab(i, cx));
+        self.focus_current(window, cx);
+    }
+
+    /// Shows tab `i` (0-based) and focuses its focused pane.
+    pub fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        if self.app.update(cx, |a, cx| a.select_tab(i, cx)) {
+            self.focus_current(window, cx);
+        }
+    }
+
+    fn select_numbered_tab(&mut self, a: &SelectTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(i) = a.number.checked_sub(1) {
+            self.select_tab(i, window, cx);
+        }
+    }
+
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.modal() && self.app.update(cx, |a, cx| a.next_tab(cx)) {
+            self.focus_current(window, cx);
+        }
+    }
+
+    fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.modal() && self.app.update(cx, |a, cx| a.prev_tab(cx)) {
+            self.focus_current(window, cx);
+        }
+    }
+
+    /// The strip's labels: each tab's number and its focused pane's program.
+    fn tab_labels(&self, cx: &App) -> Vec<String> {
+        let app = self.app.read(cx);
+        let tabs = app.tabs();
+        (0..tabs.len())
+            .map(|i| {
+                let program = tabs
+                    .tab_focused(i)
+                    .and_then(|p| tabs.agent(p))
+                    .and_then(|id| app.agents.iter().find(|r| r.info.id == id))
+                    .map(|r| program_name(&r.info.program));
+                tab_label(i + 1, program.as_deref())
+            })
+            .collect()
+    }
+
     /// Shows the agent in the focused pane (a sidebar click).
     pub fn show_agent(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.app.update(cx, |a, cx| a.show_agent(agent_id, cx));
@@ -453,7 +529,7 @@ impl Workspace {
             PaneMenuState {
                 on_grid,
                 has_selection: view.is_some_and(|v| v.has_selection()),
-                can_split: app.layout.panes().len() < MAX_PANES,
+                can_split: app.layout().panes().len() < MAX_PANES,
                 maximized: app.maximized == Some(pane),
                 restartable: view.is_some_and(|v| v.restartable()),
             }
@@ -630,7 +706,7 @@ impl Workspace {
     fn follow_pane_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let views: Vec<(PaneId, Entity<PaneView>)> = {
             let app = self.app.read(cx);
-            app.layout
+            app.tabs()
                 .panes()
                 .into_iter()
                 .filter_map(|p| Some((p, app.pane_view(p)?.clone())))
@@ -711,12 +787,12 @@ impl Workspace {
                     h: 1.0,
                 },
             )],
-            None => app.layout.rects(1.0, 1.0),
+            None => app.layout().rects(1.0, 1.0),
         };
         self.drawn = rects.iter().map(|(p, _)| *p).collect();
         let dividers = match app.maximized {
             Some(_) => Vec::new(),
-            None => self.split_drag.render(&app.layout, &self.app),
+            None => self.split_drag.render(app.layout(), &self.app),
         };
         let children: Vec<_> = rects
             .into_iter()
@@ -750,7 +826,7 @@ impl Workspace {
     fn menu_items(&self, agent_id: u64, cx: &App) -> Vec<MenuEntry<RowMenuItem>> {
         let app = self.app.read(cx);
         let is_ended = app.agents.iter().any(|r| r.info.id == agent_id && ended(r));
-        row_menu(app.layout.panes().len() < MAX_PANES, is_ended)
+        row_menu(app.layout().panes().len() < MAX_PANES, is_ended)
     }
 }
 
@@ -800,6 +876,8 @@ impl Render for Workspace {
                 ended: ended_rows,
                 fullscreen: window.is_fullscreen(),
                 update,
+                tabs: self.tab_labels(cx),
+                active_tab: app.tabs().active(),
             }
         };
         let bar = render_bar(&bar, &theme, cx);
@@ -925,6 +1003,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::close_shown_tab))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::prev_tab))
+            .on_action(cx.listener(Self::select_numbered_tab))
             .child(bar)
             .child(
                 div()

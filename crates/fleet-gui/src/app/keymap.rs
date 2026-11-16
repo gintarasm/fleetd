@@ -32,8 +32,19 @@ actions!(
         Cut,
         Undo,
         Redo,
+        NewTab,
+        CloseTab,
+        NextTab,
+        PrevTab,
     ]
 );
+
+/// Show workspace tab `number` (1-based; ⌘⌥1…⌘⌥9, ADR 0061).
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = fleet, no_json)]
+pub struct SelectTab {
+    pub number: usize,
+}
 
 /// Kill an agent, after the user confirms.
 #[derive(Clone, Debug, PartialEq, Action)]
@@ -79,6 +90,23 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-n", NewAgent, None),
         KeyBinding::new("cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),
+        // Workspace tabs (ADR 0061). ⌘⇧] and ⌘⇧[ may arrive as the shifted
+        // characters with shift off, so both spellings are bound.
+        KeyBinding::new("cmd-alt-t", NewTab, None),
+        KeyBinding::new("cmd-alt-w", CloseTab, None),
+        KeyBinding::new("cmd-shift-]", NextTab, None),
+        KeyBinding::new("cmd-}", NextTab, None),
+        KeyBinding::new("cmd-shift-[", PrevTab, None),
+        KeyBinding::new("cmd-{", PrevTab, None),
+        KeyBinding::new("cmd-alt-1", SelectTab { number: 1 }, None),
+        KeyBinding::new("cmd-alt-2", SelectTab { number: 2 }, None),
+        KeyBinding::new("cmd-alt-3", SelectTab { number: 3 }, None),
+        KeyBinding::new("cmd-alt-4", SelectTab { number: 4 }, None),
+        KeyBinding::new("cmd-alt-5", SelectTab { number: 5 }, None),
+        KeyBinding::new("cmd-alt-6", SelectTab { number: 6 }, None),
+        KeyBinding::new("cmd-alt-7", SelectTab { number: 7 }, None),
+        KeyBinding::new("cmd-alt-8", SelectTab { number: 8 }, None),
+        KeyBinding::new("cmd-alt-9", SelectTab { number: 9 }, None),
         KeyBinding::new("cmd-r", RestartPane, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(TERMINAL_CONTEXT)),

@@ -32,7 +32,7 @@ pub use connect::{
     Backend, ConnectSheet, RealBackend, StartupAttempt, show_connect_sheet, startup_work,
     switch_fleetd, switch_target,
 };
-pub use keymap::to_key;
+pub use keymap::{bind_keys, to_key};
 pub use pane_view::{InputSink, PaneChrome, PaneView, grid_size};
 pub use terminal_element::TerminalElement;
 pub use theme::Theme;
@@ -95,6 +95,16 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Copy", keymap::Copy),
                     MenuItem::action("Paste", keymap::Paste),
                     MenuItem::action("Select All", keymap::SelectAll),
+                ],
+            },
+            Menu {
+                name: "Window".into(),
+                items: vec![
+                    MenuItem::action("New Tab", keymap::NewTab),
+                    MenuItem::action("Close Tab", keymap::CloseTab),
+                    MenuItem::separator(),
+                    MenuItem::action("Show Next Tab", keymap::NextTab),
+                    MenuItem::action("Show Previous Tab", keymap::PrevTab),
                 ],
             },
         ]);
