@@ -1914,6 +1914,17 @@ impl Node {
         self.reported.subscribe()
     }
 
+    /// [`Node::report`] for the connection's `caller`: only an agent has a
+    /// status to report, so the user's is `forbidden:` (ADR 0075).
+    pub fn report_by(&self, caller: Caller, state: ReportedState, message: &str) -> io::Result<()> {
+        match caller {
+            Caller::Agent(id) => self.report(id, state, message),
+            Caller::User => Err(scope::forbidden(
+                "fleet report needs an agent identity (run it inside an agent)",
+            )),
+        }
+    }
+
     /// Records agent `id`'s own status (ADR 0075, `fleet report`) and
     /// announces it. `message` is at most [`REPORT_MESSAGE_MAX`] characters
     /// without control characters. The agent must be running and not a plain

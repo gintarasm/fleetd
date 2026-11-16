@@ -358,6 +358,7 @@ async fn connection(
     let removed = node.removed_events();
     let activity = node.activity_events();
     let refused = node.refused_events();
+    let reported = node.report_events();
     let id = ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
     let Some((client, caller)) =
         handshake(id, &node, session, &hello, &mut reader, &mut writer).await
@@ -408,6 +409,11 @@ async fn connection(
         )),
         tokio::spawn(scope::forward_refused(
             refused,
+            conn.outbox.clone(),
+            conn.scope.clone(),
+        )),
+        tokio::spawn(scope::forward_reported(
+            reported,
             conn.outbox.clone(),
             conn.scope.clone(),
         )),
@@ -619,6 +625,11 @@ impl Connection {
             }
             Some(request::Kind::Restart(r)) => return self.restart(req.id, r).await,
             Some(request::Kind::Forget(f)) => return self.forget(req.id, *f).await,
+            Some(request::Kind::Report(r)) => {
+                let caller = self.caller;
+                let state = r.state();
+                ack(blocking(&self.node, move |n| n.report_by(caller, state, &r.message)).await)
+            }
             Some(request::Kind::RestartDaemon(_)) => unreachable!("handled above"),
         };
         self.respond(req.id, kind).await
