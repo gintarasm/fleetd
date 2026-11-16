@@ -21,6 +21,7 @@ use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
+use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::settings::{Change, save_changes};
 use crate::core::shortcuts::ClosedPanes;
@@ -569,7 +570,12 @@ impl AppState {
         for event in batch {
             match event {
                 UiEvent::AgentsChanged => {
-                    let before = std::mem::replace(&mut self.agents, self.session.agents());
+                    let rows = self.session.agents();
+                    // Output alone is drawn on the next one-second tick
+                    // (issue #41): a printing agent's row redraws at most
+                    // once a second.
+                    let quiet = only_activity_changed(&self.agents, &rows);
+                    let before = std::mem::replace(&mut self.agents, rows);
                     if self.live {
                         let exited = feedback::newly_exited(&before, &self.agents);
                         self.show_exits(exited, cx);
@@ -584,8 +590,10 @@ impl AppState {
                             layout |= self.follow_list(cx);
                         }
                     }
-                    chrome = true;
-                    cx.notify();
+                    if !quiet {
+                        chrome = true;
+                        cx.notify();
+                    }
                 }
                 UiEvent::PaneChanged(pane) => {
                     let Some(view) = self.panes.get(&pane).cloned() else {

@@ -16,14 +16,16 @@ use gpui::{
 use super::controls;
 use super::keymap::{Kill, Remove, Restart};
 use super::status_dot::status_dot;
-use super::tail_text::tail_text;
+use super::tail_text::{head_text, tail_text};
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
 use crate::core::icons::Icon;
 use crate::core::kill::{AgentButtons, agent_buttons};
+use crate::core::row_preview::{preview_line, row_meta};
 use crate::core::session::AgentRow;
+use crate::core::sidebar::ended;
+use crate::core::sidebar::group_agents;
 pub use crate::core::sidebar::program_name;
-use crate::core::sidebar::{ended, group_agents, since};
 use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
@@ -159,26 +161,17 @@ fn render_tab(
             .type_style(text::CAPTION)
             .text_color(dot_color)
             .child(SharedString::from(state_mark(row))),
+        // The exit code is on the right (`meta`).
         Some(s) => div()
             .flex()
             .flex_row()
             .flex_none()
             .items_center()
-            .gap(px(space::XXS))
             .debug_selector(move || format!("status-{id}-{}", s.label()))
-            .child(status_dot(s, theme, data.now_ms, data.reduce_motion))
-            .children(
-                row.info
-                    .exit_code
-                    .filter(|c| *c != 0 && s == AgentStatus::Failed)
-                    .map(|c| {
-                        div()
-                            .type_style(text::CAPTION)
-                            .text_color(theme.danger)
-                            .child(SharedString::from(format!("✕{c}")))
-                    }),
-            ),
+            .child(status_dot(s, theme, data.now_ms, data.reduce_motion)),
     };
+    let meta = row_meta(row, data.now_ms);
+    let preview = preview_line(&row.last_line);
     let rang = data.bells.contains(&id);
     let buttons: Vec<RowButton> = match agent_buttons(true, ended(row)) {
         AgentButtons::None => Vec::new(),
@@ -205,7 +198,8 @@ fn render_tab(
                 })
                 .child(SharedString::from(tab_title(row, data.titles))),
         )
-        .child(
+        .child({
+            let shown = meta.text.clone();
             div()
                 .relative()
                 .flex_none()
@@ -216,18 +210,21 @@ fn render_tab(
                 .child(
                     div()
                         .type_style(text::CAPTION)
-                        .text_color(theme.tertiary)
+                        .text_color(if meta.failed {
+                            theme.danger
+                        } else {
+                            theme.tertiary
+                        })
                         .when(!buttons.is_empty(), |d| {
                             d.group_hover(ROW_GROUP, |s| s.invisible())
                         })
-                        .child(SharedString::from(since(
-                            row.last_output_unix_ms,
-                            data.now_ms,
-                        ))),
+                        .debug_selector(move || format!("meta-{id}-{shown}"))
+                        .child(SharedString::from(meta.text)),
                 )
-                .children(row_buttons(buttons, id, theme, cx)),
-        );
+                .children(row_buttons(buttons, id, theme, cx))
+        });
     let line2 = div()
+        .flex()
         .pl(px(space::LG))
         .type_style(text::SUBHEADLINE)
         .text_color(if running {
@@ -235,8 +232,11 @@ fn render_tab(
         } else {
             theme.tertiary
         })
-        .truncate()
-        .child(SharedString::from(one_line(&row.last_line)));
+        .debug_selector({
+            let shown = preview.clone();
+            move || format!("preview-{id}-{shown}")
+        })
+        .child(head_text(preview));
     let bar = div()
         .absolute()
         .left_0()
@@ -327,11 +327,6 @@ fn row_buttons(
             .items_center()
             .children(buttons),
     )
-}
-
-/// The last line, on one line.
-fn one_line(s: &str) -> String {
-    s.lines().next_back().unwrap_or("").trim().to_owned()
 }
 
 #[cfg(test)]
