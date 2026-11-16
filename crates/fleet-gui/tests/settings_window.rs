@@ -165,6 +165,21 @@ fn switches_toggle_their_settings(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn focus_mode_and_celebration_switches_start_off_and_save(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let s = setup(cx, dir.path(), GuiConfig::default());
+    show(cx, &s, "settings-tab-Behaviour");
+    let c = config(cx, &s);
+    assert!(!c.focus_mode && !c.celebrate);
+    click(cx, &s, "switch-focus-mode");
+    click(cx, &s, "switch-celebrate");
+    let c = config(cx, &s);
+    assert!(c.focus_mode && c.celebrate);
+    let saved = load_config(dir.path()).unwrap();
+    assert!(saved.focus_mode && saved.celebrate);
+}
+
+#[gpui::test]
 fn text_fields_apply_on_return_and_when_they_lose_focus(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
     let s = setup(cx, dir.path(), GuiConfig::default());

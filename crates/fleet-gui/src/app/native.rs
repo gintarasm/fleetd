@@ -11,7 +11,7 @@ use objc2::{ClassType, MainThreadMarker, Message, msg_send};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSAutoresizingMaskOptions, NSColor, NSColorSpace, NSEventType, NSGlassEffectView,
-    NSGlassEffectViewStyle, NSUserInterfaceItemIdentification, NSView, NSVisualEffectView,
+    NSGlassEffectViewStyle, NSSound, NSUserInterfaceItemIdentification, NSView, NSVisualEffectView,
     NSWindowOrderingMode, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
@@ -85,6 +85,21 @@ pub fn reduce_transparency() -> bool {
 pub fn reduce_motion() -> bool {
     MainThreadMarker::new().is_some()
         && NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
+/// The celebration's sound (`[gui] celebrate`): one of the soft system
+/// sounds in `/System/Library/Sounds`.
+pub const CELEBRATION_SOUND: &str = "Pop";
+
+/// Plays a system sound by name, at the user's alert volume; nothing if
+/// it is missing.
+pub fn play_sound(name: &str) {
+    if MainThreadMarker::new().is_none() {
+        return;
+    }
+    if let Some(sound) = NSSound::soundNamed(&NSString::from_str(name)) {
+        sound.play();
+    }
 }
 
 /// This macOS has liquid glass (`NSGlassEffectView`, macOS 26 and later).

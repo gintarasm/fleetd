@@ -78,6 +78,10 @@ pub struct GuiConfig {
     pub notifications: bool,
     /// The New agent sheet's directory; empty: the most recent one.
     pub default_dir: String,
+    /// Focus mode: panes without focus are dimmed.
+    pub focus_mode: bool,
+    /// A soft sound and a small burst when an agent exits with code 0.
+    pub celebrate: bool,
     /// Liquid glass behind the window or its chrome (macOS 26; ADR 0049).
     pub glass: GlassChoice,
     /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
@@ -100,6 +104,8 @@ impl Default for GuiConfig {
             confirm_kill: true,
             notifications: false,
             default_dir: String::new(),
+            focus_mode: false,
+            celebrate: false,
             glass: GlassChoice::Off,
             editor: String::new(),
         }

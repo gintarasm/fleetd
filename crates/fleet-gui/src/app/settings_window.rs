@@ -428,6 +428,22 @@ impl SettingsWindow {
                 theme,
             ))
             .child(setting_row(
+                "Focus mode",
+                Some("Dim the panes that do not have focus"),
+                switch("focus-mode", c.focus_mode, theme).on_click(cx.listener(
+                    move |this, _, _, cx| this.change(Change::FocusMode(!c.focus_mode), cx),
+                )),
+                theme,
+            ))
+            .child(setting_row(
+                "Celebrate success",
+                Some("A soft sound and a small burst when an agent exits with code 0"),
+                switch("celebrate", c.celebrate, theme).on_click(cx.listener(
+                    move |this, _, _, cx| this.change(Change::Celebrate(!c.celebrate), cx),
+                )),
+                theme,
+            ))
+            .child(setting_row(
                 "Option as Meta",
                 Some("Option+key sends Esc and the key to the terminal"),
                 switch("option-as-meta", c.option_as_meta, theme).on_click(cx.listener(

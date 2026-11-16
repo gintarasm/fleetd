@@ -28,6 +28,7 @@ use super::terminal_element::TerminalElement;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::feedback::{self, Tween};
 use crate::core::find::status_label;
 use crate::core::icons::Icon;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
@@ -172,6 +173,8 @@ pub struct PaneChrome {
     pub focused: bool,
     /// The pane fills the window (its button offers Restore).
     pub maximized: bool,
+    /// Focus mode dims this pane while it lacks focus.
+    pub dims: bool,
     /// The agent's status (ADR 0042); none for a shell or no agent.
     pub status: Option<AgentStatus>,
     /// The agent list arrived and is empty: an empty pane welcomes.
@@ -298,6 +301,12 @@ pub struct PaneView {
     /// The window whose activation the cursor follows, and that
     /// subscription (renewed when the view moves to a new window).
     activation: Option<(AnyWindowHandle, Subscription)>,
+    /// The focus ring's (and the dim veil's) cross-fade since focus last
+    /// moved to or from this pane.
+    focus_fade: Option<Tween>,
+    /// When the selection was last copied, while "Copied" shows, and the
+    /// timer that hides it.
+    copied: Option<(Instant, Task<()>)>,
     /// What to start here, while the pane a split opened is empty (the
     /// split chooser); drawn in place of [`empty_message`].
     chooser: Option<AnyView>,
@@ -381,6 +390,8 @@ impl PaneView {
             fade_timer: None,
             reduce_motion: native::reduce_motion,
             activation: None,
+            focus_fade: None,
+            copied: None,
             flash: None,
             flashes: 0,
             editor: config.editor.clone(),
@@ -731,6 +742,11 @@ impl PaneView {
     /// Replaces the header and banner facts; redraws if they changed.
     pub fn set_chrome(&mut self, chrome: PaneChrome, cx: &mut Context<Self>) {
         if self.chrome != chrome {
+            // Focus moved (not the first facts): the ring cross-fades.
+            let moved = self.chrome.number > 0 && self.chrome.focused != chrome.focused;
+            if moved && !controls::reduces_motion(cx) {
+                self.focus_fade = Some(Tween::new(Instant::now(), feedback::FOCUS_FADE_MS));
+            }
             self.chrome = chrome;
             cx.notify();
         }
@@ -825,7 +841,37 @@ impl PaneView {
         let text = self.model().selection_text();
         if let Some(text) = text.filter(|t| !t.is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+            // "Copied" shows for a moment (one timer, no ticking).
+            let hide = cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(feedback::COPIED_MS))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.copied = None;
+                    cx.notify();
+                });
+            });
+            self.copied = Some((Instant::now(), hide));
+            cx.notify();
         }
+    }
+
+    /// "Copied" is showing.
+    pub fn copied_shown(&self) -> bool {
+        self.copied.is_some()
+    }
+
+    /// How strongly the focus ring is drawn now, 0..=1, and whether it is
+    /// still fading (another frame is due).
+    fn ring(&mut self, now: Instant) -> (f32, bool) {
+        let fade = self.focus_fade.filter(|t| t.running(now));
+        if fade.is_none() {
+            self.focus_fade = None;
+        }
+        (
+            feedback::ring(self.chrome.focused, fade.map(|t| t.value(now))),
+            fade.is_some(),
+        )
     }
 
     fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1152,6 +1198,27 @@ impl Render for PaneView {
         }
         let theme = theme(cx);
         let focused = window.is_window_active() && self.focus.is_focused(window);
+        let reduce_motion = controls::reduces_motion(cx);
+        let now = Instant::now();
+        let (ring, fading) = self.ring(now);
+        let dim = feedback::dim_alpha(self.chrome.dims, ring);
+        // "Copied" holds then fades; the selection glows then settles.
+        let (copied_alpha, glow, copy_moving) = match &self.copied {
+            None => (0.0, 0.0, false),
+            Some(_) if reduce_motion => (1.0, 0.0, false),
+            Some((at, _)) => {
+                let flash = Tween::new(*at, feedback::COPIED_MS);
+                let glow = Tween::new(*at, feedback::GLOW_MS);
+                (
+                    feedback::flash_alpha(flash.progress(now)),
+                    feedback::glow(glow.value(now)),
+                    flash.running(now),
+                )
+            }
+        };
+        if fading || copy_moving {
+            window.request_animation_frame();
+        }
         let (state, title, observing) = {
             let model = self.model();
             let state = model.state();
@@ -1172,6 +1239,7 @@ impl Render for PaneView {
             focused,
             show_cursor: draws_cursor(&self.chrome, state),
             marked: self.marked.clone(),
+            selection_glow: glow,
             link: self.hover,
             scrollbar,
         };
@@ -1406,6 +1474,33 @@ impl Render for PaneView {
                     .child(SharedString::from(text)),
             );
         }
+        if self.copied.is_some() {
+            let number = chrome.number;
+            grid = grid.child(
+                div()
+                    .absolute()
+                    .top(px(space::XS))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .debug_selector(move || format!("pane-{number}-copied"))
+                            .px(px(space::SM))
+                            .py(px(space::XXS))
+                            .rounded(px(radius::MD))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.raised)
+                            .shadow_md()
+                            .text_color(theme.text)
+                            .type_style(text::CALLOUT)
+                            .opacity(copied_alpha)
+                            .child("Copied"),
+                    ),
+            );
+        }
         let chooser = self.chooser.clone().filter(|_| !chrome.has_agent);
         if chooser.is_none() && empty_state(chrome) == EmptyPane::Welcome {
             grid = grid.child(welcome(&theme, cx));
@@ -1453,11 +1548,7 @@ impl Render for PaneView {
                 spread_radius: px(0.),
             }])
             .border_1()
-            .border_color(if chrome.focused {
-                theme.accent.opacity(0.55)
-            } else {
-                theme.border
-            })
+            .border_color(ring_color(&theme, ring))
             .bg(theme.card)
             .relative()
             .child(header)
@@ -1481,6 +1572,27 @@ impl Render for PaneView {
                 }
             }))
             .children(ended_bar(self, state, &theme, cx))
+            .children((dim > 0.0).then(|| {
+                // The veil only draws: clicks and keys go to the pane.
+                div()
+                    .debug_selector(move || format!("pane-{}-dim", chrome.number))
+                    .absolute()
+                    .inset_0()
+                    .bg(theme.window.opacity(dim))
+            }))
+    }
+}
+
+/// The card's border at focus-ring strength `ring`: the plain border at
+/// 0, the accent ring at 1, cross-faded between.
+fn ring_color(theme: &super::theme::Theme, ring: f32) -> gpui::Hsla {
+    let lit = theme.accent.opacity(0.55);
+    if ring >= 1.0 {
+        lit
+    } else if ring <= 0.0 {
+        theme.border
+    } else {
+        theme.border.blend(lit.opacity(ring))
     }
 }
 
@@ -1877,6 +1989,33 @@ mod tests {
         // A plain click clears the selection.
         cx.simulate_click(from, Modifiers::none());
         assert_eq!(selected(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn copying_flashes_copied_for_a_moment(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"hello world");
+        let (view, _sink, cx) = pane(cx, model);
+        // Nothing selected: nothing copied, nothing shown.
+        cx.dispatch_action(Copy);
+        assert!(!view.read_with(cx, |v, _| v.copied_shown()));
+        let (from, to) = (cell(&view, cx, 0, 0), cell(&view, cx, 4, 0));
+        drag(cx, from, to, Modifiers::none());
+        cx.dispatch_action(Copy);
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |v, _| v.copied_shown()));
+        assert!(
+            cx.debug_bounds("pane-0-copied").is_some(),
+            "Copied is drawn"
+        );
+        cx.executor()
+            .advance_clock(Duration::from_millis(crate::core::feedback::COPIED_MS));
+        cx.run_until_parked();
+        assert!(
+            !view.read_with(cx, |v, _| v.copied_shown()),
+            "and goes by itself"
+        );
+        assert!(cx.debug_bounds("pane-0-copied").is_none());
     }
 
     #[gpui::test]

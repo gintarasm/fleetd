@@ -18,6 +18,7 @@ use super::workspace::Workspace;
 use crate::core::config::{GuiConfig, load_config};
 use crate::core::drag_drop::DropAction;
 use crate::core::ended::run_time;
+use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
@@ -294,6 +295,13 @@ pub struct AppState {
     /// A neutral message (a successful restart), shown when there is no
     /// error; dismissed the same way.
     pub(super) notice: Option<String>,
+    /// Agents that exited while the window watched (#44), each with a
+    /// Restart; they go on their own after a while.
+    pub(super) exit_toasts: ExitToasts,
+    /// Removes the oldest exit toast when its time is up (no ticking).
+    exit_expiry: Option<Task<()>>,
+    /// The agent whose success is being celebrated, and since when.
+    pub(super) celebrating: Option<(u64, Instant)>,
     /// `error` is a failure to connect, cleared once connected.
     error_is_connection: bool,
     /// A config error from launch, still shown after the first connect.
@@ -371,6 +379,9 @@ impl AppState {
             error_is_connection: false,
             config_error: None,
             notice: None,
+            exit_toasts: ExitToasts::default(),
+            exit_expiry: None,
+            celebrating: None,
             starting: HashSet::new(),
             spawn_dirs: HashMap::new(),
             requested: HashMap::new(),
@@ -450,6 +461,9 @@ impl AppState {
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
         self.error_is_connection = false;
+        self.exit_toasts = ExitToasts::default();
+        self.exit_expiry = None;
+        self.celebrating = None;
         self.starting.clear();
         self.spawn_dirs.clear();
         self.requested.clear();
@@ -555,7 +569,11 @@ impl AppState {
         for event in batch {
             match event {
                 UiEvent::AgentsChanged => {
-                    self.agents = self.session.agents();
+                    let before = std::mem::replace(&mut self.agents, self.session.agents());
+                    if self.live {
+                        let exited = feedback::newly_exited(&before, &self.agents);
+                        self.show_exits(exited, cx);
+                    }
                     let agents = &self.agents;
                     self.bells
                         .retain(|id| agents.iter().any(|r| r.info.id == *id));
@@ -910,6 +928,12 @@ impl AppState {
         let reconnect_in = self
             .reconnect_at
             .map(|at| at.saturating_duration_since(Instant::now()));
+        let drawn = if self.maximized.is_some() {
+            1
+        } else {
+            self.layout.panes().len()
+        };
+        let dims = feedback::dims(self.config.focus_mode, drawn);
         let no_agents = self.live && self.session.listed() && self.agents.is_empty();
         for (i, pane) in self.layout.panes().into_iter().enumerate() {
             let agent = self.layout.agent(pane);
@@ -931,6 +955,7 @@ impl AppState {
                 reconnect_in,
                 focused: pane == self.focused,
                 maximized: self.maximized == Some(pane),
+                dims,
                 status: agent.and_then(|id| self.statuses.get(&id).copied()),
                 no_agents,
                 run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
@@ -1454,7 +1479,34 @@ impl AppState {
     fn set_config(&mut self, config: GuiConfig, cx: &mut Context<Self>) {
         self.config = config;
         self.apply_pane_config(cx);
+        // Focus mode dims the panes without focus.
+        self.refresh_chrome(cx);
         cx.notify();
+    }
+
+    /// The exit toasts shown, oldest first.
+    pub fn exit_toasts(&self) -> impl Iterator<Item = &ExitNote> {
+        self.exit_toasts.items()
+    }
+
+    /// Agents that exited just now: a toast each (with Restart), and the
+    /// celebration for a success when it is turned on. Toasts whose agent
+    /// was restarted or removed meanwhile go.
+    fn show_exits(&mut self, exited: Vec<ExitNote>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let mut changed = !exited.is_empty();
+        for note in exited {
+            if feedback::celebrates(self.config.celebrate, &note) {
+                super::native::play_sound(super::native::CELEBRATION_SOUND);
+                self.celebrating = Some((note.agent_id, now));
+            }
+            self.exit_toasts.push(note, now);
+        }
+        changed |= self.exit_toasts.prune(&self.agents, now);
+        if changed {
+            self.schedule_exit_expiry(cx);
+            cx.notify();
+        }
     }
 
     /// The config the panes follow: the settings, with the zoomed size.
@@ -1479,6 +1531,38 @@ impl AppState {
             self.apply_pane_config(cx);
             cx.notify();
         }
+    }
+
+    /// Wakes once, when the oldest exit toast is due to go.
+    fn schedule_exit_expiry(&mut self, cx: &mut Context<Self>) {
+        self.exit_expiry = self.exit_toasts.next_expiry().map(|at| {
+            cx.spawn(async move |this, cx| {
+                let wait = at.saturating_duration_since(Instant::now());
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |s, cx| {
+                    // The timer waited until `at`: prune as of then at least.
+                    if s.exit_toasts.prune(&s.agents, Instant::now().max(at)) {
+                        cx.notify();
+                    }
+                    s.schedule_exit_expiry(cx);
+                });
+            })
+        });
+    }
+
+    /// The exit toast's ✕.
+    pub fn dismiss_exit(&mut self, agent_id: u64, cx: &mut Context<Self>) {
+        if self.exit_toasts.dismiss(agent_id) {
+            self.schedule_exit_expiry(cx);
+            cx.notify();
+        }
+    }
+
+    /// The exit toast's Restart: the agent again (panes showing it
+    /// follow), and the toast goes.
+    pub fn restart_from_toast(&mut self, agent_id: u64, cx: &mut Context<Self>) {
+        self.restart(agent_id);
+        self.dismiss_exit(agent_id, cx);
     }
 
     /// The terminal font size the panes show (the configured one, zoomed).

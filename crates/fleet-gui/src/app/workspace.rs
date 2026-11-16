@@ -2,22 +2,22 @@
 //! sheets over them, drawn from [`AppState`].
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Action, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px,
-    relative, size,
+    Action, Animation, AnimationExt, App, AppContext, Bounds, Context, Div, Entity, EntityId,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, deferred, div, point, px, relative, size,
 };
 
 use super::app_state::AppState;
 use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
 use super::context_menu::{self, MenuLine};
-use super::controls::appear;
+use super::controls::{ButtonKind, ReducedMotion, appear, button};
 use super::keymap::{
     ClosePane, CommandPalette, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
     FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTerminal, NextAgent, Paste,
@@ -39,6 +39,7 @@ use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use super::{controls, keymap};
 use crate::core::config::{GuiConfig, save_confirm_kill, save_connection};
 use crate::core::drag_drop::DropTarget;
+use crate::core::feedback::{self, Tween};
 use crate::core::glass::{Backdrop, GlassChoice, glass_tint};
 use crate::core::kill::{KillFlow, kill_flow};
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
@@ -207,6 +208,8 @@ pub struct Workspace {
     reduce_motion: bool,
     /// The settings the window last applied.
     look: Look,
+    /// Panes easing in (opened or split), since when.
+    entering: HashMap<PaneId, Instant>,
     /// What the window draws behind the content (blur, glass, opaque).
     backdrop: Backdrop,
     /// A split divider being dragged.
@@ -310,11 +313,13 @@ impl Workspace {
             window_title: String::new(),
             reduce_motion: config.reduce_motion.resolve(native::reduce_motion()),
             look: Look::of(&config),
+            entering: HashMap::new(),
             backdrop,
             split_drag: SplitDrag::default(),
             pane_drag: PaneDrag::default(),
             _subscriptions: vec![observe, appearance, activation],
         };
+        cx.set_global(ReducedMotion(ws.reduce_motion));
         ws.focus_pane(ws.app.read(cx).focused(), window, cx);
         ws
     }
@@ -346,6 +351,7 @@ impl Workspace {
             Some(glass_tint(&window_tokens(window, &config))),
         );
         self.reduce_motion = config.reduce_motion.resolve(native::reduce_motion());
+        cx.set_global(ReducedMotion(self.reduce_motion));
         self.app.update(cx, |a, cx| a.set_theme(theme, cx));
         window.refresh();
     }
@@ -358,6 +364,11 @@ impl Workspace {
     /// Motion is reduced (sheets and the toast appear without sliding).
     pub fn reduces_motion(&self) -> bool {
         self.reduce_motion
+    }
+
+    /// The panes easing in (opened or split just now).
+    pub fn easing_panes(&self) -> Vec<PaneId> {
+        self.entering.keys().copied().collect()
     }
 
     /// The panes the last frame drew (one while maximized).
@@ -1255,7 +1266,7 @@ impl Workspace {
     /// The pane cards, [`chrome::PANE_GAP`] apart and from the edges;
     /// only the maximized one when a pane is maximized (the others stay
     /// attached); then the split dividers' strips over the gaps.
-    fn render_panes(&mut self, cx: &App) -> impl IntoElement + use<> {
+    fn render_panes(&mut self, window: &mut Window, cx: &App) -> impl IntoElement + use<> {
         let app = self.app.read(cx);
         let rects = match app.maximized {
             Some(pane) => vec![(
@@ -1269,7 +1280,24 @@ impl Workspace {
             )],
             None => app.layout.rects(1.0, 1.0),
         };
-        self.drawn = rects.iter().map(|(p, _)| *p).collect();
+        let drawn: Vec<PaneId> = rects.iter().map(|(p, _)| *p).collect();
+        // New panes (opened, split, or shown again on restore) ease in.
+        let now = Instant::now();
+        if !self.reduce_motion {
+            for pane in feedback::entering(&self.drawn, &drawn) {
+                self.entering.insert(pane, now);
+            }
+        }
+        self.drawn = drawn;
+        self.entering.retain(|pane, at| {
+            !self.reduce_motion
+                && self.drawn.contains(pane)
+                && Tween::new(*at, feedback::PANE_IN_MS).running(now)
+        });
+        if !self.entering.is_empty() {
+            window.request_animation_frame();
+        }
+        let entering = &self.entering;
         let dividers = match app.maximized {
             Some(_) => Vec::new(),
             None => self.split_drag.render(&app.layout, &self.app),
@@ -1284,6 +1312,10 @@ impl Workspace {
             .into_iter()
             .filter_map(|(pane, r)| {
                 let view = app.pane_view(pane)?.clone();
+                // 1 when settled; grows from an inset while fading in.
+                let t = entering
+                    .get(&pane)
+                    .map_or(1.0, |at| Tween::new(*at, feedback::PANE_IN_MS).value(now));
                 let drag = self.pane_drag.clone();
                 Some(
                     div()
@@ -1296,7 +1328,10 @@ impl Workspace {
                         .top(relative(r.y))
                         .w(relative(r.w))
                         .h(relative(r.h))
-                        .p(px(chrome::PANE_GAP / 2.0))
+                        .p(px(
+                            chrome::PANE_GAP / 2.0 + feedback::PANE_IN_INSET * (1.0 - t)
+                        ))
+                        .opacity(t)
                         .child(view),
                 )
             })
@@ -1319,6 +1354,139 @@ impl Workspace {
         let is_ended = app.agents.iter().any(|r| r.info.id == agent_id && ended(r));
         row_menu(app.layout.panes().len() < MAX_PANES, is_ended)
     }
+
+    /// The exit toasts (#44), bottom centre, newest at the bottom: what
+    /// exited with its code, Restart and ✕. A success being celebrated
+    /// gets a check and, with motion, a small burst.
+    fn render_exit_toasts(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let app = self.app.read(cx);
+        let notes: Vec<_> = app.exit_toasts().cloned().collect();
+        if notes.is_empty() {
+            return None;
+        }
+        let celebrating = app.celebrating;
+        let reduce_motion = self.reduce_motion;
+        let theme = *theme;
+        let mut column = div().flex().flex_col().items_center().gap(px(space::SM));
+        for note in notes {
+            let id = note.agent_id;
+            let party = celebrating
+                .is_some_and(|(a, at)| a == id && at.elapsed() < feedback::EXIT_TOAST_TTL);
+            let restart = button(
+                ("exit-restart", id),
+                "Restart",
+                &theme,
+                ButtonKind::Secondary,
+                true,
+            )
+            .debug_selector(move || format!("exit-toast-{id}-restart"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.app.update(cx, |a, cx| a.restart_from_toast(id, cx));
+            }));
+            let close = div()
+                .id(("exit-close", id))
+                .debug_selector(move || format!("exit-toast-{id}-close"))
+                .px(px(space::XS))
+                .text_color(theme.secondary)
+                .cursor_pointer()
+                .hover(move |s| s.text_color(theme.text))
+                .child("✕")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.app.update(cx, |a, cx| a.dismiss_exit(id, cx));
+                }));
+            let card = div()
+                .id(("exit-toast", id))
+                .debug_selector(move || format!("exit-toast-{id}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SM))
+                .pl(px(space::MD))
+                .pr(px(space::XS))
+                .py(px(space::XS))
+                .rounded(px(radius::MD))
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.raised)
+                .shadow_lg()
+                .text_color(theme.text)
+                .type_style(text::CALLOUT)
+                .occlude()
+                .children(party.then(|| celebration(id, &theme, reduce_motion)))
+                .child(SharedString::from(note.text()))
+                .child(restart)
+                .child(close);
+            column = column.child(appear(
+                div().child(card),
+                ("exit-toast-appear", id),
+                motion::SHEET_OFFSET,
+                motion::TOAST_MS,
+                reduce_motion,
+            ));
+        }
+        Some(
+            div()
+                .absolute()
+                .bottom(px(space::LG))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(column),
+        )
+    }
+}
+
+/// A check in the success colour; with motion, six dots burst out of it
+/// and fade once ([`feedback::CELEBRATE_MS`]), then nothing moves.
+fn celebration(agent_id: u64, theme: &Theme, reduce_motion: bool) -> gpui::AnyElement {
+    const SIZE: f32 = 16.0;
+    const DOTS: usize = 6;
+    const DOT: f32 = 4.0;
+    let check = div()
+        .debug_selector(move || format!("exit-toast-{agent_id}-celebration"))
+        .relative()
+        .size(px(SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(theme.success)
+        .font_weight(gpui::FontWeight::BOLD)
+        .child("✓");
+    if reduce_motion {
+        return check.into_any_element();
+    }
+    let colours = [
+        theme.success,
+        theme.accent,
+        theme.success,
+        theme.accent,
+        theme.success,
+        theme.accent,
+    ];
+    let mut burst = check;
+    for (i, colour) in colours.into_iter().enumerate().take(DOTS) {
+        let angle = i as f32 * std::f32::consts::TAU / DOTS as f32;
+        let dot = div()
+            .absolute()
+            .size(px(DOT))
+            .rounded_full()
+            .bg(colour)
+            .with_animation(
+                ("celebrate", agent_id * DOTS as u64 + i as u64),
+                Animation::new(Duration::from_millis(feedback::CELEBRATE_MS))
+                    .with_easing(motion::ease_out),
+                move |dot, t| {
+                    let r = 2.0 + 12.0 * t;
+                    let c = SIZE / 2.0 - DOT / 2.0;
+                    dot.left(px(c + r * angle.cos()))
+                        .top(px(c + r * angle.sin()))
+                        .opacity(1.0 - t)
+                },
+            );
+        burst = burst.child(dot);
+    }
+    burst.into_any_element()
 }
 
 impl Render for Workspace {
@@ -1381,7 +1549,8 @@ impl Render for Workspace {
         };
         let bar = render_bar(&bar, &theme, cx);
         super::bench::sidebar_drawn(window);
-        let panes = self.render_panes(cx);
+        let panes = self.render_panes(window, cx);
+        let exits = self.render_exit_toasts(&theme, cx);
         // Under glass gpui leaves the tint to the glass (ADR 0049).
         let tint = self.backdrop.tint();
         // Without glass the root's one fill covers all and nothing is
@@ -1614,6 +1783,7 @@ impl Render for Workspace {
                     .child(sidebar)
                     .child(panes),
             )
+            .children(exits)
             .children(toast)
             .children(palette)
             .children(switcher)
@@ -1765,15 +1935,17 @@ mod tests {
 
     use super::Workspace;
     use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
-    use crate::app::keymap::{Kill, bind_keys};
+    use crate::app::keymap::{FocusPane1, Kill, SplitRight, bind_keys};
     use crate::app::pane_view::InputSink;
     use crate::app::sidebar_view::TabMark;
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
+    use crate::core::feedback;
     use crate::core::layout::Layout;
     use crate::core::menus::{MenuEntry, PaneMenuItem, RowMenuItem};
     use crate::core::pane::PaneModel;
     use crate::core::session::{AgentRow, ConnState, PaneId, UiEvent};
+    use crate::core::settings::{Change, MotionChoice};
     use crate::core::shortcuts::{EmptyPane, key_glyphs};
     use crate::core::spawn::SpawnRequest;
     use crate::core::state::GuiState;
@@ -3682,6 +3854,140 @@ mod tests {
         click(&mut s, "clear-exited");
         assert!(!s.cx.has_pending_prompt());
         assert_eq!(fake.calls().last(), Some(&Call::ClearExited));
+    }
+
+    fn exited(id: u64, code: i32) -> AgentRow {
+        let mut r = ended(id, "/w", id as i64, AgentState::Exited);
+        r.info.exit_code = Some(code);
+        r
+    }
+
+    fn exit_ids(s: &mut Setup<'_>) -> Vec<u64> {
+        s.app
+            .read_with(s.cx, |a, _| a.exit_toasts().map(|n| n.agent_id).collect())
+    }
+
+    #[gpui::test]
+    fn an_exit_shows_a_toast_with_its_code_and_restart(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        // First seen already exited: not news.
+        agents(&mut s, &fake, vec![exited(6, 1), row(7, "/w", 1)]);
+        assert!(exit_ids(&mut s).is_empty());
+        agents(&mut s, &fake, vec![exited(6, 1), exited(7, 3)]);
+        assert_eq!(exit_ids(&mut s), vec![7]);
+        let text = s
+            .app
+            .read_with(s.cx, |a, _| a.exit_toasts().next().unwrap().text());
+        assert_eq!(text, "sh exited with code 3");
+        assert!(s.cx.debug_bounds("exit-toast-7").is_some());
+        assert!(
+            s.cx.debug_bounds("exit-toast-7-celebration").is_none(),
+            "no celebration for a failure, nor while it is off"
+        );
+        click(&mut s, "exit-toast-7-restart");
+        assert!(fake.calls().contains(&Call::Restart(7)));
+        assert!(exit_ids(&mut s).is_empty(), "Restart takes the toast away");
+    }
+
+    #[gpui::test]
+    fn exit_toasts_close_go_on_their_own_and_follow_the_list(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![row(1, "/w", 1), row(2, "/w", 2), row(3, "/w", 3)],
+        );
+        agents(
+            &mut s,
+            &fake,
+            vec![exited(1, 0), exited(2, 0), exited(3, 0)],
+        );
+        assert_eq!(exit_ids(&mut s), vec![1, 2, 3]);
+        click(&mut s, "exit-toast-1-close");
+        assert_eq!(exit_ids(&mut s), vec![2, 3]);
+        // Agent 2 restarted elsewhere: it left the list, its toast goes.
+        agents(&mut s, &fake, vec![exited(3, 0)]);
+        assert_eq!(exit_ids(&mut s), vec![3]);
+        s.cx.executor()
+            .advance_clock(feedback::EXIT_TOAST_TTL + Duration::from_millis(10));
+        s.cx.run_until_parked();
+        assert!(exit_ids(&mut s).is_empty(), "the last one timed out");
+    }
+
+    #[gpui::test]
+    fn celebration_needs_the_setting_and_code_zero(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let config = GuiConfig {
+            celebrate: true,
+            ..GuiConfig::default()
+        };
+        let mut s = setup_with(cx, &fake, dir.path(), config);
+        agents(&mut s, &fake, vec![row(7, "/w", 1), row(8, "/w", 2)]);
+        agents(&mut s, &fake, vec![exited(7, 0), exited(8, 2)]);
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("exit-toast-7-celebration").is_some());
+        assert!(s.cx.debug_bounds("exit-toast-8-celebration").is_none());
+    }
+
+    #[gpui::test]
+    fn focus_mode_dims_the_panes_without_focus(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        // Reduced motion: the dim is there at once, no cross-fade to wait for.
+        let config = GuiConfig {
+            reduce_motion: MotionChoice::On,
+            ..GuiConfig::default()
+        };
+        let mut s = setup_with(cx, &fake, dir.path(), config);
+        s.cx.dispatch_action(SplitRight);
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("pane-1-dim").is_none(), "off by default");
+        s.app.update(s.cx, |a, cx| {
+            a.change_settings(vec![Change::FocusMode(true)], cx)
+                .unwrap();
+        });
+        s.cx.run_until_parked();
+        assert_eq!(focused(&mut s), PaneId(2));
+        assert!(s.cx.debug_bounds("pane-1-dim").is_some(), "applies live");
+        assert!(
+            s.cx.debug_bounds("pane-2-dim").is_none(),
+            "the focused one is clear"
+        );
+        s.cx.dispatch_action(FocusPane1);
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("pane-2-dim").is_some());
+        // (gpui keeps the bounds of elements once drawn: the chrome says
+        // which pane is dimmed from here on.)
+        let chrome = |s: &mut Setup<'_>, pane: u32| {
+            s.app.read_with(s.cx, |a, cx| {
+                let c = &a.pane_view(PaneId(pane)).unwrap().read(cx).chrome;
+                (c.dims, c.focused)
+            })
+        };
+        assert_eq!(chrome(&mut s, 1), (true, true), "focused: clear");
+        assert_eq!(chrome(&mut s, 2), (true, false), "dimmed");
+    }
+
+    #[gpui::test]
+    fn no_pane_eases_in_at_launch_or_under_reduce_motion(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let config = GuiConfig {
+            reduce_motion: MotionChoice::On,
+            ..GuiConfig::default()
+        };
+        let mut s = setup_with(cx, &fake, dir.path(), config);
+        assert!(s.ws.read_with(s.cx, |w, _| w.easing_panes()).is_empty());
+        s.cx.dispatch_action(SplitRight);
+        s.cx.run_until_parked();
+        assert_eq!(panes(&mut s).len(), 2);
+        assert!(s.ws.read_with(s.cx, |w, _| w.easing_panes()).is_empty());
+        assert!(s.cx.update(|_, cx| crate::app::controls::reduces_motion(cx)));
     }
 
     // Issue #46: reopen closed pane, shortcut cheat sheet, first-run welcome.
