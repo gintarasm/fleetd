@@ -448,3 +448,60 @@ fn name_of(db: &Store, agent: u64) -> String {
         .and_then(|mut l| l.remove(scope::NAME_LABEL))
         .unwrap_or_default()
 }
+
+/// The wire form of a wait state.
+pub fn wait_state_proto(s: WaitState) -> fleet_proto::WaitState {
+    use fleet_proto::WaitState as W;
+    match s {
+        WaitState::Waiting => W::Waiting,
+        WaitState::Done => W::Done,
+        WaitState::Error => W::Error,
+        WaitState::Exited => W::Exited,
+        WaitState::Lost => W::Lost,
+        WaitState::Message => W::Message,
+    }
+}
+
+/// A wire wait state; `None` for one this node does not know.
+pub fn wait_state_from_proto(s: i32) -> Option<WaitState> {
+    use fleet_proto::WaitState as W;
+    Some(match W::try_from(s).ok()? {
+        W::Unspecified => return None,
+        W::Waiting => WaitState::Waiting,
+        W::Done => WaitState::Done,
+        W::Error => WaitState::Error,
+        W::Exited => WaitState::Exited,
+        W::Lost => WaitState::Lost,
+        W::Message => WaitState::Message,
+    })
+}
+
+impl Node {
+    /// The answer to a wait: `matches` (empty on a timeout), with each
+    /// message's sender name, and the targets as they are now.
+    pub fn wait_result(
+        &self,
+        caller: Caller,
+        spec: &WaitSpec,
+        matches: Vec<WaitMatch>,
+    ) -> io::Result<fleet_proto::WaitResult> {
+        let matches = {
+            let db = lock(&self.store);
+            matches
+                .into_iter()
+                .map(|m| fleet_proto::WaitMatch {
+                    agent_id: m.agent,
+                    state: wait_state_proto(m.state) as i32,
+                    message: m.message.map(|msg| {
+                        let name = msg.sender.map(|s| name_of(&db, s)).unwrap_or_default();
+                        message_proto(&msg, name)
+                    }),
+                })
+                .collect()
+        };
+        Ok(fleet_proto::WaitResult {
+            matches,
+            agents: self.wait_targets(caller, spec)?,
+        })
+    }
+}

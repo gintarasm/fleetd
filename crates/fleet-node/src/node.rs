@@ -61,7 +61,9 @@ use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scope::{self, Caller, Member, Quotas, Tree};
 
 mod mailbox;
-pub use self::mailbox::{INBOX_PAGE_MAX, WaitSpec, mailbox_of, message_proto};
+pub use self::mailbox::{
+    INBOX_PAGE_MAX, WaitSpec, mailbox_of, message_proto, wait_state_from_proto, wait_state_proto,
+};
 use crate::scrollback::{self, Scrollback};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
