@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, ThemeChoice};
 use super::state::write_atomic;
 use super::target::Target;
 
@@ -61,9 +62,24 @@ pub struct GuiConfig {
     pub font_family: String,
     pub font_size: f32,
     pub option_as_meta: bool,
+    /// Light, dark, or the system's appearance.
+    pub theme: ThemeChoice,
+    /// The window backdrop's blur radius, in points.
+    pub blur: f32,
+    /// The alpha of the window tint over the blurred desktop.
+    pub window_opacity: f32,
+    /// Overrides System Settings' Reduce Motion, or follows it.
+    pub reduce_motion: MotionChoice,
+    /// Kill asks first.
+    pub confirm_kill: bool,
     /// macOS notifications when an agent needs you or ends while the
     /// window is not focused (ADR 0042). Off unless asked for.
     pub notifications: bool,
+    /// The New agent sheet's directory; empty: the most recent one.
+    pub default_dir: String,
+    /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
+    /// blank means `$VISUAL`, then `$EDITOR` (ADR 0046).
+    pub editor: String,
 }
 
 impl Default for GuiConfig {
@@ -74,7 +90,14 @@ impl Default for GuiConfig {
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
             option_as_meta: true,
+            theme: ThemeChoice::System,
+            blur: DEFAULT_BLUR,
+            window_opacity: DEFAULT_OPACITY,
+            reduce_motion: MotionChoice::System,
+            confirm_kill: true,
             notifications: false,
+            default_dir: String::new(),
+            editor: String::new(),
         }
     }
 }
@@ -116,19 +139,33 @@ pub fn load_config(state_dir: &Path) -> Result<GuiConfig, ConfigError> {
 
 /// Sets `[gui] connection`, leaving comments and every other key as they were.
 pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
-    save_gui_key(
+    save_gui_values(
         state_dir,
-        "connection",
-        toml_edit::value(target.to_string()),
+        vec![("connection", toml_edit::Value::from(target.to_string()))],
+    )
+}
+
+/// Sets `[gui] confirm_kill`, leaving comments and every other key as they
+/// were.
+pub fn save_confirm_kill(state_dir: &Path, confirm: bool) -> io::Result<()> {
+    save_gui_values(
+        state_dir,
+        vec![("confirm_kill", toml_edit::Value::from(confirm))],
     )
 }
 
 /// Sets `[gui] notifications`, leaving comments and every other key as they were.
 pub fn save_notifications(state_dir: &Path, on: bool) -> io::Result<()> {
-    save_gui_key(state_dir, "notifications", toml_edit::value(on))
+    save_gui_values(
+        state_dir,
+        vec![("notifications", toml_edit::Value::from(on))],
+    )
 }
 
-fn save_gui_key(state_dir: &Path, key: &str, value: toml_edit::Item) -> io::Result<()> {
+/// Sets these keys of `[gui]`, leaving comments and every other key as
+/// they were; creates the file (and the table) when missing. The file's
+/// mode is kept.
+pub fn save_gui_values(state_dir: &Path, values: Vec<(&str, toml_edit::Value)>) -> io::Result<()> {
     let path = config_path(state_dir);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -145,7 +182,19 @@ fn save_gui_key(state_dir: &Path, key: &str, value: toml_edit::Item) -> io::Resu
         doc["gui"] = toml_edit::table();
     }
     let gui = doc["gui"].as_table_like_mut().expect("gui is a table");
-    gui.insert(key, value);
+    for (key, value) in values {
+        // Keep a trailing comment on a key that was already there.
+        match gui.get_mut(key).and_then(|i| i.as_value_mut()) {
+            Some(old) => {
+                let decor = old.decor().clone();
+                *old = value;
+                *old.decor_mut() = decor;
+            }
+            None => {
+                gui.insert(key, toml_edit::Item::Value(value));
+            }
+        }
+    }
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&path).map_or(0o644, |m| m.permissions().mode() & 0o777);
     write_atomic(&path, doc.to_string().as_bytes(), mode)
@@ -192,6 +241,14 @@ mod tests {
         assert!(c.option_as_meta);
         assert!(!c.notifications);
         assert_eq!(c.connection, None);
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
+    fn config_reads_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\neditor = \"zed\"\n");
+        assert_eq!(load_config(dir.path()).unwrap().editor, "zed");
     }
 
     #[test]

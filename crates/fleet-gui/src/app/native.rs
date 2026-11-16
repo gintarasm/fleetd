@@ -1,16 +1,20 @@
 //! AppKit (objc2) calls for what gpui 0.2.2 does not offer: dragging the
 //! window by our own titlebar, the strength of the window's blur, the
-//! system accent colour and the accessibility display settings. Main thread only; elsewhere, or without
-//! the event they need, they do nothing.
+//! system accent colour, the app's appearance and the accessibility
+//! display settings. Main thread only; elsewhere, or without the event
+//! they need, they do nothing.
 
 use gpui::Window;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{ClassType, MainThreadMarker, msg_send};
 use objc2_app_kit::{
-    NSApplication, NSColor, NSColorSpace, NSEventType, NSView, NSVisualEffectView, NSWorkspace,
+    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSColor,
+    NSColorSpace, NSEventType, NSView, NSVisualEffectView, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSNumber, NSObjectProtocol, NSString};
+
+use crate::core::settings::ThemeChoice;
 
 /// Lets the window server move the window with the mouse, from the left
 /// mouse-down being handled (a press on the unified bar). The window
@@ -43,6 +47,26 @@ pub fn accent_color() -> Option<(f32, f32, f32)> {
         c(color.greenComponent()),
         c(color.blueComponent()),
     ))
+}
+
+/// Draws every window of the app light, dark, or as the system does
+/// (`[gui] theme`). AppKit then reports the new effective appearance to
+/// each window, so the themes, the blur's material, native menus and
+/// alerts all follow, through the same path as a system change.
+pub fn set_app_appearance(choice: ThemeChoice) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    // SAFETY: AppKit's appearance name constants are immutable statics.
+    let name = unsafe {
+        match choice {
+            ThemeChoice::System => None,
+            ThemeChoice::Light => Some(NSAppearanceNameAqua),
+            ThemeChoice::Dark => Some(NSAppearanceNameDarkAqua),
+        }
+    };
+    let appearance = name.and_then(NSAppearance::appearanceNamed);
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
 }
 
 /// System Settings › Accessibility › Display › Reduce transparency: the

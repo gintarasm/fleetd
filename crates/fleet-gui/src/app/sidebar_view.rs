@@ -9,17 +9,21 @@ use std::path::Path;
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px,
+    Action, Context, Div, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 
+use super::controls;
+use super::keymap::{Kill, Remove, Restart};
 use super::status_dot::status_dot;
 use super::tail_text::tail_text;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
+use crate::core::icons::Icon;
+use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::session::AgentRow;
 pub use crate::core::sidebar::program_name;
-use crate::core::sidebar::{group_agents, since};
+use crate::core::sidebar::{ended, group_agents, since};
 use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
@@ -176,6 +180,14 @@ fn render_tab(
             ),
     };
     let rang = data.bells.contains(&id);
+    let buttons: Vec<RowButton> = match agent_buttons(true, ended(row)) {
+        AgentButtons::None => Vec::new(),
+        AgentButtons::Stop => vec![("stop", Icon::Stop, Box::new(Kill { agent_id: id }))],
+        AgentButtons::RestartRemove => vec![
+            ("restart", Icon::Restart, Box::new(Restart { agent_id: id })),
+            ("remove", Icon::Trash, Box::new(Remove { agent_id: id })),
+        ],
+    };
     let line1 = div()
         .flex()
         .flex_row()
@@ -195,13 +207,25 @@ fn render_tab(
         )
         .child(
             div()
+                .relative()
                 .flex_none()
-                .type_style(text::CAPTION)
-                .text_color(theme.tertiary)
-                .child(SharedString::from(since(
-                    row.last_output_unix_ms,
-                    data.now_ms,
-                ))),
+                .flex()
+                .justify_end()
+                // Room for the buttons drawn over it.
+                .min_w(px(chrome::ICON_BUTTON * buttons.len() as f32))
+                .child(
+                    div()
+                        .type_style(text::CAPTION)
+                        .text_color(theme.tertiary)
+                        .when(!buttons.is_empty(), |d| {
+                            d.group_hover(ROW_GROUP, |s| s.invisible())
+                        })
+                        .child(SharedString::from(since(
+                            row.last_output_unix_ms,
+                            data.now_ms,
+                        ))),
+                )
+                .children(row_buttons(buttons, id, theme, cx)),
         );
     let line2 = div()
         .pl(px(space::LG))
@@ -227,6 +251,7 @@ fn render_tab(
         });
     div()
         .id(("agent", id))
+        .group(ROW_GROUP)
         .debug_selector(move || format!("tab-{id}"))
         .relative()
         .flex()
@@ -250,6 +275,47 @@ fn render_tab(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
+}
+
+/// A row's hover group (its agent buttons show on hover).
+const ROW_GROUP: &str = "agent-row";
+
+/// A button on a row: its id, icon and the action it dispatches.
+type RowButton = (&'static str, Icon, Box<dyn Action>);
+
+/// The row's buttons, over its "since" (hidden meanwhile), invisible and
+/// not clickable until the row is hovered.
+fn row_buttons(
+    buttons: Vec<RowButton>,
+    agent_id: u64,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> Option<Div> {
+    if buttons.is_empty() {
+        return None;
+    }
+    let buttons = buttons.into_iter().map(|(name, icon, action)| {
+        controls::icon_button(name, icon, theme, true)
+            .debug_selector(move || format!("tab-{agent_id}-{name}"))
+            .invisible()
+            .group_hover(ROW_GROUP, |s| s.visible())
+            .on_click(cx.listener(move |_, _, window, cx| {
+                // The row's own click (show the agent) does not run.
+                cx.stop_propagation();
+                window.dispatch_action(action.boxed_clone(), cx);
+            }))
+    });
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .children(buttons),
+    )
 }
 
 /// The last line, on one line.

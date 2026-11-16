@@ -87,6 +87,15 @@ fn hello_carries_instance_and_binary() {
     assert_ne!(instances[0], instances[1]);
 }
 
+/// Limit for a check that ends on its own: generous, since starting a
+/// process on a busy machine can take seconds; only a hang reaches it.
+const ENDS: Duration = Duration::from_secs(30);
+/// Limit for a check whose child never ends in time.
+const TIMES_OUT: Duration = Duration::from_secs(2);
+/// How long a timed-out check may take beyond its limit (killing and
+/// reaping), still far less than its child's own run time.
+const KILL_SLACK: Duration = Duration::from_secs(15);
+
 fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
     let p = dir.join(name);
     fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -97,18 +106,22 @@ fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
 #[test]
 fn check_refusals() {
     let tmp = tempfile::tempdir().unwrap();
-    let t = Duration::from_secs(2);
-    let err = |p: &Path| run_check(p, t).unwrap_err();
+    let err = |p: &Path| run_check(p, ENDS).unwrap_err();
 
     assert_eq!(err(&tmp.path().join("missing")), "not an executable file");
     let plain = tmp.path().join("plain");
     fs::write(&plain, "#!/bin/sh\n").unwrap();
     assert_eq!(err(&plain), "not an executable file");
 
-    let slow = script(tmp.path(), "slow", "sleep 5");
+    // The limit, not the child, ends the check.
+    let slow = script(tmp.path(), "slow", "sleep 60");
     let started = Instant::now();
-    assert_eq!(err(&slow), "check timed out");
-    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(run_check(&slow, TIMES_OUT).unwrap_err(), "check timed out");
+    let took = started.elapsed();
+    assert!(
+        took >= TIMES_OUT && took < TIMES_OUT + KILL_SLACK,
+        "timed-out check took {took:?}"
+    );
 
     assert_eq!(
         err(&script(tmp.path(), "v9", "echo 'handoff 9'")),
@@ -118,11 +131,26 @@ fn check_refusals() {
         err(&script(tmp.path(), "bad", "exit 3")),
         "check failed (exit 3)"
     );
-    run_check(&script(tmp.path(), "ok", "echo 'handoff 1'"), t).unwrap();
-    run_check(Path::new(env!("CARGO_BIN_EXE_fleetd")), t).unwrap();
+    run_check(&script(tmp.path(), "ok", "echo 'handoff 1'"), ENDS).unwrap();
+    run_check(Path::new(env!("CARGO_BIN_EXE_fleetd")), ENDS).unwrap();
 }
 
-/// Pids of processes whose command line contains `needle`.
+/// Waits up to 10 s for no process's command line to match `needle` (a
+/// killed process lingers until it is reaped); panics with `what` if one
+/// still does.
+fn wait_gone(needle: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pids = pgrep(needle);
+        if pids.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what}: pids {pids:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Pids of processes whose command line matches `needle`.
 fn pgrep(needle: &str) -> Vec<String> {
     let out = Command::new("pgrep")
         .arg("-f")
@@ -138,23 +166,31 @@ fn pgrep(needle: &str) -> Vec<String> {
 #[test]
 fn check_leaves_no_descendants_and_is_bounded() {
     let tmp = tempfile::tempdir().unwrap();
-    let t = Duration::from_secs(2);
+    // Sleeps unique to this test process, so `pgrep` never sees another
+    // run's (parallel test runs share the machine).
+    let pid = std::process::id();
+    let (grandchild, child) = (format!("101.{pid}"), format!("102.{pid}"));
 
     // A grandchild holds stdout open: the check still returns promptly with
-    // the child's answer, and the grandchild is gone.
-    let leaky = script(tmp.path(), "leaky", "sleep 101 &\necho 'handoff 1'");
+    // the child's answer, long before the grandchild would exit, and the
+    // grandchild is gone.
+    let leaky = script(
+        tmp.path(),
+        "leaky",
+        &format!("sleep {grandchild} &\necho 'handoff 1'"),
+    );
     let started = Instant::now();
-    run_check(&leaky, t).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    run_check(&leaky, ENDS).unwrap();
+    let took = started.elapsed();
+    assert!(
+        took < KILL_SLACK,
+        "check waited on the grandchild: {took:?}"
+    );
 
     // A timeout takes the child's descendants with it.
-    let slow = script(tmp.path(), "slow2", "sleep 102");
-    assert_eq!(run_check(&slow, t).unwrap_err(), "check timed out");
+    let slow = script(tmp.path(), "slow2", &format!("sleep {child}"));
+    assert_eq!(run_check(&slow, TIMES_OUT).unwrap_err(), "check timed out");
 
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(pgrep("sleep 101").is_empty(), "grandchild left running");
-    assert!(
-        pgrep("sleep 102").is_empty(),
-        "timed-out child left running"
-    );
+    wait_gone(&format!("sleep {grandchild}"), "grandchild left running");
+    wait_gone(&format!("sleep {child}"), "timed-out child left running");
 }
