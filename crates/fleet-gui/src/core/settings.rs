@@ -152,6 +152,8 @@ pub enum Change {
     OptionAsMeta(bool),
     DefaultCommand(Vec<String>),
     DefaultDir(String),
+    FocusMode(bool),
+    Celebrate(bool),
 }
 
 /// Rounds to two decimals, so repeated steps do not drift.
@@ -195,6 +197,8 @@ impl Change {
             Change::OptionAsMeta(v) => set(&mut c.option_as_meta, v, "option_as_meta"),
             Change::DefaultCommand(v) => set(&mut c.default_command, v, "default_command"),
             Change::DefaultDir(v) => set(&mut c.default_dir, v.trim().to_owned(), "default_dir"),
+            Change::FocusMode(v) => set(&mut c.focus_mode, v, "focus_mode"),
+            Change::Celebrate(v) => set(&mut c.celebrate, v, "celebrate"),
         }
     }
 }
@@ -226,6 +230,8 @@ fn value_of(c: &GuiConfig, key: &str) -> Option<toml_edit::Value> {
             .collect::<toml_edit::Array>()
             .into(),
         "default_dir" => c.default_dir.as_str().into(),
+        "focus_mode" => c.focus_mode.into(),
+        "celebrate" => c.celebrate.into(),
         _ => return None,
     })
 }

@@ -221,3 +221,22 @@ fn shortcuts_are_listed_with_mac_symbols() {
     assert!(SHORTCUTS.iter().any(|s| s.keys == "cmd-,"));
     assert!(SHORTCUTS.iter().all(|s| !s.what.is_empty()));
 }
+
+#[test]
+fn focus_mode_and_celebration_are_off_by_default_and_saved() {
+    let mut c = GuiConfig::default();
+    assert!(!c.focus_mode);
+    assert!(!c.celebrate, "the celebration is opt-in (#44)");
+    let mut keys = Vec::new();
+    keys.extend(Change::FocusMode(true).apply(&mut c));
+    keys.extend(Change::Celebrate(true).apply(&mut c));
+    assert_eq!(keys, vec!["focus_mode", "celebrate"]);
+    assert_eq!(Change::FocusMode(true).apply(&mut c), None);
+    let dir = tempfile::tempdir().unwrap();
+    save_changes(dir.path(), &c, &keys).unwrap();
+    let text = read(dir.path());
+    assert!(text.contains("focus_mode = true"), "{text}");
+    assert!(text.contains("celebrate = true"), "{text}");
+    let back = load_config(dir.path()).unwrap();
+    assert!(back.focus_mode && back.celebrate);
+}

@@ -76,6 +76,10 @@ pub struct GuiConfig {
     pub notifications: bool,
     /// The New agent sheet's directory; empty: the most recent one.
     pub default_dir: String,
+    /// Focus mode: panes without focus are dimmed.
+    pub focus_mode: bool,
+    /// A soft sound and a small burst when an agent exits with code 0.
+    pub celebrate: bool,
 }
 
 impl Default for GuiConfig {
@@ -93,6 +97,8 @@ impl Default for GuiConfig {
             confirm_kill: true,
             notifications: true,
             default_dir: String::new(),
+            focus_mode: false,
+            celebrate: false,
         }
     }
 }
