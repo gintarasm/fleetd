@@ -392,9 +392,10 @@ impl Thread {
         Self(unsafe { libc::pthread_self() })
     }
 
-    fn interrupt(self) {
+    /// `pthread_kill`'s result: 0, or the error number.
+    fn interrupt(self) -> libc::c_int {
         // SAFETY: the thread is alive (see `Thread`) and the signal handled.
-        unsafe { libc::pthread_kill(self.0, FREEZE_SIGNAL) };
+        unsafe { libc::pthread_kill(self.0, FREEZE_SIGNAL) }
     }
 }
 
@@ -414,7 +415,7 @@ struct FreezeState {
     /// Readers whose agent's output has not ended, by agent.
     readers: HashMap<AgentId, Reader>,
     /// Threads inside [`AgentInput::write_all`], by a token of their own.
-    writers: HashMap<u64, Thread>,
+    writers: HashMap<u64, Writer>,
     next_writer: u64,
 }
 
@@ -423,6 +424,32 @@ struct Reader {
     /// `None` until the reader thread has started.
     thread: Option<Thread>,
     parked: bool,
+    /// What the current freeze did to this reader, for its timeout report.
+    nudges: Nudges,
+    /// Reads that failed with `EINTR` during the current freeze.
+    interrupted: u32,
+}
+
+struct Writer {
+    thread: Thread,
+    nudges: Nudges,
+}
+
+/// Signals one freeze sent a thread, and the last `pthread_kill` error.
+#[derive(Default, Clone, Copy)]
+struct Nudges {
+    sent: u32,
+    error: Option<libc::c_int>,
+}
+
+impl Nudges {
+    fn send(&mut self, thread: Thread) {
+        self.sent = self.sent.saturating_add(1);
+        match thread.interrupt() {
+            0 => {}
+            e => self.error = Some(e),
+        }
+    }
 }
 
 impl Freeze {
@@ -456,6 +483,15 @@ impl Freeze {
         }
     }
 
+    /// Called by a reader whose read failed with `EINTR`; only counted, for
+    /// a freeze's timeout report. Off the output path: only a freeze
+    /// interrupts reads.
+    fn interrupted(&self, id: AgentId) {
+        if let Some(reader) = lock(&self.state).readers.get_mut(&id) {
+            reader.interrupted = reader.interrupted.saturating_add(1);
+        }
+    }
+
     /// Called by a reader once its agent's output has ended (and by a spawn
     /// whose reader never started).
     fn reader_done(&self, id: AgentId) {
@@ -470,7 +506,13 @@ impl Freeze {
             let mut state = lock(&self.state);
             let token = state.next_writer;
             state.next_writer += 1;
-            state.writers.insert(token, Thread::current());
+            state.writers.insert(
+                token,
+                Writer {
+                    thread: Thread::current(),
+                    nudges: Nudges::default(),
+                },
+            );
             token
         };
         let _writing = WriterGuard {
@@ -494,28 +536,34 @@ impl Freeze {
         }
         state.frozen = true;
         self.frozen.store(true, Ordering::SeqCst);
+        for reader in state.readers.values_mut() {
+            reader.nudges = Nudges::default();
+            reader.interrupted = 0;
+        }
         loop {
             let mut waiting = false;
-            for reader in state.readers.values().filter(|r| !r.parked) {
+            for reader in state.readers.values_mut().filter(|r| !r.parked) {
                 waiting = true;
                 // One not yet started sees the flag before its first read.
                 if let Some(thread) = reader.thread {
-                    thread.interrupt();
+                    reader.nudges.send(thread);
                 }
             }
-            for &thread in state.writers.values() {
+            for writer in state.writers.values_mut() {
                 waiting = true;
-                thread.interrupt();
+                writer.nudges.send(writer.thread);
             }
             if !waiting {
                 return Ok(state.readers.keys().copied().collect());
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
+                let holdouts = holdouts(&state);
+                tracing::warn!(%holdouts, "freeze timed out");
                 self.thaw_locked(&mut state);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "agents did not stop in time",
+                    format!("agents did not stop in time ({holdouts})"),
                 ));
             }
             state = self
@@ -535,6 +583,38 @@ impl Freeze {
         self.frozen.store(false, Ordering::SeqCst);
         self.cv.notify_all();
     }
+}
+
+/// What a timed-out freeze still waits for, one entry per thread: e.g.
+/// `reader 0: signalled 600x, read interrupted 0x` or `reader 3: not
+/// started` or `writer: signalled 600x, pthread_kill error 3`. The host id
+/// of a reader is the `N` of its `pty-reader-N` thread.
+fn holdouts(state: &FreezeState) -> String {
+    fn nudged(out: &mut String, n: Nudges) {
+        out.push_str(&format!("signalled {}x", n.sent));
+        if let Some(e) = n.error {
+            out.push_str(&format!(", pthread_kill error {e}"));
+        }
+    }
+    let mut parts = Vec::new();
+    let mut readers: Vec<_> = state.readers.iter().filter(|(_, r)| !r.parked).collect();
+    readers.sort_by_key(|(id, _)| id.0);
+    for (id, reader) in readers {
+        let mut part = format!("reader {}: ", id.0);
+        if reader.thread.is_none() {
+            part.push_str("not started");
+        } else {
+            nudged(&mut part, reader.nudges);
+            part.push_str(&format!(", read interrupted {}x", reader.interrupted));
+        }
+        parts.push(part);
+    }
+    for writer in state.writers.values() {
+        let mut part = "writer: ".to_owned();
+        nudged(&mut part, writer.nudges);
+        parts.push(part);
+    }
+    parts.join("; ")
 }
 
 /// Deregisters a reader thread when dropped; see [`Freeze::reader_started`].
@@ -862,7 +942,9 @@ impl PtyHost {
                             agent.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
                             sink.on_output(&buf[..n]);
                         }
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                            freeze.interrupted(id);
+                        }
                         // O_NONBLOCK is set briefly while a reply is written.
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(1));
@@ -1521,5 +1603,55 @@ mod tests {
             assert!(Instant::now() < deadline, "agent never exited");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A timed-out freeze names what it still waited for and how that
+    /// thread answered the signal, so a stuck restart can be diagnosed from
+    /// the error alone.
+    #[test]
+    fn a_timed_out_freeze_names_its_holdouts() {
+        /// Holds the reader inside `on_output` until released, so it can
+        /// neither read nor park.
+        struct Stuck(std::sync::mpsc::Receiver<()>);
+        impl OutputSink for Stuck {
+            fn on_output(&mut self, _bytes: &[u8]) {
+                let _ = self.0.recv();
+            }
+            fn on_exit(&mut self, _code: i32) {}
+        }
+        let (release, rx) = std::sync::mpsc::channel();
+        let host = PtyHost::new();
+        let stuck = host
+            .spawn_with_sink(sh("printf x; sleep 30"), Box::new(Stuck(rx)))
+            .unwrap();
+        let healthy = host.spawn(sh("sleep 30")).unwrap();
+        eventually("the stuck agent's output", || {
+            host.stats(stuck).unwrap().bytes_read > 0
+        });
+        let err = host
+            .freeze(Instant::now() + Duration::from_millis(300))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with(&format!(
+                "agents did not stop in time (reader {}: signalled ",
+                stuck.0
+            )),
+            "{msg}"
+        );
+        assert!(msg.ends_with("x, read interrupted 0x)"), "{msg}");
+        // Only the holdout is named: the healthy reader parked.
+        assert!(!msg.contains(&format!("reader {}:", healthy.0)), "{msg}");
+        release.send(()).unwrap();
+        // Thawed: the next freeze succeeds.
+        let frozen = host
+            .freeze(Instant::now() + Duration::from_secs(3))
+            .unwrap();
+        host.thaw();
+        assert_eq!(frozen.len(), 2);
+        host.force_kill(stuck).unwrap();
+        host.force_kill(healthy).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
     }
 }
