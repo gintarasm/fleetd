@@ -101,8 +101,21 @@ impl TextField {
         self.changed(cx);
     }
 
+    /// Selects all the text (a find field reopened: typing replaces it).
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        self.edit.select_all();
+        self.changed(cx);
+    }
+
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    /// Types `text` at the caret (a key typed elsewhere, handed over).
+    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.edit.unmark();
+        self.edit.insert(text);
+        self.changed(cx);
     }
 
     /// After any edit or caret move: the caret shows at once.

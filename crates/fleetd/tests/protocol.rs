@@ -752,6 +752,12 @@ fn restart_marks_agents_lost() {
     let done = c.sh("exit 3");
     let done = wait_not_running(&mut c, done.id);
     assert_eq!(done.exit_code, Some(3));
+    // The exit time is listed (ADR 0058), and survives the restart.
+    let exited_at = done
+        .exited_unix_ms
+        .expect("an exited agent lists its exit time");
+    assert!(exited_at >= done.created_unix_ms);
+    assert_eq!(find(&c.list(), running.id).exited_unix_ms, None);
     drop(c);
     d.crash();
 
@@ -759,9 +765,11 @@ fn restart_marks_agents_lost() {
     let mut c = Client::open(dir.path());
     let listed = c.list();
     assert_eq!(find(&listed, running.id).state(), AgentState::Lost);
+    assert_eq!(find(&listed, running.id).exited_unix_ms, None);
     let done = find(&listed, done.id);
     assert_eq!(done.state(), AgentState::Exited);
     assert_eq!(done.exit_code, Some(3));
+    assert_eq!(done.exited_unix_ms, Some(exited_at));
     // A new agent gets a fresh id.
     let next = c.spawn("/bin/sleep", &["100"]);
     assert!(next.id > running.id && next.id > done.id);

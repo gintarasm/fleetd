@@ -28,6 +28,10 @@ fn bytes(icon: Icon) -> &'static [u8] {
         Icon::Terminal => file!("terminal"),
         Icon::Server => file!("server"),
         Icon::Folder => file!("folder-open"),
+        Icon::Stop => file!("circle-stop"),
+        Icon::Check => file!("check"),
+        Icon::ChevronUp => file!("chevron-up"),
+        Icon::ChevronDown => file!("chevron-down"),
     }
 }
 

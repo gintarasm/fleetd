@@ -1,31 +1,52 @@
 //! One line of text that, when too wide, keeps its end behind a leading
-//! `…` (see [`tail_start`]). Takes the width its parent leaves it.
+//! `…` (see [`tail_start`]), or its start before a trailing one (see
+//! [`head_end`]). Takes the width its parent leaves it.
 
 use gpui::{
     App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     Pixels, ShapedLine, SharedString, Style, Window, relative,
 };
 
-use crate::core::truncate::tail_start;
+use crate::core::truncate::{head_end, tail_start};
 
 const ELLIPSIS: &str = "…";
 
 pub struct TailText {
     text: SharedString,
+    keep_head: bool,
 }
 
 /// `text` on one line, shortened from the start to fit.
 pub fn tail_text(text: impl Into<SharedString>) -> TailText {
-    TailText { text: text.into() }
+    TailText {
+        text: text.into(),
+        keep_head: false,
+    }
+}
+
+/// `text` on one line, shortened from the end to fit.
+pub fn head_text(text: impl Into<SharedString>) -> TailText {
+    TailText {
+        text: text.into(),
+        keep_head: true,
+    }
 }
 
 /// What `text` shows in `max_w`, given its shaped width at each index.
 fn fitted(
     text: &SharedString,
+    keep_head: bool,
     max_w: Pixels,
     line: &ShapedLine,
     ellipsis_w: Pixels,
 ) -> SharedString {
+    if keep_head {
+        let width_to = |i: usize| f32::from(line.x_for_index(i));
+        return match head_end(text, max_w.into(), ellipsis_w.into(), width_to) {
+            None => text.clone(),
+            Some(i) => SharedString::from(format!("{}{ELLIPSIS}", &text[..i])),
+        };
+    }
     let total = line.width;
     let width_from = |i: usize| f32::from(total - line.x_for_index(i));
     match tail_start(text, max_w.into(), ellipsis_w.into(), width_from) {
@@ -96,7 +117,13 @@ impl Element for TailText {
         };
         let full = shape(self.text.clone());
         let ellipsis_w = shape(SharedString::new_static(ELLIPSIS)).width;
-        let shown = fitted(&self.text, bounds.size.width, &full, ellipsis_w);
+        let shown = fitted(
+            &self.text,
+            self.keep_head,
+            bounds.size.width,
+            &full,
+            ellipsis_w,
+        );
         Some(if shown == self.text {
             full
         } else {

@@ -1,26 +1,34 @@
 //! The sidebar: vertical tabs, one per agent, grouped by project or
 //! directory. (New agent and Clear exited live in the unified bar.)
 //! A click shows the agent in the focused pane; a right-click opens the
-//! row's native menu (`core::menus::row_menu`).
+//! row's native menu (`core::menus::row_menu`). Above the tabs, a filter
+//! field and status filters; a click on a group's header collapses it
+//! (issue #40, ADR 0060).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use fleet_proto::AgentState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px,
+    Action, Context, Div, Entity, FocusHandle, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 
 use super::agent_mark::{MARK_SLOT, agent_mark};
+use super::controls;
+use super::keymap::{Kill, Remove, Restart};
 use super::status_dot::status_dot;
-use super::tail_text::tail_text;
+use super::tail_text::{head_text, tail_text};
+use super::text_field::TextField;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
+use crate::core::icons::Icon;
+use crate::core::kill::{AgentButtons, agent_buttons};
+use crate::core::row_preview::{preview_line, row_meta};
 use crate::core::session::AgentRow;
+use crate::core::sidebar::ended;
 pub use crate::core::sidebar::program_name;
-use crate::core::sidebar::{group_agents, since};
+use crate::core::sidebar::{SidebarGroup, StatusFilter};
 use crate::core::status::AgentStatus;
 use crate::core::style::{chrome, radius, space, text};
 
@@ -49,7 +57,6 @@ pub enum TabMark {
 /// What the sidebar draws, gathered from the app state.
 pub struct SidebarData<'a> {
     pub rows: &'a [AgentRow],
-    pub home: &'a Path,
     pub now_ms: i64,
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
@@ -62,6 +69,12 @@ pub struct SidebarData<'a> {
     /// `[gui] agent_emoji`: each row shows its agent's emoji, not its
     /// colour (ADR 0064).
     pub agent_emoji: bool,
+    /// The groups to draw, filtered and collapsed (`core::sidebar::sidebar_groups`).
+    pub groups: Vec<SidebarGroup>,
+    pub filter_field: Entity<TextField>,
+    pub status_filter: StatusFilter,
+    /// The tabs' focus: a key typed while it has it goes to the filter.
+    pub focus: FocusHandle,
 }
 
 /// A tab's title: the agent's OSC title if a pane knows it, else the
@@ -75,42 +88,29 @@ pub fn tab_title(row: &AgentRow, titles: &HashMap<u64, String>) -> String {
 }
 
 pub fn render_sidebar(
-    data: &SidebarData<'_>,
+    mut data: SidebarData<'_>,
     theme: &Theme,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
-    let groups: Vec<_> = group_agents(data.rows, data.home)
+    let groups: Vec<_> = std::mem::take(&mut data.groups)
         .into_iter()
-        .map(|group| {
-            let tabs: Vec<_> = group
-                .agents
-                .into_iter()
-                .map(|row| render_tab(&row, data, theme, cx))
-                .collect();
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(space::XXS))
-                .child(
-                    div()
-                        .flex()
-                        .px(px(space::SM))
-                        .pt(px(space::MD))
-                        .pb(px(space::XS))
-                        .type_style(text::SECTION)
-                        .text_color(theme.secondary)
-                        .child(tail_text(group.title)),
-                )
-                .children(tabs)
-        })
+        .map(|group| render_group(group, &data, theme, cx))
         .collect();
-    let empty = data.rows.is_empty().then(|| {
+    let empty = if data.rows.is_empty() {
+        Some(("sidebar-empty", "No agents yet. Press ⌘N to start one."))
+    } else if groups.is_empty() {
+        Some(("sidebar-no-match", "No agents match."))
+    } else {
+        None
+    };
+    let empty = empty.map(|(selector, message)| {
         div()
+            .debug_selector(move || selector.to_owned())
             .px(px(space::SM))
             .pt(px(space::MD))
             .type_style(text::CALLOUT)
             .text_color(theme.tertiary)
-            .child("No agents yet. Press ⌘N to start one.")
+            .child(message)
     });
     div()
         .flex()
@@ -120,9 +120,17 @@ pub fn render_sidebar(
         .h_full()
         .text_color(theme.text)
         .type_style(text::BODY)
+        .child(render_filter(&data, theme, cx))
         .child(
             div()
                 .id("tabs")
+                .debug_selector(|| "sidebar".to_owned())
+                .track_focus(&data.focus)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.focus_sidebar(window, cx)),
+                )
+                .on_key_down(cx.listener(Workspace::sidebar_key_down))
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -133,6 +141,106 @@ pub fn render_sidebar(
                 .children(empty)
                 .children(groups),
         )
+}
+
+/// The filter field and, under it, the status filters.
+fn render_filter(
+    data: &SidebarData<'_>,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let chips: Vec<_> = StatusFilter::ALL
+        .into_iter()
+        .map(|f| {
+            let on = f == data.status_filter;
+            div()
+                .id(SharedString::from(format!("status-filter-{}", f.label())))
+                .debug_selector(move || format!("status-filter-{}", f.label()))
+                .px(px(space::XS + space::XXS))
+                .py(px(space::XXS))
+                .rounded(px(radius::SM))
+                .type_style(text::CAPTION)
+                .cursor_pointer()
+                .text_color(if on { theme.text } else { theme.secondary })
+                .when(on, |d| d.bg(theme.selected))
+                .when(!on, |d| d.hover(|d| d.bg(theme.hover)))
+                .child(f.label())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_status_filter(f, cx)))
+        })
+        .collect();
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(space::XS))
+        .px(px(space::SM))
+        .pt(px(space::SM))
+        .child(
+            div()
+                .debug_selector(|| "sidebar-filter".to_owned())
+                .on_key_down(cx.listener(Workspace::filter_key_down))
+                .child(data.filter_field.clone()),
+        )
+        .child(div().flex().flex_row().gap(px(space::XXS)).children(chips))
+}
+
+/// A group's header (a click collapses or expands it), then its tabs.
+fn render_group(
+    group: SidebarGroup,
+    data: &SidebarData<'_>,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let tabs: Vec<_> = group
+        .agents
+        .iter()
+        .map(|row| render_tab(row, data, theme, cx))
+        .collect();
+    let title = group.title.clone();
+    let selector = format!("group-{}", group.title);
+    let count = group.collapsed.then(|| {
+        let selector = format!("group-count-{}", group.title);
+        let exact = format!("{selector}-{}", group.count);
+        div()
+            .flex_none()
+            .debug_selector(move || selector.clone())
+            .child(
+                div()
+                    .debug_selector(move || exact.clone())
+                    .type_style(text::CAPTION)
+                    .text_color(theme.tertiary)
+                    .child(SharedString::from(group.count.to_string())),
+            )
+    });
+    let header = div()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::XS))
+        .px(px(space::SM))
+        .pt(px(space::MD))
+        .pb(px(space::XS))
+        .cursor_pointer()
+        .type_style(text::SECTION)
+        .text_color(theme.secondary)
+        .child(
+            div()
+                .flex_none()
+                .w(px(space::SM + space::XXS))
+                .text_color(theme.tertiary)
+                .child(if group.collapsed { "▸" } else { "▾" }),
+        )
+        .child(div().flex_1().min_w_0().child(tail_text(group.title)))
+        .children(count)
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(&title, cx)));
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::XXS))
+        .child(header)
+        .children(tabs)
 }
 
 fn render_tab(
@@ -159,27 +267,26 @@ fn render_tab(
             .type_style(text::CAPTION)
             .text_color(dot_color)
             .child(SharedString::from(state_mark(row))),
+        // The exit code is on the right (`meta`).
         Some(s) => div()
             .flex()
             .flex_row()
             .flex_none()
             .items_center()
-            .gap(px(space::XXS))
             .debug_selector(move || format!("status-{id}-{}", s.label()))
-            .child(status_dot(s, theme, data.now_ms, data.reduce_motion))
-            .children(
-                row.info
-                    .exit_code
-                    .filter(|c| *c != 0 && s == AgentStatus::Failed)
-                    .map(|c| {
-                        div()
-                            .type_style(text::CAPTION)
-                            .text_color(theme.danger)
-                            .child(SharedString::from(format!("✕{c}")))
-                    }),
-            ),
+            .child(status_dot(s, theme, data.now_ms, data.reduce_motion)),
     };
+    let meta = row_meta(row, data.now_ms);
+    let preview = preview_line(&row.last_line);
     let rang = data.bells.contains(&id);
+    let buttons: Vec<RowButton> = match agent_buttons(true, ended(row)) {
+        AgentButtons::None => Vec::new(),
+        AgentButtons::Stop => vec![("stop", Icon::Stop, Box::new(Kill { agent_id: id }))],
+        AgentButtons::RestartRemove => vec![
+            ("restart", Icon::Restart, Box::new(Restart { agent_id: id })),
+            ("remove", Icon::Trash, Box::new(Remove { agent_id: id })),
+        ],
+    };
     let line1 = div()
         .flex()
         .flex_row()
@@ -198,17 +305,33 @@ fn render_tab(
                 })
                 .child(SharedString::from(tab_title(row, data.titles))),
         )
-        .child(
+        .child({
+            let shown = meta.text.clone();
             div()
+                .relative()
                 .flex_none()
-                .type_style(text::CAPTION)
-                .text_color(theme.tertiary)
-                .child(SharedString::from(since(
-                    row.last_output_unix_ms,
-                    data.now_ms,
-                ))),
-        );
+                .flex()
+                .justify_end()
+                // Room for the buttons drawn over it.
+                .min_w(px(chrome::ICON_BUTTON * buttons.len() as f32))
+                .child(
+                    div()
+                        .type_style(text::CAPTION)
+                        .text_color(if meta.failed {
+                            theme.danger
+                        } else {
+                            theme.tertiary
+                        })
+                        .when(!buttons.is_empty(), |d| {
+                            d.group_hover(ROW_GROUP, |s| s.invisible())
+                        })
+                        .debug_selector(move || format!("meta-{id}-{shown}"))
+                        .child(SharedString::from(meta.text)),
+                )
+                .children(row_buttons(buttons, id, theme, cx))
+        });
     let line2 = div()
+        .flex()
         // Under the title: past the agent's mark and the status.
         .pl(px(MARK_SLOT + space::SM - space::XXS + space::LG))
         .type_style(text::SUBHEADLINE)
@@ -217,8 +340,11 @@ fn render_tab(
         } else {
             theme.tertiary
         })
-        .truncate()
-        .child(SharedString::from(one_line(&row.last_line)));
+        .debug_selector({
+            let shown = preview.clone();
+            move || format!("preview-{id}-{shown}")
+        })
+        .child(head_text(preview));
     let bar = div()
         .absolute()
         .left_0()
@@ -233,6 +359,7 @@ fn render_tab(
         });
     div()
         .id(("agent", id))
+        .group(ROW_GROUP)
         .debug_selector(move || format!("tab-{id}"))
         .relative()
         .flex()
@@ -251,16 +378,63 @@ fn render_tab(
         .child(bar)
         .child(line1)
         .child(line2)
-        .on_click(cx.listener(move |this, _, window, cx| this.show_agent(id, window, cx)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            // A drag that ends on its own row is not a click.
+            if this.pane_drag.is_click() {
+                this.show_agent(id, window, cx);
+            }
+        }))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, ev: &MouseDownEvent, _, _| {
+                this.pane_drag.press_agent(id, ev.position);
+            }),
+        )
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| this.open_row_menu(id, cx)),
         )
 }
 
-/// The last line, on one line.
-fn one_line(s: &str) -> String {
-    s.lines().next_back().unwrap_or("").trim().to_owned()
+/// A row's hover group (its agent buttons show on hover).
+const ROW_GROUP: &str = "agent-row";
+
+/// A button on a row: its id, icon and the action it dispatches.
+type RowButton = (&'static str, Icon, Box<dyn Action>);
+
+/// The row's buttons, over its "since" (hidden meanwhile), invisible and
+/// not clickable until the row is hovered.
+fn row_buttons(
+    buttons: Vec<RowButton>,
+    agent_id: u64,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> Option<Div> {
+    if buttons.is_empty() {
+        return None;
+    }
+    let buttons = buttons.into_iter().map(|(name, icon, action)| {
+        controls::icon_button(name, icon, theme, true)
+            .debug_selector(move || format!("tab-{agent_id}-{name}"))
+            .invisible()
+            .group_hover(ROW_GROUP, |s| s.visible())
+            .on_click(cx.listener(move |_, _, window, cx| {
+                // The row's own click (show the agent) does not run.
+                cx.stop_propagation();
+                window.dispatch_action(action.boxed_clone(), cx);
+            }))
+    });
+    Some(
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .children(buttons),
+    )
 }
 
 #[cfg(test)]
