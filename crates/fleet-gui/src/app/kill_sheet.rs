@@ -1,5 +1,5 @@
 //! The question asked before an agent is killed (issue #27): "Kill agent
-//! 7 (claude, ~/fleetd)?" with Kill / Cancel and a "Don't ask again"
+//! 7 (claude, ~/fleetd)?", or "Kill shell 4 (zsh, ~/src)?" (ADR 0071) with Kill / Cancel and a "Don't ask again"
 //! checkbox, which turns `[gui] confirm_kill` off.
 
 use gpui::prelude::FluentBuilder;
@@ -17,6 +17,7 @@ use super::titlebar_view::sheet_drag_strip;
 use crate::core::icons::Icon;
 use crate::core::kill::kill_question;
 use crate::core::sidebar::{program_name, tilde};
+use crate::core::status::Subject;
 use crate::core::style::{chrome, motion, radius, space, text};
 
 /// The sheet's answer.
@@ -43,7 +44,8 @@ pub fn question(app: &AppState, agent_id: u64) -> String {
     let row = app.agents.iter().find(|r| r.info.id == agent_id);
     let program = row.map(|r| program_name(&r.info.program));
     let cwd = row.map(|r| tilde(&r.info.cwd, &app.home));
-    kill_question(agent_id, program.as_deref(), cwd.as_deref())
+    let subject = row.map_or(Subject::Agent, |r| Subject::of(&r.info));
+    kill_question(subject, agent_id, program.as_deref(), cwd.as_deref())
 }
 
 impl KillSheet {

@@ -998,10 +998,17 @@ impl PtyHost {
         master.as_ref().ok_or_else(exited)?.resize(cols, rows)
     }
 
-    /// Sends SIGTERM to the agent's process group, so children it started
-    /// (which may hold the PTY open) go too. A no-op once the agent has exited.
+    /// Sends SIGHUP, then SIGTERM, to the agent's process group, so children
+    /// it started (which may hold the PTY open) go too. SIGHUP is what a
+    /// closed terminal sends: an interactive shell ignores SIGTERM but exits
+    /// on it (ADR 0071). A no-op once the agent has exited.
     pub fn kill(&self, id: AgentId) -> io::Result<()> {
-        self.signal_group(id, libc::SIGTERM)
+        self.signal_group(id, libc::SIGHUP)?;
+        // SIGHUP may already have ended it: before its exit is recorded, a
+        // group of zombies makes macOS killpg fail with EPERM. The group
+        // took a signal, so a failed SIGTERM only means it is going.
+        let _ = self.signal_group(id, libc::SIGTERM);
+        Ok(())
     }
 
     /// Like [`PtyHost::kill`], but SIGKILL.

@@ -61,6 +61,7 @@ use crate::core::sidebar::{
 };
 use crate::core::spawn::SpawnRequest;
 use crate::core::split_chooser::{choice_rows, off_screen_agents};
+use crate::core::status::Subject;
 use crate::core::style::{chrome, motion, radius, space, text};
 use crate::core::switcher::{AgentMru, start_row, switcher_items};
 use crate::core::tabs::tab_label;
@@ -990,10 +991,15 @@ impl Workspace {
     /// A pane's native context menu: on its header, or on its grid
     /// (`on_grid`, adding Copy and Paste).
     fn open_pane_menu(&mut self, pane: PaneId, on_grid: bool, cx: &mut Context<Self>) {
-        let state = {
+        let (state, subject) = {
             let app = self.app.read(cx);
             let view = app.pane_view(pane).map(|v| v.read(cx));
-            PaneMenuState {
+            let subject = app
+                .layout()
+                .agent(pane)
+                .and_then(|id| app.agents.iter().find(|r| r.info.id == id))
+                .map_or(Subject::Agent, |r| Subject::of(&r.info));
+            let state = PaneMenuState {
                 on_grid,
                 has_selection: view.is_some_and(|v| v.has_selection()),
                 can_split: app.layout().panes().len() < MAX_PANES,
@@ -1004,11 +1010,12 @@ impl Workspace {
                     .layout()
                     .agent(pane)
                     .is_some_and(|id| kill_sheet::running(app, id)),
-            }
+            };
+            (state, subject)
         };
         let items = pane_menu(state);
         let lines = context_menu::lines(&items, |(item, enabled)| MenuLine {
-            title: item.title().to_owned(),
+            title: item.title(subject),
             enabled,
             shortcut: item.shortcut(),
         });
@@ -1102,7 +1109,8 @@ impl Workspace {
         };
         let name = name_of(&info).unwrap_or_default().to_owned();
         let what = program_and_id(&info);
-        let sheet = cx.new(|cx| RenameSheet::new(agent_id, name, what, cx));
+        let subject = Subject::of(&info);
+        let sheet = cx.new(|cx| RenameSheet::new(agent_id, name, what, subject, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::rename_event);
         sheet.read(cx).focus(window, cx);
         self.rename = Some((sheet, sub));
@@ -2701,6 +2709,28 @@ mod tests {
         let at = center(s, selector);
         s.cx.simulate_mouse_move(at, None, Modifiers::none());
         s.cx.run_until_parked();
+    }
+
+    /// A shell from New terminal is asked about as a shell, not an agent
+    /// (ADR 0071).
+    #[gpui::test]
+    fn kill_asks_about_a_shell_as_a_shell(cx: &mut TestAppContext) {
+        use crate::core::spawn::{KIND_LABEL, SHELL_KIND};
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let mut shell = row(4, "/w", 1);
+        shell
+            .info
+            .labels
+            .insert(KIND_LABEL.to_owned(), SHELL_KIND.to_owned());
+        agents(&mut s, &fake, vec![shell]);
+        s.cx.dispatch_action(Kill { agent_id: 4 });
+        assert_eq!(kill_asked(&mut s), Some(4));
+        let question = s.ws.read_with(s.cx, |w, cx| {
+            w.kill_sheet().unwrap().read(cx).question.to_string()
+        });
+        assert_eq!(question, "Kill shell 4 (sh, /w)?");
     }
 
     #[gpui::test]

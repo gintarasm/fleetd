@@ -61,7 +61,8 @@ pub trait AgentHost: Send + Sync {
     /// Resizes the agent's terminal (the child gets SIGWINCH).
     fn resize(&self, id: AgentId, cols: u16, rows: u16) -> io::Result<()>;
 
-    /// SIGTERM to the agent's process group; a no-op once it has exited.
+    /// SIGHUP, then SIGTERM, to the agent's process group; a no-op once it
+    /// has exited.
     fn kill(&self, id: AgentId) -> io::Result<()>;
 
     /// SIGKILL to the agent's process group; a no-op once it has exited.

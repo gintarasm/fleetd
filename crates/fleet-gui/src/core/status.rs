@@ -56,6 +56,42 @@ pub fn is_shell(info: &AgentInfo) -> bool {
     info.labels.get(KIND_LABEL).map(String::as_str) == Some(SHELL_KIND)
 }
 
+/// What a row or pane shows, as the GUI names it to the user: a shell
+/// from New terminal is never called an agent (ADR 0071), though the node
+/// runs it as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Subject {
+    #[default]
+    Agent,
+    Shell,
+}
+
+impl Subject {
+    pub fn of(info: &AgentInfo) -> Self {
+        if is_shell(info) {
+            Subject::Shell
+        } else {
+            Subject::Agent
+        }
+    }
+
+    /// "agent" or "shell", for mid-sentence use.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Subject::Agent => "agent",
+            Subject::Shell => "shell",
+        }
+    }
+
+    /// "Agent" or "Shell", for menu titles.
+    pub fn title(self) -> &'static str {
+        match self {
+            Subject::Agent => "Agent",
+            Subject::Shell => "Shell",
+        }
+    }
+}
+
 /// The status of `row` at `now_ms`; `rang` is an unseen bell from a pane
 /// showing it. `None` for a shell, or a state the GUI does not know.
 pub fn agent_status(row: &AgentRow, rang: bool, now_ms: i64) -> Option<AgentStatus> {

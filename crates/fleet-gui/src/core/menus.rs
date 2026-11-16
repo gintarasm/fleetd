@@ -1,6 +1,8 @@
 //! The context menus: a sidebar row's and a pane's. What they offer and
 //! what they are called; the shell shows them as native menus.
 
+use super::status::Subject;
+
 /// A menu line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuEntry<T> {
@@ -85,19 +87,22 @@ pub enum PaneMenuItem {
 }
 
 impl PaneMenuItem {
-    pub fn title(self) -> &'static str {
+    /// The item's title; `subject` names what the pane shows ("Kill
+    /// Shell…" for a shell, ADR 0071).
+    pub fn title(self, subject: Subject) -> String {
+        let what = subject.title();
         match self {
-            PaneMenuItem::Copy => "Copy",
-            PaneMenuItem::Paste => "Paste",
-            PaneMenuItem::SplitRight => "Split Right",
-            PaneMenuItem::SplitDown => "Split Down",
-            PaneMenuItem::Maximize => "Maximize Pane",
-            PaneMenuItem::Restore => "Restore Pane",
-            PaneMenuItem::Rename => "Rename Agent…",
-            PaneMenuItem::Restart => "Restart Agent",
+            PaneMenuItem::Copy => "Copy".to_owned(),
+            PaneMenuItem::Paste => "Paste".to_owned(),
+            PaneMenuItem::SplitRight => "Split Right".to_owned(),
+            PaneMenuItem::SplitDown => "Split Down".to_owned(),
+            PaneMenuItem::Maximize => "Maximize Pane".to_owned(),
+            PaneMenuItem::Restore => "Restore Pane".to_owned(),
+            PaneMenuItem::Rename => format!("Rename {what}…"),
+            PaneMenuItem::Restart => format!("Restart {what}"),
             // It asks first (unless told not to).
-            PaneMenuItem::Kill => "Kill Agent…",
-            PaneMenuItem::Close => "Close Pane",
+            PaneMenuItem::Kill => format!("Kill {what}…"),
+            PaneMenuItem::Close => "Close Pane".to_owned(),
         }
     }
 
