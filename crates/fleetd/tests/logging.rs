@@ -397,22 +397,28 @@ fn slow_follower_gets_dropped_marker_not_disconnect() {
     let dir = TempDir::new().unwrap();
     let _d = start(dir.path(), &[]);
     let mut slow = Client::open(dir.path());
-    // A small receive buffer, so the daemon backs up sooner.
     slow.read_logs(0, true);
-    // Many log lines (two per connection) while the follower does not read.
+    // Many log lines (two per connection) while the follower does not read:
+    // far more than its queue, the outbox and the socket buffers hold.
     for _ in 0..2500 {
         drop(Client::open(dir.path()));
     }
-    // Catch up; one more line carries the drop marker.
-    while slow.next_log_line(Duration::from_millis(300)).is_some() {}
-    let _one_more = Client::open(dir.path());
+    // Catch up. The marker rides on the first line offered once the
+    // follower's queue has room again: a late line of the flood (the last
+    // "connection closed") while we read, or else a line we cause. So every
+    // line read counts, and while the stream is idle each new connection
+    // offers one more line, until the marker comes.
     let deadline = Instant::now() + TIMEOUT;
+    let mut extra = Vec::new();
     loop {
-        let line = slow
-            .next_log_line(deadline.saturating_duration_since(Instant::now()))
-            .expect("no drop marker");
-        if line.contains("lines dropped") {
-            break;
+        assert!(
+            Instant::now() < deadline,
+            "no drop marker within {TIMEOUT:?} after the flood"
+        );
+        match slow.next_log_line(Duration::from_millis(300)) {
+            Some(line) if line.contains("lines dropped") => break,
+            Some(_) => {}
+            None => extra.push(Client::open(dir.path())),
         }
     }
     // Still connected and served.
