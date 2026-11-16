@@ -27,6 +27,7 @@ fn spawn_request_roundtrips_with_env() {
         rows: 24,
         attach: true,
         labels: [("project".to_string(), "fleetd".to_string())].into(),
+        priority: fleet_proto::AgentPriority::Normal.into(),
     };
     let f = Frame::Request(Request {
         id: 1,

@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Action, App, AppContext, Bounds, Context, Entity, EntityId, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, PromptButton, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
+    IntoElement, ModifiersChangedEvent, ParentElement, PromptButton, PromptLevel, Render,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, deferred, div, point, px, relative,
     size,
 };
@@ -19,8 +19,8 @@ use super::context_menu::{self, MenuLine};
 use super::controls::appear;
 use super::keymap::{
     ClosePane, CommandPalette, Copy, FocusDown, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
-    FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTerminal, Paste, Remove, Restart,
-    RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
+    FocusPane4, FocusRight, FocusUp, Kill, NewAgent, NewTerminal, NextAgent, Paste, PreviousAgent,
+    Remove, Restart, RestartPane, SplitDown, SplitRight, ToggleMaximize, WORKSPACE_CONTEXT,
 };
 use super::native;
 use super::new_agent::{NewAgentSheet, SheetEvent};
@@ -42,6 +42,7 @@ use crate::core::session::PaneId;
 use crate::core::sidebar::ended;
 use crate::core::spawn::SpawnRequest;
 use crate::core::style::{chrome, motion, radius, space, text};
+use crate::core::switcher::{AgentMru, start_row, switcher_items};
 use crate::core::target::Target;
 use crate::core::titlebar::{Link, bar_title, window_title};
 
@@ -110,6 +111,14 @@ fn blur_within(window: &mut Window, frames: u32) {
     });
 }
 
+/// The open agent switcher.
+struct Switcher {
+    view: Entity<PickerView>,
+    /// ⌃ was seen down: its release picks.
+    held: bool,
+    _sub: Subscription,
+}
+
 /// The window's root view, over [`AppState`].
 pub struct Workspace {
     app: Entity<AppState>,
@@ -118,6 +127,10 @@ pub struct Workspace {
     palette: Option<(Entity<PickerView>, Vec<Entry>, Subscription)>,
     /// The palette's recent picks, most recent first.
     palette_recents: Recents,
+    /// The agent switcher (⌃Tab), while it is open.
+    switcher: Option<Switcher>,
+    /// The agents the focused pane showed, most recent first.
+    agent_mru: AgentMru,
     /// The connect sheet, over everything else.
     connect: Option<(Entity<ConnectSheet>, [Subscription; 2])>,
     /// The [`AppState::session_epoch`] last seen; a change closes the
@@ -147,7 +160,10 @@ impl Workspace {
             let epoch = app.read(cx).session_epoch();
             if epoch != this.epoch {
                 this.epoch = epoch;
-                if this.sheet.take().is_some() | this.palette.take().is_some() {
+                if this.sheet.take().is_some()
+                    | this.palette.take().is_some()
+                    | this.switcher.take().is_some()
+                {
                     this.focus_current(window, cx);
                 }
             }
@@ -197,6 +213,8 @@ impl Workspace {
             sheet: None,
             palette: None,
             palette_recents: Recents::default(),
+            switcher: None,
+            agent_mru: AgentMru::default(),
             connect: None,
             epoch,
             pane_focus: HashMap::new(),
@@ -228,6 +246,11 @@ impl Workspace {
         self.palette.as_ref().map(|(p, _, _)| p)
     }
 
+    /// The agent switcher, while it is open.
+    pub fn switcher(&self) -> Option<&Entity<PickerView>> {
+        self.switcher.as_ref().map(|s| &s.view)
+    }
+
     pub fn connect_sheet(&self) -> Option<&Entity<ConnectSheet>> {
         self.connect.as_ref().map(|(s, _)| s)
     }
@@ -241,7 +264,10 @@ impl Workspace {
 
     /// A sheet is open over the panes.
     fn modal(&self) -> bool {
-        self.sheet.is_some() || self.connect.is_some() || self.palette.is_some()
+        self.sheet.is_some()
+            || self.connect.is_some()
+            || self.palette.is_some()
+            || self.switcher.is_some()
     }
 
     /// Opens the connect sheet (or brings it up), showing `reason`.
@@ -253,6 +279,7 @@ impl Workspace {
     ) {
         self.sheet = None;
         self.palette = None;
+        self.switcher = None;
         if let Some((sheet, _)) = &self.connect {
             let sheet = sheet.clone();
             sheet.update(cx, |s, cx| {
@@ -650,6 +677,91 @@ impl Workspace {
         }
     }
 
+    /// ⌃Tab (⌃⇧Tab, `backward`): opens the agent switcher on the agent
+    /// used before the current one (on the least recent), or moves its
+    /// selection while open. Not over a sheet or the palette.
+    pub fn switch_agent(&mut self, backward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let delta = if backward { -1 } else { 1 };
+        if let Some(s) = &self.switcher {
+            s.view.update(cx, |v, cx| v.move_selection(delta, cx));
+            return;
+        }
+        if self.modal() {
+            return;
+        }
+        let app = self.app.read(cx);
+        let current = app.layout.agent(app.focused());
+        self.agent_mru.observe(current);
+        let items: Vec<_> = switcher_items(&app.agents, &app.home)
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let recents = self.agent_mru.recents();
+        let view = cx.new(|cx| PickerView::list(items, recents, cx));
+        view.update(cx, |v, cx| {
+            let p = v.picker();
+            let current_first = current.is_some_and(|id| {
+                p.selected_item()
+                    .is_some_and(|i| i.key == Entry::Agent(id).key())
+            });
+            let row = start_row(p.ranked().len(), current_first, backward);
+            v.select(row, cx);
+        });
+        let sub = cx.subscribe_in(&view, window, Self::switcher_event);
+        view.read(cx).focus(window, cx);
+        self.switcher = Some(Switcher {
+            view,
+            held: window.modifiers().control,
+            _sub: sub,
+        });
+        cx.notify();
+    }
+
+    /// ⌃ released after a ⌃Tab: the selected agent is shown.
+    fn switcher_modifiers(
+        &mut self,
+        ev: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(s) = &mut self.switcher else {
+            return;
+        };
+        if ev.modifiers.control {
+            s.held = true;
+        } else if s.held {
+            let view = s.view.clone();
+            view.update(cx, |v, cx| v.confirm(cx));
+        }
+    }
+
+    /// A switcher pick shows the agent in the focused pane.
+    fn switcher_event(
+        &mut self,
+        _view: &Entity<PickerView>,
+        event: &PickerEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.switcher.take().is_none() {
+            return;
+        }
+        self.focus_current(window, cx);
+        cx.notify();
+        let PickerEvent::Pick(key) = event else {
+            return;
+        };
+        let id = key
+            .strip_prefix("agent:")
+            .and_then(|id| id.parse::<u64>().ok());
+        if let Some(id) = id {
+            self.show_agent(id, window, cx);
+        }
+    }
+
     /// A new agent running `[gui] default_command` in `dir`, in the
     /// focused pane.
     fn spawn_default_in(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -863,6 +975,10 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_pane_focus(window, cx);
+        {
+            let app = self.app.read(cx);
+            self.agent_mru.observe(app.layout.agent(app.focused()));
+        }
         let theme = self.app.read(cx).theme;
         let (rows, home, error, notice, titles, marks, update) = {
             let app = self.app.read(cx);
@@ -1008,6 +1124,36 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
+        let switcher = self.switcher.as_ref().map(|s| {
+            // Centred, like ⌘Tab; a click beside it cancels.
+            deferred(
+                div()
+                    .id("switcher-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.switcher.take().is_some() {
+                                this.focus_current(window, cx);
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(appear(
+                        div().child(s.view.clone()),
+                        "switcher-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
         let sheet = self.sheet.as_ref().map(|(sheet, _)| {
             // The backdrop takes every click and wheel event over the panes.
             deferred(
@@ -1062,6 +1208,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::restart_pane))
             .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(|this, _: &NextAgent, w, cx| this.switch_agent(false, w, cx)))
+            .on_action(cx.listener(|this, _: &PreviousAgent, w, cx| this.switch_agent(true, w, cx)))
+            .on_modifiers_changed(cx.listener(Self::switcher_modifiers))
             .child(bar)
             .child(
                 div()
@@ -1074,6 +1223,7 @@ impl Render for Workspace {
             )
             .children(toast)
             .children(palette)
+            .children(switcher)
             .children(sheet)
             .children(connect)
     }

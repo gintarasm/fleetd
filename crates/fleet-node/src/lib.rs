@@ -3,6 +3,7 @@ mod handoff;
 pub mod history;
 pub mod host;
 pub mod node;
+pub mod priority;
 pub mod pty;
 pub mod scrollback;
 pub mod store;

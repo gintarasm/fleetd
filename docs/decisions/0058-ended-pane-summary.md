@@ -2,7 +2,7 @@
 
 **Status:** accepted · 2026-11-16 (issue #45)
 
-Amends [0010](0010-storage-and-layout.md) (store schema v4) and [0022](0022-protocol-v2.md) (one new field). Builds on [0030](0030-agent-restart-and-forget.md) (Restart and Remove).
+Amends [0010](0010-storage-and-layout.md) (store schema v5) and [0022](0022-protocol-v2.md) (one new field). Builds on [0030](0030-agent-restart-and-forget.md) (Restart and Remove).
 
 ## Context
 
@@ -12,7 +12,7 @@ An agent that exits leaves its final screen in the pane, with a small "exited (n
 
 ### The node records when an agent exited
 
-- Store schema **v4**: `agents.exited_unix_ms INTEGER` (nullable), added with `ALTER TABLE` to a v3 database; a new database is created at v4 directly. `set_exited` writes it with the exit code. It stays `NULL` while running, for a lost agent (when it died is unknown), and for rows that exited before v4.
+- Store schema **v5** (v4 is the priority column, ADR 0066): `agents.exited_unix_ms INTEGER` (nullable), added with `ALTER TABLE` to a v4 database; a new database is created at v5 directly. `set_exited` writes it with the exit code. It stays `NULL` while running, for a lost agent (when it died is unknown), and for rows that exited before v5.
 - Protocol: `AgentInfo.exited_unix_ms = 9` (`optional int64`). Additive: `PROTOCOL_VERSION` stays 2, and old clients skip the field.
 
 ### The GUI's summary bar
@@ -26,5 +26,5 @@ An agent that exits leaves its final screen in the pane, with a small "exited (n
 
 ## Consequences
 
-- Exits recorded before v4, and on a node that predates it, show no run time unless the GUI saw them happen.
-- The store migration is one `ALTER TABLE`; a v4 database cannot be opened by an older fleetd (it refuses newer schemas), as with every schema bump.
+- Exits recorded before v5, and on a node that predates it, show no run time unless the GUI saw them happen.
+- The store migration is one `ALTER TABLE`; a v5 database cannot be opened by an older fleetd (it refuses newer schemas), as with every schema bump.

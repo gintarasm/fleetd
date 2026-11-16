@@ -62,7 +62,9 @@ use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
 use crate::term::{HistoryEvent, Terminal};
 use bytes::{Bytes, BytesMut};
 use fleet_proto::handoff::{HandoffAgent, handoff_agent};
-use fleet_proto::{AgentActivity, AgentExited, AgentInfo, AgentRemoved, AttachOk, SpawnAgent};
+use fleet_proto::{
+    AgentActivity, AgentExited, AgentInfo, AgentPriority, AgentRemoved, AttachOk, SpawnAgent,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::os::fd::{IntoRawFd, OwnedFd};
@@ -975,10 +977,10 @@ impl AgentPipeline {
 }
 
 impl AgentPipeline {
-    /// Feeds PTY output through the pipeline; `true` if this is the first
-    /// output since the activity ticker last looked.
-    fn feed(&self, bytes: &[u8]) -> bool {
+    /// Feeds PTY output through the pipeline.
+    fn feed(&self, bytes: &[u8]) -> Fed {
         let mut marked = false;
+        let mut lagged = Vec::new();
         let reply = {
             let mut state = self.lock();
             state.last_output_unix_ms = unix_ms_now();
@@ -997,9 +999,13 @@ impl AgentPipeline {
             if !state.subscribers.is_empty() {
                 let chunk = Bytes::copy_from_slice(bytes);
                 let before = state.subscribers.len();
-                state
-                    .subscribers
-                    .retain(|s| s.offer(StreamItem::Output(chunk.clone())));
+                state.subscribers.retain(|s| {
+                    let kept = s.offer(StreamItem::Output(chunk.clone()));
+                    if !kept && s.lagged.load(Ordering::Relaxed) {
+                        lagged.push(s.conn);
+                    }
+                    kept
+                });
                 if state.subscribers.len() != before {
                     state.check_primary();
                 }
@@ -1014,8 +1020,19 @@ impl AgentPipeline {
         if let Some((input, replies)) = reply {
             input.try_write_reply(&replies);
         }
-        marked
+        Fed { marked, lagged }
     }
+}
+
+/// What [`AgentPipeline::feed`] did beyond feeding.
+struct Fed {
+    /// The first output since the activity ticker last looked.
+    marked: bool,
+    /// Subscribers this output dropped because their queue was full (their
+    /// connection; `None` for an anonymous one). Their client learns of the
+    /// lag only when it reads its way to the end of the queue, which a
+    /// stalled client may never do.
+    lagged: Vec<Option<ConnId>>,
 }
 
 impl OutputSink for AgentPipeline {
@@ -1561,7 +1578,15 @@ impl OutputSink for NodeSink {
     }
 
     fn on_output(&mut self, bytes: &[u8]) {
-        if self.pipeline.feed(bytes) {
+        let fed = self.pipeline.feed(bytes);
+        for conn in fed.lagged {
+            warn!(
+                agent = self.id,
+                conn = conn.map(|c| c.0),
+                "subscriber dropped: its queue is full"
+            );
+        }
+        if fed.marked {
             self.activity.mark(self.id, &self.pipeline);
         }
     }
@@ -1609,6 +1634,9 @@ pub struct Node {
     activity: Arc<ActivityHub>,
     /// The base of every agent's environment.
     base_env: LoginEnv,
+    /// The node's agent priority setting (ADR 0066): how much lower than
+    /// the daemon agents run by default; 0 is off.
+    agent_nice: u8,
     /// Holds spawns, restarts and forgets out of a handoff.
     handoff: HandoffGate,
 }
@@ -1814,6 +1842,7 @@ impl Node {
             })),
             activity,
             base_env: LoginEnv::daemon(),
+            agent_nice: 0,
             handoff: HandoffGate::default(),
         })
     }
@@ -1831,6 +1860,13 @@ impl Node {
     /// daemon's own. The first spawn waits for a capture still running.
     pub fn with_base_env(mut self, env: LoginEnv) -> Node {
         self.base_env = env;
+        self
+    }
+
+    /// Lowers agents spawned from now on by `nice` (as `nice -n`; 0 is
+    /// off), unless spawned with `AGENT_PRIORITY_NORMAL` (ADR 0066).
+    pub fn with_agent_nice(mut self, nice: u8) -> Node {
+        self.agent_nice = nice;
         self
     }
 
@@ -1984,6 +2020,7 @@ impl Node {
             labels: old.labels,
             env: HashMap::new(),
             attach: false,
+            priority: old.priority,
         };
         let (info, attached) = self.start(req, attach)?;
         if let Err(e) = lock(&self.store).replace_agent(id, info.id) {
@@ -2026,6 +2063,8 @@ impl Node {
         if req.program.is_empty() {
             return Err(invalid("program is empty".into()));
         }
+        let priority = AgentPriority::try_from(req.priority)
+            .map_err(|_| invalid(format!("unknown agent priority {}", req.priority)))?;
         // Waits (bounded) for a login-env capture still running, before
         // anything is recorded.
         let base_env = self.base_env.wait();
@@ -2047,6 +2086,7 @@ impl Node {
             created_unix_ms,
             scrollback_path: String::new(),
             labels: req.labels,
+            priority: req.priority,
         };
         let (id, path) = lock(&self.store)
             .insert_agent_with_scrollback(&new, |id| {
@@ -2084,6 +2124,7 @@ impl Node {
                     env: agent_env(req.env, id),
                     cols,
                     rows,
+                    nice: crate::priority::agent_nice(self.agent_nice, priority),
                 };
                 let host_id = self.host.spawn_with_base_env(
                     spec,
@@ -2878,6 +2919,133 @@ mod tests {
         assert!(e.to_string().contains("injected"), "{e}");
         let ids: Vec<u64> = node.list().unwrap().iter().map(|a| a.id).collect();
         assert_eq!(ids, vec![b, c]);
+        node.shutdown();
+    }
+
+    /// fleetd's own nice value (agents inherit it).
+    fn own_nice() -> i32 {
+        // SAFETY: no memory effects; cannot fail for the calling process.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+    }
+
+    /// Spawns an agent that, after a pause (past the node's spawn), writes
+    /// its nice value to `out`, and returns its id.
+    fn spawn_reporting_nice(node: &Node, out: &Path, priority: AgentPriority) -> u64 {
+        node.spawn(SpawnAgent {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "sleep 0.2; ps -o nice= -p $$ > '{}.tmp' && mv '{0}.tmp' '{0}'",
+                    out.display()
+                ),
+            ],
+            priority: priority.into(),
+            ..Default::default()
+        })
+        .unwrap()
+        .id
+    }
+
+    /// The nice value an agent wrote to `out`, waiting for it.
+    fn reported_nice(out: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(out) {
+                return s.trim().parse().unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no nice reported in {}",
+                out.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn agents_keep_fleetds_priority_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let out = dir.path().join("nice");
+        spawn_reporting_nice(&node, &out, AgentPriority::Default);
+        assert_eq!(reported_nice(&out), own_nice());
+        node.shutdown();
+    }
+
+    #[test]
+    fn the_setting_lowers_agents_and_normal_opts_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap().with_agent_nice(5);
+        let lowered = (own_nice() + 5).min(crate::pty::MAX_NICE);
+        for (priority, want) in [
+            (AgentPriority::Default, lowered),
+            (AgentPriority::Low, lowered),
+            (AgentPriority::Normal, own_nice()),
+        ] {
+            let out = dir.path().join(format!("nice-{}", priority.as_str_name()));
+            spawn_reporting_nice(&node, &out, priority);
+            assert_eq!(reported_nice(&out), want, "{priority:?}");
+        }
+        node.shutdown();
+    }
+
+    #[test]
+    fn low_is_lowered_with_the_setting_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let out = dir.path().join("nice");
+        spawn_reporting_nice(&node, &out, AgentPriority::Low);
+        assert_eq!(
+            reported_nice(&out),
+            (own_nice() + i32::from(crate::priority::LOW_NICE)).min(crate::pty::MAX_NICE)
+        );
+        node.shutdown();
+    }
+
+    #[test]
+    fn restart_keeps_the_agents_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap().with_agent_nice(5);
+        let out = dir.path().join("nice");
+        let mut exits = node.exit_events();
+        let id = spawn_reporting_nice(&node, &out, AgentPriority::Normal);
+        assert_eq!(reported_nice(&out), own_nice());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !node
+            .list()
+            .unwrap()
+            .iter()
+            .any(|a| a.id == id && a.state == fleet_proto::AgentState::Exited as i32)
+        {
+            assert!(Instant::now() < deadline, "agent {id} did not exit");
+            let _ = exits.try_recv();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::remove_file(&out).unwrap();
+        let new = node.restart(id, 0, 0, None).unwrap().info.id;
+        assert_eq!(reported_nice(&out), own_nice(), "the restart was lowered");
+        assert_eq!(
+            lock(&node.store).agent(new).unwrap().unwrap().priority,
+            AgentPriority::Normal as i32
+        );
+        node.shutdown();
+    }
+
+    #[test]
+    fn spawn_refuses_an_unknown_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).unwrap();
+        let e = node
+            .spawn(SpawnAgent {
+                program: "/bin/sleep".into(),
+                args: vec!["100".into()],
+                priority: 99,
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(node.list().unwrap().is_empty());
         node.shutdown();
     }
 
