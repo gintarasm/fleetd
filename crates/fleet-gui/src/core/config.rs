@@ -76,6 +76,9 @@ pub struct GuiConfig {
     pub notifications: bool,
     /// The New agent sheet's directory; empty: the most recent one.
     pub default_dir: String,
+    /// The command line that opens ⌘-clicked files (`zed`, `code -r`);
+    /// blank means `$VISUAL`, then `$EDITOR` (ADR 0046).
+    pub editor: String,
 }
 
 impl Default for GuiConfig {
@@ -93,6 +96,7 @@ impl Default for GuiConfig {
             confirm_kill: true,
             notifications: true,
             default_dir: String::new(),
+            editor: String::new(),
         }
     }
 }
@@ -137,6 +141,15 @@ pub fn save_connection(state_dir: &Path, target: &Target) -> io::Result<()> {
     save_gui_values(
         state_dir,
         vec![("connection", toml_edit::Value::from(target.to_string()))],
+    )
+}
+
+/// Sets `[gui] confirm_kill`, leaving comments and every other key as they
+/// were.
+pub fn save_confirm_kill(state_dir: &Path, confirm: bool) -> io::Result<()> {
+    save_gui_values(
+        state_dir,
+        vec![("confirm_kill", toml_edit::Value::from(confirm))],
     )
 }
 
@@ -218,6 +231,14 @@ mod tests {
         assert_eq!(c.font_size, 13.0);
         assert!(c.option_as_meta);
         assert_eq!(c.connection, None);
+        assert_eq!(c.editor, "");
+    }
+
+    #[test]
+    fn config_reads_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "[gui]\neditor = \"zed\"\n");
+        assert_eq!(load_config(dir.path()).unwrap().editor, "zed");
     }
 
     #[test]

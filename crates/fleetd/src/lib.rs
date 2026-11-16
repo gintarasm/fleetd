@@ -139,6 +139,23 @@ impl From<io::Error> for StartupError {
     }
 }
 
+/// The node's agent priority setting from `FLEETD_AGENT_NICE` (ADR 0066),
+/// logged; an invalid value is logged and treated as off.
+fn agent_nice_setting() -> u8 {
+    use fleet_node::priority::{AGENT_NICE_VAR, parse_setting};
+    match parse_setting(std::env::var_os(AGENT_NICE_VAR).as_deref()) {
+        Ok(0) => 0,
+        Ok(nice) => {
+            info!(nice, "agents run lowered ({AGENT_NICE_VAR})");
+            nice
+        }
+        Err(e) => {
+            warn!("{e}; agents keep fleetd's priority");
+            0
+        }
+    }
+}
+
 /// A started daemon: holds the instance lock and the bound (non-blocking) listener.
 pub struct Daemon {
     lock: File,
@@ -323,7 +340,7 @@ impl Daemon {
                 (node, restore)
             }
         };
-        let node = Arc::new(node);
+        let node = Arc::new(node.with_agent_nice(agent_nice_setting()));
         let identity = handoff::Identity::current();
         let instance = identity.instance;
         // What a restart with no binary named restarts onto.
