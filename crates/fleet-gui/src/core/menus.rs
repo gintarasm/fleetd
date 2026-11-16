@@ -17,7 +17,7 @@ pub enum MenuEntry<T> {
 /// bindings perform it; the menu only displays it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shortcut {
-    /// The key: a lowercase character, or `"enter"`.
+    /// The key: a lowercase character, `"enter"`, `"up"` or `"down"`.
     pub key: &'static str,
     pub shift: bool,
 }
@@ -99,6 +99,10 @@ pub fn group_menu(current: GroupBy) -> Vec<(GroupBy, bool)> {
 pub enum PaneMenuItem {
     Copy,
     Paste,
+    SelectAll,
+    ScrollToTop,
+    ScrollToBottom,
+    ClearScrollback,
     SplitRight,
     SplitDown,
     Maximize,
@@ -121,6 +125,11 @@ impl PaneMenuItem {
         match self {
             PaneMenuItem::Copy => "Copy".to_owned(),
             PaneMenuItem::Paste => "Paste".to_owned(),
+            PaneMenuItem::SelectAll => "Select All".to_owned(),
+            PaneMenuItem::ScrollToTop => "Scroll to Top".to_owned(),
+            PaneMenuItem::ScrollToBottom => "Scroll to Bottom".to_owned(),
+            // This view only: the agent and `fleet history` keep it.
+            PaneMenuItem::ClearScrollback => "Clear Scrollback".to_owned(),
             PaneMenuItem::SplitRight => "Split Right".to_owned(),
             PaneMenuItem::SplitDown => "Split Down".to_owned(),
             PaneMenuItem::Maximize => "Maximize Pane".to_owned(),
@@ -142,6 +151,10 @@ impl PaneMenuItem {
         match self {
             PaneMenuItem::Copy => cmd("c"),
             PaneMenuItem::Paste => cmd("v"),
+            PaneMenuItem::SelectAll => cmd("a"),
+            PaneMenuItem::ScrollToTop => cmd("up"),
+            PaneMenuItem::ScrollToBottom => cmd("down"),
+            PaneMenuItem::ClearScrollback => cmd("k"),
             PaneMenuItem::SplitRight => cmd("d"),
             PaneMenuItem::SplitDown => cmd_shift("d"),
             PaneMenuItem::Maximize | PaneMenuItem::Restore => cmd_shift("enter"),
@@ -164,6 +177,13 @@ pub struct PaneMenuState {
     pub on_grid: bool,
     /// Some text is selected (Copy is enabled).
     pub has_selection: bool,
+    /// The view can scroll from the keyboard: not the alternate screen,
+    /// and there is history (Scroll to Top is enabled).
+    pub can_scroll: bool,
+    /// The view is scrolled up (Scroll to Bottom is enabled).
+    pub scrolled: bool,
+    /// History is loaded (Clear Scrollback is enabled).
+    pub has_history: bool,
     /// Another pane can be added.
     pub can_split: bool,
     pub maximized: bool,
@@ -182,6 +202,14 @@ pub fn pane_menu(s: PaneMenuState) -> Vec<MenuEntry<(PaneMenuItem, bool)>> {
     if s.on_grid {
         out.push(MenuEntry::Item((PaneMenuItem::Copy, s.has_selection)));
         out.push(MenuEntry::Item((PaneMenuItem::Paste, true)));
+        out.push(MenuEntry::Item((PaneMenuItem::SelectAll, true)));
+        out.push(MenuEntry::Separator);
+        out.push(MenuEntry::Item((PaneMenuItem::ScrollToTop, s.can_scroll)));
+        out.push(MenuEntry::Item((PaneMenuItem::ScrollToBottom, s.scrolled)));
+        out.push(MenuEntry::Item((
+            PaneMenuItem::ClearScrollback,
+            s.has_history,
+        )));
         out.push(MenuEntry::Separator);
     }
     if !s.maximized {
@@ -314,6 +342,9 @@ mod tests {
         let grid = PaneMenuState {
             on_grid: true,
             has_selection: false,
+            can_scroll: true,
+            scrolled: false,
+            has_history: true,
             can_split: false,
             maximized: false,
             restartable: true,
@@ -325,6 +356,10 @@ mod tests {
             [
                 (P::Copy, false),
                 (P::Paste, true),
+                (P::SelectAll, true),
+                (P::ScrollToTop, true),
+                (P::ScrollToBottom, false),
+                (P::ClearScrollback, true),
                 (P::SplitRight, false),
                 (P::SplitDown, false),
                 (P::Maximize, true),
@@ -370,7 +405,7 @@ mod tests {
 
     #[test]
     fn menus_never_start_or_end_with_a_separator_or_double_one() {
-        let states = (0..128u8).map(|bits| PaneMenuState {
+        let states = (0..1024u16).map(|bits| PaneMenuState {
             on_grid: bits & 1 != 0,
             has_selection: bits & 2 != 0,
             can_split: bits & 4 != 0,
@@ -378,6 +413,9 @@ mod tests {
             restartable: bits & 16 != 0,
             killable: bits & 32 != 0,
             has_agent: bits & 64 != 0,
+            can_scroll: bits & 128 != 0,
+            scrolled: bits & 256 != 0,
+            has_history: bits & 512 != 0,
         });
         let check = |seps: Vec<bool>| {
             assert!(!seps.first().unwrap() && !seps.last().unwrap());
@@ -409,5 +447,9 @@ mod tests {
         assert_eq!(P::Restore.shortcut(), P::Maximize.shortcut());
         assert_eq!(P::SaveOutput.shortcut().unwrap().key, "s");
         assert!(P::SaveOutput.shortcut().unwrap().shift);
+        assert_eq!(P::SelectAll.shortcut().unwrap().key, "a");
+        assert_eq!(P::ClearScrollback.shortcut().unwrap().key, "k");
+        assert_eq!(P::ScrollToTop.shortcut().unwrap().key, "up");
+        assert_eq!(P::ScrollToBottom.shortcut().unwrap().key, "down");
     }
 }

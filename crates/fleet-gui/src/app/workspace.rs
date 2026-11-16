@@ -22,12 +22,13 @@ use super::context_menu::{self, MenuLine};
 use super::controls::{ButtonKind, ReducedMotion, appear, button};
 use super::graph_view::{GraphEvent, GraphView};
 use super::keymap::{
-    ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, EditLabelsPane, FocusDown,
-    FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight, FocusUp,
-    Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenOutput, Paste, PrevTab,
-    PreviousAgent, Remove, RemoveExited, RemovePane, RenamePane, ReopenClosedPane, Restart,
-    RestartPane, SaveOutput, SelectTab, ShowShortcuts, SplitDown, SplitRight, ToggleGraph,
-    ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+    ClearScrollback, ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, EditLabelsPane,
+    FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3, FocusPane4, FocusRight,
+    FocusUp, Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent, NextTab, OpenOutput, Paste,
+    PrevTab, PreviousAgent, Remove, RemoveExited, RemovePane, RenamePane, ReopenClosedPane,
+    Restart, RestartPane, SaveOutput, ScrollToBottom, ScrollToTop, SelectAll, SelectTab,
+    ShowShortcuts, SplitDown, SplitRight, ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::labels_sheet::{LabelsEvent, LabelsSheet};
@@ -1109,9 +1110,14 @@ impl Workspace {
                 .agent(pane)
                 .and_then(|id| app.agents.iter().find(|r| r.info.id == id))
                 .map_or(Subject::Agent, |r| Subject::of(&r.info));
+            let (can_scroll, scrolled, has_history) =
+                view.map_or((false, false, false), |v| v.scroll_state());
             let state = PaneMenuState {
                 on_grid,
                 has_selection: view.is_some_and(|v| v.has_selection()),
+                can_scroll,
+                scrolled,
+                has_history,
                 can_split: app.layout().panes().len() < MAX_PANES,
                 maximized: app.maximized == Some(pane),
                 restartable: view.is_some_and(|v| v.restartable()),
@@ -1153,12 +1159,21 @@ impl Workspace {
             return;
         }
         let event = match item {
-            PaneMenuItem::Copy | PaneMenuItem::Paste => {
+            PaneMenuItem::Copy
+            | PaneMenuItem::Paste
+            | PaneMenuItem::SelectAll
+            | PaneMenuItem::ScrollToTop
+            | PaneMenuItem::ScrollToBottom
+            | PaneMenuItem::ClearScrollback => {
+                // The pane's own actions, as its keys perform them.
                 self.focus_pane(pane, window, cx);
-                let action: Box<dyn Action> = if item == PaneMenuItem::Copy {
-                    Box::new(Copy)
-                } else {
-                    Box::new(Paste)
+                let action: Box<dyn Action> = match item {
+                    PaneMenuItem::Copy => Box::new(Copy),
+                    PaneMenuItem::Paste => Box::new(Paste),
+                    PaneMenuItem::SelectAll => Box::new(SelectAll),
+                    PaneMenuItem::ScrollToTop => Box::new(ScrollToTop),
+                    PaneMenuItem::ScrollToBottom => Box::new(ScrollToBottom),
+                    _ => Box::new(ClearScrollback),
                 };
                 window.dispatch_action(action, cx);
                 return;
