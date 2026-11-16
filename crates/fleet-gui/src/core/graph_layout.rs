@@ -13,8 +13,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::graph::Forest;
 use super::layout::Rect;
+use fleet_client::tree::Tree;
 
 /// Card and spacing metrics.
 pub mod metrics {
@@ -101,7 +101,7 @@ pub fn intersects(a: &Rect, b: &Rect) -> bool {
 
 /// What [`layout`] reads.
 pub struct LayoutInput<'a> {
-    pub forest: &'a Forest,
+    pub forest: &'a Tree,
     /// The machine box's title.
     pub machine: &'a str,
     /// The project box an agent's tree goes in, by the tree's root.
@@ -288,7 +288,7 @@ pub struct Signature {
 impl Signature {
     pub fn new(
         machine: &str,
-        forest: &Forest,
+        forest: &Tree,
         project: &dyn Fn(u64) -> String,
         collapsed: &HashSet<u64>,
         shown: Option<&HashSet<u64>>,
@@ -474,16 +474,16 @@ pub fn step(layout: &GraphLayout, from: u64, dir: Step) -> Option<u64> {
 mod tests {
     use super::*;
 
-    fn forest(nodes: &[(u64, Option<u64>)]) -> Forest {
-        Forest::build(nodes.iter().copied())
+    fn forest(nodes: &[(u64, Option<u64>)]) -> Tree {
+        crate::core::graph::tree_by_id(nodes.iter().copied())
     }
 
-    fn lay(f: &Forest, collapsed: &[u64], shown: Option<&[u64]>) -> GraphLayout {
+    fn lay(f: &Tree, collapsed: &[u64], shown: Option<&[u64]>) -> GraphLayout {
         lay_projects(f, collapsed, shown, &|_| "p".into())
     }
 
     fn lay_projects(
-        f: &Forest,
+        f: &Tree,
         collapsed: &[u64],
         shown: Option<&[u64]>,
         project: &dyn Fn(u64) -> String,

@@ -2,7 +2,7 @@
 
 **Status:** accepted · 2026-11-16 (builder's decisions within spec §7 of the [M3 design](../superpowers/specs/2026-11-16-m3-satellite-design.md); issue #103)
 
-**Builds on:** [0033](0033-satellite-milestone.md) (the view's purpose and keys), [0025](0025-core-knows-agents-workflows-own-hierarchy.md) (`fleet.parent`, `project` label), [0042](0042-gui-agent-status.md) (inferred status), [0071](0071-kill-escalates-and-shells-are-not-agents.md) (kill escalation), [0014](0014-performance-gate.md) (benchmarks).
+**Builds on:** [0074](0074-sidebar-tree-and-fleet-tree.md) (the shared tree), [0033](0033-satellite-milestone.md) (the view's purpose and keys), [0025](0025-core-knows-agents-workflows-own-hierarchy.md) (`fleet.parent`, `project` label), [0042](0042-gui-agent-status.md) (inferred status), [0071](0071-kill-escalates-and-shells-are-not-agents.md) (kill escalation), [0014](0014-performance-gate.md) (benchmarks).
 
 ## Context
 
@@ -12,7 +12,7 @@ The spec settles what the graph shows and how it is drawn (gpui elements for car
 
 ### Tree and layout (`fleet-gui/src/core/graph.rs`, `graph_layout.rs`, gpui-free)
 
-- **Parent** is the `fleet.parent` label: a local id, or `node/id` (the id part is used until M6). A parent that is not listed (removed) makes the child a root. Labels are never trusted to form a tree: a cycle is broken at its smallest id, which becomes a root.
+- **Parent resolution is the shared one** (`fleet_client::tree::Tree`, ADR 0074), so the graph, the sidebar and `fleet tree` always agree: the `fleet.parent` label as a local id; a parent not listed, a value that is not a local id, or a loop makes a root. The graph feeds it the agents sorted by id, so siblings and roots are ordered by id. `Tree::root_of` was added to `fleet-client` for the graph (a tree goes in its root's project box).
 - **Layout is a band layout.** A subtree takes one row if it is a leaf or collapsed, else the sum of its children's rows; a parent sits on its first child's row, in the column of its depth (roots on the left). Siblings and roots are ordered by id, project boxes by title. Positions depend on the tree only, so an agent coming or going moves only what is below it (its later siblings' subtrees, later trees and boxes). A centred tidy tree was rejected: a new child would move its parent.
 - **Boxes.** One machine box (titled *This Mac*, or the ssh destination) holds one box per project. A tree goes in its **root's** project box; a child working in another project stays with its parent and shows its own project on its card (edges never cross boxes).
 - **Project** is the `project` label (as the sidebar groups, 0025), else the git root of the cwd (the nearest directory with a `.git` file or directory, looked up once per cwd and only for a local fleetd), else the cwd, with `~` for home.
@@ -43,10 +43,9 @@ The spec settles what the graph shows and how it is drawn (gpui elements for car
 - `gui_graph_open_ns`: fleetd with 50 idle agents; the GUI (`FLEET_GUI_BENCH=graph-open`) toggles the graph on 20 times (off in between) and times each from the dispatched `ToggleGraph` to its first presented frame; median. Budget 100 ms.
 - `gui_graph_frame_flood50_ns`: 50 `fake-agent --forever` flood; the GUI (`graph-flood`, `FLEET_GUI_BENCH_AGENTS=50`) shows the graph and times 100 window redraws (after 20 warm-up) from the start of the workspace's render to the end of the graph's paint; median. This is the frame's CPU cost, without the wait for the display. Budget 16 ms.
 - fleetd refuses `fleet.*` labels from a client, so both bench modes draw a **synthetic tree** (fan-out 3, by id) over agents with no parent; the edges are drawn as in real use.
-- The GUI hooks (`app/bench.rs`) and the measuring functions (`fleet-perf/src/wall/gui.rs`) exist; **`wall.rs` does not call them yet.** It is gate code (`approval.rs` `GATE_PATHS`), so the hookup, and the baseline entries without values, are left to a commit of the user's with `Perf-Approved` (the diff is in the PR). No baselines are recorded until the user records them from CI.
+- The GUI hooks (`app/bench.rs`) and the measuring functions (`fleet-perf/src/wall/gui.rs`) exist. They are additions only: the existing metrics' code is unchanged (byte-identical), since nothing can be measured while `PERF_CI` is off; the graph flood has its own flood helper. **`wall.rs` does not call them yet.** It is gate code (`approval.rs` `GATE_PATHS`), so the hookup, and the baseline entries without values, are left to a commit of the user's with `Perf-Approved` (the diff is in the PR). No baselines are recorded until the user records them from CI.
 
 ## Consequences
 
-- M3-C builds a tree in `fleet-client` in parallel. If both exist at merge, `core::graph::Forest` can be replaced by it; the layout only needs roots, children by id and parents.
 - M3-D changes `card_dot` (and nothing else in the view) to show reported status.
 - Wave 3 adds message lines to the edges canvas (a second path set).

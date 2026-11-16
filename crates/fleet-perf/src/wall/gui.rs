@@ -1,6 +1,5 @@
-//! GUI wall scenarios (macOS window server): `fleet-gui` cold start,
-//! input-to-render latency and the graph view (opening it, and a frame of
-//! it during a flood), measured through the GUI's `FLEET_GUI_BENCH`
+//! GUI wall scenarios (macOS window server): `fleet-gui` cold start and
+//! input-to-render latency, measured through the GUI's `FLEET_GUI_BENCH`
 //! hooks (`crates/fleet-gui/src/app/bench.rs`).
 //!
 //! The GUI prints one line on stdout when its measurement is done (`ready`,
@@ -83,7 +82,6 @@ impl GuiRun<'_> {
             .env("FLEET_GUI_BENCH", self.mode)
             .env_remove("FLEET_GUI_BENCH_AGENT")
             .env_remove("FLEET_GUI_BENCH_EXTRA_PANES")
-            .env_remove("FLEET_GUI_BENCH_AGENTS")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -159,15 +157,9 @@ fn spawn_cat(client: &mut Client, streams: &mut Streams) -> Result<u64, String> 
 
 /// The median the GUI printed as `input_ns <median>`.
 fn parse_input_ns(line: &str) -> Result<f64, String> {
-    parse_ns(line, "input_ns")
-}
-
-/// The value the GUI printed as `<name> <ns>`.
-fn parse_ns(line: &str, name: &str) -> Result<f64, String> {
-    line.strip_prefix(name)
-        .and_then(|v| v.strip_prefix(' '))
+    line.strip_prefix("input_ns ")
         .and_then(|v| v.trim().parse().ok())
-        .ok_or_else(|| format!("fleet-gui printed {line:?}, not `{name} <ns>`"))
+        .ok_or_else(|| format!("fleet-gui printed {line:?}, not `input_ns <ns>`"))
 }
 
 /// `gui_cold_start_ns`: fleetd with [`COLD_START_AGENTS`] idle agents; from
@@ -231,8 +223,42 @@ pub(super) fn input_to_render_flood_ns(
     let mut client = Client::connect(&daemon.sock)?;
     let mut streams = Streams::default();
     let cat = spawn_cat(&mut client, &mut streams)?;
-    let flood = ForeverFlood::start(&daemon, fake_agent, agents)?;
-    let extra: Vec<String> = flood.ids[..FLOOD_PANES.min(flood.ids.len())]
+
+    let mut flood_client = Client::connect(&daemon.sock)?;
+    let mut flood_streams = Streams::default();
+    let mut ids = Vec::with_capacity(agents);
+    let flood_start = Instant::now();
+    for i in 0..agents {
+        ids.push(spawn_fake(
+            &mut flood_client,
+            &mut flood_streams,
+            fake_agent,
+            &["--forever".into()],
+            i,
+        )?);
+    }
+    // Flood agents that have exited so far, with their exit codes.
+    let exited: Arc<Mutex<Vec<(u64, i32)>>> = Arc::default();
+    let flood = std::thread::spawn({
+        let ids: HashSet<u64> = ids.iter().copied().collect();
+        let exited = Arc::clone(&exited);
+        move || -> Result<(), String> {
+            let mut seen = HashSet::new();
+            while seen.len() < ids.len() {
+                if let Some(r) = flood_streams.take(flood_client.recv()?)? {
+                    return Err(format!("unexpected response {r:?}"));
+                }
+                for (&id, &code) in &flood_streams.exited {
+                    if ids.contains(&id) && seen.insert(id) {
+                        lock(&exited).push((id, code));
+                    }
+                }
+            }
+            Ok(())
+        }
+    });
+
+    let extra: Vec<String> = ids[..FLOOD_PANES.min(ids.len())]
         .iter()
         .map(u64::to_string)
         .collect();
@@ -246,8 +272,22 @@ pub(super) fn input_to_render_flood_ns(
         ],
     };
     let result = run.run("input_ns ");
-    let early = flood.stop(&mut client, &mut streams, "input to render")?;
+    let gui_done = flood_start.elapsed();
+    let early = lock(&exited).clone();
     let line = result?.0;
+    for &agent_id in &ids {
+        let req = client.request(request::Kind::Kill(KillAgent { agent_id }))?;
+        streams.wait(&mut client, req)?;
+    }
+    flood
+        .join()
+        .map_err(|_| "flood thread panicked".to_string())??;
+    eprintln!(
+        "fleet-perf: input to render (flood): GUI done {:.2} s after the first \
+         flood spawn, {} of {agents} flood agents still running",
+        gui_done.as_secs_f64(),
+        agents - early.len()
+    );
     if !early.is_empty() {
         let msg = format!(
             "input to render: {} of {agents} flood agents exited before the GUI \
@@ -260,6 +300,14 @@ pub(super) fn input_to_render_flood_ns(
         eprintln!("fleet-perf: {msg}");
     }
     parse_input_ns(&line)
+}
+
+/// The value the GUI printed as `<name> <ns>` (the graph metrics).
+fn parse_ns(line: &str, name: &str) -> Result<f64, String> {
+    line.strip_prefix(name)
+        .and_then(|v| v.strip_prefix(' '))
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or_else(|| format!("fleet-gui printed {line:?}, not `{name} <ns>`"))
 }
 
 /// `gui_graph_open_ns` (ADR 0073): fleetd with [`GRAPH_OPEN_AGENTS`] idle

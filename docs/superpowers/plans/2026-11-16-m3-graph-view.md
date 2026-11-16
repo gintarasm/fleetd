@@ -5,8 +5,7 @@ Issue #103 · spec §7 of `docs/superpowers/specs/2026-11-16-m3-satellite-design
 ## Pieces
 
 1. **`core/graph.rs` (gpui-free, unit-tested)**
-   - `parent_of(info)`: the `fleet.parent` label as a local id (`node/id` keeps the id part).
-   - `Forest::build(rows, project_of)`: parents, children sorted by id, roots; unknown or cyclic parents make roots.
+   - The tree is `fleet_client::tree::Tree` (M3-C, ADR 0074) fed agents sorted by id; `Tree::root_of` added there.
    - `layout(forest, collapsed, filter-visible set) -> GraphLayout`: boxes (machine ⊃ projects, sorted by title), trees within a box sorted by root id, a band layout (a subtree takes `max(1, Σ children)` rows, a parent sits on its first child's row, column = depth). Stable: a node coming or going moves only what is below it.
    - Edge geometry (elbow polylines), collapse with hidden-descendant counts, viewport (pan, zoom about a point, clamp) and culling, keyboard navigation (←/→ parent/first child, ↑/↓ nearest card in the same column), subtree helpers (stop order deepest first, all-ended check, ids), the filter (name, status, `key=value`; ancestors of a match stay).
    - A `Signature` of what the layout depends on, so the view re-lays out only when it changes.

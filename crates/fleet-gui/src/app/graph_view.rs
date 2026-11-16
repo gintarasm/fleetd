@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
+use fleet_client::tree::Tree;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext, BorderStyle, Bounds, Context, Entity, EventEmitter, FocusHandle,
@@ -28,8 +29,8 @@ use super::status_dot::dot_color;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography};
 use crate::core::graph::{
-    CardContent, CardDot, DotFill, Forest, card_content, filter_shown, git_root_with,
-    project_title, removable, remove_question, stop_order, stop_question,
+    CardContent, CardDot, DotFill, card_content, filter_shown, git_root_with, project_title,
+    removable, remove_question, stop_order, stop_question, tree_by_id, tree_of,
 };
 use crate::core::graph_layout::{
     BoxKind, Card, GraphLayout, LayoutInput, Signature, Step, Viewport, ZOOM_STEP, layout, step,
@@ -73,7 +74,7 @@ pub struct GraphView {
     layout: Rc<GraphLayout>,
     signature: Option<Signature>,
     /// The forest the layout was built from.
-    forest: Rc<Forest>,
+    forest: Rc<Tree>,
     /// Each agent's project, as of the last layout.
     projects: HashMap<u64, String>,
     /// Git roots found for a cwd (local target only).
@@ -154,8 +155,8 @@ impl GraphView {
         let titles = app.titles.clone();
         let statuses = app.statuses.clone();
         let forest = match super::bench::synthetic_parents(&rows) {
-            Some(nodes) => Forest::build(nodes),
-            None => Forest::of_rows(&rows),
+            Some(nodes) => tree_by_id(nodes),
+            None => tree_of(&rows),
         };
         let mut projects = HashMap::with_capacity(rows.len());
         for r in &rows {

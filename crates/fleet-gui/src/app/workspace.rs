@@ -5310,7 +5310,7 @@ mod tests {
     mod graph {
         use super::*;
         use crate::app::graph_view::GraphView;
-        use crate::core::graph::PARENT_LABEL;
+        use fleet_client::tree::PARENT_LABEL;
 
         fn child(id: u64, parent: u64) -> AgentRow {
             let mut r = row(id, "/w", id as i64);
