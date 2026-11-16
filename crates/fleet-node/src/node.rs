@@ -975,10 +975,10 @@ impl AgentPipeline {
 }
 
 impl AgentPipeline {
-    /// Feeds PTY output through the pipeline; `true` if this is the first
-    /// output since the activity ticker last looked.
-    fn feed(&self, bytes: &[u8]) -> bool {
+    /// Feeds PTY output through the pipeline.
+    fn feed(&self, bytes: &[u8]) -> Fed {
         let mut marked = false;
+        let mut lagged = Vec::new();
         let reply = {
             let mut state = self.lock();
             state.last_output_unix_ms = unix_ms_now();
@@ -997,9 +997,13 @@ impl AgentPipeline {
             if !state.subscribers.is_empty() {
                 let chunk = Bytes::copy_from_slice(bytes);
                 let before = state.subscribers.len();
-                state
-                    .subscribers
-                    .retain(|s| s.offer(StreamItem::Output(chunk.clone())));
+                state.subscribers.retain(|s| {
+                    let kept = s.offer(StreamItem::Output(chunk.clone()));
+                    if !kept && s.lagged.load(Ordering::Relaxed) {
+                        lagged.push(s.conn);
+                    }
+                    kept
+                });
                 if state.subscribers.len() != before {
                     state.check_primary();
                 }
@@ -1014,8 +1018,19 @@ impl AgentPipeline {
         if let Some((input, replies)) = reply {
             input.try_write_reply(&replies);
         }
-        marked
+        Fed { marked, lagged }
     }
+}
+
+/// What [`AgentPipeline::feed`] did beyond feeding.
+struct Fed {
+    /// The first output since the activity ticker last looked.
+    marked: bool,
+    /// Subscribers this output dropped because their queue was full (their
+    /// connection; `None` for an anonymous one). Their client learns of the
+    /// lag only when it reads its way to the end of the queue, which a
+    /// stalled client may never do.
+    lagged: Vec<Option<ConnId>>,
 }
 
 impl OutputSink for AgentPipeline {
@@ -1561,7 +1576,15 @@ impl OutputSink for NodeSink {
     }
 
     fn on_output(&mut self, bytes: &[u8]) {
-        if self.pipeline.feed(bytes) {
+        let fed = self.pipeline.feed(bytes);
+        for conn in fed.lagged {
+            warn!(
+                agent = self.id,
+                conn = conn.map(|c| c.0),
+                "subscriber dropped: its queue is full"
+            );
+        }
+        if fed.marked {
             self.activity.mark(self.id, &self.pipeline);
         }
     }
