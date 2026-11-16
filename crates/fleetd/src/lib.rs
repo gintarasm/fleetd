@@ -8,6 +8,7 @@ mod scope;
 mod server;
 pub mod stdio;
 pub mod stop_signal;
+mod wait;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -350,6 +351,7 @@ impl Daemon {
         // What a restart with no binary named restarts onto.
         let own_binary = identity.binary.path.clone();
         let server = Server::new(Arc::clone(&node), identity, restore);
+        let leases = tokio::spawn(server::lease::drive(Arc::clone(&node)));
         let restarts = server.restarts();
         // The restart whose binary is being checked.
         let mut check: Option<JoinHandle<restart::Checked>> = None;
@@ -393,6 +395,7 @@ impl Daemon {
             }
         };
         info!(signal, "fleetd stopping: stopping agents");
+        leases.abort();
         tokio::task::spawn_blocking(move || node.shutdown())
             .await
             .map_err(io::Error::other)?;

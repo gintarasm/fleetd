@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fleet_node::history::HISTORY_PAGE_MAX_LINES;
+use fleet_node::lease::now_ms;
 use fleet_node::node::{ActivityReceiver, ConnId, Node, Removed, StreamItem, Subscription};
 use fleet_node::scope::Caller;
 use fleet_proto::{
@@ -39,6 +40,9 @@ use tracing::{debug, info, warn};
 use crate::handoff::Identity;
 use crate::logging;
 use crate::scope;
+use crate::wait;
+
+pub(crate) mod lease;
 
 /// Concurrent connections served; more are rejected.
 const MAX_CONNECTIONS: usize = 64;
@@ -391,6 +395,7 @@ async fn connection(
         restarting: None,
         caller,
         scope: scope::Scope::new(&node_for_scope, caller),
+        waits: Vec::new(),
     };
     // Boxed: kept out of every connection's future.
     Box::pin(conn.scope.warm()).await;
@@ -500,14 +505,25 @@ struct Connection {
     caller: Caller,
     /// What the caller may see and touch (all for the user).
     scope: scope::Scope,
+    /// Running `Wait`s, aborted with the connection.
+    waits: Vec<JoinHandle<()>>,
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Leases tied to this connection go with it, and its queued asks
+        // (ADR 0077). A restart does not reach here for the other
+        // connections: `exec` ends them without destructors.
+        if let Err(e) = self.node.leases().conn_closed(self.id, now_ms()) {
+            warn!(conn = self.id.0, error = %e, "releasing a closed connection's leases failed");
+        }
         for task in self.forwarders.values() {
             task.abort();
         }
         if let Some(task) = &self.log_follower {
+            task.abort();
+        }
+        for task in &self.waits {
             task.abort();
         }
     }
@@ -561,6 +577,10 @@ impl Connection {
             }
             Some(request::Kind::Input(_)) if self.shared.stopped.load(Ordering::SeqCst) => Err(()),
             Some(request::Kind::Input(_)) => Ok(None),
+            // A long poll: not in flight, so it never holds off a restart
+            // (which ends the connection, and the wait with it).
+            Some(request::Kind::Wait(_)) if self.shared.stopped.load(Ordering::SeqCst) => Err(()),
+            Some(request::Kind::Wait(_)) => Ok(None),
             _ => self.shared.admit().map(Some).ok_or(()),
         };
         let kind = match req.kind {
@@ -630,9 +650,49 @@ impl Connection {
                 let state = r.state();
                 ack(blocking(&self.node, move |n| n.report_by(caller, state, &r.message)).await)
             }
+            Some(request::Kind::AcquireLease(a)) => return self.acquire_lease(req.id, *a).await,
+            Some(request::Kind::ReleaseLease(r)) => {
+                return self.release_lease(req.id, r.name).await;
+            }
+            Some(request::Kind::ListLeases(_)) => return self.list_leases(req.id).await,
             Some(request::Kind::RestartDaemon(_)) => unreachable!("handled above"),
+            // Boxed: kept out of every request's future.
+            Some(request::Kind::SendMessage(m)) => {
+                Box::pin(wait::send_message(&self.node, self.caller, *m)).await
+            }
+            Some(request::Kind::ReadInbox(r)) => {
+                Box::pin(wait::read_inbox(&self.node, self.caller, r)).await
+            }
+            Some(request::Kind::Wait(w)) => match self.start_wait(req.id, *w) {
+                Ok(()) => return true,
+                Err(message) => error(message),
+            },
         };
         self.respond(req.id, kind).await
+    }
+
+    /// Starts a `Wait` on its own task (see [`wait`]); it answers when it
+    /// matches or times out, while this connection serves other requests.
+    /// At most [`wait::MAX_WAITS_PER_CONNECTION`] at a time: each re-reads
+    /// the store on every notice, so a looping client must not pile them up.
+    fn start_wait(&mut self, id: u64, req: fleet_proto::Wait) -> Result<(), String> {
+        self.waits.retain(|t| !t.is_finished());
+        if self.waits.len() >= wait::MAX_WAITS_PER_CONNECTION {
+            return Err(format!(
+                "too many waits on this connection (at most {})",
+                wait::MAX_WAITS_PER_CONNECTION
+            ));
+        }
+        let notices = self.node.notices();
+        self.waits.push(tokio::spawn(wait::run(
+            Arc::clone(&self.node),
+            self.caller,
+            id,
+            req,
+            notices,
+            self.outbox.clone(),
+        )));
+        Ok(())
     }
 
     /// Hands a restart to the serve loop and answers with its outcome. One
@@ -1281,6 +1341,7 @@ mod tests {
             restarting: None,
             caller: Caller::User,
             scope: scope::Scope::user(),
+            waits: Vec::new(),
         };
         (server, conn, rx)
     }
@@ -1406,6 +1467,115 @@ mod tests {
         assert!(matches!(rx.recv().await, Some(Frame::Response(_))));
         assert!(conn.forwarders.is_empty());
         assert!(!lock(&conn.attached).contains(&7));
+    }
+
+    fn wait_req(timeout_ms: u64, states: &[fleet_proto::WaitState]) -> request::Kind {
+        request::Kind::Wait(Box::new(fleet_proto::Wait {
+            agent_ids: Vec::new(),
+            states: states.iter().map(|s| *s as i32).collect(),
+            timeout_ms,
+        }))
+    }
+
+    async fn next_response(rx: &mut mpsc::Receiver<Frame>) -> Response {
+        loop {
+            if let Some(Frame::Response(r)) = rx.recv().await {
+                return r;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wait_answers_on_a_message_while_the_connection_serves_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut conn, mut rx) = test_conn(Arc::new(Node::open(dir.path()).unwrap()));
+        let wait = wait_req(10_000, &[fleet_proto::WaitState::Message]);
+        assert!(
+            conn.handle(Request {
+                id: 1,
+                kind: Some(wait)
+            })
+            .await
+        );
+        // The connection answers the next request before the wait.
+        let send = request::Kind::SendMessage(Box::new(fleet_proto::SendMessage {
+            body: "note to self".into(),
+            to_user: true,
+            ..Default::default()
+        }));
+        assert!(
+            conn.handle(Request {
+                id: 2,
+                kind: Some(send)
+            })
+            .await
+        );
+        let first = next_response(&mut rx).await;
+        assert_eq!(first.id, 2);
+        assert!(matches!(first.kind, Some(response::Kind::MessagesSent(_))));
+        let waited = next_response(&mut rx).await;
+        assert_eq!(waited.id, 1);
+        let Some(response::Kind::WaitResult(r)) = waited.kind else {
+            panic!("{waited:?}");
+        };
+        assert_eq!(r.matches.len(), 1);
+        assert_eq!(r.matches[0].message.as_ref().unwrap().body, "note to self");
+    }
+
+    #[tokio::test]
+    async fn a_wait_times_out_with_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut conn, mut rx) = test_conn(Arc::new(Node::open(dir.path()).unwrap()));
+        assert!(
+            conn.handle(Request {
+                id: 1,
+                kind: Some(wait_req(50, &[]))
+            })
+            .await
+        );
+        let Some(response::Kind::WaitResult(r)) = next_response(&mut rx).await.kind else {
+            panic!("no wait result");
+        };
+        assert!(r.matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn waits_per_connection_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut conn, mut rx) = test_conn(Arc::new(Node::open(dir.path()).unwrap()));
+        for id in 0..wait::MAX_WAITS_PER_CONNECTION as u64 {
+            let kind = Some(wait_req(60_000, &[]));
+            assert!(conn.handle(Request { id, kind }).await);
+        }
+        let kind = Some(wait_req(60_000, &[]));
+        assert!(conn.handle(Request { id: 99, kind }).await);
+        let refused = next_response(&mut rx).await;
+        assert_eq!(refused.id, 99);
+        assert!(
+            matches!(&refused.kind, Some(response::Kind::Error(e)) if e.message.starts_with("too many waits")),
+            "{refused:?}"
+        );
+        // A finished wait frees its slot.
+        conn.waits[0].abort();
+        wait_until(|| conn.waits[0].is_finished()).await;
+        let kind = Some(wait_req(60_000, &[]));
+        assert!(conn.handle(Request { id: 100, kind }).await);
+        assert_eq!(conn.waits.len(), wait::MAX_WAITS_PER_CONNECTION);
+    }
+
+    #[tokio::test]
+    async fn a_wait_does_not_hold_off_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, mut conn, _rx) = test_server_conn(Arc::new(Node::open(dir.path()).unwrap()));
+        assert!(
+            conn.handle(Request {
+                id: 1,
+                kind: Some(wait_req(60_000, &[]))
+            })
+            .await
+        );
+        let soon = std::time::Instant::now() + Duration::from_millis(500);
+        assert!(server.restarts().stop_requests(soon).is_some());
     }
 
     #[tokio::test]
