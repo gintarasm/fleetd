@@ -205,20 +205,6 @@ pub fn toggle_collapsed(collapsed: &mut BTreeSet<String>, title: &str) {
     }
 }
 
-/// Compact age of the last output: `5s`, `2m`, `3h`, `4d`; empty when unknown.
-pub fn since(last_output_unix_ms: Option<i64>, now_ms: i64) -> String {
-    let Some(last) = last_output_unix_ms else {
-        return String::new();
-    };
-    let s = ((now_ms - last) / 1000).max(0);
-    match s {
-        0..=59 => format!("{s}s"),
-        60..=3599 => format!("{}m", s / 60),
-        3600..=86399 => format!("{}h", s / 3600),
-        _ => format!("{}d", s / 86400),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,15 +433,5 @@ mod tests {
         assert!(set.contains("alpha"));
         toggle_collapsed(&mut set, "alpha");
         assert!(set.is_empty());
-    }
-
-    #[test]
-    fn since_formats() {
-        assert_eq!(since(None, 1_000), "");
-        assert_eq!(since(Some(0), 5_000), "5s");
-        assert_eq!(since(Some(0), 120_000), "2m");
-        assert_eq!(since(Some(0), 3 * 3_600_000), "3h");
-        assert_eq!(since(Some(0), 4 * 86_400_000), "4d");
-        assert_eq!(since(Some(10_000), 5_000), "0s");
     }
 }
