@@ -2,6 +2,7 @@
 
 mod attach;
 mod history;
+mod lease;
 mod skill;
 mod tree;
 mod upgrade;
@@ -85,6 +86,8 @@ enum Command {
     },
     /// Show agents as a spawned-by tree
     Tree(tree::Args),
+    /// Hold a named lease while a command runs, or take, release and list leases
+    Lease(lease::Args),
     /// Set or remove labels on an agent
     Label {
         /// Agent id or name
@@ -493,6 +496,7 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }
         Command::Tree(args) => tree::run(&mut client, &args, &parse_labels(&args.labels)?)?,
+        Command::Lease(args) => return lease::run(client, &sock, token.as_deref(), args),
         Command::Label { agent, set, remove } => {
             let set = parse_labels(&set)?;
             if let Some(n) = set.get(NAME_LABEL) {

@@ -629,7 +629,9 @@ impl Connection {
             Some(request::Kind::Restart(r)) => return self.restart(req.id, r).await,
             Some(request::Kind::Forget(f)) => return self.forget(req.id, *f).await,
             Some(request::Kind::AcquireLease(a)) => return self.acquire_lease(req.id, a).await,
-            Some(request::Kind::ReleaseLease(r)) => return self.release_lease(req.id, r.name).await,
+            Some(request::Kind::ReleaseLease(r)) => {
+                return self.release_lease(req.id, r.name).await;
+            }
             Some(request::Kind::ListLeases(_)) => return self.list_leases(req.id).await,
             Some(request::Kind::RestartDaemon(_)) => unreachable!("handled above"),
         };

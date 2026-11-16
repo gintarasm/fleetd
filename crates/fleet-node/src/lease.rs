@@ -595,11 +595,19 @@ mod tests {
     #[test]
     fn closing_the_connection_releases_a_bound_lease_but_not_an_unbound_one() {
         let f = fixture();
-        granted(f.leases.acquire(want("bound", Some(1), 1), false, 0).unwrap());
+        granted(
+            f.leases
+                .acquire(want("bound", Some(1), 1), false, 0)
+                .unwrap(),
+        );
         let mut un = want("unbound", Some(1), 1);
         un.bind = false;
         granted(f.leases.acquire(un, false, 0).unwrap());
-        let mut next = queued(f.leases.acquire(want("bound", Some(2), 2), true, 1).unwrap());
+        let mut next = queued(
+            f.leases
+                .acquire(want("bound", Some(2), 2), true, 1)
+                .unwrap(),
+        );
         f.leases.conn_closed(ConnId(1), 2).unwrap();
         assert_eq!(next.try_recv().unwrap().holder, Some(2));
         let names: Vec<_> = f.leases.list().into_iter().map(|i| i.name).collect();
@@ -622,7 +630,9 @@ mod tests {
     fn a_dropped_receiver_is_skipped() {
         let f = fixture();
         granted(f.leases.acquire(want("x", Some(1), 1), false, 0).unwrap());
-        drop(queued(f.leases.acquire(want("x", Some(2), 2), true, 1).unwrap()));
+        drop(queued(
+            f.leases.acquire(want("x", Some(2), 2), true, 1).unwrap(),
+        ));
         let mut kept = queued(f.leases.acquire(want("x", Some(3), 3), true, 1).unwrap());
         f.leases.release("x", Releaser::User, 3).unwrap();
         assert_eq!(kept.try_recv().unwrap().holder, Some(3));
@@ -718,7 +728,11 @@ mod tests {
         // The "new daemon" at 2000 ms: agent 7 does not exist.
         let leases = open(&f.path, 2000, &f.load);
         let names: Vec<_> = leases.list().into_iter().map(|i| i.name).collect();
-        assert_eq!(names, ["agent-held", "long"], "agent 7's lease went with it");
+        assert_eq!(
+            names,
+            ["agent-held", "long"],
+            "agent 7's lease went with it"
+        );
         // `long` is unbound and keeps its expiry; nothing is due before it.
         assert_eq!(leases.next_wake(2000), Some(59_000));
     }
