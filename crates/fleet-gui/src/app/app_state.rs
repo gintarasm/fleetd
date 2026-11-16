@@ -68,6 +68,8 @@ pub trait SessionApi: InputSink {
     fn forget(&self, ids: Vec<u64>);
     /// Sets an agent's name (ADR 0052).
     fn rename(&self, agent_id: u64, name: String);
+    /// Sets, then removes, an agent's labels (Edit Labels, ADR 0087).
+    fn set_labels(&self, _agent_id: u64, _set: HashMap<String, String>, _remove: Vec<String>) {}
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
@@ -134,6 +136,10 @@ impl SessionApi for Session {
 
     fn rename(&self, agent_id: u64, name: String) {
         Session::rename(self, agent_id, name);
+    }
+
+    fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
+        Session::set_labels(self, agent_id, set, remove);
     }
 
     fn clear_exited(&self) {
@@ -1502,6 +1508,10 @@ impl AppState {
 
     pub fn rename(&self, agent_id: u64, name: String) {
         self.session.rename(agent_id, name);
+    }
+
+    pub fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
+        self.session.set_labels(agent_id, set, remove);
     }
 
     /// The summary bar's Remove: forgets the agent `pane` shows if it

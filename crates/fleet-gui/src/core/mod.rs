@@ -15,6 +15,7 @@ pub mod icons;
 pub mod identity;
 pub mod keys;
 pub mod kill;
+pub mod labels;
 pub mod launch;
 pub mod layout;
 pub mod links;

@@ -392,8 +392,15 @@ enum ControlCmd {
     Kill(u64),
     Restart(u64),
     Forget(Vec<u64>),
-    /// Sets an agent's `name` label (ADR 0052), then lists.
-    Rename(u64, String),
+    /// Sets, then removes, an agent's labels (Rename sets `name`, ADR
+    /// 0052; Edit Labels the rest, ADR 0087), then lists. `verb` names it
+    /// in an error.
+    SetLabels {
+        agent_id: u64,
+        set: HashMap<String, String>,
+        remove: Vec<String>,
+        verb: &'static str,
+    },
     ClearExited,
     RestartDaemon(String),
     Stop,
@@ -600,7 +607,23 @@ impl Session {
     /// Renames an agent (its `name` label, ADR 0052); the sidebar follows
     /// with the list sent right after it.
     pub fn rename(&self, agent_id: u64, name: String) {
-        self.control(ControlCmd::Rename(agent_id, name));
+        self.control(ControlCmd::SetLabels {
+            agent_id,
+            set: HashMap::from([(NAME_LABEL.to_owned(), name)]),
+            remove: Vec::new(),
+            verb: "rename",
+        });
+    }
+
+    /// Sets, then removes, an agent's labels (Edit Labels, ADR 0087); the
+    /// sidebar follows with the list sent right after it.
+    pub fn set_labels(&self, agent_id: u64, set: HashMap<String, String>, remove: Vec<String>) {
+        self.control(ControlCmd::SetLabels {
+            agent_id,
+            set,
+            remove,
+            verb: "edit labels",
+        });
     }
 
     /// Forgets these exited agents (running ones are refused by fleetd).
@@ -1141,13 +1164,18 @@ fn control_writer(
                     request::Kind::Forget(Box::new(forget)),
                 );
             }
-            Some(ControlCmd::Rename(agent_id, name)) => {
+            Some(ControlCmd::SetLabels {
+                agent_id,
+                set,
+                remove,
+                verb,
+            }) => {
                 let set = SetLabels {
                     agent_id,
-                    set: HashMap::from([(NAME_LABEL.to_owned(), name)]),
-                    remove: Vec::new(),
+                    set,
+                    remove,
                 };
-                send_tracked(&mut sender, "rename", request::Kind::SetLabels(set));
+                send_tracked(&mut sender, verb, request::Kind::SetLabels(set));
                 list(&mut sender, &mut next_list);
             }
             Some(ControlCmd::RestartDaemon(binary)) => {

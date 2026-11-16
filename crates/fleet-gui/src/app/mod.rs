@@ -13,6 +13,7 @@ mod graph_view;
 mod icons;
 mod keymap;
 mod kill_sheet;
+mod labels_sheet;
 mod native;
 mod new_agent;
 mod palette;

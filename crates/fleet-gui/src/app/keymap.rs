@@ -30,9 +30,10 @@ actions!(
         InstallSkill,
         RestartPane,
         KillPane,
-        // Unbound: the palette's Rename Agent… and Remove Exited Agent in
-        // Pane, on the focused pane's agent.
+        // Unbound: the palette's Rename Agent…, Edit Labels… and Remove
+        // Exited Agent in Pane, on the focused pane's agent.
         RenamePane,
+        EditLabelsPane,
         RemovePane,
         SelectAll,
         Cut,
