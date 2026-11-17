@@ -8,10 +8,10 @@ use rusqlite::{Connection, OptionalExtension};
 
 /// Identity took 8 (spec "Waves"); the mailbox (M3-E) 9, leases 10 (ADR 0077),
 /// the status report 11 (ADR 0075).
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 mod mailbox;
-use mailbox::MAILBOX_DDL;
+use mailbox::{MAILBOX_DDL, QUESTION_DDL};
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -62,6 +62,17 @@ pub struct Reported {
     pub state: i32,
     pub message: String,
     pub at_unix_ms: i64,
+    /// The question the report asks, while it is open (ADR 0078).
+    pub question: Option<Question>,
+}
+
+/// An open question of an agent's (ADR 0078): the id of its `question`
+/// message in the user's mailbox, the text and the offered choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub id: u64,
+    pub text: String,
+    pub choices: Vec<String>,
 }
 
 pub struct Store {
@@ -122,7 +133,8 @@ fn conversion_err(col: usize, e: Box<dyn std::error::Error + Send + Sync>) -> ru
 
 const AGENT_COLUMNS: &str = "SELECT id, program, args_json, cwd, state, exit_code, \
      created_unix_ms, scrollback_path, priority, exited_unix_ms, \
-     reported_state, reported_message, reported_unix_ms FROM agents";
+     reported_state, reported_message, reported_unix_ms, \
+     question_id, question_text, question_choices FROM agents";
 
 fn unix_ms_now() -> i64 {
     SystemTime::now()
@@ -156,6 +168,18 @@ fn decode_agent(
                 state,
                 message: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
                 at_unix_ms: r.get::<_, Option<i64>>(12)?.unwrap_or_default(),
+                question: match r.get::<_, Option<i64>>(13)? {
+                    Some(id) => Some(Question {
+                        id: id as u64,
+                        text: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                        choices: match r.get::<_, Option<String>>(15)? {
+                            Some(json) => serde_json::from_str(&json)
+                                .map_err(|e| conversion_err(15, Box::new(e)))?,
+                            None => Vec::new(),
+                        },
+                    }),
+                    None => None,
+                },
             }),
             None => None,
         },
@@ -285,10 +309,20 @@ impl Store {
                  COMMIT;",
             )?;
         }
+        if version < 12 {
+            // v12: open questions (ADR 0078). The DDL must match
+            // `create_latest`'s.
+            self.conn.execute_batch(&format!(
+                "BEGIN;
+                 {QUESTION_DDL}
+                 PRAGMA user_version = 12;
+                 COMMIT;"
+            ))?;
+        }
         Ok(())
     }
 
-    /// The latest schema for a new DB; the same tables the v1 -> ... -> v11
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v12
     /// migrations produce.
     fn create_latest(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(&format!(
@@ -317,7 +351,8 @@ impl Store {
              {AGENT_TOKENS_DDL}
              {MAILBOX_DDL}
              {LEASES_DDL}
-             PRAGMA user_version = 11;
+             {QUESTION_DDL}
+             PRAGMA user_version = 12;
              COMMIT;"
         ))
     }
@@ -639,7 +674,8 @@ impl Store {
     pub fn set_reported(&self, id: u64, state: i32, message: &str) -> rusqlite::Result<i64> {
         let at = unix_ms_now();
         let n = self.conn.execute(
-            "UPDATE agents SET reported_state = ?2, reported_message = ?3, reported_unix_ms = ?4
+            "UPDATE agents SET reported_state = ?2, reported_message = ?3, reported_unix_ms = ?4,
+             question_id = NULL, question_text = NULL, question_choices = NULL
              WHERE id = ?1 AND state = 'running'",
             (id as i64, state, message, at),
         )?;
@@ -787,8 +823,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v11() {
-        assert_eq!(SCHEMA_VERSION, 11);
+    fn schema_is_v12() {
+        assert_eq!(SCHEMA_VERSION, 12);
     }
 
     #[test]
@@ -801,6 +837,7 @@ mod tests {
             state: 3,
             message: "tests green".into(),
             at_unix_ms: at,
+            question: None,
         };
         assert_eq!(s.agent(a).unwrap().unwrap().reported, Some(rep.clone()));
         // A later report replaces it.
@@ -813,6 +850,34 @@ mod tests {
             (1, "", at2)
         );
         assert_eq!(s.list_agents().unwrap()[0].reported.as_ref(), Some(&got));
+    }
+
+    #[test]
+    fn an_open_question_survives_reopening_and_a_report_clears_it() {
+        let (_d, p, s) = open_tmp();
+        let a = s.insert_agent(&new_agent(1)).unwrap();
+        let choices = vec!["yes".to_owned(), "no".to_owned()];
+        let (_, q, to) = s
+            .set_reported_asking(a, 2, "stuck", "ok?", &choices)
+            .unwrap();
+        assert_eq!(to, [None]);
+        drop(s);
+        let s = Store::open(&p).unwrap();
+        let got = s.agent(a).unwrap().unwrap().reported.unwrap();
+        assert_eq!(got.question, Some(q.clone()));
+        assert_eq!(s.messages_after(None, 0, 10).unwrap()[0].choices, choices);
+        assert_eq!(s.answer_question(a, Some(q.id + 1), "x").unwrap(), None);
+        assert!(s.answer_question(a, Some(q.id), "yes").unwrap().is_some());
+        assert_eq!(
+            s.agent(a).unwrap().unwrap().reported.unwrap().question,
+            None
+        );
+        s.set_reported_asking(a, 2, "", "again?", &[]).unwrap();
+        s.set_reported(a, 1, "").unwrap();
+        assert_eq!(
+            s.agent(a).unwrap().unwrap().reported.unwrap().question,
+            None
+        );
     }
 
     #[test]
@@ -872,7 +937,7 @@ mod tests {
         let (_d, p, s) = open_tmp();
         drop(s);
         let c = Connection::open(&p).unwrap();
-        c.execute_batch("ALTER TABLE agents DROP COLUMN reported_state; ALTER TABLE agents DROP COLUMN reported_message; ALTER TABLE agents DROP COLUMN reported_unix_ms; DROP TABLE leases; DROP TABLE messages; DROP TABLE inbox_marks; PRAGMA user_version = 8;")
+        c.execute_batch("ALTER TABLE agents DROP COLUMN question_id; ALTER TABLE agents DROP COLUMN question_text; ALTER TABLE agents DROP COLUMN question_choices; ALTER TABLE messages DROP COLUMN choices; ALTER TABLE agents DROP COLUMN reported_state; ALTER TABLE agents DROP COLUMN reported_message; ALTER TABLE agents DROP COLUMN reported_unix_ms; DROP TABLE leases; DROP TABLE messages; DROP TABLE inbox_marks; PRAGMA user_version = 8;")
             .unwrap();
         drop(c);
         let s = Store::open(&p).unwrap();
@@ -956,7 +1021,7 @@ mod tests {
         let conn = Connection::open(&p).unwrap();
         conn.execute_batch(
             "DROP TABLE agent_tokens;
-             ALTER TABLE agents DROP COLUMN reported_state;
+             ALTER TABLE agents DROP COLUMN question_id; ALTER TABLE agents DROP COLUMN question_text; ALTER TABLE agents DROP COLUMN question_choices; ALTER TABLE messages DROP COLUMN choices; ALTER TABLE agents DROP COLUMN reported_state;
              ALTER TABLE agents DROP COLUMN reported_message;
              ALTER TABLE agents DROP COLUMN reported_unix_ms;
              DROP TABLE leases;
@@ -1403,7 +1468,7 @@ mod tests {
         // Back to the v4 shape: no exit time column.
         conn.execute_batch(
             "DROP TABLE agent_tokens;
-             ALTER TABLE agents DROP COLUMN reported_state;
+             ALTER TABLE agents DROP COLUMN question_id; ALTER TABLE agents DROP COLUMN question_text; ALTER TABLE agents DROP COLUMN question_choices; ALTER TABLE messages DROP COLUMN choices; ALTER TABLE agents DROP COLUMN reported_state;
              ALTER TABLE agents DROP COLUMN reported_message;
              ALTER TABLE agents DROP COLUMN reported_unix_ms;
              DROP TABLE leases;

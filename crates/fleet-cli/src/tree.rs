@@ -206,6 +206,7 @@ pub fn json_tree(sel: &Selection, now_ms: i64) -> Value {
                 "state": r.state().name(),
                 "message": r.message,
                 "at_unix_ms": r.at_unix_ms,
+                "question": crate::report::question_json(r),
             })),
             "exit_code": info.exit_code,
             "run_secs": run_secs(info, now_ms),

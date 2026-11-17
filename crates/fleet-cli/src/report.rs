@@ -35,6 +35,15 @@ pub struct Args {
     pub state: State,
     /// A short note (at most 200 characters)
     pub message: Option<String>,
+    /// Ask the user a question (only with `waiting`; at most 500
+    /// characters). They answer in the GUI or with `fleet answer`; read the
+    /// answer with `fleet inbox` or `fleet wait --state message`.
+    #[arg(long)]
+    pub question: Option<String>,
+    /// An answer to offer as a button (repeatable, at most 6, each at most
+    /// 60 characters; needs --question)
+    #[arg(long = "choice", value_name = "TEXT", requires = "question")]
+    pub choices: Vec<String>,
 }
 
 /// Reports for the calling agent; the exit code.
@@ -44,11 +53,17 @@ pub fn run(client: &mut Connection, args: &Args) -> Result<u8> {
         eprintln!("fleet: the message is longer than {MESSAGE_MAX} characters");
         return Ok(2);
     }
+    if args.question.is_some() && !matches!(args.state, State::Waiting) {
+        eprintln!("fleet: --question goes with the state waiting");
+        return Ok(2);
+    }
     let report = ReportStatus {
         state: ReportedState::from(args.state).into(),
         message,
+        question: args.question.clone(),
+        choices: args.choices.clone(),
     };
-    match client.call(request::Kind::Report(report)) {
+    match client.call(request::Kind::Report(Box::new(report))) {
         Ok(_) => Ok(0),
         // Exit 3, from `main`.
         Err(e) if e.is_forbidden() => Err(e),
@@ -57,4 +72,13 @@ pub fn run(client: &mut Connection, args: &Args) -> Result<u8> {
             Ok(2)
         }
     }
+}
+
+/// The open question of a report as JSON (`ls --json`, `tree --json`):
+/// `{id, text, choices}`, or null.
+pub fn question_json(r: &fleet_proto::Reported) -> serde_json::Value {
+    r.question.as_ref().map_or(
+        serde_json::Value::Null,
+        |q| serde_json::json!({"id": q.id, "text": q.text, "choices": q.choices}),
+    )
 }

@@ -1,6 +1,7 @@
 //! gpui shell (macOS only).
 
 mod agent_mark;
+mod answer_sheet;
 mod app_state;
 mod attention;
 mod bench;
@@ -21,6 +22,7 @@ mod palette;
 mod pane_drag;
 mod pane_view;
 mod picker_view;
+mod question_view;
 mod rename;
 mod resident;
 mod send_sheet;

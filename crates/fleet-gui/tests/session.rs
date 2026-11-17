@@ -278,10 +278,11 @@ fn sidebar_follows_an_agents_report() {
         s.agents().iter().any(|r| r.info.id == id)
     });
     agent
-        .call(request::Kind::Report(fleet_proto::ReportStatus {
+        .call(request::Kind::Report(Box::new(fleet_proto::ReportStatus {
             state: fleet_proto::ReportedState::ReportedWaiting.into(),
             message: "need a review".into(),
-        }))
+            ..Default::default()
+        })))
         .expect("report");
     wait_until("the report in the row", || {
         s.agents()
@@ -296,6 +297,71 @@ fn sidebar_follows_an_agents_report() {
         fleet_gui::core::status::agent_status(&row, false, i64::MAX / 2),
         Some(fleet_gui::core::status::AgentStatus::NeedsYou)
     );
+    s.shutdown();
+}
+
+/// An agent's question reaches its row at once, and the session's answer
+/// (as the user) closes it, for the row and for the agent's inbox (ADR
+/// 0078).
+#[test]
+fn a_question_reaches_the_row_and_the_answer_closes_it() {
+    let d = Daemon::start();
+    let (s, events) = start_session(&d);
+    wait_until("the control connection", || {
+        events.has(|e| *e == UiEvent::Connection(ConnState::Connected))
+    });
+    let tok = d.path().join("q.tok");
+    let id = d.spawn(
+        &format!(
+            "printf %s \"$FLEET_AGENT_TOKEN\" > {0}.tmp && mv {0}.tmp {0}; exec sleep 30",
+            tok.display()
+        ),
+        80,
+        24,
+    );
+    wait_until("the agent's token", || tok.exists());
+    let token = std::fs::read_to_string(&tok).unwrap();
+    let sock = d.path().join("fleetd.sock");
+    let mut agent = Connection::unix_as(&sock, "agent", Some(&token)).expect("connect as agent");
+    wait_until("the agent listed", || {
+        s.agents().iter().any(|r| r.info.id == id)
+    });
+    agent
+        .call(request::Kind::Report(Box::new(fleet_proto::ReportStatus {
+            state: fleet_proto::ReportedState::ReportedWaiting.into(),
+            message: "stuck".into(),
+            question: Some("Which branch?".into()),
+            choices: vec!["main".into(), "dev".into()],
+        })))
+        .expect("ask");
+    let open = || {
+        s.agents()
+            .iter()
+            .find(|r| r.info.id == id)
+            .and_then(|r| fleet_gui::core::question::open_question(&r.info))
+    };
+    wait_until("the question in the row", || open().is_some());
+    let q = open().unwrap();
+    assert_eq!((q.text.as_str(), q.choices.len()), ("Which branch?", 2));
+    s.answer(id, q.id, "dev".into());
+    wait_until("the question closed", || open().is_none());
+    match agent
+        .call(request::Kind::ReadInbox(fleet_proto::ReadInbox {
+            since: Some(0),
+            max: 0,
+        }))
+        .expect("inbox")
+    {
+        fleet_proto::response::Kind::Inbox(i) => {
+            let a = i
+                .messages
+                .iter()
+                .find(|m| m.kind() == fleet_proto::MessageKind::Answer)
+                .expect("an answer");
+            assert_eq!((a.body.as_str(), a.sender), ("dev", None));
+        }
+        other => panic!("inbox: {other:?}"),
+    }
     s.shutdown();
 }
 

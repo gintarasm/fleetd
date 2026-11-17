@@ -105,6 +105,7 @@ pub fn message_proto(m: &Message, sender_name: String) -> fleet_proto::Message {
         sender_name,
         status: m.status.clone().unwrap_or_default(),
         exit_code: m.exit_code,
+        choices: m.choices.clone(),
     }
 }
 

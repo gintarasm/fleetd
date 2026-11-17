@@ -10,6 +10,7 @@ use fleet_client::tree::{Tree, parent_of};
 use fleet_proto::AgentInfo;
 
 use super::ended::{format_run_time, run_time};
+use super::question::open_question;
 use super::session::{AgentRow, PaneId};
 use super::sidebar::{ended, program_name, query_matches, tilde};
 pub use super::status::DotFill;
@@ -166,6 +167,9 @@ pub struct CardContent {
     pub waiting: bool,
     /// While collapsed: "3 children".
     pub hidden: Option<String>,
+    /// The open question's text (ADR 0078): shown in place of the last
+    /// line, with a Reply… button.
+    pub question: Option<String>,
 }
 
 /// The card of `row`; `children` is its shown child count when collapsed.
@@ -197,6 +201,7 @@ pub fn card_content(
             1 => "1 child".to_owned(),
             n => format!("{n} children"),
         }),
+        question: open_question(&row.info).map(|q| q.text),
     }
 }
 
@@ -388,6 +393,25 @@ mod tests {
         let shell = card_content(&r, "sh".into(), "~".into(), None, Some(3), 0);
         assert_eq!(shell.dot, None);
         assert_eq!(shell.hidden.as_deref(), Some("3 children"));
+    }
+
+    #[test]
+    fn a_card_carries_the_open_question() {
+        let mut r = row(3, None);
+        let plain = card_content(&r, "a".into(), "~".into(), None, None, 0);
+        assert_eq!(plain.question, None);
+        r.info.reported = Some(fleet_proto::Reported {
+            state: fleet_proto::ReportedState::ReportedWaiting.into(),
+            message: String::new(),
+            at_unix_ms: 1,
+            question: Some(fleet_proto::Question {
+                id: 1,
+                text: "Which?".into(),
+                choices: Vec::new(),
+            }),
+        });
+        let asked = card_content(&r, "a".into(), "~".into(), None, None, 0);
+        assert_eq!(asked.question.as_deref(), Some("Which?"));
     }
 
     #[test]

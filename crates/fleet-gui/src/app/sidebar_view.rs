@@ -22,6 +22,7 @@ use gpui::{
 use super::agent_mark::{MARK_SLOT, agent_mark};
 use super::controls::{self, ButtonKind, Tooltip};
 use super::keymap::{Kill, Remove, Restart};
+use super::question_view::{Click, question_block};
 use super::status_dot::status_dot;
 use super::tail_text::{head_text, tail_text};
 use super::text_field::TextField;
@@ -31,6 +32,7 @@ use crate::core::approval::pending_text;
 use crate::core::git;
 use crate::core::icons::Icon;
 use crate::core::kill::{AgentButtons, agent_buttons};
+use crate::core::question::open_question;
 use crate::core::row_preview::{preview_line, row_meta};
 use crate::core::session::AgentRow;
 use crate::core::sidebar::ended;
@@ -586,6 +588,30 @@ fn render_tab(
             .pl(px(ROW_INDENT))
             .children(chips.into_iter().map(|(k, v)| chip(id, k, v, theme, cx)))
     });
+    // The agent's open question, with its choices as buttons (ADR 0078).
+    let question = open_question(&row.info).map(|q| {
+        let choices = q.choices.clone();
+        let qid = q.id;
+        let block = question_block(
+            "row",
+            id,
+            &q,
+            theme,
+            |i| -> Click {
+                let choice = choices[i].clone();
+                Box::new(cx.listener(move |this, _, _, cx| {
+                    this.answer_with(id, qid, choice.clone(), cx);
+                    // Not also the row's click, which would focus a pane.
+                    cx.stop_propagation();
+                }))
+            },
+            Box::new(cx.listener(move |this, _, window, cx| {
+                this.open_answer(id, window, cx);
+                cx.stop_propagation();
+            })),
+        );
+        block.ml(px(ROW_INDENT))
+    });
     let bar = div()
         .absolute()
         .left_0()
@@ -632,6 +658,7 @@ fn render_tab(
         .child(line1)
         .child(line2)
         .children(line3)
+        .children(question)
         .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
             // A drag that ends on its own row is not a click.
             if this.pane_drag.is_click() {

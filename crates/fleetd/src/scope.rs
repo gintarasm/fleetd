@@ -216,6 +216,8 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
             return Some(forbidden("agents cannot read fleetd's log"));
         }
         Kind::RestartDaemon(_) => return Some(forbidden("agents cannot restart fleetd")),
+        // Only the user's words close a question (ADR 0078).
+        Kind::Answer(_) => return Some(forbidden("only the user answers questions")),
         // Only the user approves spawns (ADR 0079).
         Kind::ListPendingSpawns(_) | Kind::DecideSpawn(_) => {
             return Some(forbidden("only the user approves spawns"));
@@ -263,7 +265,7 @@ pub(crate) async fn forward_reported(
                     continue;
                 }
                 let frame = Frame::Event(Event {
-                    kind: Some(event::Kind::Reported(ev)),
+                    kind: Some(event::Kind::Reported(Box::new(ev))),
                 });
                 if outbox.send(frame).await.is_err() {
                     return;

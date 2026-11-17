@@ -1446,6 +1446,43 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The longest `fleet report` message, in characters (spec §2).
 pub const REPORT_MESSAGE_MAX: usize = 200;
+/// The longest question, in characters (ADR 0078).
+pub const QUESTION_MAX: usize = 500;
+/// Most choices a question offers.
+pub const CHOICES_MAX: usize = 6;
+/// The longest choice, in characters.
+pub const CHOICE_MAX: usize = 60;
+
+/// The question a report asks (ADR 0078).
+#[derive(Clone, Copy, Debug)]
+pub struct QuestionIn<'a> {
+    pub text: &'a str,
+    pub choices: &'a [String],
+}
+
+impl QuestionIn<'_> {
+    fn check(&self) -> io::Result<()> {
+        let one_line = |what: &str, s: &str, max: usize| {
+            if s.is_empty() {
+                return Err(invalid(format!("{what} must not be empty")));
+            }
+            if s.chars().count() > max {
+                return Err(invalid(format!("{what} is longer than {max} characters")));
+            }
+            if s.chars().any(char::is_control) {
+                return Err(invalid(format!("{what} has control characters")));
+            }
+            Ok(())
+        };
+        one_line("the question", self.text, QUESTION_MAX)?;
+        if self.choices.len() > CHOICES_MAX {
+            return Err(invalid(format!("at most {CHOICES_MAX} choices")));
+        }
+        self.choices
+            .iter()
+            .try_for_each(|c| one_line("a choice", c, CHOICE_MAX))
+    }
+}
 
 fn store_err(e: rusqlite::Error) -> io::Error {
     io::Error::other(e)
@@ -2014,8 +2051,19 @@ impl Node {
     /// [`Node::report`] for the connection's `caller`: only an agent has a
     /// status to report, so the user's is `forbidden:` (ADR 0075).
     pub fn report_by(&self, caller: Caller, state: ReportedState, message: &str) -> io::Result<()> {
+        self.report_question_by(caller, state, message, None)
+    }
+
+    /// [`Node::report_question`] for the connection's `caller`.
+    pub fn report_question_by(
+        &self,
+        caller: Caller,
+        state: ReportedState,
+        message: &str,
+        question: Option<QuestionIn<'_>>,
+    ) -> io::Result<()> {
         match caller {
-            Caller::Agent(id) => self.report(id, state, message),
+            Caller::Agent(id) => self.report_question(id, state, message, question),
             Caller::User => Err(scope::forbidden(
                 "fleet report needs an agent identity (run it inside an agent)",
             )),
@@ -2027,6 +2075,20 @@ impl Node {
     /// without control characters. The agent must be running and not a plain
     /// shell (shells have no status, ADR 0071).
     pub fn report(&self, id: u64, state: ReportedState, message: &str) -> io::Result<()> {
+        self.report_question(id, state, message, None)
+    }
+
+    /// [`Node::report`] that may ask the user a question (ADR 0078): only
+    /// with `waiting`. The question goes to the user's mailbox with a copy
+    /// to the parent, and stays open until it is answered or the agent
+    /// reports again (any report closes the last one).
+    pub fn report_question(
+        &self,
+        id: u64,
+        state: ReportedState,
+        message: &str,
+        question: Option<QuestionIn<'_>>,
+    ) -> io::Result<()> {
         if state == ReportedState::Unspecified {
             return Err(invalid("report needs a state".into()));
         }
@@ -2038,6 +2100,12 @@ impl Node {
         if message.chars().any(char::is_control) {
             return Err(invalid("report message has control characters".into()));
         }
+        if let Some(q) = &question {
+            if state != ReportedState::ReportedWaiting {
+                return Err(invalid("a question needs the state waiting".into()));
+            }
+            q.check()?;
+        }
         let store = lock(&self.store);
         let labels = store
             .labels(id)
@@ -2046,14 +2114,27 @@ impl Node {
         if labels.get(KIND_LABEL).map(String::as_str) == Some(SHELL_KIND) {
             return Err(invalid("a shell has no status to report".into()));
         }
-        let at_unix_ms = store
-            .set_reported(id, state as i32, message)
-            .map_err(|e| match e {
-                rusqlite::Error::StatementChangedRows(_) => {
-                    invalid(format!("agent {id} is not running"))
-                }
-                e => store_err(e),
-            })?;
+        let not_running = |e| match e {
+            rusqlite::Error::StatementChangedRows(_) => {
+                invalid(format!("agent {id} is not running"))
+            }
+            e => store_err(e),
+        };
+        let (at_unix_ms, asked, to) = match &question {
+            None => (
+                store
+                    .set_reported(id, state as i32, message)
+                    .map_err(not_running)?,
+                None,
+                Vec::new(),
+            ),
+            Some(q) => {
+                let (at, asked, to) = store
+                    .set_reported_asking(id, state as i32, message, q.text, q.choices)
+                    .map_err(not_running)?;
+                (at, Some(asked), to)
+            }
+        };
         // `status_changed` takes the store lock itself.
         drop(store);
         // No receivers is fine.
@@ -2063,12 +2144,65 @@ impl Node {
                 state: state as i32,
                 message: message.to_owned(),
                 at_unix_ms,
+                question: asked.map(question_proto),
             }),
         });
+        for recipient in to {
+            let _ = self
+                .notices
+                .send(crate::mailbox::Notice::Message { recipient });
+        }
         // The parent's mailbox and its waiters (ADR 0076's seam): one
         // `status` message per change.
         if let Some(status) = crate::mailbox::Status::of_reported(state) {
             self.status_changed(id, status, message, false)?;
+        }
+        Ok(())
+    }
+
+    /// The user's answer to agent `agent`'s open question (ADR 0078): an
+    /// `answer` message to it and a copy to its parent, the question closed.
+    /// `question` (the id the user saw) guards against answering a question
+    /// that was closed and replaced meanwhile. The agent is then reported
+    /// `working`: it has what it asked for. Only the user answers: an agent
+    /// is `forbidden:`.
+    pub fn answer(
+        &self,
+        caller: Caller,
+        agent: u64,
+        question: Option<u64>,
+        text: &str,
+    ) -> io::Result<()> {
+        if let Caller::Agent(_) = caller {
+            return Err(scope::forbidden("only the user answers questions"));
+        }
+        if text.is_empty() {
+            return Err(invalid("an answer must not be empty".into()));
+        }
+        if text.len() > crate::mailbox::MAX_BODY {
+            return Err(invalid(format!(
+                "an answer is at most {} bytes (this one is {})",
+                crate::mailbox::MAX_BODY,
+                text.len()
+            )));
+        }
+        let to = lock(&self.store)
+            .answer_question(agent, question, text)
+            .map_err(store_err)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("agent {agent} has no open question"),
+                )
+            })?;
+        for recipient in to {
+            let _ = self
+                .notices
+                .send(crate::mailbox::Notice::Message { recipient });
+        }
+        // Announces the closed question and wakes the parent.
+        if let Err(e) = self.report(agent, ReportedState::ReportedWorking, "") {
+            tracing::warn!(agent, error = %e, "reporting working after an answer failed");
         }
         Ok(())
     }
@@ -3263,8 +3397,17 @@ fn agent_info(rec: AgentRecord) -> AgentInfo {
             state: r.state,
             message: r.message,
             at_unix_ms: r.at_unix_ms,
+            question: r.question.map(question_proto),
         }),
         git: None,
+    }
+}
+
+fn question_proto(q: store::Question) -> fleet_proto::Question {
+    fleet_proto::Question {
+        id: q.id,
+        text: q.text,
+        choices: q.choices,
     }
 }
 

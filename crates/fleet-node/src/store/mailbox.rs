@@ -2,7 +2,7 @@
 
 use rusqlite::OptionalExtension;
 
-use super::{Store, unix_ms_now};
+use super::{Question, Store, unix_ms_now};
 use crate::mailbox::{AGENT_RETENTION, Mailbox, Message, MessageKind, NewMessage, USER_RETENTION};
 use crate::scope;
 
@@ -27,8 +27,16 @@ pub(super) const MAILBOX_DDL: &str = "CREATE TABLE messages (
                  last_read INTEGER NOT NULL
              );";
 
-const MESSAGE_COLUMNS: &str =
-    "SELECT id, recipient, sender, kind, body, status, exit_code, created_ms FROM messages";
+/// Schema v12 (ADR 0078): the choices of a `question` message (a JSON
+/// array; NULL for every other message) and the agent's open question (the
+/// id of its `question` message, the text and the choices; all NULL when
+/// none is open). Run after the v9 DDL by the migration and `create_latest`.
+pub(super) const QUESTION_DDL: &str = "ALTER TABLE messages ADD COLUMN choices TEXT;
+                 ALTER TABLE agents ADD COLUMN question_id INTEGER;
+                 ALTER TABLE agents ADD COLUMN question_text TEXT;
+                 ALTER TABLE agents ADD COLUMN question_choices TEXT;";
+
+const MESSAGE_COLUMNS: &str = "SELECT id, recipient, sender, kind, body, status, exit_code, created_ms, choices FROM messages";
 
 /// A message without its body: who wrote to whom (ADR 0089).
 pub struct EdgeRow {
@@ -66,6 +74,12 @@ fn decode(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         status: r.get(5)?,
         exit_code: r.get(6)?,
         created_unix_ms: r.get(7)?,
+        choices: match r.get::<_, Option<String>>(8)? {
+            Some(json) => serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, e.into())
+            })?,
+            None => Vec::new(),
+        },
     })
 }
 
@@ -267,6 +281,109 @@ impl Store {
             return Ok(None);
         };
         Ok(Some((to, self.insert_message(&m(to))?)))
+    }
+
+    /// Stores `agent`'s report asking `question` (ADR 0078): the report as
+    /// [`Store::set_reported`] does, the question's message in the user's
+    /// mailbox with a copy in its parent's, and the open question on the
+    /// agent, in one transaction. The report's time, the question, and the
+    /// mailboxes that got a message. Errors if the agent is unknown or not
+    /// running.
+    pub fn set_reported_asking(
+        &self,
+        agent: u64,
+        state: i32,
+        message: &str,
+        text: &str,
+        choices: &[String],
+    ) -> rusqlite::Result<(i64, Question, Vec<Mailbox>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let at = self.set_reported(agent, state, message)?;
+        let choices_json = serde_json::to_string(choices).expect("strings serialize");
+        let mut to = vec![None];
+        if let Some(Some(parent)) = self.report_mailbox(agent)? {
+            to.push(Some(parent));
+        }
+        let mut id = 0;
+        for &recipient in &to {
+            let mid = self.insert_message(&NewMessage {
+                recipient,
+                sender: Some(agent),
+                kind: MessageKind::Question,
+                body: text.to_owned(),
+                status: None,
+                exit_code: None,
+            })?;
+            self.conn.execute(
+                "UPDATE messages SET choices = ?2 WHERE id = ?1",
+                (mid as i64, &choices_json),
+            )?;
+            if recipient.is_none() {
+                id = mid;
+            }
+        }
+        self.conn.execute(
+            "UPDATE agents SET question_id = ?2, question_text = ?3, question_choices = ?4
+             WHERE id = ?1",
+            (agent as i64, id as i64, text, &choices_json),
+        )?;
+        tx.commit()?;
+        let question = Question {
+            id,
+            text: text.to_owned(),
+            choices: choices.to_vec(),
+        };
+        Ok((at, question, to))
+    }
+
+    /// Stores the user's answer to `agent`'s open question (ADR 0078): an
+    /// `answer` message to the agent and a copy to its parent, and the
+    /// question closed, in one transaction. `question` (when given) must be
+    /// the open one's id. The mailboxes that got a message; `None` when the
+    /// agent has no open question (or is not running).
+    pub fn answer_question(
+        &self,
+        agent: u64,
+        question: Option<u64>,
+        text: &str,
+    ) -> rusqlite::Result<Option<Vec<Mailbox>>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let open: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT question_id FROM agents WHERE id = ?1 AND state = 'running'",
+                (agent as i64,),
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        match (open, question) {
+            (None, _) => return Ok(None),
+            (Some(open), Some(asked)) if open as u64 != asked => return Ok(None),
+            _ => {}
+        }
+        let mut to = vec![Some(agent)];
+        if let Some(Some(parent)) = self.report_mailbox(agent)? {
+            to.push(Some(parent));
+        }
+        for &recipient in &to {
+            self.insert_message(&NewMessage {
+                recipient,
+                // The user's words.
+                sender: None,
+                kind: MessageKind::Answer,
+                body: text.to_owned(),
+                status: None,
+                exit_code: None,
+            })?;
+        }
+        self.conn.execute(
+            "UPDATE agents SET question_id = NULL, question_text = NULL,
+             question_choices = NULL WHERE id = ?1",
+            (agent as i64,),
+        )?;
+        tx.commit()?;
+        Ok(Some(to))
     }
 
     /// The `lost` report of an agent marked lost.
