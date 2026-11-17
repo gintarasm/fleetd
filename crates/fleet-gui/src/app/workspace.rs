@@ -42,7 +42,9 @@ use super::pane_view::{PaneEvent, PaneView};
 use super::picker_view::{PickerEvent, PickerView};
 use super::rename::{RenameEvent, RenameSheet};
 use super::send_sheet::{self, SendEvent, SendSheet};
-use super::sidebar_view::{SidebarData, TabMark, program_name, render_sidebar, tab_title};
+use super::sidebar_view::{
+    SidebarData, TabMark, program_name, render_pending, render_sidebar, tab_title,
+};
 use super::split_chooser::{ChooserEvent, SplitChooserView};
 use super::split_dividers::SplitDrag;
 use super::text_field::TextField;
@@ -251,6 +253,8 @@ pub struct Workspace {
     look: Look,
     /// Panes easing in (opened or split), since when.
     entering: HashMap<PaneId, Instant>,
+    /// Redraws while a new child's highlight shows (ADR 0079).
+    new_child_timer: controls::RedrawTimer,
     /// What the window draws behind the content (blur, glass, opaque).
     backdrop: Backdrop,
     /// A split divider being dragged.
@@ -379,6 +383,7 @@ impl Workspace {
             reduce_motion: config.reduce_motion.resolve(native::reduce_motion()),
             look: Look::of(&config),
             entering: HashMap::new(),
+            new_child_timer: controls::RedrawTimer::default(),
             backdrop,
             split_drag: SplitDrag::default(),
             pane_drag: PaneDrag::default(),
@@ -417,12 +422,22 @@ impl Workspace {
             return;
         }
         self.graph_shown = !self.graph_shown;
+        self.watch_message_lines(cx);
         if self.graph_shown {
             self.graph.0.read(cx).focus(window);
         } else {
             self.focus_current(window, cx);
         }
         cx.notify();
+    }
+
+    /// The session asks for message edges only while the graph is shown.
+    fn watch_message_lines(&self, cx: &mut Context<Self>) {
+        let shown = self.graph_shown;
+        self.app.update(cx, |a, cx| {
+            a.watch_message_edges(shown);
+            cx.notify();
+        });
     }
 
     fn graph_event(
@@ -441,6 +456,7 @@ impl Workspace {
             return;
         }
         self.graph_shown = false;
+        self.watch_message_lines(cx);
         if let GraphEvent::Open(id) = *event {
             self.app.update(cx, |a, cx| a.reveal_agent(id, cx));
         }
@@ -1503,6 +1519,11 @@ impl Workspace {
 
     /// A click on a row's label chip: the sidebar filter gets `key=value`,
     /// or loses it on a second click.
+    /// Approves or denies an agent's pending spawn (ADR 0079).
+    pub(super) fn decide_spawn(&mut self, id: u64, approve: bool, cx: &mut Context<Self>) {
+        self.app.read(cx).decide_spawn(id, approve);
+    }
+
     pub(super) fn filter_by_label(&mut self, key: &str, value: &str, cx: &mut Context<Self>) {
         let query = chip_filter(self.filter_field.read(cx).text(), key, value);
         self.filter_field.update(cx, |f, cx| f.set_text(query, cx));
@@ -2412,6 +2433,16 @@ impl Render for Workspace {
                 app.bells.clone(),
             )
         };
+        let (pending, fresh, next) = {
+            let app = self.app.read(cx);
+            let now = Instant::now();
+            (
+                app.pending_spawns.clone(),
+                app.new_children.strengths(now, self.reduce_motion),
+                app.new_children.next_change(now, self.reduce_motion),
+            )
+        };
+        self.new_child_timer.schedule(next, window, cx);
         let mark = move |id: u64| marks.get(&id).copied().unwrap_or(TabMark::None);
         // Rows that went away leave the selection.
         self.row_selection
@@ -2443,8 +2474,34 @@ impl Render for Workspace {
             status_filter: self.status_filter,
             focus: self.sidebar_focus.clone(),
             selected: self.row_selection.ids(),
+            pending: &pending,
+            fresh: &fresh,
         };
         let sidebar = render_sidebar(data, &theme, cx);
+        // The sidebar is hidden under the graph: its spawn requests float
+        // over the graph instead (ADR 0079).
+        let graph_pending = if self.graph_shown {
+            render_pending(&pending, &rows, &titles, &theme, cx).map(|block| {
+                div()
+                    .id("graph-pending-spawns")
+                    .absolute()
+                    .top(px(chrome::BAR_HEIGHT + space::SM))
+                    .right(px(space::LG))
+                    .w(px(chrome::SIDEBAR_WIDTH))
+                    .max_h(px(480.))
+                    .overflow_y_scroll()
+                    .pb(px(space::SM))
+                    .rounded(px(radius::LG))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.raised)
+                    .shadow_lg()
+                    .occlude()
+                    .child(block)
+            })
+        } else {
+            None
+        };
         let ended_rows = rows.iter().filter(|r| ended(r)).count();
         // What Clear exited removes (an ended parent of a running agent stays).
         let removable_rows = removable_ended(&rows);
@@ -2803,6 +2860,7 @@ impl Render for Workspace {
                     .child(panes)
             })
             .children(exits)
+            .children(graph_pending)
             .children(toast)
             .children(palette)
             .children(switcher)
@@ -3050,6 +3108,8 @@ mod tests {
         /// An answer to an agent's open question: agent, question id, text.
         Answer(u64, u64, String),
         ClearExited,
+        /// Approved (`true`) or denied a pending spawn.
+        Decide(u64, bool),
         Spawn {
             req: SpawnRequest,
             size: (u16, u16),
@@ -3072,6 +3132,7 @@ mod tests {
         restart_pending: std::sync::atomic::AtomicBool,
         /// What `read_output` gives per agent (unset: an error).
         outputs: Mutex<HashMap<u64, Result<String, String>>>,
+        pending: Mutex<Vec<fleet_proto::PendingSpawn>>,
     }
 
     impl Fake {
@@ -3197,6 +3258,14 @@ mod tests {
 
         fn clear_exited(&self) {
             self.calls.lock().unwrap().push(Call::ClearExited);
+        }
+
+        fn pending_spawns(&self) -> Vec<fleet_proto::PendingSpawn> {
+            self.pending.lock().unwrap().clone()
+        }
+
+        fn decide_spawn(&self, id: u64, approve: bool) {
+            self.calls.lock().unwrap().push(Call::Decide(id, approve));
         }
 
         fn send_input(&self, agent_id: u64, data: Vec<u8>) {
@@ -7217,5 +7286,77 @@ mod tests {
             error.as_deref(),
             Some("Cannot save the output of sh: no such agent. It was not removed.")
         );
+    }
+
+    #[gpui::test]
+    fn a_pending_spawn_shows_who_asks_and_can_be_approved_or_denied(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        agents(&mut s, &fake, vec![row(1, "/w", 1)]);
+        assert!(s.cx.debug_bounds("pending-spawns").is_none());
+        let spawn = |id| fleet_proto::PendingSpawn {
+            id,
+            parent: 1,
+            program: "claude".into(),
+            args: vec!["-p".into(), "go".into()],
+            cwd: "/w".into(),
+            ..Default::default()
+        };
+        *fake.pending.lock().unwrap() = vec![spawn(4), spawn(5)];
+        agents(&mut s, &fake, vec![row(1, "/w", 1)]);
+        assert!(s.cx.debug_bounds("pending-spawn-4").is_some());
+        assert!(s.cx.debug_bounds("pending-spawn-5").is_some());
+        click(&mut s, "pending-spawn-4-approve");
+        click(&mut s, "pending-spawn-5-deny");
+        let calls = fake.calls();
+        assert!(calls.contains(&Call::Decide(4, true)), "{calls:?}");
+        assert!(calls.contains(&Call::Decide(5, false)), "{calls:?}");
+
+        // Over the graph too, where the sidebar is hidden.
+        click(&mut s, "graph-toggle");
+        assert!(s.ws.read_with(s.cx, |w, _| w.graph_shown()));
+        let card = s.cx.debug_bounds("pending-spawn-4").unwrap();
+        let toggle = s.cx.debug_bounds("graph-toggle").unwrap();
+        assert!(card.top() > toggle.bottom(), "below the titlebar");
+
+        fake.pending.lock().unwrap().clear();
+        agents(&mut s, &fake, vec![row(1, "/w", 1)]);
+        assert!(
+            s.app.read_with(s.cx, |a, _| a.pending_spawns.is_empty()),
+            "a decided spawn leaves"
+        );
+    }
+
+    #[gpui::test]
+    fn a_child_spawned_while_watching_is_highlighted(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let child = |id: u64, parent: u64| {
+            let mut r = row(id, "/w", id as i64);
+            r.info
+                .labels
+                .insert("fleet.parent".to_owned(), parent.to_string());
+            r
+        };
+        fake.listed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // What was there at the first list is not news.
+        agents(&mut s, &fake, vec![row(1, "/w", 1), child(2, 1)]);
+        assert!(s.cx.debug_bounds("tab-2").is_some());
+        assert!(s.cx.debug_bounds("tab-2-new").is_none());
+        agents(
+            &mut s,
+            &fake,
+            vec![row(1, "/w", 1), child(2, 1), child(3, 2), row(4, "/w", 4)],
+        );
+        assert!(s.cx.debug_bounds("tab-3-new").is_some());
+        assert!(s.cx.debug_bounds("tab-2-new").is_none());
+        assert!(s.cx.debug_bounds("tab-4-new").is_none(), "not a child");
+        s.cx.simulate_keystrokes("cmd-shift-g");
+        s.cx.run_until_parked();
+        assert!(s.cx.debug_bounds("graph-card-3-new").is_some());
+        assert!(s.cx.debug_bounds("graph-card-2-new").is_none());
     }
 }

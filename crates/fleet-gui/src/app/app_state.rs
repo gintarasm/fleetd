@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use fleet_client::names::{live_names, name_of};
+use fleet_proto::PendingSpawn;
 use fleet_term::Palette;
 use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle};
 
@@ -24,6 +25,7 @@ use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::git;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
+use crate::core::new_children::NewChildren;
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::presets::{Preset, detect_presets, usable};
 use crate::core::question::open_question;
@@ -94,6 +96,13 @@ pub trait SessionApi: InputSink {
     fn answer(&self, _agent_id: u64, _question: u64, _text: String) {}
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
+    /// The graph is shown or hidden: message lines are polled while shown
+    /// (ADR 0089).
+    fn watch_message_edges(&self, _on: bool) {}
+    /// Who wrote to whom lately, oldest first.
+    fn message_edges(&self) -> Vec<crate::core::message_lines::Edge> {
+        Vec::new()
+    }
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
     /// arrives as a `UiEvent`.
     fn restart_daemon(&self) {}
@@ -109,6 +118,12 @@ pub trait SessionApi: InputSink {
     }
     /// The latest list's old id to newest successor.
     fn replaced(&self) -> HashMap<u64, u64>;
+    /// Agents' spawns waiting for the user's approval (ADR 0079).
+    fn pending_spawns(&self) -> Vec<PendingSpawn> {
+        Vec::new()
+    }
+    /// Approves or denies a pending spawn.
+    fn decide_spawn(&self, _id: u64, _approve: bool) {}
     fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>>;
     fn attach(&self, pane: PaneId, agent_id: u64);
     fn close_pane(&self, pane: PaneId);
@@ -120,6 +135,14 @@ pub trait SessionApi: InputSink {
 impl SessionApi for Session {
     fn agents(&self) -> Vec<AgentRow> {
         Session::agents(self)
+    }
+
+    fn pending_spawns(&self) -> Vec<PendingSpawn> {
+        Session::pending_spawns(self)
+    }
+
+    fn decide_spawn(&self, id: u64, approve: bool) {
+        Session::decide_spawn(self, id, approve);
     }
 
     fn listed(&self) -> bool {
@@ -178,6 +201,14 @@ impl SessionApi for Session {
 
     fn clear_exited(&self) {
         Session::clear_exited(self);
+    }
+
+    fn watch_message_edges(&self, on: bool) {
+        Session::watch_message_edges(self, on);
+    }
+
+    fn message_edges(&self) -> Vec<crate::core::message_lines::Edge> {
+        Session::message_edges(self)
     }
 
     fn restart_daemon(&self) {
@@ -329,12 +360,18 @@ pub struct AppState {
     pub(super) titles: HashMap<u64, String>,
     pub(super) theme: Theme,
     pub(super) agents: Vec<AgentRow>,
+    /// Who wrote to whom lately: the graph's message lines (ADR 0089).
+    pub(super) message_edges: Vec<crate::core::message_lines::Edge>,
     /// Each non-shell agent's status (ADR 0042), as of the last
     /// [`AppState::refresh_status`].
     pub(super) statuses: HashMap<u64, AgentStatus>,
     /// Agents whose pane rang the bell where you were not looking; cleared
     /// once a pane showing it is focused in the active window.
     pub(super) bells: HashSet<u64>,
+    /// Agents' spawns waiting for the user's approval (ADR 0079).
+    pub(super) pending_spawns: Vec<PendingSpawn>,
+    /// Children spawned while the GUI watched, highlighted briefly.
+    pub(super) new_children: NewChildren,
     alerts: Alerts,
     /// The window is open and has focus: no notifications then.
     window_active: bool,
@@ -408,6 +445,7 @@ impl AppState {
         let events = follow(ui, cx);
         let mut s = AppState {
             agents: session.agents(),
+            message_edges: Vec::new(),
             session,
             live: true,
             session_epoch: 0,
@@ -426,6 +464,8 @@ impl AppState {
             theme,
             statuses: HashMap::new(),
             bells: HashSet::new(),
+            pending_spawns: Vec::new(),
+            new_children: NewChildren::default(),
             alerts: Alerts::default(),
             window_active: false,
             error: None,
@@ -512,6 +552,9 @@ impl AppState {
         // The new target's waiting and ended agents are not news.
         self.statuses.clear();
         self.bells.clear();
+        self.pending_spawns.clear();
+        // The new target's children are not news either.
+        self.new_children = NewChildren::default();
         self.alerts = Alerts::default();
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
@@ -678,6 +721,14 @@ impl AppState {
         self.panes.insert(pane, view);
     }
 
+    /// Asks the session for message lines (the graph is shown) or stops.
+    pub(super) fn watch_message_edges(&mut self, on: bool) {
+        self.session.watch_message_edges(on);
+        if !on {
+            self.message_edges.clear();
+        }
+    }
+
     fn apply_events(&mut self, batch: Vec<UiEvent>, cx: &mut Context<Self>) {
         let mut status = false;
         let mut chrome = false;
@@ -698,6 +749,19 @@ impl AppState {
                     let agents = &self.agents;
                     self.bells
                         .retain(|id| agents.iter().any(|r| r.info.id == *id));
+                    if self.session.listed() {
+                        self.new_children.observe(
+                            &self.agents,
+                            &self.session.replaced(),
+                            Instant::now(),
+                        );
+                    }
+                    let pending = self.session.pending_spawns();
+                    if pending != self.pending_spawns {
+                        self.pending_spawns = pending;
+                        chrome = true;
+                        cx.notify();
+                    }
                     status = true;
                     if self.live {
                         super::bench::agents_listed();
@@ -709,6 +773,10 @@ impl AppState {
                         chrome = true;
                         cx.notify();
                     }
+                }
+                UiEvent::MessageEdgesChanged => {
+                    self.message_edges = self.session.message_edges();
+                    cx.notify();
                 }
                 UiEvent::PaneChanged(pane) => {
                     let Some(view) = self.panes.get(&pane).cloned() else {
@@ -1570,6 +1638,11 @@ impl AppState {
 
     pub fn kill(&self, agent_id: u64) {
         self.session.kill(agent_id);
+    }
+
+    /// Approves or denies an agent's pending spawn (ADR 0079).
+    pub fn decide_spawn(&self, id: u64, approve: bool) {
+        self.session.decide_spawn(id, approve);
     }
 
     /// Restarts an exited agent from the sidebar: panes showing it follow.

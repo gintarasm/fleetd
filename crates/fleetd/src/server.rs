@@ -39,6 +39,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
 
+use crate::approval;
 use crate::handoff::Identity;
 use crate::logging;
 use crate::scope;
@@ -365,6 +366,7 @@ async fn connection(
     let activity = node.activity_events();
     let refused = node.refused_events();
     let reported = node.report_events();
+    let approval_events = node.approvals().events();
     let id = ConnId(NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed));
     let Some((client, caller)) =
         handshake(id, &node, session, &hello, &mut reader, &mut writer).await
@@ -385,6 +387,7 @@ async fn connection(
     // Removals other connections caused, for the request loop to drop
     // this connection's state for them.
     let (removed_tx, mut removed_rx) = mpsc::unbounded_channel();
+    let (approved_tx, mut approved_rx) = mpsc::unbounded_channel();
     let mut conn = Connection {
         node,
         shared,
@@ -398,6 +401,9 @@ async fn connection(
         caller,
         scope: scope::Scope::new(&node_for_scope, caller),
         waits: Vec::new(),
+        approvals: Vec::new(),
+        approved_tx,
+        approved: HashSet::new(),
     };
     // Boxed: kept out of every connection's future.
     Box::pin(conn.scope.warm()).await;
@@ -421,6 +427,11 @@ async fn connection(
         )),
         tokio::spawn(scope::forward_reported(
             reported,
+            conn.outbox.clone(),
+            conn.scope.clone(),
+        )),
+        tokio::spawn(approval::forward(
+            approval_events,
             conn.outbox.clone(),
             conn.scope.clone(),
         )),
@@ -449,6 +460,12 @@ async fn connection(
                 Some(Err(e)) => break format!("read error: {e}"),
             },
             Some(agent_id) = removed_rx.recv() => conn.removed_elsewhere(agent_id).await,
+            Some(req) = approved_rx.recv() => {
+                conn.approved.insert(req.id);
+                if !conn.handle(req).await {
+                    break "write failed".to_string();
+                }
+            }
         }
     };
     info!(conn = id.0, reason, "connection closed");
@@ -509,6 +526,13 @@ struct Connection {
     scope: scope::Scope,
     /// Running `Wait`s, aborted with the connection.
     waits: Vec<JoinHandle<()>>,
+    /// Spawns waiting for the user's approval (ADR 0079), aborted (so
+    /// withdrawn) with the connection.
+    approvals: Vec<JoinHandle<()>>,
+    /// Where those hand an approved spawn back to the request loop.
+    approved_tx: mpsc::UnboundedSender<Request>,
+    /// Approved spawn requests being handled: they skip the approval.
+    approved: HashSet<u64>,
 }
 
 impl Drop for Connection {
@@ -525,7 +549,7 @@ impl Drop for Connection {
         if let Some(task) = &self.log_follower {
             task.abort();
         }
-        for task in &self.waits {
+        for task in self.waits.iter().chain(&self.approvals) {
             task.abort();
         }
     }
@@ -567,6 +591,13 @@ impl Connection {
             let refused = Box::pin(scope::refusal(&self.scope, a, &req.kind));
             if let Some(message) = refused.await {
                 return self.respond(req.id, error(message)).await;
+            }
+            if let (Some(request::Kind::Spawn(_)), Some(timeout)) =
+                (&req.kind, self.node.spawn_approval())
+                && !self.approved.remove(&req.id)
+            {
+                // Boxed: kept out of every request's future.
+                return Box::pin(self.ask_approval(req, timeout)).await;
             }
         }
         // `Err` refuses the request. No await of its own: each one adds
@@ -679,12 +710,44 @@ impl Connection {
             Some(request::Kind::ReadInbox(r)) => {
                 Box::pin(wait::read_inbox(&self.node, self.caller, r)).await
             }
+            Some(request::Kind::ListPendingSpawns(_)) => approval::list(&self.node),
+            Some(request::Kind::DecideSpawn(d)) => approval::decide(&self.node, &d),
+            Some(request::Kind::ListMessageEdges(r)) => {
+                let (since, max) = (r.since_unix_ms, r.max as usize);
+                match blocking(&self.node, move |n| n.message_edges(since, max)).await {
+                    Ok(edges) => response::Kind::MessageEdges(edges),
+                    Err(e) => error(e.to_string()),
+                }
+            }
             Some(request::Kind::Wait(w)) => match self.start_wait(req.id, *w) {
                 Ok(()) => return true,
                 Err(message) => error(message),
             },
         };
         self.respond(req.id, kind).await
+    }
+
+    /// Starts waiting for the user's approval of an agent's spawn (see
+    /// [`approval`]); it is answered once decided.
+    async fn ask_approval(&mut self, req: Request, timeout_secs: u32) -> bool {
+        let id = req.id;
+        let asked = approval::ask(
+            &self.node,
+            self.caller,
+            req,
+            timeout_secs,
+            self.outbox.clone(),
+            self.approved_tx.clone(),
+        )
+        .await;
+        match asked {
+            Ok(task) => {
+                self.approvals.retain(|t| !t.is_finished());
+                self.approvals.push(task);
+                true
+            }
+            Err(message) => self.respond(id, error(message)).await,
+        }
     }
 
     /// Starts a `Wait` on its own task (see [`wait`]); it answers when it
@@ -1358,6 +1421,9 @@ mod tests {
             caller: Caller::User,
             scope: scope::Scope::user(),
             waits: Vec::new(),
+            approvals: Vec::new(),
+            approved_tx: mpsc::unbounded_channel().0,
+            approved: HashSet::new(),
         };
         (server, conn, rx)
     }

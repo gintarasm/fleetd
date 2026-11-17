@@ -38,6 +38,15 @@ pub(super) const QUESTION_DDL: &str = "ALTER TABLE messages ADD COLUMN choices T
 
 const MESSAGE_COLUMNS: &str = "SELECT id, recipient, sender, kind, body, status, exit_code, created_ms, choices FROM messages";
 
+/// A message without its body: who wrote to whom (ADR 0089).
+pub struct EdgeRow {
+    pub id: u64,
+    pub sender: u64,
+    pub recipient: u64,
+    pub kind: MessageKind,
+    pub created_ms: i64,
+}
+
 fn id_param(id: Option<u64>) -> Option<i64> {
     id.map(|id| id as i64)
 }
@@ -128,6 +137,30 @@ impl Store {
             "{MESSAGE_COLUMNS} WHERE recipient IS ?1 AND id > ?2 ORDER BY id LIMIT ?3"
         ))?;
         let rows = stmt.query_map((id_param(mailbox), after as i64, limit as i64), decode)?;
+        rows.collect()
+    }
+
+    /// Who wrote to whom: the newest `limit` messages of kind `message`,
+    /// `question` or `answer` with an agent as sender and as recipient,
+    /// created at or after `since_ms`, oldest first. No bodies (ADR 0089).
+    pub fn message_edges(&self, since_ms: i64, limit: usize) -> rusqlite::Result<Vec<EdgeRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, sender, recipient, kind, created_ms FROM (
+                 SELECT id, sender, recipient, kind, created_ms FROM messages
+                 WHERE sender IS NOT NULL AND recipient IS NOT NULL
+                   AND kind IN ('message','question','answer') AND created_ms >= ?1
+                 ORDER BY id DESC LIMIT ?2) ORDER BY id",
+        )?;
+        let rows = stmt.query_map((since_ms, limit as i64), |r| {
+            let kind: String = r.get(3)?;
+            Ok(EdgeRow {
+                id: r.get::<_, i64>(0)? as u64,
+                sender: r.get::<_, i64>(1)? as u64,
+                recipient: r.get::<_, i64>(2)? as u64,
+                kind: MessageKind::parse(&kind).unwrap_or(MessageKind::Message),
+                created_ms: r.get(4)?,
+            })
+        })?;
         rows.collect()
     }
 

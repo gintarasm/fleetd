@@ -147,3 +147,85 @@ pub fn run(args: SkillArgs) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SKILL;
+    use clap::{Command, CommandFactory};
+
+    fn find_long(cmd: &Command, long: &str) -> bool {
+        cmd.get_arguments().any(|a| a.get_long() == Some(long))
+    }
+
+    /// Every `fleet …` command in a fenced block names a real subcommand and
+    /// real flags, so the skill cannot drift from the CLI. (Commands still in
+    /// flight on another branch are written inline, outside fences.)
+    #[test]
+    fn fenced_commands_exist() {
+        let root = crate::Cli::command();
+        let mut fenced = false;
+        let mut checked = 0;
+        for line in SKILL.lines() {
+            if line.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            let Some(at) = line.find("fleet ").filter(|_| fenced) else {
+                continue;
+            };
+            let mut cmd = &root;
+            let mut words = line[at + 6..].split_whitespace().peekable();
+            let Some(first) = words.next() else { continue };
+            cmd = cmd
+                .find_subcommand(first)
+                .unwrap_or_else(|| panic!("`fleet {first}` is not a command: {line}"));
+            if let Some(next) = words.peek()
+                && let Some(sub) = cmd.find_subcommand(next)
+            {
+                cmd = sub;
+            }
+            for w in words {
+                if w == "--" {
+                    break;
+                }
+                if let Some(long) = w.strip_prefix("--") {
+                    let long = long.split('=').next().unwrap_or(long);
+                    assert!(
+                        find_long(cmd, long) || find_long(&root, long),
+                        "`fleet {first}` has no --{long}: {line}"
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked >= 15, "only {checked} commands checked");
+    }
+
+    #[test]
+    fn covers_the_m3_coordination_contract() {
+        for needle in [
+            "fleet report",
+            "fleet wait",
+            "fleet message",
+            "fleet inbox",
+            "fleet lease",
+            "fleet tree",
+            "fleet send",
+            "fallback",
+            "descendants",
+            "forbidden",
+            "**`answer`**",
+            "~/.fleet/fleetd.sock",
+            "Bash(fleet:*)",
+            "--question",
+            "--choice",
+        ] {
+            assert!(SKILL.contains(needle), "skill does not mention {needle}");
+        }
+        // The exit-code table: 0, 1, 2 and 3.
+        for code in ["| 0 |", "| 1 |", "| 2 |", "| 3 |"] {
+            assert!(SKILL.contains(code), "no {code} row");
+        }
+        assert!(SKILL.starts_with("---\nname: fleet\n"));
+    }
+}
