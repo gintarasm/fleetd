@@ -88,6 +88,11 @@ fn info() -> AgentInfo {
             state: ReportedState::ReportedWaiting.into(),
             message: "need a review".into(),
             at_unix_ms: 3,
+            question: Some(fleet_proto::Question {
+                id: 5,
+                text: "Which branch?".into(),
+                choices: vec!["main".into(), "dev".into()],
+            }),
         }),
         git: Some(fleet_proto::GitInfo {
             repo: "fleetd".into(),
@@ -180,17 +185,17 @@ fn roundtrip_every_kind() {
             exited_only: false,
             selector: labels(),
         })),
-        request::Kind::Report(ReportStatus {
+        request::Kind::Report(Box::new(ReportStatus {
             state: ReportedState::ReportedDone.into(),
             message: "tests green".into(),
             ..Default::default()
-        }),
-        request::Kind::Report(ReportStatus {
+        })),
+        request::Kind::Report(Box::new(ReportStatus {
             state: ReportedState::ReportedWaiting.into(),
             message: "stuck".into(),
             question: Some("Which branch?".into()),
             choices: vec!["main".into(), "dev".into()],
-        }),
+        })),
         request::Kind::Answer(AnswerQuestion {
             agent_id: 3,
             text: "dev".into(),
@@ -224,6 +229,7 @@ fn roundtrip_every_kind() {
         sender_name: "worker".into(),
         status: String::new(),
         exit_code: Some(2),
+        choices: vec!["a".into()],
     };
     let responses = [
         response::Kind::Spawned(Box::new(info())),
@@ -272,14 +278,15 @@ fn roundtrip_every_kind() {
         })),
     ];
     let events = [
-        event::Kind::Reported(AgentReported {
+        event::Kind::Reported(Box::new(AgentReported {
             agent_id: 1,
             reported: Some(Reported {
                 state: ReportedState::ReportedError.into(),
                 message: "build broke".into(),
                 at_unix_ms: 9,
+                question: None,
             }),
-        }),
+        })),
         event::Kind::Exited(AgentExited {
             agent_id: 1,
             exit_code: -9,

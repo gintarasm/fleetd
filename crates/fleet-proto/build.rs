@@ -15,6 +15,8 @@ fn main() {
         .boxed(".fleet.v1.Response.kind.lease_granted")
         .boxed(".fleet.v1.Request.kind.send_message")
         .boxed(".fleet.v1.Request.kind.wait")
+        .boxed(".fleet.v1.Request.kind.report")
+        .boxed(".fleet.v1.Event.kind.reported")
         .boxed(".fleet.v1.Response.kind.spawned")
         .boxed(".fleet.v1.Response.kind.attached")
         .boxed(".fleet.v1.Response.kind.spawned_attached")

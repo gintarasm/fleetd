@@ -253,7 +253,7 @@ pub(crate) async fn forward_reported(
                     continue;
                 }
                 let frame = Frame::Event(Event {
-                    kind: Some(event::Kind::Reported(ev)),
+                    kind: Some(event::Kind::Reported(Box::new(ev))),
                 });
                 if outbox.send(frame).await.is_err() {
                     return;

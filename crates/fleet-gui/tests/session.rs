@@ -278,11 +278,11 @@ fn sidebar_follows_an_agents_report() {
         s.agents().iter().any(|r| r.info.id == id)
     });
     agent
-        .call(request::Kind::Report(fleet_proto::ReportStatus {
+        .call(request::Kind::Report(Box::new(fleet_proto::ReportStatus {
             state: fleet_proto::ReportedState::ReportedWaiting.into(),
             message: "need a review".into(),
             ..Default::default()
-        }))
+        })))
         .expect("report");
     wait_until("the report in the row", || {
         s.agents()
@@ -327,12 +327,12 @@ fn a_question_reaches_the_row_and_the_answer_closes_it() {
         s.agents().iter().any(|r| r.info.id == id)
     });
     agent
-        .call(request::Kind::Report(fleet_proto::ReportStatus {
+        .call(request::Kind::Report(Box::new(fleet_proto::ReportStatus {
             state: fleet_proto::ReportedState::ReportedWaiting.into(),
             message: "stuck".into(),
             question: Some("Which branch?".into()),
             choices: vec!["main".into(), "dev".into()],
-        }))
+        })))
         .expect("ask");
     let open = || {
         s.agents()

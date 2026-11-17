@@ -63,7 +63,7 @@ pub fn run(client: &mut Connection, args: &Args) -> Result<u8> {
         question: args.question.clone(),
         choices: args.choices.clone(),
     };
-    match client.call(request::Kind::Report(report)) {
+    match client.call(request::Kind::Report(Box::new(report))) {
         Ok(_) => Ok(0),
         // Exit 3, from `main`.
         Err(e) if e.is_forbidden() => Err(e),

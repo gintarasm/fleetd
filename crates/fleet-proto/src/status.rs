@@ -283,6 +283,7 @@ mod tests {
             state: ReportedState::ReportedWaiting.into(),
             message: "m".into(),
             at_unix_ms: 5,
+            question: None,
         };
         let mut i = info(AgentState::Running, None);
         assert_eq!(live_report(&i), None);

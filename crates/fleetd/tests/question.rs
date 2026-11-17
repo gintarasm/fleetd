@@ -92,12 +92,12 @@ fn spawn_with_token(c: &mut Connection, dir: &Path, name: &str) -> (u64, String)
 }
 
 fn ask(question: &str) -> request::Kind {
-    request::Kind::Report(ReportStatus {
+    request::Kind::Report(Box::new(ReportStatus {
         state: ReportedState::ReportedWaiting.into(),
         message: "stuck".into(),
         question: Some(question.into()),
         choices: vec!["main".into(), "dev".into()],
-    })
+    }))
 }
 
 fn open_question(
@@ -110,7 +110,7 @@ fn open_question(
         if let Frame::Event(e) = f
             && let Some(event::Kind::Reported(r)) = e.kind
         {
-            out.push(r);
+            out.push(*r);
         }
     }
     out

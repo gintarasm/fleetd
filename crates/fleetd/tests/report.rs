@@ -91,11 +91,11 @@ fn spawn_with_token(c: &mut Connection, dir: &Path, name: &str) -> (u64, String)
 }
 
 fn report(state: ReportedState, message: &str) -> request::Kind {
-    request::Kind::Report(ReportStatus {
+    request::Kind::Report(Box::new(ReportStatus {
         state: state.into(),
         message: message.into(),
         ..Default::default()
-    })
+    }))
 }
 
 /// The `AgentReported` events in `rx` within `wait`.
@@ -109,7 +109,7 @@ fn reports(
         if let Frame::Event(e) = f
             && let Some(event::Kind::Reported(r)) = e.kind
         {
-            out.push(r);
+            out.push(*r);
         }
     }
     out
