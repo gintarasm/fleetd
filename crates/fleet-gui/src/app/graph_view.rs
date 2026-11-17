@@ -39,6 +39,7 @@ use crate::core::graph_layout::{
 };
 use crate::core::icons::Icon;
 use crate::core::layout::Rect;
+use crate::core::message_lines;
 use crate::core::session::AgentRow;
 use crate::core::sidebar::ended;
 use crate::core::style::{chrome, radius, space, text};
@@ -625,6 +626,15 @@ impl Render for GraphView {
                 live_edges.push(pts);
             }
         }
+        // Message lines (ADR 0089): the recent ones between cards the layout
+        // has, culled to the view, one path per fade step.
+        let mut msg_lines: [Vec<[(f32, f32); 2]>; message_lines::STEPS] = Default::default();
+        for line in message_lines::lines(&layout, &app.message_edges, now, &view) {
+            for seg in line.segments {
+                msg_lines[line.step].push(seg.map(|p| vp.to_screen(p)));
+            }
+        }
+        let msg_colour = theme.accent;
         let area = self.area.clone();
         let (box_fill, box_border, edge, edge_ended) = (
             theme.hover.opacity(0.35),
@@ -673,6 +683,21 @@ impl Render for GraphView {
                     }
                     if let Ok(path) = path.build() {
                         window.paint_path(path, colour);
+                    }
+                }
+                // Oldest (faintest) first, so fresh lines lie on top.
+                for (step, segs) in msg_lines.iter().enumerate().rev() {
+                    if segs.is_empty() {
+                        continue;
+                    }
+                    let mut path = PathBuilder::stroke(px((1.25 * z).max(1.0)));
+                    for seg in segs {
+                        path.move_to(to_px(o, seg[0]));
+                        path.line_to(to_px(o, seg[1]));
+                    }
+                    if let Ok(path) = path.build() {
+                        window
+                            .paint_path(path, msg_colour.opacity(message_lines::opacity_of(step)));
                     }
                 }
             },

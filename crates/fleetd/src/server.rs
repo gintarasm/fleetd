@@ -696,6 +696,13 @@ impl Connection {
             }
             Some(request::Kind::ListPendingSpawns(_)) => approval::list(&self.node),
             Some(request::Kind::DecideSpawn(d)) => approval::decide(&self.node, &d),
+            Some(request::Kind::ListMessageEdges(r)) => {
+                let (since, max) = (r.since_unix_ms, r.max as usize);
+                match blocking(&self.node, move |n| n.message_edges(since, max)).await {
+                    Ok(edges) => response::Kind::MessageEdges(edges),
+                    Err(e) => error(e.to_string()),
+                }
+            }
             Some(request::Kind::Wait(w)) => match self.start_wait(req.id, *w) {
                 Ok(()) => return true,
                 Err(message) => error(message),

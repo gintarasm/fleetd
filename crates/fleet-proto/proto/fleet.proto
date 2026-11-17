@@ -73,6 +73,8 @@ message Request {
     // Spawn approval (ADR 0079): the user's only.
     ListPendingSpawns list_pending_spawns = 75;
     DecideSpawn decide_spawn = 76;
+    // Message lines in the GUI's graph (ADR 0089): 85-89. The user only.
+    ListMessageEdges list_message_edges = 85;
   }
 }
 
@@ -98,6 +100,7 @@ message Response {
     WaitResult wait_result = 57;
     // Spawn approval (ADR 0079).
     PendingSpawns pending_spawns = 75;
+    MessageEdges message_edges = 85;
   }
 }
 
@@ -394,6 +397,20 @@ message MessagesSent { repeated uint64 agent_ids = 1; bool user = 2; }
 // The caller's mailbox after cursor `since` (unset: after its read mark,
 // the newest message read so far), at most `max` messages (0 or above
 // 1000: 1000). What it returns is marked read.
+// Who wrote to whom, without what (ADR 0089): the newest agent-to-agent
+// `message`, `question` and `answer` messages created at or after
+// `since_unix_ms`, at most `max` (0 or above 500: 500). Only the user may
+// ask: it reads every mailbox. Answered by `MessageEdges`, oldest first.
+message ListMessageEdges { int64 since_unix_ms = 1; uint32 max = 2; }
+message MessageEdge {
+  uint64 id = 1;
+  uint64 sender = 2;
+  uint64 recipient = 3;
+  MessageKind kind = 4;
+  int64 created_unix_ms = 5;
+}
+message MessageEdges { repeated MessageEdge edges = 1; }
+
 message ReadInbox { optional uint64 since = 1; uint32 max = 2; }
 // `cursor`: the newest id returned (else the cursor asked from).
 message Inbox { repeated Message messages = 1; uint64 cursor = 2; }

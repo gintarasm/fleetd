@@ -93,6 +93,13 @@ pub trait SessionApi: InputSink {
     fn send_input(&self, _agent_id: u64, _data: Vec<u8>) {}
     /// Forgets every exited or lost agent on the target.
     fn clear_exited(&self);
+    /// The graph is shown or hidden: message lines are polled while shown
+    /// (ADR 0089).
+    fn watch_message_edges(&self, _on: bool) {}
+    /// Who wrote to whom lately, oldest first.
+    fn message_edges(&self) -> Vec<crate::core::message_lines::Edge> {
+        Vec::new()
+    }
     /// Restarts fleetd into its binary on disk, agents kept; the outcome
     /// arrives as a `UiEvent`.
     fn restart_daemon(&self) {}
@@ -187,6 +194,14 @@ impl SessionApi for Session {
 
     fn clear_exited(&self) {
         Session::clear_exited(self);
+    }
+
+    fn watch_message_edges(&self, on: bool) {
+        Session::watch_message_edges(self, on);
+    }
+
+    fn message_edges(&self) -> Vec<crate::core::message_lines::Edge> {
+        Session::message_edges(self)
     }
 
     fn restart_daemon(&self) {
@@ -338,6 +353,8 @@ pub struct AppState {
     pub(super) titles: HashMap<u64, String>,
     pub(super) theme: Theme,
     pub(super) agents: Vec<AgentRow>,
+    /// Who wrote to whom lately: the graph's message lines (ADR 0089).
+    pub(super) message_edges: Vec<crate::core::message_lines::Edge>,
     /// Each non-shell agent's status (ADR 0042), as of the last
     /// [`AppState::refresh_status`].
     pub(super) statuses: HashMap<u64, AgentStatus>,
@@ -421,6 +438,7 @@ impl AppState {
         let events = follow(ui, cx);
         let mut s = AppState {
             agents: session.agents(),
+            message_edges: Vec::new(),
             session,
             live: true,
             session_epoch: 0,
@@ -696,6 +714,14 @@ impl AppState {
         self.panes.insert(pane, view);
     }
 
+    /// Asks the session for message lines (the graph is shown) or stops.
+    pub(super) fn watch_message_edges(&mut self, on: bool) {
+        self.session.watch_message_edges(on);
+        if !on {
+            self.message_edges.clear();
+        }
+    }
+
     fn apply_events(&mut self, batch: Vec<UiEvent>, cx: &mut Context<Self>) {
         let mut status = false;
         let mut chrome = false;
@@ -740,6 +766,10 @@ impl AppState {
                         chrome = true;
                         cx.notify();
                     }
+                }
+                UiEvent::MessageEdgesChanged => {
+                    self.message_edges = self.session.message_edges();
+                    cx.notify();
                 }
                 UiEvent::PaneChanged(pane) => {
                     let Some(view) = self.panes.get(&pane).cloned() else {

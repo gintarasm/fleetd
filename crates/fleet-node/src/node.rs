@@ -64,6 +64,7 @@ use crate::pty::{AgentId, AgentInput, CommandSpec, OutputSink, PtyHost};
 use crate::scope::{self, Caller, Member, Quotas, Tree};
 
 mod mailbox;
+mod waiting;
 pub use self::mailbox::{
     INBOX_PAGE_MAX, WaitSpec, mailbox_of, message_proto, wait_state_from_proto, wait_state_proto,
 };
@@ -604,6 +605,15 @@ struct State {
 }
 
 impl State {
+    /// The last non-blank visible row, trimmed to [`ACTIVITY_LINE_CHARS`].
+    fn last_line(&self) -> String {
+        let mut line = self.term.last_nonblank_line().unwrap_or_default();
+        if let Some((cut, _)) = line.char_indices().nth(ACTIVITY_LINE_CHARS) {
+            line.truncate(cut);
+        }
+        line
+    }
+
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
@@ -882,15 +892,27 @@ impl AgentPipeline {
         if !std::mem::take(&mut state.activity_dirty) || state.exit_code.is_some() || !sinks.any() {
             return;
         }
-        let mut last_line = state.term.last_nonblank_line().unwrap_or_default();
-        if let Some((cut, _)) = last_line.char_indices().nth(ACTIVITY_LINE_CHARS) {
-            last_line.truncate(cut);
-        }
         sinks.publish(AgentActivity {
             agent_id,
-            last_line,
+            last_line: state.last_line(),
             last_output_unix_ms: state.last_output_unix_ms,
         });
+    }
+
+    /// The agent's last non-blank visible row and when output last arrived
+    /// (Unix ms; 0: none yet). `None` after exit. For the inferred-status
+    /// sweep (ADR 0088): a read under the pipeline lock, nothing is kept.
+    pub fn activity(&self) -> Option<(String, i64)> {
+        let state = self.lock();
+        state
+            .exit_code
+            .is_none()
+            .then(|| (state.last_line(), state.last_output_unix_ms))
+    }
+
+    /// When output last arrived (Unix ms; 0: none yet), without the row.
+    pub fn last_output_unix_ms(&self) -> i64 {
+        self.lock().last_output_unix_ms
     }
 
     /// A page of the agent's history (see [`History::read_page`]); `None` if
@@ -1681,12 +1703,15 @@ pub struct Node {
     git: GitCache,
     /// Agents' spawns waiting for the user (ADR 0079).
     approvals: Approvals,
+    /// The inferred-`waiting` sweep (ADR 0088).
+    sweeper: Arc<waiting::Sweeper>,
 }
 
 impl Drop for Node {
-    /// Stops the activity ticker.
+    /// Stops the activity ticker and the waiting sweep.
     fn drop(&mut self) {
         self.activity.stop();
+        self.sweeper.stop();
     }
 }
 
@@ -1875,10 +1900,11 @@ impl Node {
         let activity = Arc::new(ActivityHub::new());
         let store = Arc::new(Mutex::new(store));
         let leases = Leases::load(Arc::clone(&store), now_ms(), load_average)?;
+        let agents = Arc::new(Mutex::new(Agents::default()));
         Ok(Node {
             host: Arc::new(PtyHost::new()),
-            store,
-            agents: Arc::new(Mutex::new(Agents::default())),
+            store: Arc::clone(&store),
+            agents: Arc::clone(&agents),
             exits,
             removed,
             scrollback_dir,
@@ -1896,9 +1922,14 @@ impl Node {
             refused,
             reported,
             leases,
-            notices,
             git: GitCache::default(),
             approvals: Approvals::new(),
+            sweeper: Arc::new(waiting::Sweeper::new(
+                Arc::clone(&agents),
+                Arc::clone(&store),
+                notices.clone(),
+            )),
+            notices,
         })
     }
 
@@ -2522,6 +2553,7 @@ impl Node {
             }
             agents.register(&*self.host, id, live)
         };
+        self.sweeper.kick();
         let mut histories = lock(&self.histories);
         histories.spawning.remove(&id);
         if let Some(evicted) = evicted {
@@ -3180,6 +3212,7 @@ impl Node {
         };
         let host_id = self.host.adopt(spec, Box::new(self.sink(id, &pipeline)))?;
         let evicted = lock(&self.agents).register(&*self.host, id, LiveAgent { host_id, pipeline });
+        self.sweeper.kick();
         if let Some(evicted) = evicted {
             lock(&self.histories).delete(evicted, "beyond retention");
         }

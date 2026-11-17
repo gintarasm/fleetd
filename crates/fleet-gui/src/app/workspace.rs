@@ -416,12 +416,22 @@ impl Workspace {
             return;
         }
         self.graph_shown = !self.graph_shown;
+        self.watch_message_lines(cx);
         if self.graph_shown {
             self.graph.0.read(cx).focus(window);
         } else {
             self.focus_current(window, cx);
         }
         cx.notify();
+    }
+
+    /// The session asks for message edges only while the graph is shown.
+    fn watch_message_lines(&self, cx: &mut Context<Self>) {
+        let shown = self.graph_shown;
+        self.app.update(cx, |a, cx| {
+            a.watch_message_edges(shown);
+            cx.notify();
+        });
     }
 
     fn graph_event(
@@ -435,6 +445,7 @@ impl Workspace {
             return;
         }
         self.graph_shown = false;
+        self.watch_message_lines(cx);
         if let GraphEvent::Open(id) = *event {
             self.app.update(cx, |a, cx| a.reveal_agent(id, cx));
         }
