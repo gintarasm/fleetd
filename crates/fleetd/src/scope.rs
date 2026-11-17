@@ -210,6 +210,8 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
             return Some(forbidden("agents cannot read fleetd's log"));
         }
         Kind::RestartDaemon(_) => return Some(forbidden("agents cannot restart fleetd")),
+        // Reads every mailbox's senders and recipients: the GUI's (ADR 0089).
+        Kind::ListMessageEdges(_) => return Some(forbidden("agents cannot read every mailbox")),
         Kind::Attach(r) => vec![r.agent_id],
         Kind::Input(r) => vec![r.agent_id],
         Kind::Resize(r) => vec![r.agent_id],

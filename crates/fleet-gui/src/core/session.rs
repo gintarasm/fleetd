@@ -19,13 +19,14 @@ use fleet_client::{
 };
 use fleet_proto::{
     AgentInfo, AgentState, BinaryIdentity, ForgetAgents, Frame, HelloOk, KillAgent, ListAgents,
-    Response, RestartAgent, RestartDaemon, SendInput, SetLabels, SpawnAgent, event, request,
-    response,
+    ListMessageEdges, Response, RestartAgent, RestartDaemon, SendInput, SetLabels, SpawnAgent,
+    event, request, response,
 };
 use fleet_term::Palette;
 
 use super::backoff::Backoff;
 use super::launch::{find_tool, update_available};
+use super::message_lines::{self, Edge as MessageEdge};
 use super::pane::PaneModel;
 use super::pane_link::PaneLink;
 use super::spawn::SpawnRequest;
@@ -117,6 +118,8 @@ impl DaemonState {
 
 /// Sidebar re-list interval.
 const RELIST: Duration = Duration::from_secs(5);
+/// How often the shown graph asks who wrote to whom.
+const EDGES_POLL: Duration = Duration::from_secs(2);
 /// How long [`Session::shutdown`] waits for panes to detach before closing
 /// their connections outright (gpui's quit budget is 100 ms).
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(60);
@@ -126,6 +129,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(60);
 pub enum UiEvent {
     /// The sidebar rows changed; read [`Session::agents`].
     AgentsChanged,
+    /// The message lines changed; read [`Session::message_edges`] (ADR 0089).
+    MessageEdgesChanged,
     /// `agent_id` was forgotten, or restarted as `replaced_by`: panes and
     /// saved layouts showing it follow. Sent for the control connection's
     /// copy of `AgentRemoved` only.
@@ -350,6 +355,9 @@ struct Sidebar {
     listed: bool,
     /// How many `ListAgents` replies arrived.
     lists: u64,
+    /// The latest `MessageEdges` reply (only asked for while the graph is
+    /// shown).
+    edges: Vec<MessageEdge>,
 }
 
 impl Sidebar {
@@ -392,6 +400,8 @@ enum ControlCmd {
     Connected(Sender),
     Disconnected,
     List,
+    /// Start or stop asking for message edges (the graph is shown or not).
+    MessageEdges(bool),
     Kill(u64),
     Restart(u64),
     Forget(Vec<u64>),
@@ -767,6 +777,20 @@ impl Session {
             .or_else(|| find_tool("fleetd"))
     }
 
+    /// The graph is shown (`true`) or hidden: while shown, who wrote to whom
+    /// is asked for every [`EDGES_POLL`] (ADR 0089).
+    pub fn watch_message_edges(&self, on: bool) {
+        if !on {
+            lock(&self.inner.sidebar).edges.clear();
+        }
+        self.control(ControlCmd::MessageEdges(on));
+    }
+
+    /// The latest message edges, oldest first (empty unless watching).
+    pub fn message_edges(&self) -> Vec<MessageEdge> {
+        lock(&self.inner.sidebar).edges.clone()
+    }
+
     /// Forgets every exited or lost agent on the target.
     pub fn clear_exited(&self) {
         self.control(ControlCmd::ClearExited);
@@ -1005,6 +1029,7 @@ impl ControlReader {
     fn apply(&self, batch: Vec<Frame>) {
         let mut changed = false;
         let mut relist = false;
+        let mut edges_changed = false;
         {
             let mut sb = lock(&self.sidebar);
             for frame in batch {
@@ -1022,6 +1047,25 @@ impl ControlReader {
                     }) => {
                         sb.set_list(list.agents, list.replaced, Instant::now());
                         changed = true;
+                    }
+                    Frame::Response(Response {
+                        kind: Some(response::Kind::MessageEdges(list)),
+                        ..
+                    }) => {
+                        let edges: Vec<MessageEdge> = list
+                            .edges
+                            .iter()
+                            .map(|e| MessageEdge {
+                                id: e.id,
+                                from: e.sender,
+                                to: e.recipient,
+                                at_ms: e.created_unix_ms,
+                            })
+                            .collect();
+                        if sb.edges != edges {
+                            sb.edges = edges;
+                            edges_changed = true;
+                        }
                     }
                     Frame::Response(Response {
                         kind: Some(response::Kind::RestartingDaemon(r)),
@@ -1127,6 +1171,9 @@ impl ControlReader {
         if changed {
             self.ctx.notify(UiEvent::AgentsChanged);
         }
+        if edges_changed {
+            self.ctx.notify(UiEvent::MessageEdgesChanged);
+        }
     }
 }
 
@@ -1148,6 +1195,14 @@ fn control_writer(
         }
         None => ctx.notify(UiEvent::Error("not connected to fleetd".into())),
     };
+    // For polls: with no connection there is nobody to tell.
+    let send_quiet = |sender: &mut Option<Sender>, req: request::Kind| {
+        if let Some(s) = sender
+            && s.send(req).is_err()
+        {
+            *sender = None;
+        }
+    };
     // A restart or forget is recorded before it is sent, so its reply finds
     // the verb.
     let send_tracked = |sender: &mut Option<Sender>, verb: &'static str, req: request::Kind| {
@@ -1157,8 +1212,11 @@ fn control_writer(
         send(sender, req);
     };
     let mut next_list = Instant::now() + RELIST;
+    // Some(next poll) while the graph is shown.
+    let mut next_edges: Option<Instant> = None;
     loop {
-        let cmd = match rx.recv_timeout(next_list.saturating_duration_since(Instant::now())) {
+        let wake = next_edges.map_or(next_list, |e| e.min(next_list));
+        let cmd = match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
             Ok(cmd) => Some(cmd),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
@@ -1172,8 +1230,25 @@ fn control_writer(
                 }
             }
         };
+        // Poll before anything else, so a busy control channel cannot starve
+        // the lines.
+        if let Some(at) = next_edges
+            && Instant::now() >= at
+        {
+            next_edges = Some(Instant::now() + EDGES_POLL);
+            let since = unix_ms_now() - message_lines::WINDOW_MS;
+            let req = ListMessageEdges {
+                since_unix_ms: since,
+                max: 0,
+            };
+            send_quiet(&mut sender, request::Kind::ListMessageEdges(req));
+        }
         match cmd {
+            None if Instant::now() < next_list => {}
             None | Some(ControlCmd::List) => list(&mut sender, &mut next_list),
+            Some(ControlCmd::MessageEdges(on)) => {
+                next_edges = on.then(Instant::now);
+            }
             Some(ControlCmd::Connected(s)) => {
                 lock(pending).clear();
                 sender = Some(s);
