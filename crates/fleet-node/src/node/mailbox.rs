@@ -12,7 +12,8 @@ use fleet_proto::{AgentInfo, Broadcast, MessagesSent, SendMessage};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use super::{Node, invalid, labels_match, lock, store_err};
+use super::{Node, agent_info, invalid, labels_match, lock, store_err, waiting};
+use crate::lease::now_ms;
 use crate::mailbox::{
     MAX_BODY, Mailbox, Message, MessageKind, NewMessage, Notice, Status, WaitMatch, WaitState,
 };
@@ -292,48 +293,7 @@ impl Node {
         message: &str,
         inferred: bool,
     ) -> io::Result<bool> {
-        let body = match (inferred, message.is_empty()) {
-            (true, true) => format!("{} (inferred)", status.as_str()),
-            (true, false) => format!("{message} (inferred)"),
-            (false, _) => message.to_owned(),
-        };
-        let posted = {
-            let db = lock(&self.store);
-            let last = db.latest_status_message(agent).map_err(store_err)?;
-            if last
-                .as_ref()
-                .is_some_and(|m| m.status.as_deref() == Some(status.as_str()) && m.body == body)
-            {
-                return Ok(false);
-            }
-            db.post_report(agent, |to| NewMessage {
-                recipient: to,
-                sender: Some(agent),
-                kind: MessageKind::Status,
-                body,
-                status: Some(status.as_str().into()),
-                exit_code: None,
-            })
-            .map_err(store_err)?
-        };
-        let Some((recipient, _)) = posted else {
-            return Ok(false);
-        };
-        let _ = self.notices.send(Notice::Message { recipient });
-        if let Some(state) = WaitState::of_status(status) {
-            let _ = self.notices.send(Notice::State { agent, state });
-        }
-        Ok(true)
-    }
-
-    /// Whether `agent` is inferred to be waiting (spec §2: no output for
-    /// 30 s at a prompt-like last line).
-    ///
-    /// The seam for M3-D's shared heuristic: until it lands nothing is
-    /// inferred, and `fleet wait --state waiting` matches reported
-    /// `waiting` only.
-    fn inferred_waiting(&self, _agent: u64) -> bool {
-        false
+        post_status(&self.store, &self.notices, agent, status, message, inferred)
     }
 
     /// What a wait by `caller` matches now: unread reports and messages in
@@ -347,6 +307,21 @@ impl Node {
         spec: &WaitSpec,
         notice: Option<&Notice>,
     ) -> io::Result<Vec<WaitMatch>> {
+        self.wait_check_at(caller, spec, notice, now_ms())
+    }
+
+    /// [`Node::wait_check`] as of `now_ms` (Unix ms), for the inferred
+    /// `waiting` of a named target (ADR 0088: the same data and rule as the
+    /// sweep).
+    pub fn wait_check_at(
+        &self,
+        caller: Caller,
+        spec: &WaitSpec,
+        notice: Option<&Notice>,
+        now_ms: i64,
+    ) -> io::Result<Vec<WaitMatch>> {
+        // Before the store lock: the agents lock is never taken inside it.
+        let activity = self.live_activity(spec.targets.iter().flatten().copied());
         let mut found: Vec<WaitMatch> = Vec::new();
         let mailbox = mailbox_of(caller);
         let wanted = |s: WaitState| spec.states.contains(&s);
@@ -392,7 +367,10 @@ impl Node {
                 {
                     now.push(state);
                 }
-                if rec.state == AgentState::Running && self.inferred_waiting(id) {
+                if rec.state == AgentState::Running
+                    && let Some((line, at)) = activity.get(&id)
+                    && waiting::is_waiting(&agent_info(rec.clone()), line, *at, now_ms)
+                {
                     now.push(WaitState::Waiting);
                 }
                 for state in now.into_iter().filter(|s| wanted(*s)) {
@@ -440,6 +418,50 @@ impl Node {
         agents.sort_by_key(|a| a.id);
         Ok(agents)
     }
+}
+
+/// [`Node::status_changed`]'s work, on the node's parts so the waiting
+/// sweep's thread can do it too (ADR 0088).
+pub(super) fn post_status(
+    store: &Mutex<Store>,
+    notices: &broadcast::Sender<Notice>,
+    agent: u64,
+    status: Status,
+    message: &str,
+    inferred: bool,
+) -> io::Result<bool> {
+    let body = match (inferred, message.is_empty()) {
+        (true, true) => format!("{} (inferred)", status.as_str()),
+        (true, false) => format!("{message} (inferred)"),
+        (false, _) => message.to_owned(),
+    };
+    let posted = {
+        let db = lock(store);
+        let last = db.latest_status_message(agent).map_err(store_err)?;
+        if last
+            .as_ref()
+            .is_some_and(|m| m.status.as_deref() == Some(status.as_str()) && m.body == body)
+        {
+            return Ok(false);
+        }
+        db.post_report(agent, |to| NewMessage {
+            recipient: to,
+            sender: Some(agent),
+            kind: MessageKind::Status,
+            body,
+            status: Some(status.as_str().into()),
+            exit_code: None,
+        })
+        .map_err(store_err)?
+    };
+    let Some((recipient, _)) = posted else {
+        return Ok(false);
+    };
+    let _ = notices.send(Notice::Message { recipient });
+    if let Some(state) = WaitState::of_status(status) {
+        let _ = notices.send(Notice::State { agent, state });
+    }
+    Ok(true)
 }
 
 /// `agent`'s `name` label (empty: none, or it is gone).
