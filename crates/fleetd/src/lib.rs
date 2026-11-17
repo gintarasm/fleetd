@@ -1,6 +1,7 @@
 //! fleetd: the single-instance node daemon, serving the fleet protocol on a
 //! unix socket in the state dir.
 
+mod approval;
 pub mod handoff;
 pub mod logging;
 mod restart;

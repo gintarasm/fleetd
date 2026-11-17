@@ -178,6 +178,12 @@ impl Scope {
         }
     }
 
+    /// Whether the connection hears of spawns waiting for approval: the
+    /// user's only, since only the user approves (ADR 0079).
+    pub(crate) fn sees_spawn_approvals(&self) -> bool {
+        self.0.is_none()
+    }
+
     /// Whether a refused spawn of `parent`'s is the connection's business:
     /// its own, or a descendant's.
     async fn sees_refusal(&self, parent: u64) -> bool {
@@ -210,6 +216,10 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
             return Some(forbidden("agents cannot read fleetd's log"));
         }
         Kind::RestartDaemon(_) => return Some(forbidden("agents cannot restart fleetd")),
+        // Only the user approves spawns (ADR 0079).
+        Kind::ListPendingSpawns(_) | Kind::DecideSpawn(_) => {
+            return Some(forbidden("only the user approves spawns"));
+        }
         // Reads every mailbox's senders and recipients: the GUI's (ADR 0089).
         Kind::ListMessageEdges(_) => return Some(forbidden("agents cannot read every mailbox")),
         Kind::Attach(r) => vec![r.agent_id],

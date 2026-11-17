@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 
 use fleet_client::names::name_of;
-use fleet_proto::AgentState;
+use fleet_proto::{AgentState, PendingSpawn};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Action, AppContext, Context, Div, Entity, ExternalPaths, FocusHandle, InteractiveElement,
@@ -20,13 +20,14 @@ use gpui::{
 };
 
 use super::agent_mark::{MARK_SLOT, agent_mark};
-use super::controls::{self, Tooltip};
+use super::controls::{self, ButtonKind, Tooltip};
 use super::keymap::{Kill, Remove, Restart};
 use super::status_dot::status_dot;
 use super::tail_text::{head_text, tail_text};
 use super::text_field::TextField;
 use super::theme::{Theme, Typography};
 use super::workspace::Workspace;
+use crate::core::approval::pending_text;
 use crate::core::git;
 use crate::core::icons::Icon;
 use crate::core::kill::{AgentButtons, agent_buttons};
@@ -84,6 +85,10 @@ pub struct SidebarData<'a> {
     pub focus: FocusHandle,
     /// The rows picked with ⌘-click and ⇧-click (ADR 0083).
     pub selected: &'a [u64],
+    /// Agents' spawns waiting for the user's approval (ADR 0079).
+    pub pending: &'a [PendingSpawn],
+    /// New children's highlight strength, 0 to 1 (ADR 0079).
+    pub fresh: &'a HashMap<u64, f32>,
 }
 
 /// A tab's title: the agent's name (ADR 0052), else its OSC title if a
@@ -133,6 +138,13 @@ pub fn render_sidebar(
         .text_color(theme.text)
         .type_style(text::BODY)
         .child(render_filter(&data, theme, cx))
+        .children(render_pending(
+            data.pending,
+            data.rows,
+            data.titles,
+            theme,
+            cx,
+        ))
         .child(
             div()
                 .id("tabs")
@@ -153,6 +165,127 @@ pub fn render_sidebar(
                 .children(empty)
                 .children(groups),
         )
+}
+
+/// Agents' spawns waiting for approval (ADR 0079): a card each, with who
+/// asks, the command, its folder and labels, and Deny / Approve. Above the
+/// agents, so a request is never scrolled out of sight.
+/// The graph view shows the same block over the graph.
+pub fn render_pending(
+    pending: &[PendingSpawn],
+    rows: &[AgentRow],
+    titles: &HashMap<u64, String>,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> Option<Div> {
+    if pending.is_empty() {
+        return None;
+    }
+    let cards: Vec<_> = pending
+        .iter()
+        .map(|p| {
+            let id = p.id;
+            let asker = rows
+                .iter()
+                .find(|r| r.info.id == p.parent)
+                .map(|r| tab_title(r, titles));
+            let t = pending_text(p, asker.as_deref());
+            let labels = (!t.labels.is_empty()).then(|| {
+                div()
+                    .type_style(text::CAPTION)
+                    .text_color(theme.tertiary)
+                    .truncate()
+                    .child(SharedString::from(t.labels.join("  ")))
+            });
+            div()
+                .id(("pending-spawn", id))
+                .debug_selector(move || format!("pending-spawn-{id}"))
+                .flex()
+                .flex_col()
+                .gap(px(space::XXS))
+                .p(px(space::SM))
+                .rounded(px(radius::MD))
+                .border_1()
+                .border_color(theme.accent.opacity(0.6))
+                .bg(theme.accent.opacity(0.08))
+                .child(
+                    div()
+                        .type_style(text::CAPTION)
+                        .text_color(theme.secondary)
+                        .child(SharedString::from(t.title)),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || format!("pending-spawn-{id}-command"))
+                        .type_style(text::SUBHEADLINE)
+                        .text_color(theme.text)
+                        .child(SharedString::from(t.command)),
+                )
+                .child(
+                    div()
+                        .type_style(text::CAPTION)
+                        .text_color(theme.tertiary)
+                        .child(tail_text(format!("in {}", t.cwd))),
+                )
+                .children(labels)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(space::XS))
+                        .pt(px(space::XXS))
+                        .child(
+                            controls::button(
+                                ("pending-deny", id),
+                                "Deny",
+                                theme,
+                                ButtonKind::Secondary,
+                                true,
+                            )
+                            .debug_selector(move || format!("pending-spawn-{id}-deny"))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.decide_spawn(id, false, cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            controls::button(
+                                ("pending-approve", id),
+                                "Approve",
+                                theme,
+                                ButtonKind::Primary,
+                                true,
+                            )
+                            .debug_selector(move || format!("pending-spawn-{id}-approve"))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.decide_spawn(id, true, cx);
+                                },
+                            )),
+                        ),
+                )
+        })
+        .collect();
+    Some(
+        div()
+            .debug_selector(|| "pending-spawns".to_owned())
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(space::XS))
+            .px(px(space::SM))
+            .pt(px(space::SM))
+            .child(
+                div()
+                    .px(px(space::XS))
+                    .type_style(text::SECTION)
+                    .text_color(theme.secondary)
+                    .child("Spawn requests"),
+            )
+            .children(cards),
+    )
 }
 
 /// The filter field and, under it, the status filters.
@@ -310,6 +443,7 @@ fn render_tab(
     let meta = row_meta(row, data.now_ms);
     let preview = preview_line(&row.last_line);
     let rang = data.bells.contains(&id);
+    let fresh = data.fresh.get(&id).copied().filter(|f| *f > 0.0);
     let picked = data.selected.contains(&id);
     let buttons: Vec<RowButton> = match agent_buttons(true, ended(row)) {
         AgentButtons::None => Vec::new(),
@@ -483,6 +617,12 @@ fn render_tab(
         .when(mark == TabMark::Focused, |s| s.bg(theme.selected))
         .when(rang && mark != TabMark::Focused, |s| {
             s.bg(theme.warning.opacity(0.14))
+        })
+        // Spawned just now by another agent (ADR 0079): an accent tint
+        // that fades.
+        .when_some(fresh, |s, f| {
+            s.debug_selector(move || format!("tab-{id}-new"))
+                .bg(theme.accent.opacity(0.26 * f))
         })
         // Picked for Send to Selected…: an accent tint over the rest.
         .when(picked, |s| s.bg(theme.accent.opacity(0.22)))

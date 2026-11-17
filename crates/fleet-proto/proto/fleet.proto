@@ -70,6 +70,9 @@ message Request {
     SendMessage send_message = 55;
     ReadInbox read_inbox = 56;
     Wait wait = 57;
+    // Spawn approval (ADR 0079): the user's only.
+    ListPendingSpawns list_pending_spawns = 75;
+    DecideSpawn decide_spawn = 76;
     // Message lines in the GUI's graph (ADR 0089): 85-89. The user only.
     ListMessageEdges list_message_edges = 85;
   }
@@ -95,6 +98,8 @@ message Response {
     MessagesSent messages_sent = 55;
     Inbox inbox = 56;
     WaitResult wait_result = 57;
+    // Spawn approval (ADR 0079).
+    PendingSpawns pending_spawns = 75;
     MessageEdges message_edges = 85;
   }
 }
@@ -110,6 +115,9 @@ message Event {
     AgentRemoved agent_removed = 7;
     SpawnRefused spawn_refused = 40;
     AgentReported reported = 50;
+    // Spawn approval (ADR 0079): to the user's connections only.
+    PendingSpawn spawn_pending = 75;
+    SpawnDecided spawn_decided = 76;
   }
 }
 
@@ -442,3 +450,40 @@ message WaitMatch {
   // The message that reported it, when one did.
   optional Message message = 3;
 }
+
+// Spawn approval (ADR 0079): with `[node] spawn_approval = true`, an agent's
+// spawn waits for the user. Pending spawns live in the daemon's memory
+// only; a daemon restart refuses them.
+message PendingSpawn {
+  // The pending request's id (not an agent id; counts from 1 per daemon).
+  uint64 id = 1;
+  // The agent asking: the child's parent.
+  uint64 parent = 2;
+  string program = 3;
+  repeated string args = 4;
+  string cwd = 5;
+  // The labels the child would get (inherited and narrowed, with
+  // `fleet.parent`).
+  map<string, string> labels = 6;
+  int64 asked_unix_ms = 7;
+  // Refused as not approved at this time unless decided first.
+  int64 expires_unix_ms = 8;
+}
+message ListPendingSpawns {}
+message PendingSpawns { repeated PendingSpawn pending = 1; }
+// Answered with `Ack`, or an error for an id that is not pending.
+message DecideSpawn { uint64 id = 1; bool approve = 2; }
+
+enum SpawnDecision {
+  SPAWN_DECISION_UNSPECIFIED = 0;
+  SPAWN_APPROVED = 1;
+  SPAWN_DENIED = 2;
+  // No answer before `expires_unix_ms`.
+  SPAWN_EXPIRED = 3;
+  // The asking connection closed first.
+  SPAWN_WITHDRAWN = 4;
+  // Refused because fleetd is restarting.
+  SPAWN_RESTARTING = 5;
+}
+// A pending spawn is no longer pending.
+message SpawnDecided { uint64 id = 1; SpawnDecision decision = 2; }

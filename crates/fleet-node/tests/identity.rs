@@ -326,3 +326,52 @@ fn an_agents_forget_exited_keeps_to_its_subtree() {
     assert!(left.contains(&theirs), "{left:?}");
     node.shutdown();
 }
+
+#[test]
+fn precheck_narrows_labels_and_runs_the_quotas_first_without_spawning() {
+    let dir = tempfile::tempdir().unwrap();
+    let quotas = Quotas {
+        max_children: 1,
+        spawn_approval: true,
+        spawn_approval_timeout_secs: 60,
+        ..Quotas::default()
+    };
+    let node = Node::open(&dir.path().join("state"))
+        .unwrap()
+        .with_quotas(quotas);
+    assert_eq!(node.spawn_approval(), Some(60));
+    let a = node
+        .spawn(sh("exec sleep 600", &[("team", "x")]))
+        .unwrap()
+        .id;
+    let mut refused = node.refused_events();
+    let mut req = sh("exec sleep 600", &[("role", "child")]);
+    req.cwd = "/tmp".into();
+    let pending = node.precheck_spawn(Caller::Agent(a), &req).unwrap();
+    assert_eq!(pending.parent, a);
+    assert_eq!(pending.program, "/bin/sh");
+    assert_eq!(pending.cwd, "/tmp");
+    assert_eq!(pending.labels.get("team").map(String::as_str), Some("x"));
+    assert_eq!(
+        pending.labels.get("role").map(String::as_str),
+        Some("child")
+    );
+    assert_eq!(
+        pending.labels.get(PARENT_LABEL).map(String::as_str),
+        Some(a.to_string().as_str())
+    );
+    assert_eq!(node.list().unwrap().len(), 1, "nothing was spawned");
+    // With its one child running, a's next spawn fails the quota before
+    // anyone is asked.
+    node.spawn_by(Caller::Agent(a), sleeper()).unwrap();
+    let e = node.precheck_spawn(Caller::Agent(a), &req).unwrap_err();
+    assert!(is_forbidden(&e), "{e}");
+    assert!(refused.try_recv().is_ok(), "the refusal is announced");
+    assert!(node.precheck_spawn(Caller::User, &req).is_err());
+    assert_eq!(
+        Node::open(&dir.path().join("other"))
+            .unwrap()
+            .spawn_approval(),
+        None
+    );
+}
