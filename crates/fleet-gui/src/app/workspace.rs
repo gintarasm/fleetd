@@ -175,6 +175,80 @@ struct Switcher {
     _sub: Subscription,
 }
 
+/// What is open over the panes: one at a time (issue #143). Each holds
+/// its view's subscriptions, which are kept, never read.
+#[allow(dead_code)]
+enum Modal {
+    /// The New agent sheet.
+    NewAgent(Entity<NewAgentSheet>, Subscription),
+    /// The Rename sheet (ADR 0052).
+    Rename(Entity<RenameSheet>, Subscription),
+    /// The Answer sheet (ADR 0078).
+    Answer(Entity<AnswerSheet>, Subscription),
+    /// The Edit Labels sheet (ADR 0087).
+    Labels(Entity<LabelsSheet>, Subscription),
+    /// The question before a kill (issue #27).
+    Kill(Entity<KillSheet>, Subscription),
+    /// Send to Agents… (ADR 0083).
+    Send(Entity<SendSheet>, Subscription),
+    /// Search All Agents (⇧⌘F, ADR 0098).
+    SearchAll(Entity<SearchAllView>, Subscription),
+    /// The command palette (⌘P) and what its rows stand for.
+    Palette(Entity<PickerView>, Vec<Entry>, Subscription),
+    /// The agent switcher (⌃Tab).
+    Switcher(Switcher),
+    /// The peek (ADR 0103).
+    Peek(Entity<PeekView>, Subscription),
+    /// The ⌘/ cheat sheet, and its focus (for Escape).
+    Shortcuts(Vec<Section>, FocusHandle),
+    /// The connect sheet (drawn unless quiet).
+    Connect(Entity<ConnectSheet>, [Subscription; 2]),
+}
+
+impl Modal {
+    /// Stays open when the session switches target: these name nothing
+    /// of the old target's layout or agents.
+    fn survives_target_switch(&self) -> bool {
+        match self {
+            Modal::Shortcuts(..) | Modal::Connect(..) | Modal::SearchAll(..) => true,
+            Modal::NewAgent(..)
+            | Modal::Rename(..)
+            | Modal::Answer(..)
+            | Modal::Labels(..)
+            | Modal::Kill(..)
+            | Modal::Send(..)
+            | Modal::Palette(..)
+            | Modal::Switcher(..)
+            | Modal::Peek(..) => false,
+        }
+    }
+
+    /// The agent it is about went from the list (or, for Answer, its
+    /// question closed): the sheet would act on nothing.
+    fn target_gone(&self, app: &AppState, cx: &App) -> bool {
+        let info = |id: u64| app.agents.iter().find(|r| r.info.id == id).map(|r| &r.info);
+        match self {
+            Modal::Rename(s, _) => info(s.read(cx).agent_id).is_none(),
+            Modal::Labels(s, _) => info(s.read(cx).agent_id).is_none(),
+            Modal::Peek(p, _) => info(p.read(cx).agent()).is_none(),
+            Modal::Answer(s, _) => {
+                let s = s.read(cx);
+                info(s.agent_id)
+                    .and_then(open_question)
+                    .is_none_or(|q| q.id != s.question.id)
+            }
+            Modal::Kill(s, _) => s.read(cx).agent_ids.iter().any(|&id| info(id).is_none()),
+            Modal::NewAgent(..)
+            | Modal::Send(..)
+            | Modal::SearchAll(..)
+            | Modal::Palette(..)
+            | Modal::Switcher(..)
+            | Modal::Shortcuts(..)
+            | Modal::Connect(..) => false,
+        }
+    }
+}
+
 /// The settings the window's look and motion follow (re-applied when one
 /// changes).
 #[derive(Clone, Copy, PartialEq)]
@@ -201,23 +275,10 @@ impl Look {
 /// The window's root view, over [`AppState`].
 pub struct Workspace {
     app: Entity<AppState>,
-    sheet: Option<(Entity<NewAgentSheet>, Subscription)>,
-    /// The Rename sheet (ADR 0052).
-    rename: Option<(Entity<RenameSheet>, Subscription)>,
-    /// The Answer sheet (ADR 0078).
-    answer: Option<(Entity<AnswerSheet>, Subscription)>,
-    /// The Edit Labels sheet (ADR 0087).
-    labels: Option<(Entity<LabelsSheet>, Subscription)>,
-    /// The question before a kill (issue #27).
-    kill: Option<(Entity<KillSheet>, Subscription)>,
-    /// Send to Agents… (ADR 0083).
-    send: Option<(Entity<SendSheet>, Subscription)>,
+    /// The one sheet, picker or popover over the panes, if any.
+    modal: Option<Modal>,
     /// The sidebar rows picked with ⌘-click and ⇧-click (ADR 0083).
     row_selection: RowSelection,
-    /// Search All Agents (⇧⌘F, ADR 0098), while it is open.
-    search_all: Option<(Entity<SearchAllView>, Subscription)>,
-    /// The command palette (⌘P) and what its rows stand for.
-    palette: Option<(Entity<PickerView>, Vec<Entry>, Subscription)>,
     /// The palette's recent picks, most recent first.
     palette_recents: Recents,
     /// The split chooser of each pane a split opened that is still empty,
@@ -226,16 +287,10 @@ pub struct Workspace {
     /// Some pane view may still hold a chooser (the per-frame sync is
     /// skipped otherwise).
     choosers_drawn: bool,
-    /// The agent switcher (⌃Tab), while it is open.
-    switcher: Option<Switcher>,
-    /// The peek (ADR 0103), while open.
-    peek: Option<(Entity<PeekView>, Subscription)>,
     /// The agents the focused pane showed, most recent first.
     agent_mru: AgentMru,
-    /// The connect sheet, over everything else.
-    connect: Option<(Entity<ConnectSheet>, [Subscription; 2])>,
     /// The [`AppState::session_epoch`] last seen; a change closes the
-    /// new-agent sheet, and a pick from a context menu opened before is
+    /// modal (unless it [survives](Modal::survives_target_switch)), and a pick from a context menu opened before is
     /// dropped.
     epoch: u64,
     /// Each pane's view, its focus handle, and its focus-in and
@@ -243,8 +298,6 @@ pub struct Workspace {
     pane_focus: HashMap<PaneId, (EntityId, FocusHandle, [Subscription; 2])>,
     /// The panes drawn by the last render.
     drawn: Vec<PaneId>,
-    /// The ⌘/ cheat sheet while shown, and its focus (for Escape).
-    shortcuts: Option<(Vec<Section>, FocusHandle)>,
     /// The window title last set.
     window_title: String,
     /// Motion is reduced: System Settings' Reduce Motion (read at launch
@@ -298,18 +351,21 @@ impl Workspace {
                 // the picked rows agents of the old target.
                 this.choosers.clear();
                 this.row_selection = RowSelection::default();
-                if this.sheet.take().is_some()
-                    | this.rename.take().is_some()
-                    | this.answer.take().is_some()
-                    | this.labels.take().is_some()
-                    | this.kill.take().is_some()
-                    | this.send.take().is_some()
-                    | this.palette.take().is_some()
-                    | this.switcher.take().is_some()
-                    | this.peek.take().is_some()
+                if this
+                    .modal
+                    .as_ref()
+                    .is_some_and(|m| !m.survives_target_switch())
                 {
-                    this.focus_current(window, cx);
+                    this.close_modal(window, cx);
                 }
+            }
+            // A sheet for an agent that went (or a question that closed).
+            if this
+                .modal
+                .as_ref()
+                .is_some_and(|m| m.target_gone(app.read(cx), cx))
+            {
+                this.close_modal(window, cx);
             }
             // Settings changed the look: apply it now.
             let look = Look::of(app.read(cx).config());
@@ -374,26 +430,15 @@ impl Workspace {
         let ws = Workspace {
             app,
             _ticker: ticker,
-            sheet: None,
-            rename: None,
-            answer: None,
-            labels: None,
-            kill: None,
-            send: None,
+            modal: None,
             row_selection: RowSelection::default(),
-            search_all: None,
-            palette: None,
             palette_recents: Recents::default(),
             choosers: HashMap::new(),
             choosers_drawn: false,
-            switcher: None,
-            peek: None,
             agent_mru: AgentMru::default(),
-            connect: None,
             epoch,
             pane_focus: HashMap::new(),
             drawn: Vec::new(),
-            shortcuts: None,
             window_title: String::new(),
             reduce_motion: config.reduce_motion.resolve(native::reduce_motion()),
             look: Look::of(&config),
@@ -433,7 +478,7 @@ impl Workspace {
     /// ⌘⇧G or the titlebar's graph button: switches between the panes and
     /// the graph view.
     pub fn toggle_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         self.graph_shown = !self.graph_shown;
@@ -548,20 +593,32 @@ impl Workspace {
     }
 
     pub fn sheet(&self) -> Option<&Entity<NewAgentSheet>> {
-        self.sheet.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(Modal::NewAgent(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn rename_sheet(&self) -> Option<&Entity<RenameSheet>> {
-        self.rename.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(Modal::Rename(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn labels_sheet(&self) -> Option<&Entity<LabelsSheet>> {
-        self.labels.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(Modal::Labels(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     /// The command palette, while it is open.
     pub fn palette(&self) -> Option<&Entity<PickerView>> {
-        self.palette.as_ref().map(|(p, _, _)| p)
+        match &self.modal {
+            Some(Modal::Palette(p, _, _)) => Some(p),
+            _ => None,
+        }
     }
 
     /// `pane`'s split chooser, while it asks what to start there.
@@ -571,48 +628,81 @@ impl Workspace {
 
     /// Search All Agents, while it is open.
     pub fn search_all(&self) -> Option<&Entity<SearchAllView>> {
-        self.search_all.as_ref().map(|(v, _)| v)
+        match &self.modal {
+            Some(Modal::SearchAll(v, _)) => Some(v),
+            _ => None,
+        }
     }
 
     /// The agent switcher, while it is open.
     pub fn switcher(&self) -> Option<&Entity<PickerView>> {
-        self.switcher.as_ref().map(|s| &s.view)
+        match &self.modal {
+            Some(Modal::Switcher(s)) => Some(&s.view),
+            _ => None,
+        }
     }
 
     pub fn connect_sheet(&self) -> Option<&Entity<ConnectSheet>> {
-        self.connect.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(Modal::Connect(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     /// The connect sheet is drawn (not a quiet startup attempt).
     pub fn connect_sheet_shown(&self, cx: &App) -> bool {
-        self.connect
-            .as_ref()
-            .is_some_and(|(sheet, _)| !sheet.read(cx).quiet)
+        self.connect_sheet()
+            .is_some_and(|sheet| !sheet.read(cx).quiet)
     }
 
     /// A sheet is open over the panes.
-    fn modal(&self) -> bool {
-        self.sheet.is_some()
-            || self.rename.is_some()
-            || self.answer.is_some()
-            || self.labels.is_some()
-            || self.kill.is_some()
-            || self.send.is_some()
-            || self.connect.is_some()
-            || self.shortcuts.is_some()
-            || self.palette.is_some()
-            || self.switcher.is_some()
-            || self.search_all.is_some()
-            || self.peek.is_some()
+    fn has_modal(&self) -> bool {
+        self.modal.is_some()
+    }
+
+    /// The ⌘/ cheat sheet is shown.
+    #[cfg(test)]
+    fn shortcuts_shown(&self) -> bool {
+        matches!(self.modal, Some(Modal::Shortcuts(..)))
+    }
+
+    /// Takes the modal down, without giving the keyboard back (the peek's
+    /// connection is closed).
+    fn drop_modal(&mut self, cx: &mut Context<Self>) {
+        if let Some(Modal::Peek(..)) = self.modal.take() {
+            self.app.update(cx, |a, cx| a.close_peek(cx));
+        }
+        cx.notify();
+    }
+
+    /// Closes the modal, if one is open, and gives the keyboard back: to
+    /// the graph from a peek over it, to the focused pane otherwise.
+    fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(modal) = &self.modal else {
+            return;
+        };
+        let to_graph = matches!(modal, Modal::Peek(..)) && self.graph_shown;
+        self.drop_modal(cx);
+        if to_graph {
+            self.graph.0.read(cx).focus(window);
+        } else {
+            self.focus_current(window, cx);
+        }
     }
 
     pub fn kill_sheet(&self) -> Option<&Entity<KillSheet>> {
-        self.kill.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(Modal::Kill(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     /// The Send to Agents sheet, while it is open.
     pub fn send_sheet(&self) -> Option<&Entity<SendSheet>> {
-        self.send.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(Modal::Send(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     /// The sidebar rows picked with ⌘-click and ⇧-click.
@@ -622,12 +712,12 @@ impl Workspace {
 
     /// ⌘/: shows the cheat sheet of every key binding, or hides it.
     pub fn toggle_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shortcuts.take().is_some() {
-            self.focus_current(window, cx);
-        } else if !self.modal() {
+        if matches!(self.modal, Some(Modal::Shortcuts(..))) {
+            self.close_modal(window, cx);
+        } else if !self.has_modal() {
             let handle = cx.focus_handle();
             window.focus(&handle);
-            self.shortcuts = Some((keymap::cheat_sheet(cx), handle));
+            self.modal = Some(Modal::Shortcuts(keymap::cheat_sheet(cx), handle));
         }
         cx.notify();
     }
@@ -639,7 +729,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         if self.app.update(cx, |a, cx| a.reopen_closed(cx)).is_some() {
@@ -654,17 +744,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.sheet = None;
-        self.rename = None;
-        self.answer = None;
-        self.labels = None;
-        self.kill = None;
-        self.send = None;
-        self.palette = None;
-        self.switcher = None;
-        self.search_all = None;
-        self.close_peek(window, cx);
-        if let Some((sheet, _)) = &self.connect {
+        if let Some(Modal::Connect(sheet, _)) = &self.modal {
             let sheet = sheet.clone();
             sheet.update(cx, |s, cx| {
                 if reason.is_some() {
@@ -677,6 +757,8 @@ impl Workspace {
             cx.notify();
             return;
         }
+        // Over everything else: whatever was open closes.
+        self.close_modal(window, cx);
         let Some(sheet) = self.install_connect_sheet(reason, window, cx) else {
             return;
         };
@@ -721,7 +803,7 @@ impl Workspace {
             }
             cx.notify();
         });
-        self.connect = Some((sheet.clone(), [events, shown]));
+        self.modal = Some(Modal::Connect(sheet.clone(), [events, shown]));
         cx.notify();
         Some(sheet)
     }
@@ -745,9 +827,7 @@ impl Workspace {
             }
             ConnectEvent::Dismiss => {}
         }
-        self.connect = None;
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
     }
 
     fn pane_focus_handle(&self, pane: PaneId, cx: &App) -> Option<FocusHandle> {
@@ -772,7 +852,7 @@ impl Workspace {
 
     /// Splits the focused pane; the new pane asks what to start in it.
     fn split(&mut self, axis: Axis, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let origin = self.app.read(cx).focused();
@@ -883,7 +963,7 @@ impl Workspace {
     }
 
     fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let pane = self.app.read(cx).focused();
@@ -893,7 +973,7 @@ impl Workspace {
     }
 
     fn focus_dir(&mut self, dir: Dir, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         if let Some(pane) = self.app.read(cx).neighbour(dir) {
@@ -902,7 +982,7 @@ impl Workspace {
     }
 
     fn focus_number(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         if let Some(pane) = self.app.read(cx).pane_by_number(n) {
@@ -917,7 +997,7 @@ impl Workspace {
     /// ⌘⌥T (or the strip's New tab button): a new tab with one empty
     /// pane, focused.
     pub fn add_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         if self.app.update(cx, |a, cx| a.new_tab(cx)).is_some() {
@@ -933,7 +1013,7 @@ impl Workspace {
 
     /// Closes tab `i` (0-based; its close button), detaching its agents.
     pub fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         self.app.update(cx, |a, cx| a.close_tab(i, cx));
@@ -942,7 +1022,7 @@ impl Workspace {
 
     /// Shows tab `i` (0-based) and focuses its focused pane.
     pub fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         if self.app.update(cx, |a, cx| a.select_tab(i, cx)) {
@@ -957,13 +1037,13 @@ impl Workspace {
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.modal() && self.app.update(cx, |a, cx| a.next_tab(cx)) {
+        if !self.has_modal() && self.app.update(cx, |a, cx| a.next_tab(cx)) {
             self.focus_current(window, cx);
         }
     }
 
     fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.modal() && self.app.update(cx, |a, cx| a.prev_tab(cx)) {
+        if !self.has_modal() && self.app.update(cx, |a, cx| a.prev_tab(cx)) {
             self.focus_current(window, cx);
         }
     }
@@ -997,7 +1077,7 @@ impl Workspace {
         paths: &ExternalPaths,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let paths: Vec<String> = paths
@@ -1011,13 +1091,16 @@ impl Workspace {
 
     /// The peek, while it is open (ADR 0103).
     pub fn peek(&self) -> Option<&Entity<PeekView>> {
-        self.peek.as_ref().map(|(p, _)| p)
+        match &self.modal {
+            Some(Modal::Peek(p, _)) => Some(p),
+            _ => None,
+        }
     }
 
     /// Peeks at `agent_id` in a popover, without changing the layout. One
     /// peek at a time: another one open is replaced. Not over a sheet.
     pub fn open_peek(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.peek.is_none() && self.modal() {
+        if self.peek().is_none() && self.has_modal() {
             return;
         }
         if !self
@@ -1033,22 +1116,7 @@ impl Workspace {
         let view = cx.new(|cx| PeekView::new(app, agent_id, cx));
         let sub = cx.subscribe_in(&view, window, Self::peek_event);
         view.read(cx).focus(window, cx);
-        self.peek = Some((view, sub));
-        cx.notify();
-    }
-
-    /// Closes the peek, and gives the keyboard back to the graph or the
-    /// focused pane.
-    fn close_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.peek.take().is_none() {
-            return;
-        }
-        self.app.update(cx, |a, cx| a.close_peek(cx));
-        if self.graph_shown {
-            self.graph.0.read(cx).focus(window);
-        } else {
-            self.focus_current(window, cx);
-        }
+        self.modal = Some(Modal::Peek(view, sub));
         cx.notify();
     }
 
@@ -1060,9 +1128,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match *event {
-            PeekEvent::Close => self.close_peek(window, cx),
+            PeekEvent::Close => self.close_modal(window, cx),
             PeekEvent::OpenInPane(id) => {
-                self.close_peek(window, cx);
+                self.close_modal(window, cx);
                 if self.graph_shown {
                     self.graph_shown = false;
                     self.watch_message_lines(cx);
@@ -1096,7 +1164,7 @@ impl Workspace {
 
     /// ⌥⌘F: the keyboard goes to the sidebar's filter field.
     fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         window.focus(self.filter_field.read(cx).focus_handle());
@@ -1282,7 +1350,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if epoch != self.epoch || self.modal() {
+        if epoch != self.epoch || self.has_modal() {
             return;
         }
         // The agent may have changed since the menu opened (a Kill for an
@@ -1367,7 +1435,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if epoch != self.epoch || self.modal() {
+        if epoch != self.epoch || self.has_modal() {
             return;
         }
         let event = match item {
@@ -1419,12 +1487,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.connect.is_some() {
-            return;
-        }
-        if let Some((sheet, _)) = &self.sheet {
-            sheet.read(cx).focus(window, cx);
-            return;
+        match &self.modal {
+            Some(Modal::Connect(..)) => return,
+            Some(Modal::NewAgent(sheet, _)) => {
+                sheet.read(cx).focus(window, cx);
+                return;
+            }
+            // It opens over any other (which closes).
+            _ => self.drop_modal(cx),
         }
         let presets = self.app.update(cx, |a, _| a.presets());
         let app = self.app.read(cx);
@@ -1444,14 +1514,14 @@ impl Workspace {
         let sheet = cx.new(|cx| NewAgentSheet::new(setup, &target, taken, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::sheet_event);
         sheet.read(cx).focus(window, cx);
-        self.sheet = Some((sheet, sub));
+        self.modal = Some(Modal::NewAgent(sheet, sub));
         cx.notify();
     }
 
     /// Opens the Rename sheet for an agent (a double-click on its name, or
     /// Rename… in a menu).
     pub fn open_rename(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let Some(info) = self
@@ -1470,7 +1540,7 @@ impl Workspace {
         let sheet = cx.new(|cx| RenameSheet::new(agent_id, name, what, subject, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::rename_event);
         sheet.read(cx).focus(window, cx);
-        self.rename = Some((sheet, sub));
+        self.modal = Some(Modal::Rename(sheet, sub));
         cx.notify();
     }
 
@@ -1484,15 +1554,13 @@ impl Workspace {
         if let RenameEvent::Rename { agent_id, name } = event {
             self.app.read(cx).rename(*agent_id, name.clone());
         }
-        self.rename = None;
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
     }
 
     /// Opens the Answer sheet for an agent's open question (Reply… on its
     /// row, header or graph card, ADR 0078).
     pub fn open_answer(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let Some(info) = self
@@ -1516,12 +1584,15 @@ impl Workspace {
         let sheet = cx.new(|cx| AnswerSheet::new(agent_id, what, question, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::answer_event);
         sheet.read(cx).focus(window, cx);
-        self.answer = Some((sheet, sub));
+        self.modal = Some(Modal::Answer(sheet, sub));
         cx.notify();
     }
 
     pub fn answer_sheet(&self) -> Option<&Entity<AnswerSheet>> {
-        self.answer.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(Modal::Answer(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     fn answer_event(
@@ -1539,9 +1610,7 @@ impl Workspace {
         {
             self.app.read(cx).answer(*agent_id, *question, text.clone());
         }
-        self.answer = None;
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
     }
 
     /// A click on a choice button: answers question `question` of
@@ -1559,7 +1628,7 @@ impl Workspace {
     /// Opens the Edit Labels sheet for an agent (Edit Labels… in the row
     /// and pane menus).
     pub fn open_labels(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let Some(info) = self
@@ -1579,7 +1648,7 @@ impl Workspace {
         let sheet = cx.new(|cx| LabelsSheet::new(agent_id, info.labels.clone(), what, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::labels_event);
         sheet.read(cx).focus(window, cx);
-        self.labels = Some((sheet, sub));
+        self.modal = Some(Modal::Labels(sheet, sub));
         cx.notify();
     }
 
@@ -1597,15 +1666,13 @@ impl Workspace {
                 .read(cx)
                 .set_labels(*agent_id, edit.set.clone(), edit.remove.clone());
         }
-        self.labels = None;
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
     }
 
     /// Opens Send to Agents… with `preselect` checked (those running).
     /// Not over a sheet, and not without a running agent.
     pub fn open_send(&mut self, preselect: &[u64], window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         if !self.app.read(cx).agents.iter().any(sendable) {
@@ -1618,7 +1685,7 @@ impl Workspace {
         let sheet = cx.new(|cx| SendSheet::new(app, preselect, cx));
         let sub = cx.subscribe_in(&sheet, window, Self::send_event);
         sheet.read(cx).focus(window, cx);
-        self.send = Some((sheet, sub));
+        self.modal = Some(Modal::Send(sheet, sub));
         cx.notify();
     }
 
@@ -1638,9 +1705,7 @@ impl Workspace {
         if let SendEvent::Send(plan) = event {
             self.app.update(cx, |a, cx| a.send_text(plan, cx));
         }
-        self.send = None;
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
     }
 
     /// A click on a row's label chip: the sidebar filter gets `key=value`,
@@ -1690,7 +1755,7 @@ impl Workspace {
 
     /// ⌘T: a plain login shell, focused (see [`AppState::new_terminal`]).
     pub fn open_new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         if let Err(e) = self.app.update(cx, |a, cx| a.new_terminal(cx)) {
@@ -1723,20 +1788,17 @@ impl Workspace {
                 }
             }
         }
-        self.sheet = None;
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
     }
 
     /// ⌘P: opens the command palette (actions, agents, recent folders),
     /// or closes it if open. Not over a sheet.
     pub fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.take().is_some() {
-            self.focus_current(window, cx);
-            cx.notify();
+        if self.palette().is_some() {
+            self.close_modal(window, cx);
             return;
         }
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let state = self.palette_state(cx);
@@ -1757,7 +1819,7 @@ impl Workspace {
             cx.new(|cx| PickerView::new(items, recents, "Search actions, agents and folders", cx));
         let sub = cx.subscribe_in(&palette, window, Self::palette_event);
         palette.read(cx).focus(window, cx);
-        self.palette = Some((palette, entries, sub));
+        self.modal = Some(Modal::Palette(palette, entries, sub));
         cx.notify();
     }
 
@@ -1785,7 +1847,7 @@ impl Workspace {
     /// ⌘J: shows the next agent that needs you in the focused pane (ADR
     /// 0100); a short toast when none does. Not over a sheet.
     pub fn next_needs_you(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let target = {
@@ -1809,19 +1871,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.search_all.take().is_some() {
-            self.focus_current(window, cx);
-            cx.notify();
+        if self.search_all().is_some() {
+            self.close_modal(window, cx);
             return;
         }
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let app = self.app.clone();
         let view = cx.new(|cx| SearchAllView::new(app, cx));
         let sub = cx.subscribe_in(&view, window, Self::search_all_event);
         view.read(cx).focus(window, cx);
-        self.search_all = Some((view, sub));
+        self.modal = Some(Modal::SearchAll(view, sub));
         cx.notify();
     }
 
@@ -1834,11 +1895,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.search_all.take().is_none() {
+        if self.search_all().is_none() {
             return;
         }
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
         let SearchAllEvent::Show {
             agent_id,
             line,
@@ -1870,11 +1930,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((_, entries, _)) = self.palette.take() else {
+        let Some(Modal::Palette(_, entries, _)) = &mut self.modal else {
             return;
         };
-        self.focus_current(window, cx);
-        cx.notify();
+        let entries = std::mem::take(entries);
+        self.close_modal(window, cx);
         let PickerEvent::Pick(key) = event else {
             return;
         };
@@ -1900,11 +1960,11 @@ impl Workspace {
     /// selection while open. Not over a sheet or the palette.
     pub fn switch_agent(&mut self, backward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let delta = if backward { -1 } else { 1 };
-        if let Some(s) = &self.switcher {
+        if let Some(Modal::Switcher(s)) = &self.modal {
             s.view.update(cx, |v, cx| v.move_selection(delta, cx));
             return;
         }
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let app = self.app.read(cx);
@@ -1930,11 +1990,11 @@ impl Workspace {
         });
         let sub = cx.subscribe_in(&view, window, Self::switcher_event);
         view.read(cx).focus(window, cx);
-        self.switcher = Some(Switcher {
+        self.modal = Some(Modal::Switcher(Switcher {
             view,
             held: window.modifiers().control,
             _sub: sub,
-        });
+        }));
         cx.notify();
     }
 
@@ -1945,7 +2005,7 @@ impl Workspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(s) = &mut self.switcher else {
+        let Some(Modal::Switcher(s)) = &mut self.modal else {
             return;
         };
         if ev.modifiers.control {
@@ -1964,11 +2024,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.switcher.take().is_none() {
+        if self.switcher().is_none() {
             return;
         }
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
         let PickerEvent::Pick(key) = event else {
             return;
         };
@@ -2024,7 +2083,7 @@ impl Workspace {
     /// with `agent_id`'s command, folder and labels, and a new name. Works
     /// while it runs.
     pub fn duplicate_agent(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let Some(prefill) = self
@@ -2051,7 +2110,7 @@ impl Workspace {
     /// Asks before killing (only the question's Kill kills), unless
     /// `[gui] confirm_kill` is off.
     fn kill(&mut self, action: &Kill, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let agent_id = action.agent_id;
@@ -2063,7 +2122,7 @@ impl Workspace {
                 let sheet = cx.new(|cx| KillSheet::new(agent_id, question, cx));
                 let sub = cx.subscribe_in(&sheet, window, Self::kill_event);
                 sheet.read(cx).focus(window);
-                self.kill = Some((sheet, sub));
+                self.modal = Some(Modal::Kill(sheet, sub));
             }
         }
         cx.notify();
@@ -2090,9 +2149,7 @@ impl Workspace {
                 }
             });
         }
-        self.kill = None;
-        self.focus_current(window, cx);
-        cx.notify();
+        self.close_modal(window, cx);
     }
 
     /// The sidebar's selection (of several rows) split by what Kill,
@@ -2108,7 +2165,7 @@ impl Workspace {
     /// asks once, listing the names (unless `[gui] confirm_kill` is off);
     /// the others act at once, as their single-agent forms do.
     fn bulk(&mut self, action: BulkAction, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let targets = self.bulk_targets(cx);
@@ -2130,7 +2187,7 @@ impl Workspace {
                         let sheet = cx.new(|cx| KillSheet::many(ids, names, cx));
                         let sub = cx.subscribe_in(&sheet, window, Self::kill_event);
                         sheet.read(cx).focus(window);
-                        self.kill = Some((sheet, sub));
+                        self.modal = Some(Modal::Kill(sheet, sub));
                     }
                 }
             }
@@ -2200,7 +2257,7 @@ impl Workspace {
     /// Remove Exited Agent in Pane (palette): forgets the focused pane's
     /// agent if it ended, as the pane's summary bar does.
     fn remove_pane(&mut self, _: &RemovePane, _: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let app = self.app.read(cx);
@@ -2226,7 +2283,7 @@ impl Workspace {
     /// Output First…" saves each one's output into a folder, then removes
     /// those saved (ADR 0086).
     fn remove_exited(&mut self, _: &RemoveExited, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let count = self.app.read(cx).ended_count();
@@ -2263,7 +2320,7 @@ impl Workspace {
 
     /// The agent the focused pane shows, unless a sheet is up.
     fn focused_agent(&self, cx: &App) -> Option<(PaneId, u64)> {
-        if self.modal() {
+        if self.has_modal() {
             return None;
         }
         let app = self.app.read(cx);
@@ -2311,7 +2368,7 @@ impl Workspace {
     }
 
     fn restart_pane(&mut self, _: &RestartPane, _: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         self.app.update(cx, |a, cx| a.restart_focused(cx));
@@ -2382,7 +2439,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         self.focus_pane(pane, window, cx);
@@ -2442,7 +2499,7 @@ impl Workspace {
     }
 
     fn toggle_maximize(&mut self, _: &ToggleMaximize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         self.app.update(cx, |a, cx| a.toggle_maximize(cx));
@@ -2871,10 +2928,9 @@ impl Render for Workspace {
                 ))
         });
         let connect = self
-            .connect
-            .as_ref()
+            .connect_sheet()
             .filter(|_| self.connect_sheet_shown(cx))
-            .map(|(sheet, _)| {
+            .map(|sheet| {
                 deferred(
                     div()
                         .id("connect-backdrop")
@@ -2898,10 +2954,17 @@ impl Render for Workspace {
                 )
                 .with_priority(3)
             });
-        let shortcuts = self.shortcuts.as_ref().map(|(sections, handle)| {
-            render_shortcuts(sections, handle, &theme, reduce_motion, cx)
-        });
-        let palette = self.palette.as_ref().map(|(palette, _, _)| {
+        let shortcuts = match &self.modal {
+            Some(Modal::Shortcuts(sections, handle)) => Some(render_shortcuts(
+                sections,
+                handle,
+                &theme,
+                reduce_motion,
+                cx,
+            )),
+            _ => None,
+        };
+        let palette = self.palette().map(|palette| {
             // A click beside it closes it, never reaching the panes.
             deferred(
                 div()
@@ -2916,7 +2979,7 @@ impl Render for Workspace {
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
-                            if this.palette.is_some() {
+                            if this.palette().is_some() {
                                 this.toggle_palette(window, cx);
                             }
                         }),
@@ -2931,7 +2994,7 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
-        let search_all = self.search_all.as_ref().map(|(view, _)| {
+        let search_all = self.search_all().map(|view| {
             // Placed as the palette is; a click beside it closes it.
             deferred(
                 div()
@@ -2946,9 +3009,8 @@ impl Render for Workspace {
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
-                            if this.search_all.take().is_some() {
-                                this.focus_current(window, cx);
-                                cx.notify();
+                            if this.search_all().is_some() {
+                                this.close_modal(window, cx);
                             }
                         }),
                     )
@@ -2962,7 +3024,7 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
-        let switcher = self.switcher.as_ref().map(|s| {
+        let switcher = self.switcher().map(|view| {
             // Centred, like ⌘Tab; a click beside it cancels.
             deferred(
                 div()
@@ -2976,14 +3038,13 @@ impl Render for Workspace {
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
-                            if this.switcher.take().is_some() {
-                                this.focus_current(window, cx);
-                                cx.notify();
+                            if this.switcher().is_some() {
+                                this.close_modal(window, cx);
                             }
                         }),
                     )
                     .child(appear(
-                        div().child(s.view.clone()),
+                        div().child(view.clone()),
                         "switcher-appear",
                         -motion::SHEET_OFFSET,
                         motion::SHEET_MS,
@@ -2992,7 +3053,7 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
-        let rename = self.rename.as_ref().map(|(sheet, _)| {
+        let rename = self.rename_sheet().map(|sheet| {
             deferred(
                 div()
                     .id("rename-backdrop")
@@ -3014,7 +3075,7 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
-        let answer = self.answer.as_ref().map(|(sheet, _)| {
+        let answer = self.answer_sheet().map(|sheet| {
             deferred(
                 div()
                     .id("answer-backdrop")
@@ -3036,7 +3097,7 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
-        let labels = self.labels.as_ref().map(|(sheet, _)| {
+        let labels = self.labels_sheet().map(|sheet| {
             deferred(
                 div()
                     .id("labels-backdrop")
@@ -3058,7 +3119,7 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
-        let sheet = self.sheet.as_ref().map(|(sheet, _)| {
+        let sheet = self.sheet().map(|sheet| {
             // The backdrop takes every click and wheel event over the panes.
             deferred(
                 div()
@@ -3177,23 +3238,20 @@ impl Render for Workspace {
             .children(search_all)
             .children(switcher)
             .children(
-                self.peek
-                    .as_ref()
-                    .map(|(p, _)| peek_view::render_over(p, reduce_motion)),
+                self.peek()
+                    .map(|p| peek_view::render_over(p, reduce_motion)),
             )
             .children(sheet)
             .children(rename)
             .children(answer)
             .children(labels)
             .children(
-                self.kill
-                    .as_ref()
-                    .map(|(sheet, _)| kill_sheet::render_over(sheet, reduce_motion)),
+                self.kill_sheet()
+                    .map(|sheet| kill_sheet::render_over(sheet, reduce_motion)),
             )
             .children(
-                self.send
-                    .as_ref()
-                    .map(|(sheet, _)| send_sheet::render_over(sheet, reduce_motion)),
+                self.send_sheet()
+                    .map(|sheet| send_sheet::render_over(sheet, reduce_motion)),
             )
             .children(shortcuts)
             .children(connect)
@@ -5504,7 +5562,8 @@ mod tests {
         let mut s = setup(cx, &fake, dir.path());
         agents(&mut s, &fake, vec![ended(7, "/w", 1, AgentState::Exited)]);
         s.cx.simulate_keystrokes("cmd-d cmd-n");
-        let (open, epoch) = s.ws.read_with(s.cx, |ws, _| (ws.sheet.is_some(), ws.epoch));
+        let (open, epoch) =
+            s.ws.read_with(s.cx, |ws, _| (ws.sheet().is_some(), ws.epoch));
         assert!(open);
         // A direct switch (not through the connect sheet).
         let other = Arc::new(Fake::default());
@@ -5516,7 +5575,7 @@ mod tests {
         s.app
             .update(s.cx, |a, cx| a.replace_session(session, rx, target, cx));
         s.cx.run_until_parked();
-        let closed = s.ws.read_with(s.cx, |ws, _| ws.sheet.is_none());
+        let closed = s.ws.read_with(s.cx, |ws, _| ws.sheet().is_none());
         assert!(closed, "the sheet targeted the old layout's panes");
         // A pick from a menu opened before the switch does nothing.
         s.ws.update_in(s.cx, |ws, window, cx| {
@@ -6407,7 +6466,7 @@ mod tests {
         let tab = s.cx.debug_bounds("tab-7").unwrap();
         assert!(bar.bottom() <= tab.top());
         click(&mut s, "new-agent");
-        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet().is_some()));
     }
 
     #[gpui::test]
@@ -6430,7 +6489,7 @@ mod tests {
         s.cx.simulate_click(clear, Modifiers::none());
         s.cx.run_until_parked();
         assert!(!fake.calls().contains(&Call::ClearExited));
-        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet().is_some()));
     }
 
     #[gpui::test]
@@ -7358,7 +7417,7 @@ mod tests {
     // checked on the state, not with `drawn`.
     fn shortcuts_shown(s: &mut Setup<'_>) -> bool {
         s.cx.run_until_parked();
-        s.ws.read_with(s.cx, |ws, _| ws.shortcuts.is_some())
+        s.ws.read_with(s.cx, |ws, _| ws.shortcuts_shown())
     }
 
     fn welcomes(s: &mut Setup<'_>) -> bool {
@@ -7493,9 +7552,9 @@ mod tests {
         s.cx.simulate_keystrokes("escape");
         assert!(!shortcuts_shown(&mut s));
         click(&mut s, "welcome-new-agent");
-        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_some()));
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet().is_some()));
         s.cx.simulate_keystrokes("escape");
-        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet.is_none()));
+        assert!(s.ws.read_with(s.cx, |ws, _| ws.sheet().is_none()));
         click(&mut s, "welcome-terminal");
         assert!(
             fake.calls().iter().any(|c| matches!(c, Call::Spawn { .. })),
@@ -8197,5 +8256,123 @@ mod tests {
         s.cx.run_until_parked();
         assert_eq!(peeked(&mut s), None);
         assert!(s.cx.debug_bounds("graph-card-2").is_some());
+    }
+
+    fn pane_has_keyboard(s: &mut Setup<'_>, pane: PaneId) -> bool {
+        let app = s.app.clone();
+        s.cx.update(|window, cx| {
+            let view = app.read(cx).pane_view(pane).unwrap().clone();
+            view.read(cx).focus_handle().is_focused(window)
+        })
+    }
+
+    /// Issue #143: Rename, Edit Labels, the kill question and the peek
+    /// close when their agent is removed (and stay for another agent's
+    /// removal); the keyboard goes back to the focused pane.
+    #[gpui::test]
+    fn a_sheet_closes_when_its_agent_goes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        type Open = fn(&mut Workspace, &mut gpui::Window, &mut gpui::Context<Workspace>);
+        type IsOpen = fn(&Workspace) -> bool;
+        let cases: [(&str, Open, IsOpen); 4] = [
+            (
+                "rename",
+                |w, window, cx| w.open_rename(3, window, cx),
+                |w| w.rename_sheet().is_some(),
+            ),
+            (
+                "labels",
+                |w, window, cx| w.open_labels(3, window, cx),
+                |w| w.labels_sheet().is_some(),
+            ),
+            (
+                "kill",
+                |w, window, cx| w.kill(&Kill { agent_id: 3 }, window, cx),
+                |w| w.kill_sheet().is_some(),
+            ),
+            (
+                "peek",
+                |w, window, cx| w.open_peek(3, window, cx),
+                |w| w.peek().is_some(),
+            ),
+        ];
+        for (what, open, is_open) in cases {
+            agents(&mut s, &fake, vec![row(3, "/w", 3), row(4, "/w", 4)]);
+            s.ws.update_in(s.cx, open);
+            s.cx.run_until_parked();
+            assert!(s.ws.read_with(s.cx, |w, _| is_open(w)), "{what} opens");
+            agents(&mut s, &fake, vec![row(3, "/w", 3)]);
+            assert!(
+                s.ws.read_with(s.cx, |w, _| is_open(w)),
+                "{what} stays for another agent's removal"
+            );
+            agents(&mut s, &fake, vec![]);
+            assert!(
+                s.ws.read_with(s.cx, |w, _| !w.has_modal()),
+                "{what} closes with its agent"
+            );
+            assert!(
+                pane_has_keyboard(&mut s, PaneId(1)),
+                "{what}: keyboard back"
+            );
+        }
+    }
+
+    /// Issue #143: the kill question for several agents closes when one of
+    /// them is removed (its list of names would be wrong).
+    #[gpui::test]
+    fn the_bulk_kill_question_closes_when_one_of_its_agents_goes(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![row(2, "/w", 2), row(3, "/w", 3), row(4, "/w", 4)],
+        );
+        s.ws.update_in(s.cx, |w, window, cx| {
+            let sheet =
+                cx.new(|cx| super::KillSheet::many(vec![2, 3], vec!["2".into(), "3".into()], cx));
+            let sub = cx.subscribe_in(&sheet, window, Workspace::kill_event);
+            w.modal = Some(super::Modal::Kill(sheet, sub));
+        });
+        agents(&mut s, &fake, vec![row(2, "/w", 2), row(3, "/w", 3)]);
+        assert!(s.ws.read_with(s.cx, |w, _| w.kill_sheet().is_some()));
+        agents(&mut s, &fake, vec![row(2, "/w", 2)]);
+        assert!(s.ws.read_with(s.cx, |w, _| w.kill_sheet().is_none()));
+        assert!(kills(&fake).is_empty());
+    }
+
+    /// Issue #143: the Answer sheet closes when its question closes (the
+    /// agent reported on, or asked another), or its agent goes.
+    #[gpui::test]
+    fn the_answer_sheet_closes_with_its_question(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let open = |s: &mut Setup<'_>| {
+            s.ws.update_in(s.cx, |w, window, cx| w.open_answer(3, window, cx));
+            s.cx.run_until_parked();
+            s.ws.read_with(s.cx, |w, _| w.answer_sheet().is_some())
+        };
+        let still_open =
+            |s: &mut Setup<'_>| s.ws.read_with(s.cx, |w, _| w.answer_sheet().is_some());
+        for after in [
+            vec![asking(3, 10)],
+            vec![row(3, "/w", 3)],
+            vec![row(4, "/w", 4)],
+        ] {
+            agents(&mut s, &fake, vec![asking(3, 9), row(4, "/w", 4)]);
+            assert!(open(&mut s));
+            // Another agent going changes nothing.
+            agents(&mut s, &fake, vec![asking(3, 9)]);
+            assert!(still_open(&mut s));
+            agents(&mut s, &fake, after);
+            assert!(!still_open(&mut s));
+            assert!(pane_has_keyboard(&mut s, PaneId(1)));
+        }
+        assert!(!fake.calls().iter().any(|c| matches!(c, Call::Answer(..))));
     }
 }
