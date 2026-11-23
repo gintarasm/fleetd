@@ -3068,7 +3068,7 @@ mod tests {
 
     use super::{SendSheet, Workspace, now_ms};
     use crate::app::app_state::{AppState, SAVE_DEBOUNCE, SessionApi};
-    use crate::app::keymap::{FocusPane1, Kill, RemoveExited, SplitRight, bind_keys};
+    use crate::app::keymap::{FocusPane1, FocusPane2, Kill, RemoveExited, SplitRight, bind_keys};
     use crate::app::new_agent::NewAgentSheet;
     use crate::app::pane_view::InputSink;
     use crate::app::sidebar_view::TabMark;
@@ -3121,6 +3121,8 @@ mod tests {
     struct Fake {
         calls: Mutex<Vec<Call>>,
         inputs: Mutex<Vec<Vec<u8>>>,
+        /// The same input, with the pane it went to.
+        pane_inputs: Mutex<Vec<(PaneId, Vec<u8>)>>,
         agents: Mutex<Vec<AgentRow>>,
         models: Mutex<HashMap<PaneId, Arc<Mutex<PaneModel>>>>,
         spawn_error: Mutex<Option<String>>,
@@ -3146,7 +3148,8 @@ mod tests {
     }
 
     impl InputSink for Fake {
-        fn input(&self, _pane: PaneId, bytes: Vec<u8>) {
+        fn input(&self, pane: PaneId, bytes: Vec<u8>) {
+            self.pane_inputs.lock().unwrap().push((pane, bytes.clone()));
             self.inputs.lock().unwrap().push(bytes);
         }
 
@@ -6616,6 +6619,52 @@ mod tests {
         s.cx.run_until_parked();
         assert!(s.cx.debug_bounds("exit-toast-7-celebration").is_some());
         assert!(s.cx.debug_bounds("exit-toast-8-celebration").is_none());
+    }
+
+    #[gpui::test]
+    fn panes_report_focus_moving_between_them_and_window_activation(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        s.cx.dispatch_action(SplitRight);
+        s.cx.run_until_parked();
+        assert_eq!(focused(&mut s), PaneId(2));
+        // Both programs ask for focus reports (DECSET 1004).
+        for pane in [1, 2] {
+            let model = fake.model(PaneId(pane));
+            model.lock().unwrap().on_output(b"\x1b[?1004h");
+        }
+        let take = |fake: &Fake| {
+            let mut sent = std::mem::take(&mut *fake.pane_inputs.lock().unwrap());
+            sent.sort_by_key(|(pane, _)| pane.0);
+            sent
+        };
+        take(&fake);
+        let (focus_in, focus_out) = (b"\x1b[I".to_vec(), b"\x1b[O".to_vec());
+
+        s.cx.dispatch_action(FocusPane1);
+        s.cx.run_until_parked();
+        assert_eq!(
+            take(&fake),
+            vec![
+                (PaneId(1), focus_in.clone()),
+                (PaneId(2), focus_out.clone())
+            ]
+        );
+
+        // Only the focused pane hears of the window's activation.
+        s.cx.deactivate_window();
+        assert_eq!(take(&fake), vec![(PaneId(1), focus_out.clone())]);
+        s.cx.update(|window, _| window.activate_window());
+        s.cx.run_until_parked();
+        assert_eq!(take(&fake), vec![(PaneId(1), focus_in.clone())]);
+
+        // A pane whose program did not ask hears nothing.
+        let model = fake.model(PaneId(1));
+        model.lock().unwrap().on_output(b"\x1b[?1004l");
+        s.cx.dispatch_action(FocusPane2);
+        s.cx.run_until_parked();
+        assert_eq!(take(&fake), vec![(PaneId(2), focus_in)]);
     }
 
     #[gpui::test]
