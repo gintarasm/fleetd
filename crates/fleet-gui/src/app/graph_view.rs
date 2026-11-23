@@ -550,7 +550,7 @@ impl GraphView {
                         .bg(theme.accent)
                         .text_size(cap)
                         .line_height(cap_lh)
-                        .text_color(gpui::white())
+                        .text_color(theme.on_accent)
                         .cursor_pointer()
                         .child("Reply…")
                         // Not the card's click, which opens the agent.
@@ -590,9 +590,9 @@ impl GraphView {
             .rounded(size(radius::LG))
             .overflow_hidden()
             .bg(if fresh > 0.0 {
-                theme.card.blend(theme.accent.opacity(0.22 * fresh))
+                theme.card.blend(theme.accent_tint.opacity(fresh))
             } else if c.waiting {
-                theme.card.blend(theme.warning.opacity(0.12))
+                theme.card.blend(theme.warning_tint)
             } else {
                 theme.card
             })

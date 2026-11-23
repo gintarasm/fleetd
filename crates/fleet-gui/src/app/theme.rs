@@ -28,6 +28,13 @@ pub struct Theme {
     pub secondary: Hsla,
     pub tertiary: Hsla,
     pub accent: Hsla,
+    /// Text on a solid accent fill, and its dim variant.
+    pub on_accent: Hsla,
+    pub on_accent_dim: Hsla,
+    /// Translucent accent fills under text (wash, tint, strong).
+    pub accent_wash: Hsla,
+    pub accent_tint: Hsla,
+    pub accent_strong: Hsla,
     /// Translucent fill drawn over selected cells.
     pub selection: Hsla,
     /// Background of the IME's marked (uncommitted) text.
@@ -38,6 +45,7 @@ pub struct Theme {
     pub danger: Hsla,
     pub success: Hsla,
     pub warning: Hsla,
+    pub warning_tint: Hsla,
     pub shadow: Hsla,
 }
 
@@ -62,6 +70,11 @@ impl Theme {
             secondary: hsla(t.secondary),
             tertiary: hsla(t.tertiary),
             accent: hsla(t.accent),
+            on_accent: hsla(t.on_accent),
+            on_accent_dim: hsla(t.on_accent_dim),
+            accent_wash: hsla(t.accent_wash),
+            accent_tint: hsla(t.accent_tint),
+            accent_strong: hsla(t.accent_strong),
             selection: hsla(t.selection),
             marked: hsla(t.marked),
             find_match: hsla(t.find_match),
@@ -69,6 +82,7 @@ impl Theme {
             danger: hsla(t.danger),
             success: hsla(t.success),
             warning: hsla(t.warning),
+            warning_tint: hsla(t.warning_tint),
             shadow: hsla(t.shadow),
         }
     }

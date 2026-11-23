@@ -68,7 +68,7 @@ pub fn button(
     let b = match kind {
         ButtonKind::Primary => b
             .bg(theme.accent)
-            .text_color(gpui::white())
+            .text_color(theme.on_accent)
             .font_weight(gpui::FontWeight::MEDIUM),
         ButtonKind::Secondary => b
             .border_1()
@@ -172,7 +172,7 @@ pub fn check_box(checked: bool, theme: &Theme) -> Div {
         .border_color(if checked { theme.accent } else { theme.border })
         .when(checked, |b| {
             b.bg(theme.accent)
-                .child(icons::sized(Icon::Check, 11.0).text_color(gpui::white()))
+                .child(icons::sized(Icon::Check, 11.0).text_color(theme.on_accent))
         })
         .when(!checked, |b| b.bg(theme.field))
 }
