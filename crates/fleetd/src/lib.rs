@@ -4,6 +4,7 @@
 mod approval;
 pub mod handoff;
 pub mod logging;
+mod primitives;
 mod restart;
 mod scope;
 mod server;
@@ -397,9 +398,14 @@ impl Daemon {
         };
         info!(signal, "fleetd stopping: stopping agents");
         leases.abort();
-        tokio::task::spawn_blocking(move || node.shutdown())
-            .await
-            .map_err(io::Error::other)?;
+        tokio::task::spawn_blocking(move || {
+            // Execs (ADR 0091) run in their own sessions: nothing else
+            // would end them.
+            fleet_node::primitives::kill_all_execs();
+            node.shutdown()
+        })
+        .await
+        .map_err(io::Error::other)?;
         match fs::remove_file(&self.socket_path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),

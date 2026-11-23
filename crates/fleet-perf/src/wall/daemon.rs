@@ -496,6 +496,35 @@ pub(super) fn reattach_snapshot_ns(
     Ok(median(samples))
 }
 
+/// `exec_true_roundtrip_ns` (ADR 0091): median latency from `Exec
+/// /usr/bin/true` sent to its `ExecResult` received, over `execs` calls on
+/// one connection to an idle daemon (after a few warm-up calls).
+pub(super) fn exec_true_roundtrip_ns(fleetd: &Path, execs: usize) -> Result<f64, String> {
+    const WARMUP: usize = 3;
+    let daemon = Daemon::start(fleetd)?;
+    let mut client = Client::connect(&daemon.sock)?;
+    let mut streams = Streams::default();
+    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    let mut samples = Vec::with_capacity(execs);
+    for i in 0..WARMUP + execs {
+        let exec = fleet_proto::Exec {
+            argv: vec!["/usr/bin/true".into()],
+            cwd: cwd.clone(),
+            ..Default::default()
+        };
+        let sent = Instant::now();
+        let req = client.request(request::Kind::Exec(Box::new(exec)))?;
+        match streams.wait(&mut client, req)? {
+            response::Kind::ExecResult(r) if r.exit_code == 0 => {}
+            other => return Err(format!("exec true: unexpected {other:?}")),
+        }
+        if i >= WARMUP {
+            samples.push(sent.elapsed().as_nanos() as f64);
+        }
+    }
+    Ok(median(samples))
+}
+
 /// Spawns one `fake-agent --ansi --bytes <bytes> --seed <seed>`; returns its id.
 pub(super) fn spawn_fake_agent(
     client: &mut Client,

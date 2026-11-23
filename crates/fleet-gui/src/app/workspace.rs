@@ -7599,6 +7599,58 @@ mod tests {
         }
 
         #[gpui::test]
+        fn hovering_a_message_line_explains_it_and_a_click_selects_the_sender(
+            cx: &mut TestAppContext,
+        ) {
+            use crate::core::message_lines::{Edge, Kind, route_all};
+            let dir = tempfile::tempdir().unwrap();
+            let fake = Arc::new(Fake::default());
+            let mut s = open_graph(
+                cx,
+                &fake,
+                dir.path(),
+                vec![row(1, "/w", 1), child(2, 1), child(3, 1)],
+            );
+            let now = now_ms();
+            s.app.update(s.cx, |a, cx| {
+                a.message_edges = vec![Edge {
+                    id: 1,
+                    from: 3,
+                    to: 1,
+                    kind: Kind::Message,
+                    at_ms: now - 2 * 60_000,
+                }];
+                cx.notify();
+            });
+            s.cx.run_until_parked();
+            let g = graph(&mut s);
+            let (route, vp) = g.read_with(s.cx, |g, _| {
+                (route_all(g.layout(), &[(3, 1)])[0].clone(), g.viewport())
+            });
+            // The middle of the line's run along the column gap, on screen.
+            let (a, b) = (route.points[1], route.points[2]);
+            let (x, y) = vp.to_screen(((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0));
+            let area = s.cx.debug_bounds("graph-area").unwrap().origin;
+            let at = point(area.x + gpui::px(x + 2.0), area.y + gpui::px(y));
+            s.cx.simulate_mouse_move(at, None, Modifiers::none());
+            s.cx.run_until_parked();
+            assert_eq!(g.read_with(s.cx, |g, _| g.hovered_line()), Some((3, 1)));
+            assert!(s.cx.debug_bounds("graph-line-tip-3-1").is_some());
+            // Over a card: the card, not the line.
+            let card = s.cx.debug_bounds("graph-card-2").unwrap().center();
+            s.cx.simulate_mouse_move(card, None, Modifiers::none());
+            s.cx.run_until_parked();
+            assert_eq!(g.read_with(s.cx, |g, _| g.hovered_line()), None);
+            // Back on the line, a click selects the sender and stays in the
+            // graph.
+            s.cx.simulate_mouse_move(at, None, Modifiers::none());
+            s.cx.simulate_click(at, Modifiers::none());
+            s.cx.run_until_parked();
+            assert_eq!(selected(&mut s), Some(3));
+            assert!(shown(&mut s));
+        }
+
+        #[gpui::test]
         fn enter_opens_the_selected_agent_in_the_focused_pane(cx: &mut TestAppContext) {
             let dir = tempfile::tempdir().unwrap();
             let fake = Arc::new(Fake::default());

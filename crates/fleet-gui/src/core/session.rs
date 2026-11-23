@@ -1179,6 +1179,13 @@ impl ControlReader {
                                 id: e.id,
                                 from: e.sender,
                                 to: e.recipient,
+                                kind: match e.kind() {
+                                    fleet_proto::MessageKind::Question => {
+                                        message_lines::Kind::Question
+                                    }
+                                    fleet_proto::MessageKind::Answer => message_lines::Kind::Answer,
+                                    _ => message_lines::Kind::Message,
+                                },
                                 at_ms: e.created_unix_ms,
                             })
                             .collect();

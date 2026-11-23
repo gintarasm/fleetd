@@ -89,6 +89,7 @@ fn run(cx: &mut TestAppContext) {
         id: 1,
         from: 1,
         to: 2,
+        kind: Default::default(),
         at_ms: 1,
     });
     ui.send_blocking(UiEvent::MessageEdgesChanged).unwrap();

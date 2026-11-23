@@ -25,6 +25,7 @@ use gpui::{
 
 use super::app_state::AppState;
 use super::controls;
+use super::graph_lines::{self, GraphLines};
 use super::graph_panel::PanelSlot;
 use super::icons;
 use super::keymap::{OpenAgentPanel, OpenInMainView, ToggleChildren};
@@ -42,7 +43,6 @@ use crate::core::graph_layout::{
 use crate::core::graph_panel::{GraphEscape, graph_escape};
 use crate::core::icons::Icon;
 use crate::core::layout::Rect;
-use crate::core::message_lines;
 use crate::core::peek::{HOVER_HOLD, HoverHold};
 use crate::core::session::AgentRow;
 use crate::core::sidebar::ended;
@@ -106,6 +106,8 @@ pub struct GraphView {
     hover_timer: Option<gpui::Task<()>>,
     /// The terminal panel (ADR 0105; `graph_panel.rs`).
     pub(super) panel: PanelSlot,
+    /// Message lines: routes, hover, tooltip (ADR 0106).
+    lines: GraphLines,
     _subs: Vec<Subscription>,
 }
 
@@ -138,6 +140,7 @@ impl GraphView {
             new_child_timer: controls::RedrawTimer::default(),
             hover: HoverHold::default(),
             hover_timer: None,
+            lines: GraphLines::default(),
             _subs: subs,
         }
     }
@@ -156,6 +159,11 @@ impl GraphView {
 
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    /// The message line under the pointer: `(sender, recipient)`.
+    pub fn hovered_line(&self) -> Option<(u64, u64)> {
+        self.lines.hovered_line()
     }
 
     /// The nearest `.git` above `cwd`, looked up once per cwd and only for
@@ -731,14 +739,10 @@ impl Render for GraphView {
                 live_edges.push(pts);
             }
         }
-        // Message lines (ADR 0089): the recent ones between cards the layout
-        // has, culled to the view, one path per fade step.
-        let mut msg_lines: [Vec<[(f32, f32); 2]>; message_lines::STEPS] = Default::default();
-        for line in message_lines::lines(&layout, &app.message_edges, now, &view) {
-            for seg in line.segments {
-                msg_lines[line.step].push(seg.map(|p| vp.to_screen(p)));
-            }
-        }
+        // Message lines (ADRs 0089, 0106): routed around the cards.
+        let msg_lines =
+            self.lines
+                .prepare(self.layouts, &layout, &app.message_edges, now, &view, vp);
         let msg_colour = theme.accent;
         let area = self.area.clone();
         let (box_fill, box_border, edge, edge_ended) = (
@@ -790,21 +794,7 @@ impl Render for GraphView {
                         window.paint_path(path, colour);
                     }
                 }
-                // Oldest (faintest) first, so fresh lines lie on top.
-                for (step, segs) in msg_lines.iter().enumerate().rev() {
-                    if segs.is_empty() {
-                        continue;
-                    }
-                    let mut path = PathBuilder::stroke(px((1.25 * z).max(1.0)));
-                    for seg in segs {
-                        path.move_to(to_px(o, seg[0]));
-                        path.line_to(to_px(o, seg[1]));
-                    }
-                    if let Ok(path) = path.build() {
-                        window
-                            .paint_path(path, msg_colour.opacity(message_lines::opacity_of(step)));
-                    }
-                }
+                msg_lines.paint(o, z, msg_colour, window);
             },
         )
         .absolute()
@@ -855,6 +845,11 @@ impl Render for GraphView {
             })
             .collect();
         self.built = contents.iter().map(|(c, _)| c.id).collect();
+        let name = |id: u64| {
+            rows.get(&id)
+                .map_or_else(|| format!("agent {id}"), |r| tab_title(r, &titles_by_id))
+        };
+        let line_tip = self.lines.tooltip(&name, now, &theme);
         let empty = layout.is_empty();
         let filtering = !self.filter.read(cx).text().trim().is_empty();
         let (fresh, next) = {
@@ -926,6 +921,7 @@ impl Render for GraphView {
                         "Arrows move · Space terminal · ⌘⏎ open · C collapse · ⌫ stop subtree · ⇧⌫ remove ended · / filter · Esc back",
                     ),
             )
+            .child(graph_lines::legend(&theme))
             .child(
                 div()
                     .flex_none()
@@ -944,14 +940,30 @@ impl Render for GraphView {
             .on_scroll_wheel(cx.listener(Self::scroll))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     this.hover.cancel();
-                    this.drag = Some(ev.position);
                     window.focus(&this.focus);
+                    // A click on a message line selects its sender.
+                    if let Some((from, _)) = this.lines.hovered_line() {
+                        this.select(from, window, cx);
+                        return;
+                    }
+                    this.drag = Some(ev.position);
                 }),
             )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered && this.lines.pointer_left() {
+                    cx.notify();
+                }
+            }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
-                let Some(last) = this.drag else { return };
+                let Some(last) = this.drag else {
+                    let at = this.to_area(ev.position);
+                    if this.lines.pointer_moved(&this.layout, this.viewport, at) {
+                        cx.notify();
+                    }
+                    return;
+                };
                 if ev.pressed_button != Some(MouseButton::Left) {
                     this.drag = None;
                     return;
@@ -976,6 +988,7 @@ impl Render for GraphView {
             .children(titles)
             .children(cards)
             .children(placeholder)
+            .children(line_tip)
             .child(end);
 
         let graph = div()

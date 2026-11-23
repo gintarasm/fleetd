@@ -2002,6 +2002,12 @@ impl Node {
         self
     }
 
+    /// The login-shell environment the node's processes start from (agents,
+    /// and the `Exec` primitive, ADR 0091).
+    pub fn login_env(&self) -> LoginEnv {
+        self.base_env.clone()
+    }
+
     /// Lowers agents spawned from now on by `nice` (as `nice -n`; 0 is
     /// off), unless spawned with `AGENT_PRIORITY_NORMAL` (ADR 0066).
     pub fn with_agent_nice(mut self, nice: u8) -> Node {

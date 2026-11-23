@@ -295,6 +295,9 @@ impl Restart {
                 if let Some(reason) = stopping() {
                     return reason;
                 }
+                // Execs (ADR 0091) are in their own sessions and would
+                // outlive the new daemon: a restart kills them.
+                fleet_node::primitives::kill_all_execs();
                 let e = handoff::exec(binary, &self.state_dir, record_fd, &keep, &pids);
                 format!("exec {}: {e}", binary.display())
             }

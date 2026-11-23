@@ -20,6 +20,7 @@ use tokio_util::codec::{Decoder, Encoder};
 
 pub mod history;
 pub mod names;
+pub mod node;
 mod restart;
 pub mod search;
 pub mod tree;
