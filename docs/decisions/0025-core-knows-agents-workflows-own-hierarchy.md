@@ -5,6 +5,7 @@
 **Supersedes:** [0009](0009-domain-model.md).
 
 **Amended by:** [0052](0052-agent-names.md) — the `name` label is grant-safe: an agent's spawner (another agent included) may set it, and a child never inherits it.
+[0092](0092-workflow-host-and-run-action.md) — a workflow spawning for an agent replaces the keys of the label prefix it owns (its manifest's `labels:`); narrowing holds everywhere else.
 
 **Amends:**
 - [0007](0007-plugin-system.md): new plugin kind `workflow`;

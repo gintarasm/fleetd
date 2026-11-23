@@ -25,6 +25,10 @@ fn main() {
         .boxed(".fleet.v1.Response.kind.inbox")
         .boxed(".fleet.v1.Response.kind.wait_result")
         .boxed(".fleet.v1.Event.kind.spawn_pending")
+        .boxed(".fleet.v1.Request.kind.run_action")
+        .boxed(".fleet.v1.Response.kind.action_list")
+        .boxed(".fleet.v1.Response.kind.action_result")
+        .boxed(".fleet.v1.ActionResult.outcome.spawned")
         .boxed(".fleet.v1.HelloOk.binary")
         .boxed(".fleet.v1.HelloOk.restore")
         // Node primitives (ADR 0091).

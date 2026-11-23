@@ -10,6 +10,7 @@ workspace = true
 bytes = "1.12.1"
 fleet-node = { version = "0.1.0", path = "../fleet-node" }
 fleet-proto = { version = "0.1.0", path = "../fleet-proto" }
+fleet-workflow = { version = "0.1.0", path = "../fleet-workflow" }
 fs4 = "1.1.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 libc = "0.2.191"

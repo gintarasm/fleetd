@@ -83,6 +83,10 @@ message Request {
     Exec exec = 91;
     ReadFile read_file = 92;
     ListDir list_dir = 93;
+    // Workflows (ADR 0092, M4 spec §2): 95-104 (97-104 spare: M6's
+    // progress events and cancel).
+    ListActions list_actions = 95;
+    RunAction run_action = 96;
   }
 }
 
@@ -114,6 +118,9 @@ message Response {
     ExecResult exec_result = 91;
     FileData file_data = 92;
     DirListing dir_listing = 93;
+    // Workflows (ADR 0092): 95-104.
+    ActionList action_list = 95;
+    ActionResult action_result = 96;
   }
 }
 
@@ -602,3 +609,178 @@ enum SpawnDecision {
 }
 // A pending spawn is no longer pending.
 message SpawnDecided { uint64 id = 1; SpawnDecision decision = 2; }
+
+// Workflows (ADR 0092, M4 spec §2). A workflow exposes named actions
+// (`<workflow>.<action>`); every client lists them with `ListActions` and
+// calls one with `RunAction`, rendering a form from the action's params.
+// The daemon validates every call against the action's schema and the
+// caller's scope before the workflow sees it.
+
+// Who may call an action. The default is the user only.
+enum ActionCallers {
+  ACTION_CALLERS_USER = 0;
+  ACTION_CALLERS_USER_AND_AGENTS = 1;
+}
+
+// A param's kind, and the `ParamValue` it takes:
+// string, text (multi-line), choice (one of `choices`), path (an absolute
+// directory on the node): `string`; bool: `bool`; int, duration
+// (milliseconds): `int`; agent: an id (`int`) or an id or name (`string`),
+// passed to the workflow as the id (`int`); argv: `list`; labels: `map`.
+enum ParamKind {
+  PARAM_KIND_UNSPECIFIED = 0;
+  PARAM_STRING = 1;
+  PARAM_TEXT = 2;
+  PARAM_BOOL = 3;
+  PARAM_INT = 4;
+  PARAM_DURATION = 5;
+  PARAM_CHOICE = 6;
+  PARAM_PATH = 7;
+  PARAM_AGENT = 8;
+  PARAM_ARGV = 9;
+  PARAM_LABELS = 10;
+}
+
+message StringList { repeated string items = 1; }
+message StringMap { map<string, string> entries = 1; }
+
+message ParamValue {
+  oneof value {
+    string string = 1;
+    bool bool = 2;
+    int64 int = 3;
+    StringList list = 4;
+    StringMap map = 5;
+  }
+}
+
+message ParamSpec {
+  string key = 1;
+  string title = 2;
+  ParamKind kind = 3;
+  bool required = 4;
+  // What the workflow gets when the param is not given (unset: nothing).
+  ParamValue default = 5;
+  // For `choice`: the allowed values.
+  repeated string choices = 6;
+  string help = 7;
+  string placeholder = 8;
+  // An agent caller may not set it (e.g. `force`): `forbidden:`.
+  bool user_only = 9;
+}
+
+message ActionSpec {
+  // `<workflow>.<action>`, e.g. `git-worktree.new-agent`.
+  string name = 1;
+  string title = 2;
+  string description = 3;
+  repeated ParamSpec params = 4;
+  ActionCallers callers = 5;
+  // Clients confirm before running it.
+  bool destructive = 6;
+  // The key of the `agent` param the action is about, so clients can offer
+  // it in an agent's context menu with that agent filled in; empty when
+  // the action is not about an agent.
+  string target_param = 7;
+}
+
+// Every action the caller may call (an agent: only `USER_AND_AGENTS`
+// ones). Static per daemon build: clients cache it per connection.
+message ListActions {}
+message ActionList { repeated ActionSpec actions = 1; }
+
+// Runs action `name` as the caller. `cwd` is the caller's working
+// directory (the CLI sends the shell's), for actions that default to it.
+// Answered by `ActionResult`, or an `Error` (`forbidden:` for scope).
+message RunAction {
+  string name = 1;
+  map<string, ParamValue> params = 2;
+  string cwd = 3;
+}
+
+message ActionResult {
+  oneof outcome {
+    ActionDone done = 1;
+    ActionSpawned spawned = 2;
+    View view = 3;
+    ActionRefused refused = 4;
+  }
+}
+message ActionDone { string message = 1; }
+message ActionSpawned { AgentInfo agent = 1; string message = 2; }
+// A refusal the user can override: resend the call with `retry` merged
+// into its params (e.g. `force = true`). Clients show `reason` and an
+// "… anyway" button.
+message ActionRefused {
+  string reason = 1;
+  map<string, ParamValue> retry = 2;
+}
+
+// What an action shows (the start of ADR 0007's declarative views; M5
+// adds kinds).
+message View {
+  oneof kind {
+    DiffView diff = 1;
+    TableView table = 2;
+    TextView text = 3;
+  }
+}
+
+enum FileStatus {
+  FILE_STATUS_UNSPECIFIED = 0;
+  FILE_ADDED = 1;
+  FILE_MODIFIED = 2;
+  FILE_DELETED = 3;
+  FILE_RENAMED = 4;
+  FILE_COPIED = 5;
+  FILE_TYPE_CHANGED = 6;
+}
+
+message DiffView {
+  string title = 1;          // "issue-140 · feat/m4-primitives"
+  string from_label = 2;     // "origin/main (merge base 1a2b3c4)"
+  string to_label = 3;       // "working tree"
+  repeated FileDiff files = 4;
+  uint32 files_changed = 5;
+  uint64 additions = 6;
+  uint64 deletions = 7;
+  bool truncated = 8;        // some files have hunks_omitted
+}
+message FileDiff {
+  string old_path = 1;       // empty when added
+  string new_path = 2;       // empty when deleted
+  FileStatus status = 3;
+  bool binary = 4;
+  uint32 additions = 5;
+  uint32 deletions = 6;
+  repeated Hunk hunks = 7;
+  bool hunks_omitted = 8;    // over the cap: ask again with `file`
+  string old_mode = 9;
+  string new_mode = 10;
+}
+message Hunk {
+  uint32 old_start = 1; uint32 old_lines = 2;
+  uint32 new_start = 3; uint32 new_lines = 4;
+  string header = 5;         // the text after @@ … @@
+  // The hunk's lines as in a unified diff: each starts with ' ', '+', '-'
+  // or '\', separated by '\n'. One bytes field, not a message per line:
+  // a 50,000-line diff stays one allocation per hunk on both sides.
+  bytes body = 6;
+}
+
+// Columns and rows of strings; a row may link to an agent or a path.
+message TableView {
+  string title = 1;
+  repeated string columns = 2;
+  repeated TableRow rows = 3;
+}
+message TableRow {
+  repeated string cells = 1;
+  optional uint64 agent_id = 2;
+  string path = 3;
+}
+// Pre-formatted text.
+message TextView {
+  string title = 1;
+  string text = 2;
+}

@@ -173,6 +173,63 @@ pub fn child_labels(parent: u64, parent_labels: &Labels, requested: Labels) -> i
     Ok(labels)
 }
 
+/// Whether `prefix` may be a workflow's owned label prefix (ADR 0092):
+/// ASCII letters, digits, `-`, `_` and `.`, ending in `.`, not starting
+/// with one, at most 32 bytes, and not the core's `fleet.`.
+pub fn check_owned_prefix(prefix: &str) -> io::Result<()> {
+    let ok = prefix.len() >= 2
+        && prefix.len() <= 32
+        && prefix.ends_with('.')
+        && !prefix.starts_with('.')
+        && !prefix.contains("..")
+        && !prefix.starts_with("fleet.")
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(forbidden(format!(
+            "{prefix:?} cannot be a workflow's label prefix"
+        )))
+    }
+}
+
+/// A child's labels when a workflow spawns it for agent `parent` (ADR 0092,
+/// the one exception to [`child_labels`]): the workflow owns `prefix`
+/// (from its manifest), so its `owned` keys, all in that prefix, replace
+/// every inherited key of the prefix. That is safe because the values come
+/// from the workflow, not the agent. Everything else is [`child_labels`]:
+/// `requested` (the caller's labels) may only add keys, and may not touch
+/// the prefix.
+pub fn child_labels_owned(
+    parent: u64,
+    parent_labels: &Labels,
+    requested: Labels,
+    prefix: &str,
+    owned: Labels,
+) -> io::Result<Labels> {
+    check_owned_prefix(prefix)?;
+    if let Some(key) = owned.keys().find(|k| !k.starts_with(prefix)) {
+        return Err(forbidden(format!(
+            "label {key:?} is outside the workflow's prefix {prefix:?}"
+        )));
+    }
+    if let Some(key) = requested.keys().find(|k| k.starts_with(prefix)) {
+        return Err(forbidden(format!(
+            "label {key:?} is in prefix {prefix:?}, which only its workflow writes"
+        )));
+    }
+    let inherited: Labels = parent_labels
+        .iter()
+        .filter(|(k, _)| !k.starts_with(prefix))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut labels = child_labels(parent, &inherited, requested)?;
+    labels.extend(owned);
+    Ok(labels)
+}
+
 /// The spawned-by tree of a node's agents.
 #[derive(Debug, Default)]
 pub struct Tree {
@@ -436,6 +493,107 @@ mod tests {
         // The parent's name is not inherited.
         let got = child_labels(2, &parent, Labels::new()).unwrap();
         assert!(!got.contains_key("name"));
+    }
+
+    // The owned-prefix exception (ADR 0092): a workflow spawning for an
+    // agent sets the keys of the prefix it owns, replacing inherited ones.
+
+    fn owned_parent() -> Labels {
+        labels(&[
+            ("project", "fleetd"),
+            ("name", "boss"),
+            ("git.repo", "/r"),
+            ("git.worktree", "/r-wt/a"),
+            ("git.base", "origin/main"),
+            ("fleet.parent", "1"),
+        ])
+    }
+
+    #[test]
+    fn owned_keys_replace_the_inherited_prefix() {
+        let got = child_labels_owned(
+            2,
+            &owned_parent(),
+            labels(&[("role", "rev"), ("name", "kid")]),
+            "git.",
+            labels(&[("git.repo", "/r"), ("git.worktree", "/r-wt/b")]),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            labels(&[
+                ("project", "fleetd"),
+                ("role", "rev"),
+                ("name", "kid"),
+                ("git.repo", "/r"),
+                ("git.worktree", "/r-wt/b"),
+                ("fleet.parent", "2"),
+            ]),
+            "git.base is dropped: the prefix is the workflow's, all of it"
+        );
+    }
+
+    #[test]
+    fn owned_keys_must_be_in_the_prefix() {
+        for key in ["project", "gitx.repo", "git", "fleet.parent", "name"] {
+            let e = child_labels_owned(
+                2,
+                &owned_parent(),
+                Labels::new(),
+                "git.",
+                labels(&[(key, "x")]),
+            )
+            .unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{key}: {e}");
+            assert!(e.to_string().starts_with(FORBIDDEN_PREFIX), "{e}");
+        }
+    }
+
+    #[test]
+    fn requested_labels_may_not_use_the_owned_prefix() {
+        // Only the workflow writes its prefix; what the caller asks for is
+        // narrowed as always.
+        let e = child_labels_owned(
+            2,
+            &owned_parent(),
+            labels(&[("git.worktree", "/etc")]),
+            "git.",
+            Labels::new(),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+    }
+
+    #[test]
+    fn outside_the_prefix_narrowing_still_holds() {
+        let e = child_labels_owned(
+            2,
+            &owned_parent(),
+            labels(&[("project", "other")]),
+            "git.",
+            labels(&[("git.worktree", "/r-wt/b")]),
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("inherited"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_owned_prefix_is_refused() {
+        for prefix in ["", "git", "fleet.", "fleet.x.", ".", "a b."] {
+            let e = child_labels_owned(2, &owned_parent(), Labels::new(), prefix, Labels::new())
+                .unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{prefix:?}: {e}");
+        }
+        assert!(check_owned_prefix("git.").is_ok());
+        assert!(check_owned_prefix("my-flow.x.").is_ok());
+    }
+
+    #[test]
+    fn with_no_owned_keys_it_only_clears_the_prefix() {
+        let got =
+            child_labels_owned(2, &owned_parent(), Labels::new(), "git.", Labels::new()).unwrap();
+        assert_eq!(got, labels(&[("project", "fleetd"), ("fleet.parent", "2")]));
     }
 
     #[test]

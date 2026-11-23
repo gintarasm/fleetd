@@ -1,5 +1,6 @@
 //! `fleet`: command-line client for `fleetd`.
 
+mod action;
 mod answer;
 mod approval;
 mod attach;
@@ -215,6 +216,8 @@ enum Command {
     /// Wait until agents reach a state or a message arrives (exit 0), or
     /// time out (exit 1)
     Wait(mailbox::WaitArgs),
+    /// List and run workflow actions
+    Action(action::Args),
 }
 
 #[derive(Subcommand)]
@@ -539,6 +542,7 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }
         Command::Report(args) => return report::run(&mut client, &args),
+        Command::Action(args) => return action::run(&mut client, args),
         Command::Answer(args) => return answer::run(&mut client, &args),
         Command::Pending(args) => return approval::list(&mut client, &args),
         Command::Approve(args) => return approval::decide(&mut client, &args, true),
