@@ -28,6 +28,7 @@ pub const DAEMON_FLOOD_CPU_NS_PER_MIB: &str = "daemon_flood50_cpu_ns_per_mib";
 pub const DAEMON_FLOOD_PEAK_RSS_BYTES: &str = "daemon_flood50_peak_rss_bytes";
 pub const DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS: &str = "daemon_flood50_lagged_subscriptions";
 pub const REATTACH_SNAPSHOT_NS: &str = "reattach_snapshot_ns";
+pub const EXEC_TRUE_ROUNDTRIP_NS: &str = "exec_true_roundtrip_ns";
 pub const FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS: &str = "flood50_attached4_lagged_subscriptions";
 pub const INPUT_ECHO_FLOOD_NS: &str = "input_echo_flood50_ns";
 pub const GUI_COLD_START_NS: &str = "gui_cold_start_ns";
@@ -51,6 +52,7 @@ pub const METRIC_NAMES: &[&str] = &[
     DAEMON_FLOOD_PEAK_RSS_BYTES,
     DAEMON_FLOOD_LAGGED_SUBSCRIPTIONS,
     REATTACH_SNAPSHOT_NS,
+    EXEC_TRUE_ROUNDTRIP_NS,
     FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS,
     INPUT_ECHO_FLOOD_NS,
     GUI_COLD_START_NS,
@@ -64,6 +66,10 @@ const QUICK_FLOOD_BYTES: u64 = 256 * 1024;
 /// Attaches measured by `reattach_snapshot_ns` (median taken).
 const REATTACHES: usize = 50;
 const QUICK_REATTACHES: usize = 5;
+/// `Exec /usr/bin/true` round trips measured by `exec_true_roundtrip_ns`
+/// (median taken).
+const EXECS: usize = 50;
+const QUICK_EXECS: usize = 5;
 /// Agents the client is attached to in the `flood50_attached4` scenarios (a
 /// GUI showing four panes).
 const FLOOD_ATTACHED: usize = 4;
@@ -365,6 +371,8 @@ pub fn run(quick: bool) -> Result<Results, String> {
     let pick_daemon =
         |f: fn(&daemon::DaemonFlood) -> f64| median(daemon_floods.iter().map(f).collect());
     let reattach = daemon::reattach_snapshot_ns(&fleetd, &fake_agent, bytes, reattaches)?;
+    let exec_true =
+        daemon::exec_true_roundtrip_ns(&fleetd, if quick { QUICK_EXECS } else { EXECS })?;
 
     // A client showing four panes must keep them streaming through the
     // flood: the worst run counts.
@@ -469,6 +477,7 @@ pub fn run(quick: bool) -> Result<Results, String> {
             m(pick_daemon(|f| f.lagged_subscriptions), "count"),
         ),
         (REATTACH_SNAPSHOT_NS.to_string(), m(reattach, "ns")),
+        (EXEC_TRUE_ROUNDTRIP_NS.to_string(), m(exec_true, "ns")),
         (
             FLOOD_ATTACHED4_LAGGED_SUBSCRIPTIONS.to_string(),
             m(attached4_lagged, "count"),

@@ -79,6 +79,10 @@ message Request {
     ListMessageEdges list_message_edges = 85;
     // Search every agent's output (ADR 0098): 90-94. The user only.
     SearchOutput search_output = 90;
+    // Node primitives (ADR 0091): 91-93. The user only (agents have a shell).
+    Exec exec = 91;
+    ReadFile read_file = 92;
+    ListDir list_dir = 93;
     // Workflows (ADR 0092, M4 spec §2): 95-104 (97-104 spare: M6's
     // progress events and cancel).
     ListActions list_actions = 95;
@@ -110,6 +114,10 @@ message Response {
     PendingSpawns pending_spawns = 75;
     MessageEdges message_edges = 85;
     SearchHits search_hits = 90;
+    // Node primitives (ADR 0091): 91-93.
+    ExecResult exec_result = 91;
+    FileData file_data = 92;
+    DirListing dir_listing = 93;
     // Workflows (ADR 0092): 95-104.
     ActionList action_list = 95;
     ActionResult action_result = 96;
@@ -470,6 +478,60 @@ message SearchHit { uint64 agent_id = 1; uint64 line = 2; string text = 3; }
 // `truncated`: the hit limit or the node's read budget stopped the search
 // before everything was read.
 message SearchHits { repeated SearchHit hits = 1; bool truncated = 2; }
+
+// Node primitives (ADR 0091). `Exec` runs `argv` (argv[0] looked up on the
+// node's login-shell PATH) in `cwd` (absolute) and waits. `env` is added to
+// the login-shell env (`clear_env`: to an empty one). `stdin` (at most
+// 1 MiB) is closed after writing; none: /dev/null. `timeout_ms`: 0 = 10 min,
+// at most 1 h. `max_output`: stdout and stderr together, 0 or above 15 MiB =
+// 15 MiB.
+message Exec {
+  repeated string argv = 1;
+  string cwd = 2;
+  map<string, string> env = 3;
+  bool clear_env = 4;
+  bytes stdin = 5;
+  uint32 timeout_ms = 6;
+  uint32 max_output = 7;
+}
+// `exit_code` is -1 when a signal ended the child (`signal`, else 0).
+// `*_truncated`: that stream had bytes dropped at the output cap.
+message ExecResult {
+  int32 exit_code = 1;
+  int32 signal = 2;
+  bool timed_out = 3;
+  bytes stdout = 4;
+  bytes stderr = 5;
+  bool stdout_truncated = 6;
+  bool stderr_truncated = 7;
+  uint64 duration_ms = 8;
+}
+// `max_bytes`: 0 or above 15 MiB = 15 MiB. Absolute path; symlinks followed.
+message ReadFile { string path = 1; uint64 offset = 2; uint32 max_bytes = 3; }
+message FileData {
+  bytes data = 1;
+  // The file's size and mtime when read.
+  uint64 size = 2;
+  int64 mtime_unix_ms = 3;
+  bool eof = 4;
+}
+// `max_entries`: 0 or above 10,000 = 10,000.
+message ListDir { string path = 1; uint32 max_entries = 2; }
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  ENTRY_KIND_FILE = 1;
+  ENTRY_KIND_DIR = 2;
+  ENTRY_KIND_SYMLINK = 3;
+  ENTRY_KIND_OTHER = 4;
+}
+// Size and mtime are the entry's own (a symlink's, not its target's).
+message DirEntry {
+  string name = 1;
+  EntryKind kind = 2;
+  uint64 size = 3;
+  int64 mtime_unix_ms = 4;
+}
+message DirListing { repeated DirEntry entries = 1; bool truncated = 2; }
 
 message ReadInbox { optional uint64 since = 1; uint32 max = 2; }
 // `cursor`: the newest id returned (else the cursor asked from).

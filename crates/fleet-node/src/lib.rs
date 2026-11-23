@@ -7,6 +7,7 @@ pub mod host;
 pub mod lease;
 pub mod mailbox;
 pub mod node;
+pub mod primitives;
 pub mod priority;
 pub mod pty;
 pub mod scope;

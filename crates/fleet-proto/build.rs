@@ -31,6 +31,10 @@ fn main() {
         .boxed(".fleet.v1.ActionResult.outcome.spawned")
         .boxed(".fleet.v1.HelloOk.binary")
         .boxed(".fleet.v1.HelloOk.restore")
+        // Node primitives (ADR 0091).
+        .boxed(".fleet.v1.Request.kind.exec")
+        .boxed(".fleet.v1.Response.kind.exec_result")
+        .boxed(".fleet.v1.Response.kind.file_data")
         .compile_fds(fds)
         .expect("generate prost types");
     println!("cargo:rerun-if-changed=proto/fleet.proto");

@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 use crate::approval;
 use crate::handoff::Identity;
 use crate::logging;
+use crate::primitives;
 use crate::scope;
 use crate::wait;
 
@@ -407,6 +408,7 @@ async fn connection(
         caller,
         scope: scope::Scope::new(&node_for_scope, caller),
         waits: Vec::new(),
+        execs: Vec::new(),
         approvals: Vec::new(),
         approved_tx,
         approved: HashSet::new(),
@@ -533,6 +535,9 @@ struct Connection {
     scope: scope::Scope,
     /// Running `Wait`s, aborted with the connection.
     waits: Vec<JoinHandle<()>>,
+    /// Running `Exec`s (ADR 0091), aborted with the connection: that kills
+    /// their children.
+    execs: Vec<JoinHandle<()>>,
     /// Spawns waiting for the user's approval (ADR 0079), aborted (so
     /// withdrawn) with the connection.
     approvals: Vec<JoinHandle<()>>,
@@ -558,7 +563,7 @@ impl Drop for Connection {
         if let Some(task) = &self.log_follower {
             task.abort();
         }
-        for task in self.waits.iter().chain(&self.approvals) {
+        for task in self.waits.iter().chain(&self.approvals).chain(&self.execs) {
             task.abort();
         }
     }
@@ -646,6 +651,10 @@ impl Connection {
             // (which ends the connection, and the wait with it).
             Some(request::Kind::Wait(_)) if self.shared.stopped.load(Ordering::SeqCst) => Err(()),
             Some(request::Kind::Wait(_)) => Ok(None),
+            // Likewise an Exec (ADR 0091): it can run for an hour. A restart
+            // ends the connection and kills it.
+            Some(request::Kind::Exec(_)) if self.shared.stopped.load(Ordering::SeqCst) => Err(()),
+            Some(request::Kind::Exec(_)) => Ok(None),
             // Like a wait: an action's host calls are admitted one by one.
             Some(request::Kind::RunAction(_)) if self.shared.stopped.load(Ordering::SeqCst) => {
                 Err(())
@@ -757,6 +766,12 @@ impl Connection {
                 }
             }
             Some(request::Kind::SearchOutput(r)) => search_output(&self.node, r).await,
+            Some(request::Kind::Exec(r)) => match self.start_exec(req.id, *r) {
+                Ok(()) => return true,
+                Err(message) => error(message),
+            },
+            Some(request::Kind::ReadFile(r)) => primitives::read_file(r).await,
+            Some(request::Kind::ListDir(r)) => primitives::list_dir(r).await,
             Some(request::Kind::ListActions(_)) => action::list(&self.shared, self.caller),
             Some(request::Kind::RunAction(r)) => {
                 let start = action::Start {
@@ -798,6 +813,26 @@ impl Connection {
             }
             Err(message) => self.respond(id, error(message)).await,
         }
+    }
+
+    /// Starts an `Exec` (ADR 0091) on its own task (see [`primitives`]); it
+    /// answers when the child is done, while this connection serves other
+    /// requests. The task, and so the child, ends with the connection.
+    fn start_exec(&mut self, id: u64, req: fleet_proto::Exec) -> Result<(), String> {
+        self.execs.retain(|t| !t.is_finished());
+        if self.execs.len() >= primitives::MAX_EXECS_PER_CONNECTION {
+            return Err(format!(
+                "too many execs on this connection (at most {})",
+                primitives::MAX_EXECS_PER_CONNECTION
+            ));
+        }
+        self.execs.push(tokio::spawn(primitives::exec(
+            self.node.login_env(),
+            id,
+            req,
+            self.outbox.clone(),
+        )));
+        Ok(())
     }
 
     /// Starts a `Wait` on its own task (see [`wait`]); it answers when it
@@ -1471,6 +1506,7 @@ mod tests {
             caller: Caller::User,
             scope: scope::Scope::user(),
             waits: Vec::new(),
+            execs: Vec::new(),
             approvals: Vec::new(),
             approved_tx: mpsc::unbounded_channel().0,
             approved: HashSet::new(),

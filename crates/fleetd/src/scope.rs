@@ -228,6 +228,11 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
         Kind::SearchOutput(_) => {
             return Some(forbidden("agents cannot search every agent's output"));
         }
+        // The node primitives are for the user and for workflows (ADR 0091,
+        // 0025): an agent already has a shell.
+        Kind::Exec(_) | Kind::ReadFile(_) | Kind::ListDir(_) => {
+            return Some(forbidden("agents cannot use the node's exec, read or list"));
+        }
         Kind::Attach(r) => vec![r.agent_id],
         Kind::Input(r) => vec![r.agent_id],
         Kind::Resize(r) => vec![r.agent_id],
