@@ -429,3 +429,85 @@ fn handoff_record_round_trips() {
     let got = HandoffRecord::decode(rec.encode_to_vec().as_slice()).unwrap();
     assert_eq!(got, rec);
 }
+
+#[test]
+fn node_primitives_roundtrip_in_their_block() {
+    use fleet_proto::{
+        DirEntry, DirListing, EntryKind, Exec, ExecResult, FileData, ListDir, ReadFile,
+    };
+    let reqs = [
+        request::Kind::Exec(Box::new(Exec {
+            argv: vec!["git".into(), "status".into()],
+            cwd: "/repo".into(),
+            env: [("K".to_string(), "V".to_string())].into(),
+            clear_env: true,
+            stdin: vec![1, 2, 3],
+            timeout_ms: 5_000,
+            max_output: 1024,
+        })),
+        request::Kind::ReadFile(ReadFile {
+            path: "/etc/hosts".into(),
+            offset: 4,
+            max_bytes: 100,
+        }),
+        request::Kind::ListDir(ListDir {
+            path: "/tmp".into(),
+            max_entries: 10,
+        }),
+    ];
+    for (i, kind) in reqs.into_iter().enumerate() {
+        let f = Frame::Request(Request {
+            id: i as u64,
+            kind: Some(kind),
+        });
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+    let resps = [
+        response::Kind::ExecResult(Box::new(ExecResult {
+            exit_code: 3,
+            signal: 9,
+            timed_out: true,
+            stdout: b"out".to_vec(),
+            stderr: b"err".to_vec(),
+            stdout_truncated: true,
+            stderr_truncated: false,
+            duration_ms: 12,
+        })),
+        response::Kind::FileData(Box::new(FileData {
+            data: vec![9; 5],
+            size: 99,
+            mtime_unix_ms: 1_700_000_000_000,
+            eof: true,
+        })),
+        response::Kind::DirListing(DirListing {
+            entries: vec![DirEntry {
+                name: "a".into(),
+                kind: EntryKind::Dir.into(),
+                size: 0,
+                mtime_unix_ms: 1,
+            }],
+            truncated: true,
+        }),
+    ];
+    for (i, kind) in resps.into_iter().enumerate() {
+        let f = Frame::Response(Response {
+            id: i as u64,
+            kind: Some(kind),
+        });
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+    // The wire numbers are ADR 0091's block (91-93; 90 is search, ADR 0098).
+    use prost::Message as _;
+    let field = |kind| {
+        let b = Request {
+            id: 0,
+            kind: Some(kind),
+        }
+        .encode_to_vec();
+        // Tag varint = field << 3 | 2; every field here is >= 16, so two bytes.
+        (u32::from(b[0] & 0x7f) | u32::from(b[1]) << 7) >> 3
+    };
+    assert_eq!(field(request::Kind::Exec(Box::default())), 91);
+    assert_eq!(field(request::Kind::ReadFile(ReadFile::default())), 92);
+    assert_eq!(field(request::Kind::ListDir(ListDir::default())), 93);
+}

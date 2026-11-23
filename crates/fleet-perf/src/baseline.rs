@@ -579,7 +579,17 @@ baseline = 100
             .chain(crate::instr::METRIC_NAMES)
             .copied()
             .collect();
-        assert_eq!(shipped, emitted);
+        // Emitted, but with no baseline yet: the user records them (see
+        // `bench/README.md`); a shipped baseline needs no edit here.
+        const UNRECORDED: &[&str] = &["exec_true_roundtrip_ns"];
+        assert!(shipped.is_subset(&emitted), "{shipped:?} vs {emitted:?}");
+        let missing: std::collections::BTreeSet<&str> =
+            emitted.difference(&shipped).copied().collect();
+        let unrecorded: std::collections::BTreeSet<&str> = UNRECORDED.iter().copied().collect();
+        assert!(
+            missing.is_subset(&unrecorded),
+            "no baseline for {missing:?}"
+        );
     }
 
     fn report_only() -> Baselines {
