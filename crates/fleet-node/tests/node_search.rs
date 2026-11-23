@@ -61,7 +61,9 @@ fn finds_history_and_screen_lines_of_running_and_exited_agents() {
     assert_eq!(hits.hits[1].line, 0);
     assert_eq!(hits.hits[0].line, 0);
 
-    let case = node.search(Needle::new("NEEDLE", true).unwrap(), 0, 0).unwrap();
+    let case = node
+        .search(Needle::new("NEEDLE", true).unwrap(), 0, 0)
+        .unwrap();
     assert!(case.hits.is_empty());
 }
 

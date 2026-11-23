@@ -25,6 +25,7 @@ mod picker_view;
 mod question_view;
 mod rename;
 mod resident;
+mod search_all_view;
 mod send_sheet;
 mod settings_window;
 mod sidebar_view;
@@ -129,6 +130,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Find…", keymap::Find),
                     MenuItem::action("Find Next", keymap::FindNext),
                     MenuItem::action("Find Previous", keymap::FindPrevious),
+                    MenuItem::action("Search All Agents…", keymap::SearchAllAgents),
                 ],
             },
             Menu {

@@ -244,7 +244,10 @@ mod tests {
     #[test]
     fn history_lines_lose_their_sgr_and_trailing_spaces() {
         assert_eq!(text(b"plain"), "plain");
-        assert_eq!(text(b"\x1b[1;31mred\x1b[0m and \x1b[4:3mcurl\x1b[0m  "), "red and curl");
+        assert_eq!(
+            text(b"\x1b[1;31mred\x1b[0m and \x1b[4:3mcurl\x1b[0m  "),
+            "red and curl"
+        );
         assert_eq!(text(b"err\x1b[38;2;1;2;3mor"), "error");
         assert_eq!(text("界\x1b[0m!".as_bytes()), "界!");
         assert_eq!(text(b""), "");

@@ -69,6 +69,8 @@ actions!(
         ClearScrollback,
         // ⇧⌘M: type into one or many agents (ADR 0083).
         SendToAgents,
+        // ⇧⌘F: search every agent's output (ADR 0098).
+        SearchAllAgents,
     ]
 );
 
@@ -127,7 +129,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-4", FocusPane4, None),
         KeyBinding::new("cmd-n", NewAgent, None),
         KeyBinding::new("cmd-t", NewTerminal, None),
-        KeyBinding::new("cmd-shift-f", FocusFilter, None),
+        // ⇧⌘F searches every agent's output (ADR 0098); the sidebar's
+        // filter moved to ⌥⌘F.
+        KeyBinding::new("cmd-shift-f", SearchAllAgents, None),
+        KeyBinding::new("cmd-alt-f", FocusFilter, None),
         KeyBinding::new("cmd-p", CommandPalette, None),
         KeyBinding::new("cmd-shift-m", SendToAgents, None),
         KeyBinding::new("ctrl-tab", NextAgent, None),

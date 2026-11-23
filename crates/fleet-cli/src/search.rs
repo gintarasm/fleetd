@@ -41,7 +41,9 @@ pub fn run(client: &mut Connection, args: &Args) -> Result<u8> {
             }
         }
         if hits.truncated {
-            eprintln!("fleet: more hits not shown (raise --limit or --per-agent, or narrow the text)");
+            eprintln!(
+                "fleet: more hits not shown (raise --limit or --per-agent, or narrow the text)"
+            );
         }
     }
     out.flush()?;
@@ -87,7 +89,10 @@ mod tests {
 
     #[test]
     fn prints_grep_shaped_lines() {
-        assert_eq!(line(&hit(7, 1234, "error: no such file")), "7:1234:error: no such file");
+        assert_eq!(
+            line(&hit(7, 1234, "error: no such file")),
+            "7:1234:error: no such file"
+        );
     }
 
     #[test]

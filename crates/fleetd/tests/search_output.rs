@@ -101,7 +101,10 @@ fn the_user_searches_every_agent_and_an_agent_is_refused() {
         .iter()
         .map(|h| (h.agent_id, h.text.as_str()))
         .collect();
-    assert_eq!(found, vec![(b, "second error seen"), (a, "first ERROR seen")]);
+    assert_eq!(
+        found,
+        vec![(b, "second error seen"), (a, "first ERROR seen")]
+    );
     assert!(!hits.truncated);
 
     let one = search(

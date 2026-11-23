@@ -12,8 +12,8 @@
 
 use std::collections::VecDeque;
 
-pub use fleet_term::{Needle, row_matches};
 use fleet_term::{Cell, Terminal};
+pub use fleet_term::{Needle, row_matches};
 
 use super::scrollback::Scrollback;
 
@@ -79,6 +79,9 @@ pub struct Search {
     current: Option<Match>,
     /// The current match is to be picked once the search has found it.
     pick: bool,
+    /// Pick the match on this line (or the next below it) rather than the
+    /// newest in view (Search All Agents, ADR 0098).
+    target: Option<u64>,
     cells: Vec<Cell>,
     found: Vec<(u16, u16)>,
 }
@@ -86,6 +89,12 @@ pub struct Search {
 impl Search {
     /// A search for `needle`, starting at the newest line.
     pub fn new(needle: Option<Needle>, sb: &Scrollback) -> Search {
+        Search::new_at(needle, sb, None)
+    }
+
+    /// A search for `needle` whose first current match is the one on
+    /// `target` or the next below it (else the last).
+    pub fn new_at(needle: Option<Needle>, sb: &Scrollback, target: Option<u64>) -> Search {
         let end = sb.end_line();
         Search {
             needle,
@@ -97,6 +106,7 @@ impl Search {
             grid_dirty: true,
             current: None,
             pick: true,
+            target,
             cells: Vec::new(),
             found: Vec::new(),
         }
@@ -110,7 +120,7 @@ impl Search {
     /// history was rebuilt or cleared).
     pub fn restart(&mut self, sb: &Scrollback) {
         let needle = self.needle.take();
-        *self = Search::new(needle, sb);
+        *self = Search::new_at(needle, sb, self.target);
     }
 
     /// The grid changed: scan it again on the next step.
@@ -285,6 +295,21 @@ impl Search {
     /// everything between it and `bottom` is scanned, else (when the search
     /// is done and none is above) the first below.
     fn try_pick(&mut self, sb: &Scrollback, bottom: u64) -> bool {
+        if let Some(target) = self.target {
+            // Certain once scanned down to it, or nothing older can come.
+            let more_pages = !sb.fully_loaded() && !sb.is_full();
+            if self.lo > target && !(self.done(sb) && !more_pages) {
+                return false;
+            }
+            let pick = self
+                .matches()
+                .find(|m| m.line >= target)
+                .or_else(|| self.matches().last())
+                .copied();
+            self.pick = false;
+            self.current = pick;
+            return pick.is_some();
+        }
         let above = self
             .matches()
             .take_while(|m| m.line <= bottom)

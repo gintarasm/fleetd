@@ -554,6 +554,27 @@ impl PaneView {
         cx.notify();
     }
 
+    /// Opens the find bar on `query` and goes to its match on `line` (or
+    /// the next below it), paging older history in as needed: a Search All
+    /// Agents pick (ADR 0098).
+    pub fn find_hit(
+        &mut self,
+        query: &str,
+        case_sensitive: bool,
+        line: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.find_query = query.to_owned();
+        self.find_case = case_sensitive;
+        self.find = None;
+        self.open_find(&Find, window, cx);
+        self.model().find_open_at(query, case_sensitive, line);
+        self.find_task = None;
+        self.continue_search(cx);
+        cx.notify();
+    }
+
     /// Starts searching for the find bar's query.
     fn search(&mut self, cx: &mut Context<Self>) {
         self.model().find_open(&self.find_query, self.find_case);

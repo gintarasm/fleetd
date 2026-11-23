@@ -2996,7 +2996,9 @@ impl Node {
     /// screen is its kept final screen, if any. History pages are read one
     /// at a time, so no lock is held for the whole scan.
     pub fn search(&self, needle: Needle, limit: u32, per_agent: u32) -> io::Result<Hits> {
-        let (records, _bad) = lock(&self.store).list_agents_lossy_unlabeled().map_err(store_err)?;
+        let (records, _bad) = lock(&self.store)
+            .list_agents_lossy_unlabeled()
+            .map_err(store_err)?;
         let mut ids: Vec<u64> = records.iter().map(|r| r.id).collect();
         ids.sort_unstable_by(|a, b| b.cmp(a));
         let mut scan = output_search::Scan::new(needle, limit, per_agent);

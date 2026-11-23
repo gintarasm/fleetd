@@ -55,6 +55,10 @@ pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// [`SessionApi::read_output`]).
 pub type OutputJob = Box<dyn FnOnce() -> Result<String, String> + Send>;
 
+/// A blocking job searching every agent's output (see
+/// [`SessionApi::search_output`]).
+pub type SearchJob = Box<dyn FnOnce() -> Result<fleet_proto::SearchHits, String> + Send>;
+
 /// What the workspace needs from the session: [`Session`], or a recording
 /// fake in tests.
 pub trait SessionApi: InputSink {
@@ -83,6 +87,11 @@ pub trait SessionApi: InputSink {
     /// A job reading the agent's whole output (fleetd's history, then the
     /// screen) as plain text; it blocks, so it runs off the UI thread.
     fn read_output(&self, _agent_id: u64) -> OutputJob {
+        Box::new(|| Err("not connected to a fleetd".into()))
+    }
+    /// A job searching every agent's output for `query` (ADR 0098); it
+    /// blocks, so it runs off the UI thread.
+    fn search_output(&self, _query: String, _case_sensitive: bool) -> SearchJob {
         Box::new(|| Err("not connected to a fleetd".into()))
     }
     /// Sets an agent's name (ADR 0052).
@@ -181,6 +190,10 @@ impl SessionApi for Session {
 
     fn read_output(&self, agent_id: u64) -> OutputJob {
         Box::new(Session::read_output(self, agent_id))
+    }
+
+    fn search_output(&self, query: String, case_sensitive: bool) -> SearchJob {
+        Box::new(Session::search_output(self, query, case_sensitive))
     }
 
     fn rename(&self, agent_id: u64, name: String) {
@@ -1677,6 +1690,11 @@ impl AppState {
     /// A job reading `agent_id`'s output as plain text (ADR 0086).
     pub(super) fn read_output(&self, agent_id: u64) -> OutputJob {
         self.session.read_output(agent_id)
+    }
+
+    /// A job searching every agent's output (ADR 0098).
+    pub(super) fn search_output(&self, query: String, case_sensitive: bool) -> SearchJob {
+        self.session.search_output(query, case_sensitive)
     }
 
     /// Forgets these agents (fleetd refuses running ones).

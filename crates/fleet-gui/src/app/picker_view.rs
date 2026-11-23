@@ -3,7 +3,9 @@
 //! move the selection, Enter or a click picks, Esc dismisses. The
 //! command palette is one; the agent switcher is another, without the
 //! query field ([`PickerView::list`]); the Send sheet's agent list is a
-//! third, with a checkbox on each row ([`PickerView::multi`]).
+//! third, with a checkbox on each row ([`PickerView::multi`]); Search All
+//! Agents is a fourth, whose owner lists the rows for each query, under
+//! agent headings ([`PickerView::search`], ADR 0098).
 
 use std::collections::HashSet;
 
@@ -34,6 +36,9 @@ pub enum PickerEvent {
     Dismiss,
 }
 
+/// The query of a [`PickerView::search`] changed (its owner lists rows).
+pub struct PickerQuery(pub String);
+
 pub struct PickerView {
     query: Entity<TextField>,
     picker: Picker,
@@ -44,11 +49,16 @@ pub struct PickerView {
     /// A list of checkboxes, inside a sheet: the keys checked. A pick
     /// asks the owner to toggle one ([`PickerView::set_checked`]).
     checked: Option<HashSet<String>>,
+    /// [`PickerView::search`]: a heading above each row that has one.
+    sections: Vec<Option<String>>,
+    /// A line under the rows (a search cut short).
+    footer: Option<SharedString>,
     focus: FocusHandle,
     _query_changed: Subscription,
 }
 
 impl EventEmitter<PickerEvent> for PickerView {}
+impl EventEmitter<PickerQuery> for PickerView {}
 
 impl PickerView {
     pub fn new(
@@ -64,6 +74,7 @@ impl PickerView {
             if text != this.picker.query() {
                 this.picker.set_query(&text);
                 this.scroll.scroll_to_item(0);
+                cx.emit(PickerQuery(text));
                 cx.notify();
             }
         });
@@ -74,6 +85,8 @@ impl PickerView {
             empty_text: "No matches".into(),
             show_query: true,
             checked: None,
+            sections: Vec::new(),
+            footer: None,
             focus: cx.focus_handle(),
             _query_changed: sub,
         }
@@ -100,6 +113,45 @@ impl PickerView {
             checked: Some(checked),
             ..PickerView::new(items, Recents::default(), placeholder, cx)
         }
+    }
+
+    /// A picker whose owner lists the rows for each query
+    /// ([`PickerQuery`], [`PickerView::set_listed`]).
+    pub fn search(placeholder: &str, status: &str, cx: &mut Context<Self>) -> Self {
+        let mut view = PickerView::new(Vec::new(), Recents::default(), placeholder, cx);
+        view.picker.set_listed(Vec::new(), Vec::new());
+        view.empty_text = SharedString::from(status.to_owned());
+        view
+    }
+
+    /// Shows `items` in order, each title highlighted at `hits[i]`, row `i`
+    /// under the heading `sections[i]` if any; `status` is shown when there
+    /// are no rows, else under them.
+    pub fn set_listed(
+        &mut self,
+        items: Vec<PickerItem>,
+        hits: Vec<Vec<usize>>,
+        sections: Vec<Option<String>>,
+        status: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let empty = items.is_empty();
+        self.picker.set_listed(items, hits);
+        self.sections = sections;
+        let status = status.map(SharedString::from);
+        if empty {
+            self.empty_text = status.unwrap_or_default();
+            self.footer = None;
+        } else {
+            self.footer = status;
+        }
+        self.scroll.scroll_to_item(0);
+        cx.notify();
+    }
+
+    /// Each row's heading ([`PickerView::set_listed`]).
+    pub fn sections(&self) -> &[Option<String>] {
+        &self.sections
     }
 
     /// The rows checked ([`PickerView::multi`]).
@@ -136,15 +188,29 @@ impl PickerView {
     /// Moves the selection by `delta` rows, wrapping around.
     pub fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.picker.move_selection(delta);
-        self.scroll.scroll_to_item(self.picker.selected());
+        self.scroll
+            .scroll_to_item(self.child_index(self.picker.selected()));
         cx.notify();
     }
 
     /// Selects row `row` of the ranked list.
     pub fn select(&mut self, row: usize, cx: &mut Context<Self>) {
         self.picker.select(row);
-        self.scroll.scroll_to_item(self.picker.selected());
+        self.scroll
+            .scroll_to_item(self.child_index(self.picker.selected()));
         cx.notify();
+    }
+
+    /// The list child that draws row `row`: headings are children too.
+    fn child_index(&self, row: usize) -> usize {
+        let headings = self
+            .picker
+            .ranked()
+            .iter()
+            .take(row + 1)
+            .filter(|r| matches!(self.sections.get(r.item), Some(Some(_))))
+            .count();
+        row + headings
     }
 
     /// Before the field sees them: the keys that drive the list.
@@ -265,11 +331,25 @@ impl Render for PickerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let ranked: Vec<Ranked> = self.picker.ranked().to_vec();
-        let rows: Vec<_> = ranked
-            .iter()
-            .enumerate()
-            .map(|(i, r)| self.render_row(i, r, &t, cx).into_any_element())
-            .collect();
+        let mut rows = Vec::with_capacity(ranked.len());
+        for (i, r) in ranked.iter().enumerate() {
+            if let Some(Some(heading)) = self.sections.get(r.item) {
+                rows.push(
+                    div()
+                        .debug_selector(move || format!("picker-section-{i}"))
+                        .px(px(space::SM))
+                        .pt(px(if i == 0 { space::XXS } else { space::SM }))
+                        .pb(px(space::XXS))
+                        .truncate()
+                        .type_style(text::CALLOUT)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(t.secondary)
+                        .child(SharedString::from(heading.clone()))
+                        .into_any_element(),
+                );
+            }
+            rows.push(self.render_row(i, r, &t, cx).into_any_element());
+        }
         let list = if rows.is_empty() {
             div()
                 .id("picker-list")
@@ -324,5 +404,13 @@ impl Render for PickerView {
                     .child(div().h(px(1.)).bg(t.separator))
             })
             .child(list)
+            .children(self.footer.clone().filter(|_| !ranked.is_empty()).map(|f| {
+                div()
+                    .debug_selector(|| "picker-footer".to_owned())
+                    .px(px(space::SM))
+                    .type_style(text::CALLOUT)
+                    .text_color(t.tertiary)
+                    .child(f)
+            }))
     }
 }

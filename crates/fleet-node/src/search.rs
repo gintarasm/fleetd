@@ -247,7 +247,11 @@ mod tests {
         let hits = scan.finish();
         assert_eq!(
             lines_of(&hits),
-            vec![(7, 14, "an ERROR here"), (7, 12, "Error two"), (7, 10, "error one")]
+            vec![
+                (7, 14, "an ERROR here"),
+                (7, 12, "Error two"),
+                (7, 10, "error one")
+            ]
         );
         assert!(!hits.truncated);
         assert_eq!(h.reads, 2, "pages of two lines");
@@ -261,7 +265,10 @@ mod tests {
         scan.agent(9, &[], b.range(), |x, m| b.read(x, m));
         scan.agent(3, &[], a.range(), |x, m| a.read(x, m));
         let hits = scan.finish();
-        assert_eq!(lines_of(&hits), vec![(9, 0, "needle b"), (3, 0, "needle a")]);
+        assert_eq!(
+            lines_of(&hits),
+            vec![(9, 0, "needle b"), (3, 0, "needle a")]
+        );
     }
 
     #[test]
@@ -273,7 +280,10 @@ mod tests {
         scan.agent(2, &[], b.range(), |x, m| b.read(x, m));
         let hits = scan.finish();
         let lines: Vec<_> = hits.hits.iter().map(|h| (h.agent_id, h.line)).collect();
-        assert_eq!(lines, vec![(1, 49), (1, 48), (1, 47), (2, 49), (2, 48), (2, 47)]);
+        assert_eq!(
+            lines,
+            vec![(1, 49), (1, 48), (1, 47), (2, 49), (2, 48), (2, 47)]
+        );
         assert!(!hits.truncated, "a per-agent cap is not truncation");
     }
 

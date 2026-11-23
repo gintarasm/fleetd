@@ -36,6 +36,7 @@ pub mod question;
 pub mod row_preview;
 pub mod scroll_feedback;
 pub mod scrollback;
+pub mod search_all;
 pub mod selection;
 pub mod session;
 pub mod settings;

@@ -178,7 +178,13 @@ fn send_then_attach_snapshot_contains_text() {
 fn search_prints_hits_and_exits_1_without_any() {
     let d = Daemon::start();
     let id = d
-        .ok(&["spawn", "--", "sh", "-c", "echo Build FAILED here; exec sleep 600"])
+        .ok(&[
+            "spawn",
+            "--",
+            "sh",
+            "-c",
+            "echo Build FAILED here; exec sleep 600",
+        ])
         .trim()
         .to_string();
     let mut out = String::new();
