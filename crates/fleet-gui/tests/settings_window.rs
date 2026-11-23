@@ -9,7 +9,7 @@ use fleet_gui::app::{
 };
 use fleet_gui::core::config::{GuiConfig, load_config};
 use fleet_gui::core::glass::{Backdrop, GlassChoice};
-use fleet_gui::core::settings::Section;
+use fleet_gui::core::settings::{OptionAsMeta, Section};
 use fleet_gui::core::target::Target;
 use fleet_gui::core::theme::Appearance;
 use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
@@ -155,11 +155,10 @@ fn switches_toggle_their_settings(cx: &mut TestAppContext) {
     show(cx, &s, "settings-tab-Behaviour");
     click(cx, &s, "switch-confirm-kill");
     click(cx, &s, "switch-notifications");
-    click(cx, &s, "switch-option-as-meta");
     let c = config(cx, &s);
-    assert!(!c.confirm_kill && c.notifications && !c.option_as_meta);
+    assert!(!c.confirm_kill && c.notifications);
     let saved = load_config(dir.path()).unwrap();
-    assert!(!saved.confirm_kill && saved.notifications && !saved.option_as_meta);
+    assert!(!saved.confirm_kill && saved.notifications);
     click(cx, &s, "switch-confirm-kill");
     assert!(config(cx, &s).confirm_kill);
 }
@@ -264,4 +263,21 @@ fn opening_settings_reads_edits_made_to_the_file(cx: &mut TestAppContext) {
     );
     let reopened = cx.update(|cx| settings_window(cx)).unwrap();
     assert_ne!(reopened, s.settings, "a new window");
+}
+
+#[gpui::test]
+fn option_as_meta_has_a_four_way_picker(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let s = setup(cx, dir.path(), GuiConfig::default());
+    show(cx, &s, "settings-tab-Behaviour");
+    for (selector, want) in [
+        ("option-as-meta-Left", OptionAsMeta::Left),
+        ("option-as-meta-Right", OptionAsMeta::Right),
+        ("option-as-meta-None", OptionAsMeta::None),
+        ("option-as-meta-Both", OptionAsMeta::Both),
+    ] {
+        click(cx, &s, selector);
+        assert_eq!(config(cx, &s).option_as_meta, want);
+        assert_eq!(load_config(dir.path()).unwrap().option_as_meta, want);
+    }
 }

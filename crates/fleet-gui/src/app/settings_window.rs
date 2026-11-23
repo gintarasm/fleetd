@@ -25,8 +25,8 @@ use crate::core::glass::GlassChoice;
 use crate::core::presets::{Preset, presets_note};
 use crate::core::settings::{
     BLUR_MAX, BLUR_MIN, BLUR_STEP, Change, FONT_SIZE_MAX, FONT_SIZE_MIN, FONT_SIZE_STEP,
-    MotionChoice, OPACITY_MAX, OPACITY_MIN, OPACITY_STEP, SHORTCUTS, Section, ThemeChoice,
-    key_label, parse_command_line,
+    MotionChoice, OPACITY_MAX, OPACITY_MIN, OPACITY_STEP, OptionAsMeta, SHORTCUTS, Section,
+    ThemeChoice, key_label, parse_command_line,
 };
 use crate::core::style::{chrome, radius, space, text};
 use crate::core::target::Target;
@@ -428,6 +428,21 @@ impl SettingsWindow {
                 })),
             );
         }
+        let mut option_meta = segmented();
+        for choice in OptionAsMeta::ALL {
+            option_meta = option_meta.child(
+                pill(
+                    ("option-as-meta", choice as usize),
+                    choice.title(),
+                    c.option_as_meta == choice,
+                    theme,
+                )
+                .debug_selector(move || format!("option-as-meta-{}", choice.title()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change(Change::OptionAsMeta(choice), cx);
+                })),
+            );
+        }
         let system_hint = if native::reduce_motion() {
             "System: Reduce Motion is on in System Settings"
         } else {
@@ -477,12 +492,8 @@ impl SettingsWindow {
             ))
             .child(setting_row(
                 "Option as Meta",
-                Some("Option+key sends Esc and the key to the terminal"),
-                switch("option-as-meta", c.option_as_meta, theme).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.change(Change::OptionAsMeta(!c.option_as_meta), cx);
-                    },
-                )),
+                Some("Option+key sends Esc and the key. The other Option types # @ € [ ]"),
+                option_meta,
                 theme,
             ))
     }

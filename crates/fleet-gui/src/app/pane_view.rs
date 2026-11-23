@@ -56,6 +56,7 @@ use crate::core::scroll_feedback::{
 };
 use crate::core::selection::{LineRef, SelPoint};
 use crate::core::session::{PaneId, Session};
+use crate::core::settings::OptionAsMeta;
 use crate::core::shortcuts::{EmptyPane, HINT, empty_pane};
 use crate::core::status::{AgentStatus, DotFill};
 use crate::core::style::{self, radius, space, text};
@@ -369,7 +370,7 @@ pub struct PaneView {
     model: Arc<Mutex<PaneModel>>,
     sink: Arc<dyn InputSink>,
     focus: FocusHandle,
-    option_as_meta: bool,
+    option_as_meta: OptionAsMeta,
     font: Font,
     font_size: Pixels,
     /// IME preedit text, not yet sent.
@@ -1057,7 +1058,11 @@ impl PaneView {
         }
         let modes = self.model().terminal().modes();
         // `None`: the key is text; it reaches `replace_text_in_range`.
-        if let Some(bytes) = encode_key(&key, &modes, self.option_as_meta) {
+        let meta = key.mods.alt && {
+            let (left, right) = native::option_sides();
+            self.option_as_meta.applies(left, right)
+        };
+        if let Some(bytes) = encode_key(&key, &modes, meta) {
             self.send(bytes, cx);
             cx.stop_propagation();
         }

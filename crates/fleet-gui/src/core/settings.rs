@@ -112,6 +112,82 @@ impl MotionChoice {
     }
 }
 
+/// `[gui] option_as_meta`: which Option key acts as Meta (Esc-prefixed
+/// keys). The other side composes text (`#`, `@`, `€`, `[` on UK, German
+/// and Lithuanian layouts). Ghostty's `macos-option-as-alt`. The old
+/// bool still reads: `true` is `both`, `false` is `none` (ADR 0097).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OptionAsMeta {
+    Left,
+    Right,
+    #[default]
+    Both,
+    None,
+}
+
+impl OptionAsMeta {
+    pub const ALL: [OptionAsMeta; 4] = [
+        OptionAsMeta::Left,
+        OptionAsMeta::Right,
+        OptionAsMeta::Both,
+        OptionAsMeta::None,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            OptionAsMeta::Left => "Left",
+            OptionAsMeta::Right => "Right",
+            OptionAsMeta::Both => "Both",
+            OptionAsMeta::None => "None",
+        }
+    }
+
+    /// Whether a press of Option is Meta, given which device Option keys
+    /// were down. With neither bit set the side is unknown, and only
+    /// `Both` says yes.
+    pub fn applies(self, left_down: bool, right_down: bool) -> bool {
+        match self {
+            OptionAsMeta::Both => true,
+            OptionAsMeta::Left => left_down,
+            OptionAsMeta::Right => right_down,
+            OptionAsMeta::None => false,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            OptionAsMeta::Left => "left",
+            OptionAsMeta::Right => "right",
+            OptionAsMeta::Both => "both",
+            OptionAsMeta::None => "none",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OptionAsMeta {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Name(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Flag(true) => Ok(OptionAsMeta::Both),
+            Raw::Flag(false) => Ok(OptionAsMeta::None),
+            Raw::Name(n) => match n.as_str() {
+                "left" => Ok(OptionAsMeta::Left),
+                "right" => Ok(OptionAsMeta::Right),
+                "both" => Ok(OptionAsMeta::Both),
+                "none" => Ok(OptionAsMeta::None),
+                other => Err(serde::de::Error::custom(format!(
+                    "option_as_meta: expected left, right, both or none, got {other:?}"
+                ))),
+            },
+        }
+    }
+}
+
 /// A section of the Settings window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Section {
@@ -152,7 +228,7 @@ pub enum Change {
     CursorBlink(BlinkChoice),
     ConfirmKill(bool),
     Notifications(bool),
-    OptionAsMeta(bool),
+    OptionAsMeta(OptionAsMeta),
     DefaultCommand(Vec<String>),
     DefaultDir(String),
     FocusMode(bool),
@@ -229,7 +305,7 @@ fn value_of(c: &GuiConfig, key: &str) -> Option<toml_edit::Value> {
         "cursor_blink" => c.cursor_blink.as_str().into(),
         "confirm_kill" => c.confirm_kill.into(),
         "notifications" => c.notifications.into(),
-        "option_as_meta" => c.option_as_meta.into(),
+        "option_as_meta" => c.option_as_meta.as_str().into(),
         "default_command" => c
             .default_command
             .iter()

@@ -507,7 +507,7 @@ A status item is always present: Show fleetd, the running agents, New agent…, 
 | `default_command` | `["claude"]` | what New agent runs |
 | `font_family` | `"SF Mono"` | terminal font; SF Mono is loaded from Terminal.app, any other family must be installed; Menlo when it is not |
 | `font_size` | `13` | |
-| `option_as_meta` | `true` | Option sends Esc-prefixed keys |
+| `option_as_meta` | `"both"` | which Option sends Esc-prefixed keys: `left`, `right`, `both` or `none` (a bool still reads: `true` is `both`); the other Option types `#` `@` `€` on non-US layouts |
 | `agent_emoji` | `false` | each agent's emoji in place of its colour swatch (row) and terminal icon (pane header) |
 | `confirm_kill` | `true` | ask before killing an agent; the question's "Don't ask again" writes `false` |
 | `presets` | the agents found on `PATH` | one-click commands for New agent, the split chooser and the palette: `[[gui.presets]]` tables with `name`, `command` (an array) and optional `labels`; `[]` for none |

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use super::cursor_blink::BlinkChoice;
 use super::glass::GlassChoice;
 use super::presets::Preset;
-use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, ThemeChoice};
+use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, OptionAsMeta, ThemeChoice};
 use super::state::write_atomic;
 use super::target::Target;
 
@@ -64,7 +64,7 @@ pub struct GuiConfig {
     pub default_command: Vec<String>,
     pub font_family: String,
     pub font_size: f32,
-    pub option_as_meta: bool,
+    pub option_as_meta: OptionAsMeta,
     /// Light, dark, or the system's appearance.
     pub theme: ThemeChoice,
     /// The window backdrop's blur radius, in points.
@@ -108,7 +108,7 @@ impl Default for GuiConfig {
             default_command: vec!["claude".to_owned()],
             font_family: DEFAULT_FONT_FAMILY.to_owned(),
             font_size: 13.0,
-            option_as_meta: true,
+            option_as_meta: OptionAsMeta::Both,
             theme: ThemeChoice::System,
             blur: DEFAULT_BLUR,
             window_opacity: DEFAULT_OPACITY,
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(c.default_command, ["claude"]);
         assert_eq!(c.font_family, "SF Mono");
         assert_eq!(c.font_size, 13.0);
-        assert!(c.option_as_meta);
+        assert_eq!(c.option_as_meta, OptionAsMeta::Both);
         assert!(!c.notifications);
         assert!(!c.agent_emoji);
         assert_eq!(c.connection, None);
