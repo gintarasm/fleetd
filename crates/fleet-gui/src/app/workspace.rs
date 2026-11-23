@@ -6983,6 +6983,12 @@ mod tests {
             vec![exited(1, 0), exited(2, 0), exited(3, 0)],
         );
         assert_eq!(exit_ids(&mut s), vec![1, 2, 3]);
+        // Let the toasts finish sliding in: a click at their bounds
+        // mid-animation can miss the close button.
+        s.cx.executor().advance_clock(Duration::from_millis(
+            crate::core::style::motion::TOAST_MS + 50,
+        ));
+        s.cx.run_until_parked();
         click(&mut s, "exit-toast-1-close");
         assert_eq!(exit_ids(&mut s), vec![2, 3]);
         // Agent 2 restarted elsewhere: it left the list, its toast goes.
