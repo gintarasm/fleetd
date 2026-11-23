@@ -14,6 +14,7 @@ pub mod checked;
 pub mod error;
 #[cfg(test)]
 mod fake;
+pub mod git_worktree;
 pub mod host;
 pub mod manifest;
 pub mod params;

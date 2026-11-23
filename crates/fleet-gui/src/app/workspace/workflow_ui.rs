@@ -42,7 +42,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let app = self.app.read(cx);
@@ -129,7 +129,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.modal() {
+        if self.has_modal() {
             return;
         }
         let app = self.app.read(cx);
@@ -158,7 +158,7 @@ impl Workspace {
 
     /// Archive Worktree… for `agent_id`: asks first.
     pub fn open_archive(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if self.modal() || !self.offers_archive(agent_id, cx) {
+        if self.has_modal() || !self.offers_archive(agent_id, cx) {
             return;
         }
         let app = self.app.read(cx);
@@ -197,19 +197,21 @@ impl Workspace {
     ) {
         let sub = cx.subscribe_in(&sheet, window, Self::action_sheet_event);
         sheet.read(cx).focus(window, cx);
-        self.action_sheet = Some((sheet, sub));
+        self.modal = Some(super::Modal::Action(sheet, sub));
         cx.notify();
     }
 
     /// The action sheet, while it is open.
     pub fn action_sheet(&self) -> Option<&Entity<ActionSheet>> {
-        self.action_sheet.as_ref().map(|(s, _)| s)
+        match &self.modal {
+            Some(super::Modal::Action(s, _)) => Some(s),
+            _ => None,
+        }
     }
 
     fn close_action_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.action_sheet.take().is_some() {
-            self.focus_current(window, cx);
-            cx.notify();
+        if self.action_sheet().is_some() {
+            self.close_modal(window, cx);
         }
     }
 
@@ -1004,9 +1006,7 @@ mod tests {
         let dir = repo.path().to_string_lossy().into_owned();
         s.ws.update_in(s.cx, |w, window, cx| w.open_new_agent(window, cx));
         s.cx.run_until_parked();
-        let sheet =
-            s.ws.read_with(s.cx, |w, _| w.sheet.as_ref().map(|(x, _)| x.clone()))
-                .unwrap();
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
         sheet.update(s.cx, |x, cx| {
             x.dir.update(cx, |f, cx| f.set_text(dir.clone(), cx));
             x.command

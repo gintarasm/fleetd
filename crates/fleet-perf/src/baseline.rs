@@ -583,6 +583,7 @@ baseline = 100
         // `bench/README.md`); a shipped baseline needs no edit here.
         const UNRECORDED: &[&str] = &[
             "exec_true_roundtrip_ns",
+            "diff_view_build_10k_lines_instructions",
             "gui_diff_open_ns",
             "gui_diff_scroll_frame_ns",
         ];
