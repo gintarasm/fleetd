@@ -38,11 +38,6 @@ impl LocalHost {
         }
     }
 
-    pub fn agent(&self, id: u64) -> AgentInfo {
-        let agents = self.agents.lock().unwrap();
-        agents.iter().find(|a| a.id == id).cloned().expect("agent")
-    }
-
     /// Adds an agent (as if spawned elsewhere) running in `cwd`.
     pub fn add_agent(&self, cwd: &str, labels: &[(&str, &str)], running: bool) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -132,16 +127,18 @@ impl Host for LocalHost {
     }
 
     fn list_dir(&self, req: ListDirRequest) -> BoxFuture<'_, HostResult<DirListing>> {
-        let r = std::fs::read_dir(&req.path).map_err(io).map(|rd| DirListing {
-            entries: rd
-                .filter_map(Result::ok)
-                .map(|e| DirEntry {
-                    name: e.file_name().to_string_lossy().into_owned(),
-                    ..Default::default()
-                })
-                .collect(),
-            truncated: false,
-        });
+        let r = std::fs::read_dir(&req.path)
+            .map_err(io)
+            .map(|rd| DirListing {
+                entries: rd
+                    .filter_map(Result::ok)
+                    .map(|e| DirEntry {
+                        name: e.file_name().to_string_lossy().into_owned(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                truncated: false,
+            });
         ready(r)
     }
 
@@ -214,7 +211,7 @@ impl Host for LocalHost {
 /// `origin` it was pushed to, so `origin/main` and `origin/HEAD` exist with
 /// no network.
 pub struct Repos {
-    pub dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
     /// The temp folder, its symlinks resolved (macOS's `/var` → `/private/var`).
     pub root: String,
     pub main: String,
@@ -252,10 +249,17 @@ impl Repos {
         std::fs::write(format!("{main}/.gitignore"), "target/\n").unwrap();
         git(&main, &["add", "-A"]);
         git(&main, &["commit", "-qm", "init"]);
-        git(&main, &["remote", "add", "origin", &format!("{root}/origin.git")]);
+        git(
+            &main,
+            &["remote", "add", "origin", &format!("{root}/origin.git")],
+        );
         git(&main, &["push", "-q", "origin", "main"]);
         git(&main, &["remote", "set-head", "origin", "main"]);
-        Repos { dir, root, main }
+        Repos {
+            _dir: dir,
+            root,
+            main,
+        }
     }
 
     pub fn write(&self, path: &str, text: &str) {

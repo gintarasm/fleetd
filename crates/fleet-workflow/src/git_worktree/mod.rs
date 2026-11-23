@@ -165,13 +165,20 @@ pub async fn toplevel(git: &Git<'_>, dir: &str) -> HostResult<String> {
 /// The repository's default branch: the remote's (`origin/HEAD`), else the
 /// main checkout's branch, else its commit.
 pub async fn default_base(git: &Git<'_>, main: &str) -> HostResult<String> {
-    let remote = ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"];
+    let remote = [
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    ];
     if let Ok(b) = git.line(main, &remote).await
         && !b.is_empty()
     {
         return Ok(b);
     }
-    if let Ok(b) = git.line(main, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await
+    if let Ok(b) = git
+        .line(main, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .await
         && !b.is_empty()
     {
         return Ok(b);
@@ -181,7 +188,10 @@ pub async fn default_base(git: &Git<'_>, main: &str) -> HostResult<String> {
 
 /// The checked-out branch of `dir`, else `detached <short commit>`.
 pub async fn branch_of(git: &Git<'_>, dir: &str) -> String {
-    match git.line(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
+    match git
+        .line(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .await
+    {
         Ok(b) if !b.is_empty() => b,
         _ => match git.line(dir, &["rev-parse", "--short", "HEAD"]).await {
             Ok(c) => format!("detached {c}"),
@@ -376,21 +386,51 @@ pub fn specs() -> Vec<ActionSpec> {
             "",
             vec![
                 placeholder(
-                    required(param("slug", "Slug", ParamString, "The worktree's folder name: letters, digits, . _ -")),
+                    required(param(
+                        "slug",
+                        "Slug",
+                        ParamString,
+                        "The worktree's folder name: letters, digits, . _ -",
+                    )),
                     "issue-140",
                 ),
-                required(param("command", "Command", ParamArgv, "The agent's program and arguments")),
+                required(param(
+                    "command",
+                    "Command",
+                    ParamArgv,
+                    "The agent's program and arguments",
+                )),
                 repo_param(),
-                param("base", "Base", ParamString, "The ref to branch from; the default branch when not given"),
-                param("branch", "Branch", ParamString, "The new branch; the configured prefix + slug when not given"),
+                param(
+                    "base",
+                    "Base",
+                    ParamString,
+                    "The ref to branch from; the default branch when not given",
+                ),
+                param(
+                    "branch",
+                    "Branch",
+                    ParamString,
+                    "The new branch; the configured prefix + slug when not given",
+                ),
                 param("name", "Name", ParamString, "The agent's name"),
                 param("labels", "Labels", ParamLabels, "The agent's labels"),
                 default(
-                    param("reuse", "Reuse", ParamBool, "Start the agent in the slug's existing worktree"),
+                    param(
+                        "reuse",
+                        "Reuse",
+                        ParamBool,
+                        "Start the agent in the slug's existing worktree",
+                    ),
                     Value::Bool(false),
                 ),
                 default(
-                    param("shared", "Shared", ParamBool, "With reuse: even if another agent is working there"),
+                    param(
+                        "shared",
+                        "Shared",
+                        ParamBool,
+                        "With reuse: even if another agent is working there",
+                    ),
                     Value::Bool(false),
                 ),
             ],
@@ -408,13 +448,28 @@ pub fn specs() -> Vec<ActionSpec> {
                 ParamSpec {
                     choices: vec!["base".into(), "uncommitted".into(), "committed".into()],
                     ..default(
-                        param("against", "Against", ParamChoice, "base: everything since the merge base; uncommitted: against HEAD; committed: commits only"),
+                        param(
+                            "against",
+                            "Against",
+                            ParamChoice,
+                            "base: everything since the merge base; uncommitted: against HEAD; committed: commits only",
+                        ),
                         Value::String("base".into()),
                     )
                 },
-                param("file", "File", ParamString, "Only this file (a path in the worktree)"),
+                param(
+                    "file",
+                    "File",
+                    ParamString,
+                    "Only this file (a path in the worktree)",
+                ),
                 default(
-                    param("context", "Context", ParamInt, "Lines of context around changes"),
+                    param(
+                        "context",
+                        "Context",
+                        ParamInt,
+                        "Lines of context around changes",
+                    ),
                     Value::Int(3),
                 ),
             ],
@@ -431,7 +486,12 @@ pub fn specs() -> Vec<ActionSpec> {
                 path,
                 ParamSpec {
                     user_only: true,
-                    ..param("force", "Force", ParamBool, "Even with uncommitted changes or unmerged commits (deletes the branch)")
+                    ..param(
+                        "force",
+                        "Force",
+                        ParamBool,
+                        "Even with uncommitted changes or unmerged commits (deletes the branch)",
+                    )
                 },
                 default(
                     param("keep_branch", "Keep Branch", ParamBool, "Keep the branch"),
@@ -458,7 +518,12 @@ pub fn specs() -> Vec<ActionSpec> {
             vec![
                 repo_param(),
                 default(
-                    param("dry_run", "Dry Run", ParamBool, "Only list what would be removed"),
+                    param(
+                        "dry_run",
+                        "Dry Run",
+                        ParamBool,
+                        "Only list what would be removed",
+                    ),
                     Value::Bool(false),
                 ),
             ],
@@ -483,7 +548,13 @@ impl Workflow for GitWorktree {
     }
 
     fn manifest(&self) -> Result<Manifest, String> {
-        Manifest::parse(&["exec:git", "fs:read:*", "spawn", "labels:git.", "storage:own"])
+        Manifest::parse(&[
+            "exec:git",
+            "fs:read:*",
+            "spawn",
+            "labels:git.",
+            "storage:own",
+        ])
     }
 
     fn actions(&self) -> Vec<ActionSpec> {

@@ -33,13 +33,8 @@ impl Config {
         let Some(text) = text else {
             return Ok(config);
         };
-        let doc: toml::Table = text
-            .parse()
-            .map_err(|e| format!("config.toml: {e}"))?;
-        let Some(table) = doc
-            .get("workflows")
-            .and_then(|w| w.get("git-worktree"))
-        else {
+        let doc: toml::Table = text.parse().map_err(|e| format!("config.toml: {e}"))?;
+        let Some(table) = doc.get("workflows").and_then(|w| w.get("git-worktree")) else {
             return Ok(config);
         };
         let table = table
@@ -147,10 +142,14 @@ branch_prefix = ""
 
     #[test]
     fn bad_values_are_errors() {
-        let e = Config::for_repo(Some("[workflows.git-worktree]\nfetch_base = \"yes\"\n"), "r")
-            .unwrap_err();
+        let e = Config::for_repo(
+            Some("[workflows.git-worktree]\nfetch_base = \"yes\"\n"),
+            "r",
+        )
+        .unwrap_err();
         assert!(e.contains("fetch_base"), "{e}");
-        let e = Config::for_repo(Some("[workflows.git-worktree]\nroots = \"x\"\n"), "r").unwrap_err();
+        let e =
+            Config::for_repo(Some("[workflows.git-worktree]\nroots = \"x\"\n"), "r").unwrap_err();
         assert!(e.contains("roots"), "{e}");
         assert!(Config::for_repo(Some("not toml ["), "r").is_err());
         let e = Config::for_repo(Some("[workflows.git-worktree]\nroot = \"\"\n"), "r").unwrap_err();
@@ -160,7 +159,12 @@ branch_prefix = ""
     #[test]
     fn roots_resolve_home_repo_and_relative() {
         assert_eq!(
-            resolve_root("~/.fleet/worktrees/{repo}", "fleetd", "/src/fleetd", "/Users/u"),
+            resolve_root(
+                "~/.fleet/worktrees/{repo}",
+                "fleetd",
+                "/src/fleetd",
+                "/Users/u"
+            ),
             "/Users/u/.fleet/worktrees/fleetd"
         );
         assert_eq!(

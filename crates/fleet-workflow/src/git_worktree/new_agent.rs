@@ -53,9 +53,13 @@ pub async fn run(
     git.host.check_spawn().await?;
 
     let worktrees = parse_worktree_list(
-        git.ok(&repo.main, &["worktree", "list", "--porcelain", "-z"], Mode::Read)
-            .await?
-            .as_bytes(),
+        git.ok(
+            &repo.main,
+            &["worktree", "list", "--porcelain", "-z"],
+            Mode::Read,
+        )
+        .await?
+        .as_bytes(),
     );
     let reuse = call.params.bool("reuse").unwrap_or(false);
     if worktrees.iter().any(|w| w.path == path) {
@@ -109,9 +113,7 @@ pub async fn run(
         )));
     }
 
-    let add = [
-        "worktree", "add", "--no-track", "-b", &branch, &path, &base,
-    ];
+    let add = ["worktree", "add", "--no-track", "-b", &branch, &path, &base];
     let out = git.run(&repo.main, &add, Mode::Write).await?;
     if out.exit_code != Some(0) {
         let said = failure(&add, &out);
@@ -153,10 +155,12 @@ pub async fn run(
         message.push_str("; ");
         message.push_str(&n);
     }
-    Ok(ActionOutcome::Spawned(Box::new(fleet_proto::ActionSpawned {
-        agent: Some(agent),
-        message,
-    })))
+    Ok(ActionOutcome::Spawned(Box::new(
+        fleet_proto::ActionSpawned {
+            agent: Some(agent),
+            message,
+        },
+    )))
 }
 
 /// Starts the agent in an existing worktree of the repository (`reuse`):
@@ -195,10 +199,12 @@ async fn reuse_worktree(
         .host
         .spawn(spawn_request(call, repo, path, &base, program, args))
         .await?;
-    Ok(ActionOutcome::Spawned(Box::new(fleet_proto::ActionSpawned {
-        agent: Some(agent),
-        message: format!("reused worktree {path}"),
-    })))
+    Ok(ActionOutcome::Spawned(Box::new(
+        fleet_proto::ActionSpawned {
+            agent: Some(agent),
+            message: format!("reused worktree {path}"),
+        },
+    )))
 }
 
 fn spawn_request(
@@ -227,7 +233,11 @@ fn spawn_request(
 
 /// With `fetch_base`, fetches a remote-tracking base (`origin/main`) from
 /// its remote; a note when that fails (the local ref is used).
-async fn fetch_base(git: &Git<'_>, main: &str, base: &str) -> HostResult<Option<String>> {
+pub(super) async fn fetch_base(
+    git: &Git<'_>,
+    main: &str,
+    base: &str,
+) -> HostResult<Option<String>> {
     let remotes = git.ok(main, &["remote"], Mode::Read).await?;
     let Some((remote, branch)) = remotes.lines().find_map(|r| {
         base.strip_prefix(r)

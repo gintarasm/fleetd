@@ -48,7 +48,13 @@ impl Caps {
 fn hunk_lines(f: &FileDiff) -> usize {
     f.hunks
         .iter()
-        .map(|h| if h.body.is_empty() { 0 } else { h.body.split(|&b| b == b'\n').count() })
+        .map(|h| {
+            if h.body.is_empty() {
+                0
+            } else {
+                h.body.split(|&b| b == b'\n').count()
+            }
+        })
         .sum()
 }
 
@@ -169,7 +175,10 @@ pub async fn run(git: &Git<'_>, call: &ActionCall) -> Result<ActionOutcome, Acti
         )));
     }
     let file = call.params.string("file").filter(|f| !f.is_empty());
-    let head = git.line(wt, &["rev-parse", "--verify", "--quiet", "HEAD"]).await.ok();
+    let head = git
+        .line(wt, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .await
+        .ok();
     let short = |c: &str| c.get(..7).unwrap_or(c).to_owned();
 
     let (from, from_label) = match against {
@@ -365,7 +374,11 @@ mod tests {
     fn under_the_caps_everything_stays() {
         let mut files = vec![file("a", 3), file("b", 4)];
         assert!(!apply_caps(&mut files, Caps::REPLY));
-        assert!(files.iter().all(|f| !f.hunks_omitted && !f.hunks.is_empty()));
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.hunks_omitted && !f.hunks.is_empty())
+        );
     }
 
     #[test]
@@ -405,11 +418,14 @@ mod tests {
 
     #[test]
     fn files_without_hunks_are_never_omitted() {
-        let mut files = vec![file("a", 20), FileDiff {
-            new_path: "bin".into(),
-            binary: true,
-            ..Default::default()
-        }];
+        let mut files = vec![
+            file("a", 20),
+            FileDiff {
+                new_path: "bin".into(),
+                binary: true,
+                ..Default::default()
+            },
+        ];
         let caps = Caps {
             files: 10,
             lines: 5,
@@ -426,10 +442,16 @@ mod tests {
         assert_eq!((f.old_path.as_str(), f.new_path.as_str()), ("", "n.txt"));
         assert_eq!(f.additions, 2);
         let h = &f.hunks[0];
-        assert_eq!((h.old_start, h.old_lines, h.new_start, h.new_lines), (0, 0, 1, 2));
+        assert_eq!(
+            (h.old_start, h.old_lines, h.new_start, h.new_lines),
+            (0, 0, 1, 2)
+        );
         assert_eq!(h.body, b"+a\n+b".to_vec());
         let f = untracked_file("n", b"a\nb", 3);
-        assert_eq!(f.hunks[0].body, b"+a\n+b\n\\ No newline at end of file".to_vec());
+        assert_eq!(
+            f.hunks[0].body,
+            b"+a\n+b\n\\ No newline at end of file".to_vec()
+        );
         let f = untracked_file("empty", b"", 0);
         assert!(f.hunks.is_empty() && f.additions == 0);
     }

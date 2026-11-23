@@ -40,7 +40,12 @@ pub fn parse_worktree_list(out: &[u8]) -> Vec<WorktreeEntry> {
         match key {
             "HEAD" => e.head = value.to_owned(),
             "branch" => {
-                e.branch = Some(value.strip_prefix("refs/heads/").unwrap_or(value).to_owned())
+                e.branch = Some(
+                    value
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(value)
+                        .to_owned(),
+                )
             }
             "detached" => e.detached = true,
             "bare" => e.bare = true,
@@ -77,8 +82,12 @@ pub fn parse_numstat(out: &[u8]) -> Vec<NumStat> {
         };
         let (old_path, path) = if path.is_empty() {
             // A rename or copy: the two paths follow as fields of their own.
-            let old = fields.next().map(|f| String::from_utf8_lossy(f).into_owned());
-            let new = fields.next().map(|f| String::from_utf8_lossy(f).into_owned());
+            let old = fields
+                .next()
+                .map(|f| String::from_utf8_lossy(f).into_owned());
+            let new = fields
+                .next()
+                .map(|f| String::from_utf8_lossy(f).into_owned());
             (old, new.unwrap_or_default())
         } else {
             (None, path.to_owned())
@@ -164,7 +173,9 @@ fn finish(file: Option<&mut FileDiff>) {
         FileStatus::FileDeleted => f.new_path.clear(),
         _ => {}
     }
-    if !f.old_mode.is_empty() && !f.new_mode.is_empty() && file_type(&f.old_mode) != file_type(&f.new_mode)
+    if !f.old_mode.is_empty()
+        && !f.new_mode.is_empty()
+        && file_type(&f.old_mode) != file_type(&f.new_mode)
     {
         f.status = FileStatus::FileTypeChanged as i32;
     }
@@ -301,7 +312,9 @@ fn unquote(s: &str) -> String {
                 // without core.quotepath=off).
                 let digits = &b[i - 1..(i + 2).min(b.len())];
                 i = (i + 2).min(b.len());
-                digits.iter().fold(0u8, |acc, d| acc.wrapping_mul(8).wrapping_add(d.wrapping_sub(b'0')))
+                digits.iter().fold(0u8, |acc, d| {
+                    acc.wrapping_mul(8).wrapping_add(d.wrapping_sub(b'0'))
+                })
             }
             other => other,
         });
@@ -409,12 +422,18 @@ mod tests {
         assert!(bin.binary && bin.hunks.is_empty());
         assert_eq!(bin.status(), FileStatus::FileModified);
         let exec = by_path(&files, "exec.sh");
-        assert_eq!((exec.old_mode.as_str(), exec.new_mode.as_str()), ("100644", "100755"));
+        assert_eq!(
+            (exec.old_mode.as_str(), exec.new_mode.as_str()),
+            ("100644", "100755")
+        );
         assert!(exec.hunks.is_empty());
         let ren = by_path(&files, "ren_new.txt");
         assert_eq!(ren.status(), FileStatus::FileRenamed);
         assert_eq!(ren.old_path, "ren_old.txt");
-        assert_eq!(by_path(&files, "sp ace.txt").status(), FileStatus::FileModified);
+        assert_eq!(
+            by_path(&files, "sp ace.txt").status(),
+            FileStatus::FileModified
+        );
         let quoted = by_path(&files, "tab\t\"q\".txt");
         assert_eq!(quoted.old_path, "tab\t\"q\".txt");
     }
@@ -436,7 +455,10 @@ mod tests {
         );
         let n = by_path(&files, "nonl.txt");
         let h = &n.hunks[0];
-        assert_eq!((h.old_start, h.old_lines, h.new_start, h.new_lines), (1, 1, 1, 2));
+        assert_eq!(
+            (h.old_start, h.old_lines, h.new_start, h.new_lines),
+            (1, 1, 1, 2)
+        );
         assert_eq!(
             String::from_utf8_lossy(&h.body),
             "-end\n\\ No newline at end of file\n+end\n+more\n\\ No newline at end of file"

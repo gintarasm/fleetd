@@ -100,13 +100,23 @@ mod tests {
         let r = request("/r", &["status", "-z"], Mode::Read, 5);
         assert_eq!(
             r.argv,
-            ["git", "-c", "core.quotepath=off", "--no-optional-locks", "status", "-z"]
+            [
+                "git",
+                "-c",
+                "core.quotepath=off",
+                "--no-optional-locks",
+                "status",
+                "-z"
+            ]
         );
         assert_eq!(r.env["GIT_TERMINAL_PROMPT"], "0");
         assert_eq!(r.env["GIT_OPTIONAL_LOCKS"], "0");
         assert_eq!((r.cwd.as_str(), r.timeout_ms), ("/r", 5));
         let w = request("/r", &["worktree", "add"], Mode::Write, 5);
-        assert_eq!(w.argv, ["git", "-c", "core.quotepath=off", "worktree", "add"]);
+        assert_eq!(
+            w.argv,
+            ["git", "-c", "core.quotepath=off", "worktree", "add"]
+        );
         assert_eq!(w.env["GIT_TERMINAL_PROMPT"], "0");
         assert!(!w.env.contains_key("GIT_OPTIONAL_LOCKS"));
     }
