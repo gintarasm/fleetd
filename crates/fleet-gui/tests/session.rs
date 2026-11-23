@@ -512,8 +512,20 @@ fn lagged_pane_reattaches_by_itself() {
     let pane = PaneId(1);
     let model = s.open_pane(pane, Some(id));
     wait_until("the pane to attach", || state(&model) == PaneState::Live);
-    s.pause_reader_for_test(pane, Duration::from_secs(2));
+    // The reader stays paused (it reads at most one buffered batch per
+    // pause) until the node has run the whole flood: some 900 coalesced
+    // chunks, far more than a subscriber's queue holds, so the node drops
+    // the pane's subscription however slowly a loaded machine runs it. A
+    // fixed pause raced the flood.
+    const PAUSE: Duration = Duration::from_millis(500);
+    s.pause_reader_for_test(pane, PAUSE);
     s.input(pane, b"\n".to_vec());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !d.screen(id).iter().any(|l| l == "DONE") {
+        assert!(Instant::now() < deadline, "the flood did not finish");
+        s.pause_reader_for_test(pane, PAUSE);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     wait_until("a Lagged re-attach", || s.lag_count_for_test(pane) >= 1);
     wait_until("the pane to match the node's screen", || {
         let g = grid(&model);

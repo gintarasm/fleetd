@@ -419,8 +419,11 @@ fn attach_on_pty_detaches_and_restores_terminal() {
 
 #[test]
 fn attach_detaches_on_encoded_ctrl_backslash() {
-    // Kitty keyboard protocol and modifyOtherKeys forms of Ctrl-\, split across
-    // writes; a key release does not detach.
+    // Kitty keyboard protocol and modifyOtherKeys forms of Ctrl-\; a key
+    // release does not detach. Each form is one write: `fleet attach`
+    // forwards a sequence still incomplete after 20 ms, a gap a loaded
+    // machine can put between two writes. Splits are covered, without
+    // timing, by `attach::tests::split_detach_sequences_detach`.
     let d = Daemon::start();
     let id = d.ok(&["spawn", "--", "cat"]).trim().to_string();
     let detach_forms: [&[u8]; 2] = [b"\x1b[92;5:1u", b"\x1b[27;5;92~"];
@@ -430,11 +433,8 @@ fn attach_detaches_on_encoded_ctrl_backslash() {
         p.writer.write_all(b"\x1b[92;5:3u").unwrap();
         p.writer.write_all(b"still-attached\r").unwrap();
         p.until("still-attached");
-        let (head, tail) = form.split_at(5);
-        p.writer.write_all(head).unwrap();
+        p.writer.write_all(form).unwrap();
         p.writer.flush().unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-        p.writer.write_all(tail).unwrap();
         p.until(RESTORE);
         assert_eq!(p.exit_code(), 0);
     }

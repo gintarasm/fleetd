@@ -1320,6 +1320,9 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 /// How long [`Node::shutdown`] waits for agents after SIGKILL.
 const KILL_WAIT: Duration = Duration::from_millis(500);
+/// How long a restart or forget waits for an exit already recorded in the
+/// store to finish (ADR 0110) before refusing the agent as running.
+const EXIT_SETTLE: Duration = Duration::from_secs(5);
 
 /// Exited agents whose final screen a [`Node`] keeps for attaches; beyond
 /// this the oldest exit is evicted and attaching to it yields an empty
@@ -2587,6 +2590,28 @@ impl Node {
         Ok((out, ok, sub))
     }
 
+    /// Whether `id`'s exit is recorded (its row says exited, so it is listed
+    /// and waited on as exited) while its sink is still finishing it: the
+    /// agent is still `live` until `on_exit` retires it.
+    fn exit_in_progress(&self, id: u64) -> bool {
+        let agents = lock(&self.agents);
+        agents.live.contains_key(&id)
+            && matches!(
+                lock(&self.store).agent(id),
+                Ok(Some(rec)) if rec.state == store::AgentState::Exited
+            )
+    }
+
+    /// Waits, up to [`EXIT_SETTLE`], for an exit in progress to finish, so
+    /// a client acting on an agent it saw exit (`fleet ls`, `fleet wait
+    /// --state exited`) is not refused as running (ADR 0110).
+    fn settle_exit(&self, id: u64) {
+        let deadline = Instant::now() + EXIT_SETTLE;
+        while self.exit_in_progress(id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn restart_with(
         &self,
         caller: Caller,
@@ -2597,6 +2622,7 @@ impl Node {
         origin: Option<ConnId>,
     ) -> io::Result<(RestartOutcome, Option<(AttachOk, Subscription)>)> {
         let _in_flight = self.handoff.enter()?;
+        self.settle_exit(id);
         let (old, _restarting) = {
             let mut agents = lock(&self.agents);
             if agents.restarting.contains(&id) {
@@ -2902,6 +2928,7 @@ impl Node {
         };
         let mut out = ForgetOutcome::default();
         for id in targets {
+            self.settle_exit(id);
             // Under the agents lock, so an exit cannot retire the agent
             // between the check and the delete: an agent still `live` (its
             // row may already say exited while its pipeline finishes) or

@@ -2,7 +2,7 @@
 //! handshake, and `run_check`'s refusals.
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -96,10 +96,22 @@ const TIMES_OUT: Duration = Duration::from_secs(2);
 /// reaping), still far less than its child's own run time.
 const KILL_SLACK: Duration = Duration::from_secs(15);
 
+/// Writes an executable script. A `sh` child writes it, never this process:
+/// a process another test thread forks while this one held the file open
+/// for writing would keep that fd until its exec, and running the script
+/// then fails with ETXTBSY (Linux), which `run_check` reports as "not an
+/// executable file".
 fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
     let p = dir.join(name);
-    fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"printf '#!/bin/sh\n%s\n' "$2" > "$1" && chmod 755 "$1""#)
+        .arg("sh")
+        .arg(&p)
+        .arg(body)
+        .status()
+        .unwrap();
+    assert!(status.success(), "writing {}", p.display());
     p
 }
 

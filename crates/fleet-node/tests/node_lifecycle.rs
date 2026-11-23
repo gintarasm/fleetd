@@ -277,6 +277,37 @@ fn restart_replaces_exited_agent() {
     assert_eq!(origin, None);
 }
 
+/// Spins (no sleep) until `list` shows `id` exited: the moment a client
+/// polling `fleet ls` or woken by `fleet wait --state exited` acts.
+fn spin_until_listed_exited(node: &Node, id: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !node
+        .list()
+        .unwrap()
+        .iter()
+        .any(|a| a.id == id && a.state == fleet_proto::AgentState::Exited as i32)
+    {
+        assert!(Instant::now() < deadline, "agent {id} did not exit");
+        std::thread::yield_now();
+    }
+}
+
+/// Once an agent is listed exited, a restart or forget is never refused as
+/// running, even while its exit is still being processed (#159).
+#[test]
+fn restart_and_forget_right_after_the_exit_is_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(dir.path()).unwrap();
+    for _ in 0..40 {
+        let id = spawn_sh(&node, "echo bye; exit 0");
+        spin_until_listed_exited(&node, id);
+        let new = node.restart(id, 0, 0, None).unwrap().info.id;
+        spin_until_listed_exited(&node, new);
+        let out = node.forget(&[new], false, &Labels::new(), None).unwrap();
+        assert_eq!(out.forgotten, vec![new], "refused: {:?}", out.refused);
+    }
+}
+
 #[test]
 fn restart_refuses_running_and_unknown() {
     let dir = tempfile::tempdir().unwrap();
