@@ -282,6 +282,8 @@ impl Workspace {
                 this.epoch = epoch;
                 // The graph's collapse and selection name the old agents.
                 this.graph = new_graph(&this.app, window, cx);
+                // The new session watches message lines only when asked.
+                this.watch_message_lines(cx);
                 // The choosers' pane ids name panes of the old layout,
                 // the picked rows agents of the old target.
                 this.choosers.clear();

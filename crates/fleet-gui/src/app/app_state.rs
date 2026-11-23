@@ -549,6 +549,9 @@ impl AppState {
         self.closed.clear();
         self.disclosure.clear();
         self.titles.clear();
+        // The old target's message lines and notice are not the new one's.
+        self.message_edges.clear();
+        self.notice = None;
         // The new target's waiting and ended agents are not news.
         self.statuses.clear();
         self.bells.clear();
@@ -705,6 +708,11 @@ impl AppState {
         self.error.as_deref()
     }
 
+    /// Who wrote to whom lately on the current target (graph view).
+    pub fn message_edges(&self) -> &[crate::core::message_lines::Edge] {
+        &self.message_edges
+    }
+
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }
@@ -749,6 +757,8 @@ impl AppState {
                     let agents = &self.agents;
                     self.bells
                         .retain(|id| agents.iter().any(|r| r.info.id == *id));
+                    self.titles
+                        .retain(|id, _| agents.iter().any(|r| r.info.id == *id));
                     if self.session.listed() {
                         self.new_children.observe(
                             &self.agents,
@@ -1687,7 +1697,7 @@ impl AppState {
     }
 
     /// Shows `text` in the neutral toast, until dismissed.
-    pub(super) fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+    pub fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
         self.notice = Some(text);
         cx.notify();
     }
