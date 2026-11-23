@@ -21,6 +21,25 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// How a cell is underlined (SGR 4, 4:0..4:5, 21, 24).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Underline {
+    #[default]
+    None,
+    Single,
+    Double,
+    /// Undercurl (`4:3`): diagnostics.
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl Underline {
+    pub fn is_some(self) -> bool {
+        self != Underline::None
+    }
+}
+
 /// SGR attributes of a cell.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CellStyle {
@@ -29,7 +48,9 @@ pub struct CellStyle {
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: Underline,
+    /// SGR 58; `Default` is the text colour.
+    pub underline_color: Color,
     pub strikeout: bool,
     pub inverse: bool,
     pub hidden: bool,
@@ -89,6 +110,8 @@ pub struct CursorView {
     pub row: u16,
     pub col: u16,
     pub shape: CursorShape,
+    /// The app asked for a blinking cursor (DECSCUSR 1/3/5, `?12h`).
+    pub blinking: bool,
 }
 
 /// Colours that answer OSC 4/10/11/12 queries.
@@ -173,6 +196,23 @@ pub(crate) fn color(c: AnsiColor) -> Color {
     }
 }
 
+/// The underline a cell's flags draw (the first set, if several are).
+fn underline(flags: Flags) -> Underline {
+    if !flags.intersects(Flags::ALL_UNDERLINES) {
+        Underline::None
+    } else if flags.contains(Flags::UNDERLINE) {
+        Underline::Single
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        Underline::Double
+    } else if flags.contains(Flags::UNDERCURL) {
+        Underline::Curly
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        Underline::Dotted
+    } else {
+        Underline::Dashed
+    }
+}
+
 pub(crate) fn push_row(row: &Row<GridCell>, out: &mut Vec<Cell>) {
     for cell in &row[..] {
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -191,7 +231,8 @@ pub(crate) fn push_row(row: &Row<GridCell>, out: &mut Vec<Cell>) {
                 bold: cell.flags.contains(Flags::BOLD),
                 dim: cell.flags.contains(Flags::DIM),
                 italic: cell.flags.contains(Flags::ITALIC),
-                underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+                underline: underline(cell.flags),
+                underline_color: cell.underline_color().map_or(Color::Default, color),
                 strikeout: cell.flags.contains(Flags::STRIKEOUT),
                 inverse: cell.flags.contains(Flags::INVERSE),
                 hidden: cell.flags.contains(Flags::HIDDEN),

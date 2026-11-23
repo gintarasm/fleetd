@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::cursor_blink::BlinkChoice;
 use super::glass::GlassChoice;
 use super::presets::Preset;
 use super::settings::{DEFAULT_BLUR, DEFAULT_OPACITY, MotionChoice, ThemeChoice};
@@ -72,6 +73,9 @@ pub struct GuiConfig {
     pub window_opacity: f32,
     /// Overrides System Settings' Reduce Motion, or follows it.
     pub reduce_motion: MotionChoice,
+    /// The terminal cursor blinks as the app asks, always or never
+    /// (ADR 0096).
+    pub cursor_blink: BlinkChoice,
     /// Kill asks first.
     pub confirm_kill: bool,
     /// macOS notifications when an agent needs you or ends while the
@@ -109,6 +113,7 @@ impl Default for GuiConfig {
             blur: DEFAULT_BLUR,
             window_opacity: DEFAULT_OPACITY,
             reduce_motion: MotionChoice::System,
+            cursor_blink: BlinkChoice::App,
             confirm_kill: true,
             notifications: false,
             default_dir: String::new(),

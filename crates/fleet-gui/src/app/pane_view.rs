@@ -33,6 +33,7 @@ use super::terminal_element::TerminalElement;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::config::GuiConfig;
+use crate::core::cursor_blink::{self, Blink, BlinkChoice};
 use crate::core::drop_paste::{
     DROP_NEEDS_LOCAL, IMAGE_NOT_SAVED, PasteKind, dropped_text, image_extension, paste_kind,
     save_pasted_image,
@@ -431,6 +432,13 @@ pub struct PaneView {
     find_case: bool,
     /// The search running off the UI thread, while lines are left.
     find_task: Option<Task<()>>,
+    /// `[gui] cursor_blink`.
+    cursor_blink: BlinkChoice,
+    /// The cursor's blink phase; each keypress restarts it shown.
+    pub(crate) blink: Blink,
+    /// Redraws this pane at each blink toggle, while its cursor blinks
+    /// (only the focused pane's can: ADR 0096).
+    pub(crate) blink_timer: Option<Task<()>>,
 }
 
 /// The find bar's field and its subscription.
@@ -509,6 +517,9 @@ impl PaneView {
             find_case: false,
             find_task: None,
             chooser: None,
+            cursor_blink: config.cursor_blink,
+            blink: Blink::new(Instant::now()),
+            blink_timer: None,
         }
     }
 
@@ -884,6 +895,10 @@ impl PaneView {
     /// once (the next layout resizes the grid if the cells changed).
     pub fn apply_config(&mut self, config: &GuiConfig, cx: &mut Context<Self>) {
         self.option_as_meta = config.option_as_meta;
+        if self.cursor_blink != config.cursor_blink {
+            self.cursor_blink = config.cursor_blink;
+            cx.notify();
+        }
         let font = terminal_font(&config.font_family, cx);
         let font_size = px(config.font_size);
         if font != self.font || font_size != self.font_size {
@@ -982,11 +997,46 @@ impl PaneView {
             return;
         }
         self.sink.input(self.pane, bytes);
+        self.restart_blink(cx);
         let mut model = self.model();
         if model.scroll_offset() > 0 {
             model.scroll_to_bottom();
             cx.notify();
         }
+    }
+
+    /// Typing shows the cursor: the blink starts again from its shown
+    /// half (the next frame restarts the timer to match).
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink.restart(Instant::now());
+        if self.blink_timer.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Keeps the blink timer running while the cursor blinks, and only
+    /// then: it wakes at each toggle and redraws this pane.
+    fn follow_blink(&mut self, blinking: bool, cx: &mut Context<Self>) {
+        if !blinking {
+            self.blink_timer = None;
+            return;
+        }
+        if self.blink_timer.is_some() {
+            return;
+        }
+        // Blinking starts (focus came here, or a key was typed) shown.
+        self.blink.restart(Instant::now());
+        self.blink_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(wait) = this.update(cx, |v, _| v.blink.until_toggle(Instant::now())) else {
+                    break;
+                };
+                cx.background_executor().timer(wait).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1589,12 +1639,17 @@ impl Render for PaneView {
         if fading || copy_moving {
             window.request_animation_frame();
         }
-        let (state, title, observing) = {
+        let (state, title, observing, app_blinks) = {
             let model = self.model();
             let state = model.state();
             let observing = state == PaneState::Live && !model.is_primary();
-            (state, model.title(), observing)
+            let app_blinks = model.terminal().cursor_view().blinking;
+            (state, model.title(), observing, app_blinks)
         };
+        let show_cursor = draws_cursor(&self.chrome, state);
+        let blinks = show_cursor
+            && cursor_blink::blinks(self.cursor_blink, app_blinks, focused, reduce_motion);
+        self.follow_blink(blinks, cx);
         let scrollbar = self.scrollbar_opacity(window, cx);
         self.scrollbar_shown = scrollbar.is_some();
         let element = TerminalElement {
@@ -1607,7 +1662,8 @@ impl Render for PaneView {
             font: self.font.clone(),
             font_size: self.font_size,
             focused,
-            show_cursor: draws_cursor(&self.chrome, state),
+            show_cursor,
+            cursor_shown: !blinks || self.blink.shown(now),
             marked: self.marked.clone(),
             selection_glow: glow,
             link: self.hover,
@@ -2280,13 +2336,14 @@ mod tests {
     use crate::app::keymap::{Copy, Paste, bind_keys};
     use crate::app::theme::Theme;
     use crate::core::config::GuiConfig;
+    use crate::core::cursor_blink::{self, Blink, BlinkChoice};
     use crate::core::drop_paste::{DROP_NEEDS_LOCAL, IMAGE_NEEDS_LOCAL, shell_quote};
     use crate::core::pane::PaneState;
     use crate::core::pane::{PaneModel, ViewRow};
     use crate::core::selection::{LineRef, SelPoint};
     use crate::core::session::PaneId;
     use fleet_proto::AttachOk;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[derive(Default)]
     struct Recorder {
@@ -2392,6 +2449,76 @@ mod tests {
         cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
         cx.simulate_mouse_move(to, MouseButton::Left, modifiers);
         cx.simulate_mouse_up(to, MouseButton::Left, modifiers);
+    }
+
+    /// The pane's blink timer is running.
+    fn blinking(view: &Entity<PaneView>, cx: &mut VisualTestContext) -> bool {
+        view.read_with(cx, |v, _| v.blink_timer.is_some())
+    }
+
+    /// A focused pane with a live agent (one that draws a cursor).
+    fn blinking_pane(
+        cx: &mut TestAppContext,
+        model: PaneModel,
+    ) -> (Entity<PaneView>, &mut VisualTestContext) {
+        let (view, _sink, cx) = pane(cx, model);
+        agent_pane(&view, cx, true);
+        cx.update(|window, _| window.activate_window());
+        redraw(cx);
+        (view, cx)
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_cursor_blinks_when_the_app_asks_and_only_while_focused(cx: &mut TestAppContext) {
+        let mut model = model_with_history(0);
+        model.on_output(b"\x1b[5 q");
+        let (view, cx) = blinking_pane(cx, model);
+        assert!(blinking(&view, cx), "a focused pane blinks as asked");
+
+        // Half a period on it hides, then a keypress shows it again.
+        let shown = |view: &Entity<PaneView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, _| v.blink.shown(Instant::now()))
+        };
+        assert!(shown(&view, cx));
+        view.update(cx, |v, _| {
+            v.blink = Blink::new(Instant::now() - cursor_blink::PERIOD);
+        });
+        assert!(!shown(&view, cx));
+        cx.simulate_keystrokes("a");
+        assert!(shown(&view, cx), "typing restarts the blink shown");
+
+        cx.update(|window, _| window.blur());
+        redraw(cx);
+        assert!(!blinking(&view, cx), "no timer in an unfocused pane");
+    }
+
+    #[gpui::test]
+    fn the_setting_overrides_the_app_and_reduce_motion_stops_it(cx: &mut TestAppContext) {
+        let (view, cx) = blinking_pane(cx, model_with_history(0));
+        assert!(!blinking(&view, cx), "a steady cursor by default");
+
+        let with = |choice| GuiConfig {
+            cursor_blink: choice,
+            ..GuiConfig::default()
+        };
+        view.update(cx, |v, cx| v.apply_config(&with(BlinkChoice::On), cx));
+        redraw(cx);
+        assert!(blinking(&view, cx), "Always blinks a steady cursor");
+
+        cx.update(|_, cx| cx.set_global(crate::app::controls::ReducedMotion(true)));
+        redraw(cx);
+        assert!(!blinking(&view, cx), "reduced motion: no blink");
+        cx.update(|_, cx| cx.set_global(crate::app::controls::ReducedMotion(false)));
+
+        view.update(cx, |v, _| v.model().on_output(b"\x1b[1 q"));
+        view.update(cx, |v, cx| v.apply_config(&with(BlinkChoice::Off), cx));
+        redraw(cx);
+        assert!(!blinking(&view, cx), "Never wins over the app");
     }
 
     #[gpui::test]

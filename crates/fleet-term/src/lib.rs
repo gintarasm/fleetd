@@ -43,7 +43,7 @@ mod view;
 pub use find::{Needle, history_line_text, row_matches};
 pub use history::HistoryEvent;
 pub use parse::{cells_text, parse_history_line};
-pub use view::{Cell, CellStyle, Color, CursorShape, CursorView, Modes, Palette};
+pub use view::{Cell, CellStyle, Color, CursorShape, CursorView, Modes, Palette, Underline};
 
 use history::{History, Pen, glyph, last_non_blank, put_cells, put_glyph};
 use recorder::Recorder;
@@ -241,8 +241,9 @@ impl Terminal {
     pub fn cursor_view(&self) -> CursorView {
         let term = self.term.borrow();
         let point = term.grid().cursor.point;
+        let style = term.cursor_style();
         let shape = if term.mode().contains(TermMode::SHOW_CURSOR) {
-            view::cursor_shape(term.cursor_style().shape)
+            view::cursor_shape(style.shape)
         } else {
             CursorShape::Hidden
         };
@@ -250,6 +251,7 @@ impl Terminal {
             row: to_u16(point.line.0.max(0) as usize),
             col: to_u16(point.column.0),
             shape,
+            blinking: style.blinking,
         }
     }
 
@@ -835,11 +837,97 @@ mod tests {
             CursorView {
                 row: 2,
                 col: 4,
-                shape: CursorShape::Beam
+                shape: CursorShape::Beam,
+                blinking: false,
             }
         );
         t.feed(b"\x1b[?25l");
         assert_eq!(t.cursor_view().shape, CursorShape::Hidden);
+    }
+
+    #[test]
+    fn cursor_view_keeps_the_decscusr_blink_bit() {
+        let mut t = Terminal::new(80, 24);
+        assert!(!t.cursor_view().blinking, "steady until asked");
+        t.feed(b"\x1b[5 q");
+        let c = t.cursor_view();
+        assert_eq!((c.shape, c.blinking), (CursorShape::Beam, true));
+        t.feed(b"\x1b[2 q");
+        let c = t.cursor_view();
+        assert_eq!((c.shape, c.blinking), (CursorShape::Block, false));
+        t.feed(b"\x1b[3 q");
+        let c = t.cursor_view();
+        assert_eq!((c.shape, c.blinking), (CursorShape::Underline, true));
+        // `?12h` (att610) turns blinking on for the current shape.
+        t.feed(b"\x1b[4 q\x1b[?12h");
+        assert!(t.cursor_view().blinking);
+    }
+
+    /// The underline kind and colour of row 0's first cell after `sgr`.
+    fn underline_of(sgr: &str) -> (Underline, Color) {
+        let mut t = Terminal::new(20, 3);
+        t.feed(format!("\x1b[{sgr}mx").as_bytes());
+        let mut row = Vec::new();
+        t.row_cells(0, &mut row);
+        (row[0].style.underline, row[0].style.underline_color)
+    }
+
+    #[test]
+    fn row_cells_carry_the_underline_kind_and_colour() {
+        assert_eq!(underline_of("0"), (Underline::None, Color::Default));
+        assert_eq!(underline_of("4"), (Underline::Single, Color::Default));
+        assert_eq!(underline_of("4:2"), (Underline::Double, Color::Default));
+        assert_eq!(underline_of("4:3"), (Underline::Curly, Color::Default));
+        assert_eq!(underline_of("4:4"), (Underline::Dotted, Color::Default));
+        assert_eq!(underline_of("4:5"), (Underline::Dashed, Color::Default));
+        assert_eq!(
+            underline_of("4:3;58:2::255:0:0"),
+            (Underline::Curly, Color::Rgb(255, 0, 0))
+        );
+        assert_eq!(
+            underline_of("4;58;5;196"),
+            (Underline::Single, Color::Indexed(196))
+        );
+        assert_eq!(
+            underline_of("4;58;5;196;59"),
+            (Underline::Single, Color::Default)
+        );
+    }
+
+    #[test]
+    fn history_lines_keep_the_underline_kind_and_colour() {
+        let mut t = Terminal::new(30, 2);
+        let mut rendered = Vec::new();
+        let mut parsed = Vec::new();
+        let mut row = Vec::new();
+        for line in [
+            "\x1b[4:3;58:2::255:0:0merr\x1b[0m ok\r\n",
+            "\x1b[4:2ma\x1b[4:4mb\x1b[4:5;58;5;33mc\x1b[59md\x1b[24me\r\n",
+            "\x1b[4;58;5;1mf\x1b[0m\r\n",
+            "x\r\n",
+        ] {
+            t.row_cells(0, &mut row);
+            t.feed(line.as_bytes());
+            for ev in t.drain_history() {
+                if let HistoryEvent::Line(l) = ev {
+                    rendered.push(row.clone());
+                    let mut cells = Vec::new();
+                    parse_history_line(&l, &mut cells);
+                    parsed.push(cells);
+                }
+            }
+        }
+        assert!(parsed.len() >= 2);
+        assert!(
+            parsed
+                .iter()
+                .flatten()
+                .any(|c| c.style.underline == Underline::Curly
+                    && c.style.underline_color == Color::Rgb(255, 0, 0))
+        );
+        for (p, r) in parsed.iter().zip(&rendered) {
+            assert_eq!(p[..], r[..p.len()]);
+        }
     }
 
     #[test]

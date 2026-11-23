@@ -20,6 +20,7 @@ use super::native;
 use super::status_item::set_accessory;
 use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
+use crate::core::cursor_blink::BlinkChoice;
 use crate::core::glass::GlassChoice;
 use crate::core::presets::{Preset, presets_note};
 use crate::core::settings::{
@@ -412,6 +413,21 @@ impl SettingsWindow {
                 })),
             );
         }
+        let mut blink = segmented();
+        for choice in BlinkChoice::ALL {
+            blink = blink.child(
+                pill(
+                    ("cursor-blink", choice as usize),
+                    choice.title(),
+                    c.cursor_blink == choice,
+                    theme,
+                )
+                .debug_selector(move || format!("cursor-blink-{}", choice.as_str()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change(Change::CursorBlink(choice), cx);
+                })),
+            );
+        }
         let system_hint = if native::reduce_motion() {
             "System: Reduce Motion is on in System Settings"
         } else {
@@ -419,6 +435,12 @@ impl SettingsWindow {
         };
         section_body()
             .child(setting_row("Motion", Some(system_hint), motion, theme))
+            .child(setting_row(
+                "Cursor blink",
+                Some("Only in the focused pane, and never with reduced motion"),
+                blink,
+                theme,
+            ))
             .child(setting_row(
                 "Confirm before killing",
                 Some("Kill asks first; closing a pane only detaches"),

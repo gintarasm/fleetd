@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use fleet_term::{Cell, CursorShape, CursorView};
+use fleet_term::{Cell, Color, CursorShape, CursorView, Underline};
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, CursorStyle, DispatchPhase, Element, ElementId,
     ElementInputHandler, Entity, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId, Hitbox,
@@ -21,6 +21,7 @@ use crate::core::pane::{PaneModel, ViewRow};
 use crate::core::scroll_feedback::{BAR_WIDTH, INSET, thumb};
 use crate::core::selection::LineRef;
 use crate::core::session::PaneId;
+use crate::core::underline;
 
 /// Cursor bar thickness (beam width, underline height).
 const CURSOR_BAR: Pixels = px(2.0);
@@ -41,6 +42,9 @@ pub struct TerminalElement {
     pub(crate) focused: bool,
     /// Draw the cursor at all (not in an empty pane or after the agent exited).
     pub(crate) show_cursor: bool,
+    /// The cursor is in the shown half of its blink (always, when it does
+    /// not blink).
+    pub(crate) cursor_shown: bool,
     pub(crate) marked: Option<String>,
     /// The selection's glow after a copy, 0..=1 (0: none).
     pub(crate) selection_glow: f32,
@@ -55,6 +59,9 @@ pub struct TerminalElement {
 pub struct Metrics {
     cell_w: Pixels,
     line_h: Pixels,
+    /// Where an underline's top goes, from the row's top (gpui's own
+    /// underline position: the baseline plus 0.618 of the descent).
+    under_y: Pixels,
 }
 
 /// One visible row, copied out of the model.
@@ -134,7 +141,10 @@ impl TerminalElement {
             .collect();
         let cursor = term.cursor_view();
         let scrolled = model.scroll_offset() > 0;
-        let cursor = (self.show_cursor && !scrolled && cursor.shape != CursorShape::Hidden)
+        let cursor = (self.show_cursor
+            && self.cursor_shown
+            && !scrolled
+            && cursor.shape != CursorShape::Hidden)
             .then_some(cursor);
         Snapshot {
             rows,
@@ -192,6 +202,7 @@ impl TerminalElement {
             let at = point(origin.x + m.cell_w * f32::from(piece.start_col), origin.y);
             let _ = line.paint(at, m.line_h, window, cx);
         }
+        paint_underlines(&styled, origin, m, window);
     }
 
     /// Resolved colours and font of a cell.
@@ -212,6 +223,11 @@ impl TerminalElement {
             fg = self.theme.bg();
             bg = self.theme.cursor();
         }
+        let underline_color = match s.underline_color {
+            _ if s.hidden => bg,
+            Color::Default => fg,
+            c => self.theme.resolve(c, true),
+        };
         let mut font = self.font.clone();
         if s.bold {
             font.weight = FontWeight::BOLD;
@@ -224,6 +240,7 @@ impl TerminalElement {
             bg,
             font,
             underline: s.underline,
+            underline_color,
             strikeout: s.strikeout,
         }
     }
@@ -234,7 +251,8 @@ struct CellLook {
     fg: Hsla,
     bg: Hsla,
     font: Font,
-    underline: bool,
+    underline: Underline,
+    underline_color: Hsla,
     strikeout: bool,
 }
 
@@ -245,11 +263,14 @@ impl CellLook {
             font: self.font.clone(),
             color: self.fg,
             background_color: None,
-            underline: self.underline.then_some(UnderlineStyle {
-                thickness: px(1.0),
-                color: Some(self.fg),
-                wavy: false,
-            }),
+            // Double, dotted and dashed are painted after the text.
+            underline: matches!(self.underline, Underline::Single | Underline::Curly).then_some(
+                UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(self.underline_color),
+                    wavy: self.underline == Underline::Curly,
+                },
+            ),
             strikethrough: self.strikeout.then_some(StrikethroughStyle {
                 thickness: px(1.0),
                 color: Some(self.fg),
@@ -280,7 +301,9 @@ struct Piece {
 fn row_pieces(cells: &[Cell], styled: &[(u16, u16, CellLook)]) -> Vec<Piece> {
     let end = cells
         .iter()
-        .rposition(|c| (!c.style.hidden && c.ch != ' ') || c.style.underline || c.style.strikeout)
+        .rposition(|c| {
+            (!c.style.hidden && c.ch != ' ') || c.style.underline.is_some() || c.style.strikeout
+        })
         .map_or(0, |i| i + 1);
     let mut out = Vec::new();
     let mut seg = Segment::default();
@@ -329,6 +352,7 @@ impl Segment {
             l.fg == look.fg
                 && l.font == look.font
                 && l.underline == look.underline
+                && l.underline_color == look.underline_color
                 && l.strikeout == look.strikeout
         });
         match self.runs.last_mut() {
@@ -353,6 +377,60 @@ impl Segment {
             runs: std::mem::take(&mut self.runs),
             grid,
         });
+    }
+}
+
+/// Draws the underlines the text runs do not (double, dotted, dashed),
+/// one span per stretch of cells with the same kind and colour.
+fn paint_underlines(
+    styled: &[(u16, u16, CellLook)],
+    origin: Point<Pixels>,
+    m: Metrics,
+    window: &mut Window,
+) {
+    let mut span: Option<(u16, u16, Underline, Hsla)> = None;
+    let paint = |(from, to, kind, color): (u16, u16, Underline, Hsla), window: &mut Window| {
+        let left = origin.x + m.cell_w * f32::from(from);
+        for r in underline::marks(
+            kind,
+            to - from,
+            m.cell_w.into(),
+            m.under_y.into(),
+            m.line_h.into(),
+            1.0,
+        ) {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(left + px(r.x), origin.y + px(r.y)),
+                    size(px(r.w), px(r.h)),
+                ),
+                color,
+            ));
+        }
+    };
+    for &(col, width, ref look) in styled {
+        if underline::drawn_with_text(look.underline) {
+            if let Some(s) = span.take() {
+                paint(s, window);
+            }
+            continue;
+        }
+        match &mut span {
+            Some((_, end, kind, color))
+                if *end == col && *kind == look.underline && *color == look.underline_color =>
+            {
+                *end += width;
+            }
+            _ => {
+                if let Some(s) = span.take() {
+                    paint(s, window);
+                }
+                span = Some((col, col + width, look.underline, look.underline_color));
+            }
+        }
+    }
+    if let Some(s) = span {
+        paint(s, window);
     }
 }
 
@@ -424,8 +502,10 @@ impl Element for TerminalElement {
         let cell_w = ts
             .advance(font_id, self.font_size, 'm')
             .map_or(self.font_size * 0.6, |a| a.width);
-        let line_h =
-            (ts.ascent(font_id, self.font_size) + ts.descent(font_id, self.font_size).abs()).ceil();
+        let ascent = ts.ascent(font_id, self.font_size);
+        let descent = ts.descent(font_id, self.font_size).abs();
+        let line_h = (ascent + descent).ceil();
+        let under_y = ascent + descent * 0.618;
         let (cols, rows) = grid_size(
             bounds.size.width.into(),
             bounds.size.height.into(),
@@ -454,7 +534,14 @@ impl Element for TerminalElement {
         }
         // Overlays in front (a sheet, a menu) block it.
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        (Metrics { cell_w, line_h }, hitbox)
+        (
+            Metrics {
+                cell_w,
+                line_h,
+                under_y,
+            },
+            hitbox,
+        )
     }
 
     fn paint(
@@ -732,7 +819,7 @@ impl TerminalElement {
 
 #[cfg(test)]
 mod tests {
-    use fleet_term::{Cell, CellStyle};
+    use fleet_term::{Cell, CellStyle, Underline};
     use gpui::{FontStyle, FontWeight, font, hsla};
 
     use super::{CellLook, row_pieces};
@@ -749,7 +836,8 @@ mod tests {
             fg: hsla(0., 0., 1., 1.),
             bg: hsla(0., 0., 0., 1.),
             font: f,
-            underline: false,
+            underline: Underline::None,
+            underline_color: hsla(0., 0., 1., 1.),
             strikeout: false,
         }
     }
