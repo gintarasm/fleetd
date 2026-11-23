@@ -13,8 +13,8 @@ use crate::registry::{ActionCall, ActionOutcome};
 use super::git::{Git, Mode};
 use super::parse::{WorktreeEntry, parse_worktree_list};
 use super::{
-    LABEL_BASE, LABEL_WORKTREE, agent_name, default_base, inside, records, repo_param_or_cwd,
-    running,
+    LABEL_BASE, LABEL_WORKTREE, agent_name, check_ref, default_base, inside, records,
+    repo_param_or_cwd, running,
 };
 
 /// The worktree each agent belongs to: the one it was started for (its
@@ -90,6 +90,12 @@ pub async fn run(git: &Git<'_>, call: &ActionCall) -> Result<ActionOutcome, Acti
                 })
                 .unwrap_or_else(|| default.clone())
         };
+        // A bad base (a hand-written label) is not compared with.
+        let base = if check_ref("base", &base).is_ok() {
+            base
+        } else {
+            String::new()
+        };
         let (mut ahead_behind, mut merged) = (String::new(), String::new());
         let dirty: String;
         if e.prunable {
@@ -106,14 +112,32 @@ pub async fn run(git: &Git<'_>, call: &ActionCall) -> Result<ActionOutcome, Acti
             if !base.is_empty() {
                 let range = format!("{base}...HEAD");
                 if let Ok(counts) = git
-                    .line(&e.path, &["rev-list", "--left-right", "--count", &range])
+                    .line(
+                        &e.path,
+                        &[
+                            "rev-list",
+                            "--left-right",
+                            "--count",
+                            "--end-of-options",
+                            &range,
+                        ],
+                    )
                     .await
                     && let Some((behind, ahead)) = counts.split_once('\t')
                 {
                     ahead_behind = format!("+{ahead} -{behind}");
                 }
                 merged = match git
-                    .test(&e.path, &["merge-base", "--is-ancestor", "HEAD", &base])
+                    .test(
+                        &e.path,
+                        &[
+                            "merge-base",
+                            "--is-ancestor",
+                            "--end-of-options",
+                            "HEAD",
+                            &base,
+                        ],
+                    )
                     .await
                 {
                     Ok(true) => "yes".into(),

@@ -48,6 +48,14 @@ The overseer runs each worker in its own worktree by hand: `git worktree add`, `
 
 `new <slug> [--repo D] [--base REF] [--branch B] [--name N] [--label k=v]… [--reuse [--shared]] [--json] -- <program> [args…]` prints the agent's id (the message on stderr) or JSON; `ls [--repo D] [--json]` prints aligned columns; `diff [<agent>|--path D] [--against …] [--stat] [--file F] [-U N] [--json]` prints a unified diff, coloured on a terminal (`NO_COLOR` respected; no pager), or `--stat` (git's shape: `path | n +++--`, `Bin`, and a summary); with no agent or path it is the current folder's worktree. `archive <agent>|--path D [--force] [--keep-branch]`, `prune [--repo D] [--dry-run]`. Paths are made absolute against the shell's cwd. A refusal prints the reason and the flags to add (`--force`, `--reuse --shared`). Exit codes as M3: 0 ok, 1 refused or not found (no such agent, not in a git checkout), 2 usage or other error, 3 forbidden. `force` is sent only when given, since an agent setting it at all is forbidden.
 
+### Security: no caller value becomes a git option
+
+Agents may not `Exec` (0091), and the workflow runs git in the daemon, outside any agent's sandbox, so a param that git read as an option (`base = "origin/--upload-pack=…"` → `git fetch origin --upload-pack=…`) would be arbitrary command execution. Two layers:
+- **Every ref a caller or a label names** (`base`, `branch`, a `git.base` label, a record's base) passes `check_ref` before it reaches argv: not empty, no `/`-separated part starting with `-`, no whitespace or control characters; a new branch also passes `git check-ref-format --branch`. For `new-agent` this runs before any git call; a bad label makes `diff`/`archive` invalid and is ignored by `ls`.
+- **Positional refs and paths follow `--end-of-options`** (git ≥ 2.24) in `fetch`, `rev-parse`, `merge-base`, `rev-list`, `worktree add`/`remove` and `branch -D`; a `file` follows `--`. `rev-list`'s negations are written `--not --remotes --not --end-of-options HEAD ^<base>`, since `--not` may not follow `--end-of-options`.
+
+Tests assert on the recorded argv that no option-like value from an agent ever reaches git, and that every such call carries `--end-of-options`.
+
 ### Cost
 
 Nothing at startup or idle: no thread, timer or watcher; the registry is built on first use. Every git call is an `Exec` (at most 8 at once per node, 0091), off the PTY path. `ls` runs about three git reads per worktree, one after another. New instr metric `diff_view_build_10k_lines_instructions`: parsing a fixed 10,000-line unified diff (50 files) into a capped `DiffView` and encoding it; no baseline until the user records one.

@@ -191,7 +191,7 @@ pub async fn run(git: &Git<'_>, call: &ActionCall) -> Result<ActionOutcome, Acti
             let base = base_of(git, &t, &repo.main).await?;
             let mb = match &head {
                 Some(_) => git
-                    .line(wt, &["merge-base", &base, "HEAD"])
+                    .line(wt, &["merge-base", "--end-of-options", &base, "HEAD"])
                     .await
                     .map_err(|e| {
                         ActionError::failed(format!("no merge base of {base} and HEAD ({e})"))

@@ -989,3 +989,116 @@ async fn ls_lists_every_worktree_with_its_state_and_agents() {
     );
     row(&t, &r.main);
 }
+
+// ---- option injection (no caller value reaches git as an option) ----
+
+/// Whether any git call carried `needle` anywhere in its argv.
+fn ran_with(host: &LocalHost, needle: &str) -> bool {
+    host.execs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|argv| argv.iter().any(|a| a.contains(needle)))
+}
+
+#[tokio::test]
+async fn an_option_as_base_or_branch_is_invalid_and_never_reaches_git() {
+    let r = Repos::new();
+    let f = flow(&r, true);
+    let host = LocalHost::new(Caller::Agent(9));
+    let evil = "--upload-pack=touch /tmp/pwned";
+    for (key, value) in [
+        ("base", format!("origin/{evil}")),
+        ("base", evil.to_string()),
+        ("base", "-x".to_string()),
+        ("branch", "-x".to_string()),
+        ("branch", evil.to_string()),
+        ("branch", "a b".to_string()),
+    ] {
+        let mut p = new_params(&r, "inj");
+        p.push((key, s(&value)));
+        let e = run(&f, &host, "new-agent", p).await.unwrap_err();
+        assert!(matches!(e, ActionError::Invalid(_)), "{key}={value}: {e}");
+    }
+    assert!(!ran_with(&host, "upload-pack"));
+    assert!(!ran_with(&host, "-x"));
+    assert!(!exists(&format!("{}/wt/repo/inj", r.root)));
+}
+
+#[tokio::test]
+async fn an_empty_prefix_and_a_dash_slug_do_not_make_an_option_branch() {
+    let r = Repos::new();
+    let config = format!(
+        "[workflows.git-worktree]\nroot = \"{}/wt\"\nbranch_prefix = \"\"\nfetch_base = false\n",
+        r.root
+    );
+    let f = flow_with(Some(config), &r.root);
+    let host = LocalHost::new(Caller::User);
+    let e = run(&f, &host, "new-agent", new_params(&r, "-D"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, ActionError::Invalid(_)), "{e}");
+    assert!(!ran_with(&host, "-D"));
+}
+
+#[tokio::test]
+async fn a_base_label_that_is_an_option_is_invalid_for_diff_archive_and_ls() {
+    let r = Repos::new();
+    let f = flow(&r, false);
+    let host = LocalHost::new(Caller::User);
+    let (agent, _) = spawned(
+        run(&f, &host, "new-agent", new_params(&r, "lbl"))
+            .await
+            .unwrap(),
+    );
+    host.set_state(agent.id, AgentState::Exited);
+    // The user may write any label; a bad one must not become a git option.
+    host.agents.lock().unwrap()[0]
+        .labels
+        .insert(LABEL_BASE.into(), "--output=/tmp/x".into());
+    let id = Value::Int(agent.id as i64);
+    for action in ["diff", "archive"] {
+        let e = run(&f, &host, action, vec![("agent", id.clone())])
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ActionError::Invalid(_)), "{action}: {e}");
+    }
+    assert!(!ran_with(&host, "--output"));
+}
+
+#[tokio::test]
+async fn positional_refs_follow_end_of_options() {
+    let r = Repos::new();
+    let f = flow(&r, true);
+    let host = LocalHost::new(Caller::User);
+    let a = ended(&r, &f, &host, "eoo").await;
+    run(&f, &host, "diff", by_agent(&a)).await.unwrap();
+    run(&f, &host, "ls", vec![("repo", s(&r.main))])
+        .await
+        .unwrap();
+    run(&f, &host, "archive", by_agent(&a)).await.unwrap();
+    for argv in host.execs.lock().unwrap().iter() {
+        let sub = argv.get(3).map(String::as_str).unwrap_or_default();
+        let sub = if sub == "--no-optional-locks" {
+            argv[4].as_str()
+        } else {
+            sub
+        };
+        let refs_given = argv
+            .iter()
+            .any(|x| x.contains("origin/main") || x.starts_with("fleet/"));
+        if refs_given
+            && [
+                "fetch",
+                "merge-base",
+                "worktree",
+                "branch",
+                "rev-list",
+                "rev-parse",
+            ]
+            .contains(&sub)
+        {
+            assert!(argv.iter().any(|x| x == "--end-of-options"), "{argv:?}");
+        }
+    }
+}

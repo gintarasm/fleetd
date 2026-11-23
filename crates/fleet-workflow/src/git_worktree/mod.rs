@@ -155,6 +155,24 @@ pub async fn resolve_repo(git: &Git<'_>, dir: &str) -> HostResult<Repo> {
     })
 }
 
+/// A ref named by a caller or a label (`base`, `branch`), checked before it
+/// reaches git's argv: not empty, no component starting with `-` (so it
+/// can never be read as an option, e.g. `origin/--upload-pack=…` split
+/// into a fetch's refspec), no whitespace or control characters. Git calls
+/// also put `--end-of-options` before positional refs; this is the first
+/// line.
+pub fn check_ref(what: &str, v: &str) -> Result<(), ActionError> {
+    let bad = v.is_empty()
+        || v.split('/').any(|c| c.starts_with('-'))
+        || v.chars().any(|c| c.is_whitespace() || c.is_control());
+    if bad {
+        return Err(ActionError::invalid(format!(
+            "{what} {v:?} is not a ref (no part may start with `-`, no spaces)"
+        )));
+    }
+    Ok(())
+}
+
 /// The top folder of the checkout holding `dir`.
 pub async fn toplevel(git: &Git<'_>, dir: &str) -> HostResult<String> {
     git.line(dir, &["rev-parse", "--show-toplevel"])
@@ -265,15 +283,17 @@ pub async fn target(git: &Git<'_>, call: &ActionCall) -> HostResult<Target> {
 /// The base a worktree is compared with: the agent's `git.base`, else the
 /// workflow's record, else the repository's default branch.
 pub async fn base_of(git: &Git<'_>, t: &Target, main: &str) -> HostResult<String> {
-    if let Some(b) = t.agent.as_ref().and_then(|a| a.labels.get(LABEL_BASE)) {
-        return Ok(b.clone());
-    }
-    if let Some(r) = get_record(git.host, &t.path).await?
+    let base = if let Some(b) = t.agent.as_ref().and_then(|a| a.labels.get(LABEL_BASE)) {
+        b.clone()
+    } else if let Some(r) = get_record(git.host, &t.path).await?
         && !r.base.is_empty()
     {
-        return Ok(r.base);
-    }
-    default_base(git, main).await
+        r.base
+    } else {
+        default_base(git, main).await?
+    };
+    check_ref("base", &base)?;
+    Ok(base)
 }
 
 pub fn refused(reason: impl Into<String>, retry: &[(&str, Value)]) -> ActionOutcome {

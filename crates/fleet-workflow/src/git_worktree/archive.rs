@@ -15,9 +15,9 @@ use super::git::{Git, Mode};
 use super::new_agent::fetch_base;
 use super::parse::{parse_worktree_list, split_nul};
 use super::{
-    GitWorktree, LABEL_WORKTREE, agent_name, agents_in, base_of, caller_tag, default_base,
-    delete_record, get_record, inside, records, refused, repo_param_or_cwd, resolve_repo, running,
-    target,
+    GitWorktree, LABEL_WORKTREE, agent_name, agents_in, base_of, caller_tag, check_ref,
+    default_base, delete_record, get_record, inside, records, refused, repo_param_or_cwd,
+    resolve_repo, running, target,
 };
 
 /// What decides whether a worktree may go.
@@ -34,6 +34,7 @@ pub struct State {
 }
 
 pub async fn inspect(git: &Git<'_>, wt: &str, base: &str) -> HostResult<State> {
+    check_ref("base", base)?;
     let status = git
         .ok(
             wt,
@@ -53,11 +54,32 @@ pub async fn inspect(git: &Git<'_>, wt: &str, base: &str) -> HostResult<State> {
         (false, false) => None,
     };
     let merged = git
-        .test(wt, &["merge-base", "--is-ancestor", "HEAD", base])
+        .test(
+            wt,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                "--end-of-options",
+                "HEAD",
+                base,
+            ],
+        )
         .await?;
     let local_commits = !merged
         && !git
-            .line(wt, &["rev-list", "-n1", "HEAD", "--not", "--remotes", base])
+            .line(
+                wt,
+                &[
+                    "rev-list",
+                    "-n1",
+                    "--not",
+                    "--remotes",
+                    "--not",
+                    "--end-of-options",
+                    "HEAD",
+                    &format!("^{base}"),
+                ],
+            )
             .await?
             .is_empty();
     let branch = git
@@ -112,7 +134,7 @@ async fn remove(
     if force {
         args.push("--force");
     }
-    args.push(wt);
+    args.extend(["--end-of-options", wt]);
     git.ok(main, &args, Mode::Write).await?;
     let mut said = vec![format!("archived {wt}")];
     if let Some(b) = &state.branch {
@@ -121,7 +143,8 @@ async fn remove(
         } else if state.merged || force {
             // Our own merged-into-base check decides, not `branch -d`'s
             // (which looks at the main checkout's HEAD).
-            git.ok(main, &["branch", "-D", b], Mode::Write).await?;
+            git.ok(main, &["branch", "-D", "--end-of-options", b], Mode::Write)
+                .await?;
             let why = if state.merged { "" } else { " (not merged)" };
             said.push(format!("deleted branch {b}{why}"));
         } else {

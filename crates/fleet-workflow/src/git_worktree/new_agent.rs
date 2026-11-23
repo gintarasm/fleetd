@@ -14,8 +14,8 @@ use super::git::{FETCH_TIMEOUT_MS, Git, Mode, failure, request};
 use super::parse::parse_worktree_list;
 use super::{
     GitWorktree, LABEL_BASE, LABEL_REPO, LABEL_WORKTREE, Record, Repo, agents_in, caller_tag,
-    default_base, delete_record, get_record, now_ms, put_record, refused, repo_param_or_cwd,
-    running,
+    check_ref, default_base, delete_record, get_record, now_ms, put_record, refused,
+    repo_param_or_cwd, running,
 };
 
 /// `[A-Za-z0-9._-]`, at most 64, not `.` or `..`.
@@ -44,6 +44,16 @@ pub async fn run(
     let Some((program, args)) = command.split_first() else {
         return Err(ActionError::invalid("the command is empty"));
     };
+    // Caller-named refs are checked before any git runs (they must never
+    // reach git as options).
+    let given_base = call.params.string("base").filter(|b| !b.is_empty());
+    let given_branch = call.params.string("branch").filter(|b| !b.is_empty());
+    if let Some(b) = given_base {
+        check_ref("base", b)?;
+    }
+    if let Some(b) = given_branch {
+        check_ref("branch", b)?;
+    }
     let repo = repo_param_or_cwd(git, call).await?;
     let (config, home) = flow.config(&repo.name)?;
     let root = resolve_root(&config.root, &repo.name, &repo.main, &home);
@@ -73,10 +83,24 @@ pub async fn run(
     }
 
     let mut notes = Vec::new();
-    let base = match call.params.string("base").filter(|b| !b.is_empty()) {
+    let base = match given_base {
         Some(b) => b.to_owned(),
         None => default_base(git, &repo.main).await?,
     };
+    check_ref("base", &base)?;
+    let branch = match given_branch {
+        Some(b) => b.to_owned(),
+        None => format!("{}{slug}", config.branch_prefix),
+    };
+    check_ref("branch", &branch)?;
+    if !git
+        .test(&repo.main, &["check-ref-format", "--branch", &branch])
+        .await?
+    {
+        return Err(ActionError::invalid(format!(
+            "branch {branch:?} is not a valid branch name"
+        )));
+    }
     if config.fetch_base
         && let Some(note) = fetch_base(git, &repo.main, &base).await?
     {
@@ -84,7 +108,16 @@ pub async fn run(
     }
     let commit = format!("{base}^{{commit}}");
     if !git
-        .test(&repo.main, &["rev-parse", "--verify", "--quiet", &commit])
+        .test(
+            &repo.main,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &commit,
+            ],
+        )
         .await?
     {
         return Err(ActionError::invalid(format!(
@@ -92,10 +125,6 @@ pub async fn run(
             repo.main
         )));
     }
-    let branch = match call.params.string("branch").filter(|b| !b.is_empty()) {
-        Some(b) => b.to_owned(),
-        None => format!("{}{slug}", config.branch_prefix),
-    };
     let head = format!("refs/heads/{branch}");
     if git
         .test(&repo.main, &["show-ref", "--verify", "--quiet", &head])
@@ -113,7 +142,16 @@ pub async fn run(
         )));
     }
 
-    let add = ["worktree", "add", "--no-track", "-b", &branch, &path, &base];
+    let add = [
+        "worktree",
+        "add",
+        "--no-track",
+        "-b",
+        &branch,
+        "--end-of-options",
+        &path,
+        &base,
+    ];
     let out = git.run(&repo.main, &add, Mode::Write).await?;
     if out.exit_code != Some(0) {
         let said = failure(&add, &out);
@@ -195,6 +233,7 @@ async fn reuse_worktree(
             None => default_base(git, &repo.main).await?,
         },
     };
+    check_ref("base", &base)?;
     let agent = git
         .host
         .spawn(spawn_request(call, repo, path, &base, program, args))
@@ -247,7 +286,15 @@ pub(super) async fn fetch_base(
     }) else {
         return Ok(None);
     };
-    let args = ["fetch", "--quiet", "--no-tags", remote, branch];
+    check_ref("base", base)?;
+    let args = [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--end-of-options",
+        remote,
+        branch,
+    ];
     let out = git
         .host
         .exec(request(main, &args, Mode::Write, FETCH_TIMEOUT_MS))
@@ -265,8 +312,18 @@ pub(super) async fn fetch_base(
 /// Best effort: what fails is left for `git worktree prune`.
 async fn rollback(git: &Git<'_>, main: &str, path: &str, branch: &str) {
     let _ = git
-        .run(main, &["worktree", "remove", "--force", path], Mode::Write)
+        .run(
+            main,
+            &["worktree", "remove", "--force", "--end-of-options", path],
+            Mode::Write,
+        )
         .await;
-    let _ = git.run(main, &["branch", "-D", branch], Mode::Write).await;
+    let _ = git
+        .run(
+            main,
+            &["branch", "-D", "--end-of-options", branch],
+            Mode::Write,
+        )
+        .await;
     let _ = delete_record(git.host, path).await;
 }
