@@ -224,6 +224,10 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
         }
         // Reads every mailbox's senders and recipients: the GUI's (ADR 0089).
         Kind::ListMessageEdges(_) => return Some(forbidden("agents cannot read every mailbox")),
+        // Reads every agent's output: the user's search (ADR 0098).
+        Kind::SearchOutput(_) => {
+            return Some(forbidden("agents cannot search every agent's output"));
+        }
         Kind::Attach(r) => vec![r.agent_id],
         Kind::Input(r) => vec![r.agent_id],
         Kind::Resize(r) => vec![r.agent_id],

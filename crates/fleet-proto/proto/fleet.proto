@@ -77,6 +77,8 @@ message Request {
     DecideSpawn decide_spawn = 76;
     // Message lines in the GUI's graph (ADR 0089): 85-89. The user only.
     ListMessageEdges list_message_edges = 85;
+    // Search every agent's output (ADR 0098): 90-94. The user only.
+    SearchOutput search_output = 90;
   }
 }
 
@@ -103,6 +105,7 @@ message Response {
     // Spawn approval (ADR 0079).
     PendingSpawns pending_spawns = 75;
     MessageEdges message_edges = 85;
+    SearchHits search_hits = 90;
   }
 }
 
@@ -443,6 +446,23 @@ message MessageEdge {
   int64 created_unix_ms = 5;
 }
 message MessageEdges { repeated MessageEdge edges = 1; }
+
+// Searches every agent's screen and stored history for `text` (ADR 0098):
+// newest agent first, each agent's newest line first. `limit` hits in all
+// (0: 200; capped at 1000), `per_agent` per agent (0: 20). Each line is
+// matched as plain text, case folded unless `case_sensitive`.
+message SearchOutput {
+  string text = 1;
+  bool case_sensitive = 2;
+  uint32 limit = 3;
+  uint32 per_agent = 4;
+}
+// `line`: the history line number; a screen row `r` is the history's end
+// plus `r`. `text`: the line without styling, cut to 1 KiB.
+message SearchHit { uint64 agent_id = 1; uint64 line = 2; string text = 3; }
+// `truncated`: the hit limit or the node's read budget stopped the search
+// before everything was read.
+message SearchHits { repeated SearchHit hits = 1; bool truncated = 2; }
 
 message ReadInbox { optional uint64 since = 1; uint32 max = 2; }
 // `cursor`: the newest id returned (else the cursor asked from).

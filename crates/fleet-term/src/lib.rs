@@ -34,11 +34,13 @@
 //! grid row: a long line soft-wrapped by the agent's terminal yields several
 //! rows.
 
+mod find;
 mod history;
 mod parse;
 mod recorder;
 mod view;
 
+pub use find::{Needle, history_line_text, row_matches};
 pub use history::HistoryEvent;
 pub use parse::{cells_text, parse_history_line};
 pub use view::{Cell, CellStyle, Color, CursorShape, CursorView, Modes, Palette};

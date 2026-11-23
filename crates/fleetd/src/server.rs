@@ -25,11 +25,13 @@ use fleet_node::node::{
     ActivityReceiver, ConnId, Node, QuestionIn, Removed, StreamItem, Subscription,
 };
 use fleet_node::scope::Caller;
+use fleet_node::term::Needle;
 use fleet_proto::{
     Ack, AgentList, AgentRemoved, AgentResized, AttachOk, AttachRole, Event, ForgetAgents,
     Forgotten, Frame, FrameCodec, HandshakeReject, HelloOk, HistoryPage, Lagged, LogLine, LogLines,
     MAX_FRAME, PROTOCOL_VERSION, ReadHistory, ReadLogs, Request, Response, RestartAgent, Restarted,
-    RestartingDaemon, RestoreSummary, SpawnAgent, SpawnedAttached, event, request, response,
+    RestartingDaemon, RestoreSummary, SearchHit, SearchHits, SearchOutput, SpawnAgent,
+    SpawnedAttached, event, request, response,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
@@ -573,6 +575,29 @@ fn ack(r: io::Result<()>) -> response::Kind {
     }
 }
 
+/// Searches every agent's output (ADR 0098) on the blocking pool.
+async fn search_output(node: &Arc<Node>, r: SearchOutput) -> response::Kind {
+    let Some(needle) = Needle::new(&r.text, r.case_sensitive) else {
+        return error("search text is empty".into());
+    };
+    let (limit, per_agent) = (r.limit, r.per_agent);
+    match blocking(node, move |n| n.search(needle, limit, per_agent)).await {
+        Ok(found) => response::Kind::SearchHits(SearchHits {
+            hits: found
+                .hits
+                .into_iter()
+                .map(|h| SearchHit {
+                    agent_id: h.agent_id,
+                    line: h.line,
+                    text: h.text,
+                })
+                .collect(),
+            truncated: found.truncated,
+        }),
+        Err(e) => error(e.to_string()),
+    }
+}
+
 fn error(message: String) -> response::Kind {
     response::Kind::Error(fleet_proto::Error { message })
 }
@@ -719,6 +744,7 @@ impl Connection {
                     Err(e) => error(e.to_string()),
                 }
             }
+            Some(request::Kind::SearchOutput(r)) => search_output(&self.node, r).await,
             Some(request::Kind::Wait(w)) => match self.start_wait(req.id, *w) {
                 Ok(()) => return true,
                 Err(message) => error(message),
