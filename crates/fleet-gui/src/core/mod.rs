@@ -5,6 +5,7 @@ pub mod backoff;
 pub mod broadcast;
 pub mod bulk;
 pub mod config;
+pub mod diff;
 pub mod cursor_blink;
 pub mod drag_drop;
 pub mod drop_paste;
