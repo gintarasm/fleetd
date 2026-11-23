@@ -1,6 +1,6 @@
 //! The workspace's side of workflows (ADR 0094): Show Changes, Run
 //! Action…, Archive Worktree…, the New agent sheet's worktree spawn, and
-//! what each action result does. Kept out of `workspace.rs`, which only
+//! what each action result does. Kept out of `workspace/mod.rs`, which only
 //! calls in here.
 
 use std::collections::HashMap;
