@@ -77,6 +77,8 @@ pub enum Mode {
     Input { agent: u64, extra: Vec<u64> },
     GraphOpen,
     GraphFlood { agents: usize },
+    DiffOpen,
+    DiffScroll { agents: usize },
 }
 
 /// The bench mode from the `FLEET_GUI_BENCH*` values; `None` when off.
@@ -503,6 +505,15 @@ pub fn graph_painted(window: &mut Window) {
         }
         None => {}
     }
+}
+
+/// A diff pane showed its first diff, `at` being when Show Changes asked
+/// for it (`diff-open`).
+pub fn diff_opened(at: Instant) {
+    if mode() != Some(&Mode::DiffOpen) {
+        return;
+    }
+    STATE.with_borrow_mut(|s| s.open_t0 = Some(at));
 }
 
 /// Waits for the workspace window and at least `agents` listed agents.

@@ -64,4 +64,5 @@ pub mod theme;
 pub mod titlebar;
 pub mod truncate;
 pub mod underline;
+pub mod worktree;
 pub mod zoom;

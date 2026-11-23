@@ -61,6 +61,14 @@ pub type OutputJob = Box<dyn FnOnce() -> Result<String, String> + Send>;
 /// [`SessionApi::search_output`]).
 pub type SearchJob = Box<dyn FnOnce() -> Result<fleet_proto::SearchHits, String> + Send>;
 
+/// A blocking job listing the daemon's workflow actions (see
+/// [`SessionApi::list_actions`]).
+pub type ActionsJob = Box<dyn FnOnce() -> Result<crate::core::worktree::Actions, String> + Send>;
+
+/// A blocking job running one workflow action (see
+/// [`SessionApi::run_action`]).
+pub type ActionJob = Box<dyn FnOnce() -> Result<fleet_proto::ActionResult, String> + Send>;
+
 /// What the workspace needs from the session: [`Session`], or a recording
 /// fake in tests.
 pub trait SessionApi: InputSink {
@@ -94,6 +102,14 @@ pub trait SessionApi: InputSink {
     /// A job searching every agent's output for `query` (ADR 0098); it
     /// blocks, so it runs off the UI thread.
     fn search_output(&self, _query: String, _case_sensitive: bool) -> SearchJob {
+        Box::new(|| Err("not connected to a fleetd".into()))
+    }
+    /// A job listing the daemon's workflow actions (ADR 0094); it blocks.
+    fn list_actions(&self) -> ActionsJob {
+        Box::new(|| Err("not connected to a fleetd".into()))
+    }
+    /// A job running a workflow action as the user (ADR 0094); it blocks.
+    fn run_action(&self, _call: fleet_proto::RunAction) -> ActionJob {
         Box::new(|| Err("not connected to a fleetd".into()))
     }
     /// Sets an agent's name (ADR 0052).
@@ -201,6 +217,14 @@ impl SessionApi for Session {
 
     fn search_output(&self, query: String, case_sensitive: bool) -> SearchJob {
         Box::new(Session::search_output(self, query, case_sensitive))
+    }
+
+    fn list_actions(&self) -> ActionsJob {
+        Box::new(Session::list_actions(self))
+    }
+
+    fn run_action(&self, call: fleet_proto::RunAction) -> ActionJob {
+        Box::new(Session::run_action(self, call))
     }
 
     fn rename(&self, agent_id: u64, name: String) {
