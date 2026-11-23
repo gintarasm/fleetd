@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use fleet_gui::core::config::{GuiConfig, load_config};
+use fleet_gui::core::cursor_blink::BlinkChoice;
 use fleet_gui::core::glass::GlassChoice;
 use fleet_gui::core::settings::{
     BLUR_MAX, BLUR_MIN, Change, FONT_SIZE_MAX, FONT_SIZE_MIN, MotionChoice, OPACITY_MAX,
@@ -256,5 +257,31 @@ fn glass_is_read_written_and_rejects_unknown_values() {
     assert!(read(dir.path()).contains("glass = \"window\""));
     assert_eq!(load_config(dir.path()).unwrap().glass, GlassChoice::Window);
     write(dir.path(), "[gui]\nglass = \"frosted\"\n");
+    assert!(load_config(dir.path()).is_err());
+}
+
+#[test]
+fn cursor_blink_follows_the_app_by_default_and_is_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        load_config(dir.path()).unwrap().cursor_blink,
+        BlinkChoice::App
+    );
+    write(dir.path(), "[gui]\ncursor_blink = \"off\"\n");
+    assert_eq!(
+        load_config(dir.path()).unwrap().cursor_blink,
+        BlinkChoice::Off
+    );
+    let mut c = GuiConfig::default();
+    assert_eq!(Change::CursorBlink(BlinkChoice::App).apply(&mut c), None);
+    let key = Change::CursorBlink(BlinkChoice::On).apply(&mut c).unwrap();
+    assert_eq!(key, "cursor_blink");
+    save_changes(dir.path(), &c, &[key]).unwrap();
+    assert!(read(dir.path()).contains("cursor_blink = \"on\""));
+    assert_eq!(
+        load_config(dir.path()).unwrap().cursor_blink,
+        BlinkChoice::On
+    );
+    write(dir.path(), "[gui]\ncursor_blink = \"sometimes\"\n");
     assert!(load_config(dir.path()).is_err());
 }

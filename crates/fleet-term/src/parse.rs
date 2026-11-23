@@ -4,7 +4,7 @@
 use alacritty_terminal::vte::ansi::{Attr, Handler, Processor};
 use unicode_width::UnicodeWidthChar;
 
-use crate::view::{Cell, CellStyle, color};
+use crate::view::{Cell, CellStyle, Color, Underline, color};
 
 struct LineParser<'a> {
     out: &'a mut Vec<Cell>,
@@ -37,11 +37,11 @@ impl Handler for LineParser<'_> {
             Attr::Bold => s.bold = true,
             Attr::Dim => s.dim = true,
             Attr::Italic => s.italic = true,
-            Attr::Underline
-            | Attr::DoubleUnderline
-            | Attr::Undercurl
-            | Attr::DottedUnderline
-            | Attr::DashedUnderline => s.underline = true,
+            Attr::Underline => s.underline = Underline::Single,
+            Attr::DoubleUnderline => s.underline = Underline::Double,
+            Attr::Undercurl => s.underline = Underline::Curly,
+            Attr::DottedUnderline => s.underline = Underline::Dotted,
+            Attr::DashedUnderline => s.underline = Underline::Dashed,
             Attr::Reverse => s.inverse = true,
             Attr::Hidden => s.hidden = true,
             Attr::Strike => s.strikeout = true,
@@ -51,13 +51,14 @@ impl Handler for LineParser<'_> {
                 s.dim = false;
             }
             Attr::CancelItalic => s.italic = false,
-            Attr::CancelUnderline => s.underline = false,
+            Attr::CancelUnderline => s.underline = Underline::None,
             Attr::CancelReverse => s.inverse = false,
             Attr::CancelHidden => s.hidden = false,
             Attr::CancelStrike => s.strikeout = false,
             Attr::Foreground(c) => s.fg = color(c),
             Attr::Background(c) => s.bg = color(c),
-            Attr::BlinkSlow | Attr::BlinkFast | Attr::CancelBlink | Attr::UnderlineColor(_) => {}
+            Attr::UnderlineColor(c) => s.underline_color = c.map_or(Color::Default, color),
+            Attr::BlinkSlow | Attr::BlinkFast | Attr::CancelBlink => {}
         }
     }
 }

@@ -8,6 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use super::config::{DEFAULT_FONT_FAMILY, GuiConfig, save_gui_values};
+use super::cursor_blink::BlinkChoice;
 use super::glass::GlassChoice;
 use super::theme::Appearance;
 
@@ -148,6 +149,7 @@ pub enum Change {
     FontFamily(String),
     FontSize(f32),
     ReduceMotion(MotionChoice),
+    CursorBlink(BlinkChoice),
     ConfirmKill(bool),
     Notifications(bool),
     OptionAsMeta(bool),
@@ -194,6 +196,7 @@ impl Change {
                 "font_size",
             ),
             Change::ReduceMotion(v) => set(&mut c.reduce_motion, v, "reduce_motion"),
+            Change::CursorBlink(v) => set(&mut c.cursor_blink, v, "cursor_blink"),
             Change::ConfirmKill(v) => set(&mut c.confirm_kill, v, "confirm_kill"),
             Change::Notifications(v) => set(&mut c.notifications, v, "notifications"),
             Change::OptionAsMeta(v) => set(&mut c.option_as_meta, v, "option_as_meta"),
@@ -223,6 +226,7 @@ fn value_of(c: &GuiConfig, key: &str) -> Option<toml_edit::Value> {
         "font_family" => c.font_family.as_str().into(),
         "font_size" => float(c.font_size),
         "reduce_motion" => c.reduce_motion.as_str().into(),
+        "cursor_blink" => c.cursor_blink.as_str().into(),
         "confirm_kill" => c.confirm_kill.into(),
         "notifications" => c.notifications.into(),
         "option_as_meta" => c.option_as_meta.into(),
