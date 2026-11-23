@@ -241,6 +241,9 @@ pub(crate) async fn refusal(scope: &Scope, a: u64, kind: &Option<request::Kind>)
         Kind::SendMessage(_) => return None,
         // The caller's own mailbox.
         Kind::ReadInbox(_) => return None,
+        // Workflows (ADR 0092): the host checks the action's callers, its
+        // params' scope (`agent` params in D(a)) and runs it as a.
+        Kind::ListActions(_) | Kind::RunAction(_) => return None,
         // Named agents must be in D(a); none means D(a).
         Kind::Wait(r) => r.agent_ids.clone(),
     };

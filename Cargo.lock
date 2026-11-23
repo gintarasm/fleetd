@@ -2033,6 +2033,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fleet-workflow"
+version = "0.1.0"
+dependencies = [
+ "fleet-proto",
+ "tokio",
+]
+
+[[package]]
 name = "fleetd"
 version = "0.1.0"
 dependencies = [
@@ -2040,6 +2048,7 @@ dependencies = [
  "fleet-client",
  "fleet-node",
  "fleet-proto",
+ "fleet-workflow",
  "fs4",
  "futures-util",
  "libc",

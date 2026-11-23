@@ -1,0 +1,14 @@
+[package]
+name = "fleet-workflow"
+version = "0.1.0"
+edition = "2024"
+description = "Workflows behind fleetd's RunAction: the Workflow and Host traits, manifests, capabilities and parameter validation (ADR 0092)"
+
+[lints]
+workspace = true
+
+[dependencies]
+fleet-proto = { version = "0.1.0", path = "../fleet-proto" }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt", "macros"] }

@@ -7,11 +7,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Identity took 8 (spec "Waves"); the mailbox (M3-E) 9, leases 10 (ADR 0077),
-/// the status report 11 (ADR 0075).
-const SCHEMA_VERSION: i64 = 12;
+/// the status report 11 (ADR 0075), workflow state 13 (ADR 0092).
+const SCHEMA_VERSION: i64 = 13;
 
 mod mailbox;
 use mailbox::{MAILBOX_DDL, QUESTION_DDL};
+mod workflow_kv;
+use workflow_kv::WORKFLOW_KV_DDL;
+pub use workflow_kv::{KV_MAX_KEY_BYTES, KV_MAX_KEYS, KV_MAX_VALUE_BYTES};
 
 /// An agent's labels (ADR 0025); the node validates them.
 pub type Labels = HashMap<String, String>;
@@ -319,10 +322,20 @@ impl Store {
                  COMMIT;"
             ))?;
         }
+        if version < 13 {
+            // v13: workflow state (ADR 0092). The DDL must match
+            // `create_latest`'s.
+            self.conn.execute_batch(&format!(
+                "BEGIN;
+                 {WORKFLOW_KV_DDL}
+                 PRAGMA user_version = 13;
+                 COMMIT;"
+            ))?;
+        }
         Ok(())
     }
 
-    /// The latest schema for a new DB; the same tables the v1 -> ... -> v12
+    /// The latest schema for a new DB; the same tables the v1 -> ... -> v13
     /// migrations produce.
     fn create_latest(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(&format!(
@@ -352,7 +365,8 @@ impl Store {
              {MAILBOX_DDL}
              {LEASES_DDL}
              {QUESTION_DDL}
-             PRAGMA user_version = 12;
+             {WORKFLOW_KV_DDL}
+             PRAGMA user_version = 13;
              COMMIT;"
         ))
     }
@@ -823,8 +837,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_is_v12() {
-        assert_eq!(SCHEMA_VERSION, 12);
+    fn schema_is_v13() {
+        assert_eq!(SCHEMA_VERSION, 13);
     }
 
     #[test]
@@ -937,7 +951,7 @@ mod tests {
         let (_d, p, s) = open_tmp();
         drop(s);
         let c = Connection::open(&p).unwrap();
-        c.execute_batch("ALTER TABLE agents DROP COLUMN question_id; ALTER TABLE agents DROP COLUMN question_text; ALTER TABLE agents DROP COLUMN question_choices; ALTER TABLE messages DROP COLUMN choices; ALTER TABLE agents DROP COLUMN reported_state; ALTER TABLE agents DROP COLUMN reported_message; ALTER TABLE agents DROP COLUMN reported_unix_ms; DROP TABLE leases; DROP TABLE messages; DROP TABLE inbox_marks; PRAGMA user_version = 8;")
+        c.execute_batch("DROP TABLE workflow_kv; ALTER TABLE agents DROP COLUMN question_id; ALTER TABLE agents DROP COLUMN question_text; ALTER TABLE agents DROP COLUMN question_choices; ALTER TABLE messages DROP COLUMN choices; ALTER TABLE agents DROP COLUMN reported_state; ALTER TABLE agents DROP COLUMN reported_message; ALTER TABLE agents DROP COLUMN reported_unix_ms; DROP TABLE leases; DROP TABLE messages; DROP TABLE inbox_marks; PRAGMA user_version = 8;")
             .unwrap();
         drop(c);
         let s = Store::open(&p).unwrap();
@@ -1021,6 +1035,7 @@ mod tests {
         let conn = Connection::open(&p).unwrap();
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE workflow_kv;
              ALTER TABLE agents DROP COLUMN question_id; ALTER TABLE agents DROP COLUMN question_text; ALTER TABLE agents DROP COLUMN question_choices; ALTER TABLE messages DROP COLUMN choices; ALTER TABLE agents DROP COLUMN reported_state;
              ALTER TABLE agents DROP COLUMN reported_message;
              ALTER TABLE agents DROP COLUMN reported_unix_ms;
@@ -1468,6 +1483,7 @@ mod tests {
         // Back to the v4 shape: no exit time column.
         conn.execute_batch(
             "DROP TABLE agent_tokens;
+             DROP TABLE workflow_kv;
              ALTER TABLE agents DROP COLUMN question_id; ALTER TABLE agents DROP COLUMN question_text; ALTER TABLE agents DROP COLUMN question_choices; ALTER TABLE messages DROP COLUMN choices; ALTER TABLE agents DROP COLUMN reported_state;
              ALTER TABLE agents DROP COLUMN reported_message;
              ALTER TABLE agents DROP COLUMN reported_unix_ms;

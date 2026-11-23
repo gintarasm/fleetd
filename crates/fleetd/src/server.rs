@@ -47,6 +47,7 @@ use crate::logging;
 use crate::scope;
 use crate::wait;
 
+pub(crate) mod action;
 pub(crate) mod lease;
 
 /// Concurrent connections served; more are rejected.
@@ -118,6 +119,8 @@ struct Shared {
     /// Signalled (under `settle`) when the last request in flight finishes.
     settled: Condvar,
     settle: Mutex<()>,
+    /// Workflows (ADR 0092): the registry, built on first use.
+    actions: action::Actions,
 }
 
 fn restarting() -> response::Kind {
@@ -188,6 +191,7 @@ impl Server {
                 in_flight: AtomicUsize::new(0),
                 settled: Condvar::new(),
                 settle: Mutex::new(()),
+                actions: action::Actions::new(),
             }),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         }
@@ -406,6 +410,7 @@ async fn connection(
         approvals: Vec::new(),
         approved_tx,
         approved: HashSet::new(),
+        actions: action::ConnActions::new(),
     };
     // Boxed: kept out of every connection's future.
     Box::pin(conn.scope.warm()).await;
@@ -535,6 +540,8 @@ struct Connection {
     approved_tx: mpsc::UnboundedSender<Request>,
     /// Approved spawn requests being handled: they skip the approval.
     approved: HashSet<u64>,
+    /// Running `RunAction`s' limit; cancels them when dropped (ADR 0092).
+    actions: action::ConnActions,
 }
 
 impl Drop for Connection {
@@ -639,6 +646,11 @@ impl Connection {
             // (which ends the connection, and the wait with it).
             Some(request::Kind::Wait(_)) if self.shared.stopped.load(Ordering::SeqCst) => Err(()),
             Some(request::Kind::Wait(_)) => Ok(None),
+            // Like a wait: an action's host calls are admitted one by one.
+            Some(request::Kind::RunAction(_)) if self.shared.stopped.load(Ordering::SeqCst) => {
+                Err(())
+            }
+            Some(request::Kind::RunAction(_)) => Ok(None),
             _ => self.shared.admit().map(Some).ok_or(()),
         };
         let kind = match req.kind {
@@ -745,6 +757,18 @@ impl Connection {
                 }
             }
             Some(request::Kind::SearchOutput(r)) => search_output(&self.node, r).await,
+            Some(request::Kind::ListActions(_)) => action::list(&self.shared, self.caller),
+            Some(request::Kind::RunAction(r)) => {
+                let start = action::Start {
+                    node: Arc::clone(&self.node),
+                    shared: Arc::clone(&self.shared),
+                    caller: self.caller,
+                    outbox: self.outbox.clone(),
+                    conn: self.id.0,
+                };
+                action::start(start, &self.actions, req.id, *r);
+                return true;
+            }
             Some(request::Kind::Wait(w)) => match self.start_wait(req.id, *w) {
                 Ok(()) => return true,
                 Err(message) => error(message),
@@ -1427,7 +1451,7 @@ mod tests {
     }
 
     /// A server and one connection of it.
-    fn test_server_conn(node: Arc<Node>) -> (Server, Connection, mpsc::Receiver<Frame>) {
+    pub(super) fn test_server_conn(node: Arc<Node>) -> (Server, Connection, mpsc::Receiver<Frame>) {
         let (outbox, rx) = mpsc::channel(OUTBOX_CAPACITY);
         let server = Server::new(
             Arc::clone(&node),
@@ -1450,6 +1474,7 @@ mod tests {
             approvals: Vec::new(),
             approved_tx: mpsc::unbounded_channel().0,
             approved: HashSet::new(),
+            actions: action::ConnActions::new(),
         };
         (server, conn, rx)
     }
@@ -1585,7 +1610,7 @@ mod tests {
         }))
     }
 
-    async fn next_response(rx: &mut mpsc::Receiver<Frame>) -> Response {
+    pub(super) async fn next_response(rx: &mut mpsc::Receiver<Frame>) -> Response {
         loop {
             if let Some(Frame::Response(r)) = rx.recv().await {
                 return r;

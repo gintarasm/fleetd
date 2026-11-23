@@ -2049,6 +2049,84 @@ impl Node {
         })
     }
 
+    /// [`Node::precheck_spawn`] for a spawn by a workflow owning label
+    /// prefix `owned` (ADR 0092).
+    pub fn precheck_spawn_for_workflow(
+        &self,
+        caller: Caller,
+        req: &SpawnAgent,
+        owned: &str,
+    ) -> io::Result<PendingSpawn> {
+        let Caller::Agent(parent) = caller else {
+            return Err(invalid("only an agent's spawn waits for approval".into()));
+        };
+        scope::check_owned_prefix(owned)?;
+        check_labels(&req.labels)?;
+        let mut labels = req.labels.clone();
+        drop(self.admit_spawn_owned(caller, Some(&mut labels), None, Some(owned))?);
+        Ok(PendingSpawn {
+            parent,
+            program: req.program.clone(),
+            args: req.args.clone(),
+            cwd: req.cwd.clone(),
+            labels,
+            ..Default::default()
+        })
+    }
+
+    /// Whether `caller` may spawn one more agent now: the quotas only, as
+    /// a dry run before a workflow makes side effects (ADR 0092). A
+    /// refusal is announced like a spawn's. Always yes for the user.
+    pub fn check_spawn(&self, caller: Caller) -> io::Result<()> {
+        drop(self.admit_spawn(caller, None, None)?);
+        Ok(())
+    }
+
+    /// A spawn by a workflow, for `caller` (ADR 0092): [`Node::spawn_by`],
+    /// except that the workflow owns label prefix `owned` (its manifest's
+    /// `labels:` capability). For an agent caller, the request's keys in
+    /// that prefix are the workflow's and replace the inherited ones
+    /// ([`scope::child_labels_owned`]); the rest is narrowed as usual.
+    pub fn spawn_for_workflow(
+        &self,
+        caller: Caller,
+        mut req: SpawnAgent,
+        owned: &str,
+    ) -> io::Result<AgentInfo> {
+        scope::check_owned_prefix(owned)?;
+        check_labels(&req.labels)?;
+        let _gate = self.admit_spawn_owned(caller, Some(&mut req.labels), None, Some(owned))?;
+        self.start(req, None).map(|(info, _)| info)
+    }
+
+    /// The value of workflow `workflow`'s storage `key` (ADR 0092).
+    pub fn kv_get(&self, workflow: &str, key: &str) -> io::Result<Option<Vec<u8>>> {
+        lock(&self.store).kv_get(workflow, key).map_err(store_err)
+    }
+
+    /// Sets workflow `workflow`'s storage `key`; a limit refuses it as
+    /// invalid input.
+    pub fn kv_put(&self, workflow: &str, key: &str, value: &[u8]) -> io::Result<()> {
+        lock(&self.store)
+            .kv_put(workflow, key, value)
+            .map_err(store_err)?
+            .map_err(invalid)
+    }
+
+    /// Deletes workflow `workflow`'s storage `key`; whether it was there.
+    pub fn kv_delete(&self, workflow: &str, key: &str) -> io::Result<bool> {
+        lock(&self.store)
+            .kv_delete(workflow, key)
+            .map_err(store_err)
+    }
+
+    /// Workflow `workflow`'s storage keys starting with `prefix`, sorted.
+    pub fn kv_keys(&self, workflow: &str, prefix: &str) -> io::Result<Vec<String>> {
+        lock(&self.store)
+            .kv_keys(workflow, prefix)
+            .map_err(store_err)
+    }
+
     /// Receives every spawn refused by a quota from now on.
     pub fn refused_events(&self) -> broadcast::Receiver<SpawnRefused> {
         self.refused.subscribe()
@@ -2314,6 +2392,18 @@ impl Node {
         labels: Option<&mut Labels>,
         restarting: Option<u64>,
     ) -> io::Result<Option<MutexGuard<'_, ()>>> {
+        self.admit_spawn_owned(caller, labels, restarting, None)
+    }
+
+    /// [`Node::admit_spawn`], for a workflow owning label prefix `owned`
+    /// (ADR 0092): see [`scope::child_labels_owned`].
+    fn admit_spawn_owned(
+        &self,
+        caller: Caller,
+        labels: Option<&mut Labels>,
+        restarting: Option<u64>,
+        owned: Option<&str>,
+    ) -> io::Result<Option<MutexGuard<'_, ()>>> {
         let Caller::Agent(a) = caller else {
             return Ok(None);
         };
@@ -2338,7 +2428,16 @@ impl Node {
                 .labels(a)
                 .map_err(store_err)?
                 .unwrap_or_default();
-            let narrowed = scope::child_labels(a, &parent_labels, std::mem::take(labels))?;
+            let requested = std::mem::take(labels);
+            let narrowed = match owned {
+                None => scope::child_labels(a, &parent_labels, requested)?,
+                Some(prefix) => {
+                    let (mine, requested): (Labels, Labels) = requested
+                        .into_iter()
+                        .partition(|(k, _)| k.starts_with(prefix));
+                    scope::child_labels_owned(a, &parent_labels, requested, prefix, mine)?
+                }
+            };
             if narrowed.len() > MAX_LABELS {
                 return Err(invalid(format!(
                     "{} labels with the inherited ones (at most {MAX_LABELS})",
