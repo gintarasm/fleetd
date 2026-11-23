@@ -293,8 +293,20 @@ fn an_agents_restart_of_its_child_keeps_the_parent_and_counts() {
             ..Quotas::default()
         });
     let p = node.spawn(sleeper()).unwrap().id;
+    // Exits on its first run and keeps running on its restart, so the
+    // restarted child is still running when the next spawn is counted.
+    let once = dir.path().join("ran-once");
     let c = node
-        .spawn_by(Caller::Agent(p), sh("exit 0", &[]))
+        .spawn_by(
+            Caller::Agent(p),
+            sh(
+                &format!(
+                    "if [ -e '{0}' ]; then exec sleep 600; fi; touch '{0}'",
+                    once.display()
+                ),
+                &[],
+            ),
+        )
         .unwrap()
         .id;
     wait_exit(&node, c);
