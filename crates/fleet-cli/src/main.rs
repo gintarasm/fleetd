@@ -6,6 +6,7 @@ mod attach;
 mod history;
 mod lease;
 mod mailbox;
+mod node;
 mod report;
 mod search;
 mod skill;
@@ -98,6 +99,8 @@ enum Command {
     Tree(tree::Args),
     /// Search every agent's output (screen and history) for a text
     Search(search::Args),
+    /// Run a program, read a file or list a directory on the node (the user only)
+    Node(node::Args),
     /// List agents' spawns waiting for your approval (`[node] spawn_approval = true`)
     Pending(approval::ListArgs),
     /// Approve a pending spawn
@@ -541,6 +544,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Approve(args) => return approval::decide(&mut client, &args, true),
         Command::Deny(args) => return approval::decide(&mut client, &args, false),
         Command::Search(args) => return search::run(&mut client, &args),
+        Command::Node(args) => return node::run(&mut client, &args),
         Command::Tree(args) => tree::run(&mut client, &args, &parse_labels(&args.labels)?)?,
         Command::Lease(args) => return lease::run(client, &sock, token.as_deref(), args),
         Command::Label { agent, set, remove } => {

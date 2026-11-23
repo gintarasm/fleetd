@@ -53,6 +53,7 @@ fn wall_suite_quick_emits_all_metrics() {
         "daemon_flood50_lagged_subscriptions",
         "daemon_flood50_peak_rss_bytes",
         "daemon_flood50_wall_ns",
+        "exec_true_roundtrip_ns",
         "fleetd_cold_start_ns",
         "fleetd_idle_rss_bytes",
         "flood50_attached4_lagged_subscriptions",
