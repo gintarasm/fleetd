@@ -116,6 +116,12 @@ pub(crate) fn ended_bar(
             button("restart", Some(Icon::Restart), "Restart", true)
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Restart))),
         )
+        .when(chrome.show_changes, |bar| {
+            bar.child(
+                button("show-changes", None, "Show Changes", false)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ShowChanges))),
+            )
+        })
         .child(
             button("copy-output", None, "Copy last output", false)
                 .on_click(cx.listener(|view, _, _, cx| copy_last_output(view, cx))),

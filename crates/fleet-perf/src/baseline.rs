@@ -584,6 +584,8 @@ baseline = 100
         const UNRECORDED: &[&str] = &[
             "exec_true_roundtrip_ns",
             "diff_view_build_10k_lines_instructions",
+            "gui_diff_open_ns",
+            "gui_diff_scroll_frame_ns",
         ];
         assert!(shipped.is_subset(&emitted), "{shipped:?} vs {emitted:?}");
         let missing: std::collections::BTreeSet<&str> =

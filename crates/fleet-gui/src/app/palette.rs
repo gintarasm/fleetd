@@ -7,6 +7,7 @@
 
 use gpui::{Action, Window};
 
+use super::keymap::{ArchiveWorktree, RunAction, ShowChanges};
 use super::keymap::{
     ClearScrollback, ClosePane, CloseTab, Copy, CopyLastOutput, DuplicatePane, EditLabelsPane,
     Find, FindNext, FindPrevious, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2,
@@ -41,6 +42,11 @@ const NOT_IN_PALETTE: &[(&str, &str)] = &[
     ("fleet::OpenInMainView", "graph only"),
     ("fleet::BackToGraph", "graph panel only"),
     ("fleet::ToggleChildren", "graph only"),
+    // The diff pane's own keys (ADR 0094); the palette takes the focus
+    // from the pane they act on, and Show Changes refreshes an open one.
+    ("diff_pane::RefreshDiff", "the focused diff pane's ⌘R"),
+    ("diff_pane::CopyDiff", "the focused diff pane's ⌘C"),
+    ("diff_pane::SelectAllDiff", "the focused diff pane's ⌘A"),
 ];
 
 /// The action a command dispatches.
@@ -105,6 +111,9 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::SwitchFleetd => Box::new(SwitchFleetd),
         Command::InstallSkill => Box::new(InstallSkill),
         Command::Quit => Box::new(Quit),
+        Command::ShowChanges => Box::new(ShowChanges),
+        Command::RunAction => Box::new(RunAction),
+        Command::ArchiveWorktree => Box::new(ArchiveWorktree),
     }
 }
 

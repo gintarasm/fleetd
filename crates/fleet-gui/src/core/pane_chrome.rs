@@ -27,6 +27,9 @@ pub fn grid_size(bounds_w: f32, bounds_h: f32, cell_w: f32, line_h: f32) -> (u16
 pub struct PaneChrome {
     /// 1-based, in reading order.
     pub number: usize,
+    /// The agent's changes can be shown (ADR 0094): the ended summary
+    /// offers Show Changes.
+    pub show_changes: bool,
     /// The layout puts an agent here.
     pub has_agent: bool,
     /// The agent list says that agent exited or is lost.

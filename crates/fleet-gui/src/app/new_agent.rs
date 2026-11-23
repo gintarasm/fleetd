@@ -4,7 +4,10 @@
 //! from `[gui] default_command` and offered from the recent ones, an
 //! optional first prompt (the command's last argument), a name
 //! (generated from the command and prompt until edited, ADR 0052) and
-//! optional labels.
+//! optional labels. When the daemon has `git-worktree.new-agent` and the
+//! folder is in a git checkout, a "New worktree" checkbox (remembered per
+//! target, ADR 0094) adds Slug, Branch and Base, and the spawn goes
+//! through that action instead.
 
 use fleet_client::names::NAME_LABEL;
 use gpui::{
@@ -14,7 +17,7 @@ use gpui::{
 };
 
 use super::controls::{
-    ButtonKind, button, error_text, field_label, list_row, list_well, move_focus,
+    ButtonKind, button, check_box, error_text, field_label, list_row, list_well, move_focus,
     return_is_not_a_click, sheet_card, sheet_title, tab_stop,
 };
 use super::text_field::TextField;
@@ -23,6 +26,7 @@ use crate::core::presets::{Prefill, Preset, append_prompt, name_source};
 use crate::core::session::AgentRow;
 use crate::core::style::{space, text};
 use crate::core::target::Target;
+use crate::core::worktree::{NewWorktree, in_git_checkout, slug_error, slug_from_name};
 
 use crate::core::spawn::{NameDraft, parse_label_list};
 pub use crate::core::spawn::{SpawnRequest, parse_command};
@@ -34,7 +38,40 @@ pub enum SheetEvent {
         req: SpawnRequest,
         command: String,
     },
+    /// Spawn `req` in a new worktree of its folder's repository
+    /// (`git-worktree.new-agent`, ADR 0094).
+    SpawnInWorktree {
+        req: SpawnRequest,
+        command: String,
+        worktree: NewWorktree,
+    },
     Cancel,
+}
+
+/// The "New worktree" fields.
+pub(crate) struct WorktreeFields {
+    /// The checkbox.
+    pub(crate) on: bool,
+    pub(crate) slug: Entity<TextField>,
+    pub(crate) branch: Entity<TextField>,
+    pub(crate) base: Entity<TextField>,
+    /// The slug follows the name until edited.
+    slug_edited: bool,
+    /// The folder is in a git checkout (or, remote, not known not to be).
+    pub(crate) in_checkout: bool,
+    /// Local folders are checked for a checkout; remote ones are not.
+    local: bool,
+    _observers: [Subscription; 2],
+}
+
+/// `dir` with a leading `~` as the home directory (local folders).
+fn expand_home(dir: &str) -> String {
+    match (dir.strip_prefix('~'), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{home}{rest}")
+        }
+        _ => dir.to_owned(),
+    }
 }
 
 /// The sheet's directory list: the recent directories for the target,
@@ -87,6 +124,8 @@ pub struct NewAgentSheet {
     /// [`dir_hint`] for the target.
     pub(crate) hint: Option<String>,
     pub(crate) error: Option<String>,
+    /// "New worktree", when the daemon offers it.
+    pub(crate) worktree: Option<WorktreeFields>,
     _observers: [Subscription; 4],
 }
 
@@ -100,6 +139,9 @@ pub struct SheetSetup {
     pub recent_commands: Vec<String>,
     pub presets: Vec<Preset>,
     pub prefill: Prefill,
+    /// "New worktree" is offered (the daemon has the action), checked
+    /// when `Some(true)` (remembered for the target).
+    pub worktree: Option<bool>,
 }
 
 impl EventEmitter<SheetEvent> for NewAgentSheet {}
@@ -118,6 +160,7 @@ impl NewAgentSheet {
             recent_commands,
             presets,
             prefill,
+            worktree,
         } = setup;
         let first = prefill
             .dir
@@ -129,6 +172,8 @@ impl NewAgentSheet {
             .unwrap_or_else(|| shell_words::join(&default_command));
         let draft = NameDraft::new(&command, &first, taken);
         let generated = draft.generated().to_owned();
+        let generated_name = generated.clone();
+        let first_dir = first.clone();
         let dir = cx.new(|cx| TextField::new(first, "Directory on the fleetd host", cx).tab_stop());
         let command = cx.new(|cx| TextField::new(command, "Command", cx).tab_stop());
         let prompt = cx.new(|cx| {
@@ -153,7 +198,53 @@ impl NewAgentSheet {
                 this.draft.field_changed(name.read(cx).text());
             }),
         ];
+        let local = *target == Target::Local;
+        let worktree = worktree.map(|on| {
+            let slug = cx.new(|cx| {
+                TextField::new(
+                    slug_from_name(&generated_name),
+                    "Folder name of the worktree",
+                    cx,
+                )
+                .tab_stop()
+            });
+            let branch = cx.new(|cx| TextField::new(String::new(), "fleet/<slug>", cx).tab_stop());
+            let base =
+                cx.new(|cx| TextField::new(String::new(), "The default branch", cx).tab_stop());
+            let observers = [
+                cx.observe(&slug, |this, slug, cx| {
+                    let name = slug_from_name(this.name.read(cx).text());
+                    if let Some(w) = &mut this.worktree
+                        && slug.read(cx).text() != name
+                    {
+                        w.slug_edited = true;
+                    }
+                }),
+                cx.observe(&name, |this, name, cx| {
+                    let text = slug_from_name(name.read(cx).text());
+                    if let Some(w) = &this.worktree
+                        && !w.slug_edited
+                        && w.slug.read(cx).text() != text
+                    {
+                        let slug = w.slug.clone();
+                        slug.update(cx, |f, cx| f.set_text(text, cx));
+                    }
+                }),
+            ];
+            WorktreeFields {
+                on,
+                slug,
+                branch,
+                base,
+                slug_edited: false,
+                in_checkout: !local
+                    || in_git_checkout(std::path::Path::new(&expand_home(&first_dir))),
+                local,
+                _observers: observers,
+            }
+        });
         NewAgentSheet {
+            worktree,
             dir,
             command,
             prompt,
@@ -175,8 +266,33 @@ impl NewAgentSheet {
     fn inputs_changed(&mut self, cx: &mut Context<Self>) {
         let command = name_source(self.command.read(cx).text(), self.prompt.read(cx).text());
         let cwd = self.dir.read(cx).text().trim().to_owned();
+        if let Some(w) = &mut self.worktree
+            && w.local
+        {
+            let expanded = expand_home(&cwd);
+            let in_checkout = in_git_checkout(std::path::Path::new(&expanded));
+            if in_checkout != w.in_checkout {
+                w.in_checkout = in_checkout;
+                cx.notify();
+            }
+        }
         if let Some(name) = self.draft.inputs_changed(&command, &cwd) {
             self.name.update(cx, |f, cx| f.set_text(name, cx));
+        }
+    }
+
+    /// "New worktree" is shown and checked: the spawn makes a worktree.
+    pub fn in_worktree(&self) -> bool {
+        self.worktree
+            .as_ref()
+            .is_some_and(|w| w.on && w.in_checkout)
+    }
+
+    /// Checks or unchecks "New worktree".
+    pub fn toggle_worktree(&mut self, cx: &mut Context<Self>) {
+        if let Some(w) = &mut self.worktree {
+            w.on = !w.on;
+            cx.notify();
         }
     }
 
@@ -222,10 +338,33 @@ impl NewAgentSheet {
                 labels,
             })
         };
+        let worktree = match &self.worktree {
+            Some(w) if self.in_worktree() => {
+                let wt = NewWorktree {
+                    slug: w.slug.read(cx).text().trim().to_owned(),
+                    branch: w.branch.read(cx).text().trim().to_owned(),
+                    base: w.base.read(cx).text().trim().to_owned(),
+                };
+                if let Some(e) = slug_error(&wt.slug) {
+                    self.error = Some(format!("slug: {e}"));
+                    cx.notify();
+                    return;
+                }
+                Some(wt)
+            }
+            _ => None,
+        };
         match request() {
             Ok(req) => {
                 self.error = None;
-                cx.emit(SheetEvent::Spawn { req, command });
+                match worktree {
+                    Some(worktree) => cx.emit(SheetEvent::SpawnInWorktree {
+                        req,
+                        command,
+                        worktree,
+                    }),
+                    None => cx.emit(SheetEvent::Spawn { req, command }),
+                }
             }
             Err(e) => {
                 self.error = Some(e);
@@ -280,6 +419,50 @@ impl NewAgentSheet {
             }
             _ => {}
         }
+    }
+}
+
+impl NewAgentSheet {
+    /// The "New worktree" checkbox and, while checked, its fields.
+    fn render_worktree(
+        &self,
+        theme: &super::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let w = self.worktree.as_ref().filter(|w| w.in_checkout)?;
+        let checkbox = tab_stop(div().id("new-worktree"), theme)
+            .debug_selector(|| "new-worktree".to_owned())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::SM))
+            .cursor_pointer()
+            .type_style(text::CALLOUT)
+            .child(check_box(w.on, theme))
+            .child("New worktree")
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_worktree(cx)));
+        let field = |label: &'static str, f: &Entity<TextField>| {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap(px(space::SM - space::XXS))
+                .child(field_label(label, theme))
+                .child(f.clone())
+        };
+        let mut col = div().flex().flex_col().gap(px(space::SM)).child(checkbox);
+        if w.on {
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(space::SM))
+                    .child(field("Slug", &w.slug))
+                    .child(field("Branch", &w.branch))
+                    .child(field("Base", &w.base)),
+            );
+        }
+        Some(col.into_any_element())
     }
 }
 
@@ -415,6 +598,7 @@ impl Render for NewAgentSheet {
                             .child(self.labels.clone()),
                     ),
             )
+            .children(self.render_worktree(&theme, cx))
             .children(self.error.clone().map(|e| error_text(e, &theme)))
             .child(
                 div()

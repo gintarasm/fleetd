@@ -49,6 +49,9 @@ pub struct GuiState {
     /// this build does not know reads as the default.
     #[serde(deserialize_with = "lenient_group_by")]
     pub sidebar_group_by: GroupBy,
+    /// Target strings whose New agent sheet last spawned into a new
+    /// worktree: its "New worktree" checkbox starts checked (ADR 0094).
+    pub new_worktree: BTreeSet<String>,
 }
 
 fn lenient_group_by<'de, D: Deserializer<'de>>(d: D) -> Result<GroupBy, D::Error> {

@@ -87,6 +87,12 @@ pub enum Command {
     OpenSettings,
     SwitchFleetd,
     InstallSkill,
+    /// The focused pane's agent's changes (ADR 0094).
+    ShowChanges,
+    /// A workflow action's form (ADR 0094).
+    RunAction,
+    /// Archive the focused pane's ended agent's worktree (ADR 0094).
+    ArchiveWorktree,
     Quit,
 }
 
@@ -112,6 +118,14 @@ pub struct PaletteState {
     pub selected_running: usize,
     /// Exited or lost agents in that selection (Restart, Remove).
     pub selected_ended: usize,
+    /// The focused pane's agent is in a git checkout and the daemon has
+    /// the diff action (Show Changes, ADR 0094).
+    pub can_show_changes: bool,
+    /// The focused pane's agent ended in a workflow worktree (Archive
+    /// Worktree…).
+    pub can_archive: bool,
+    /// The daemon offers workflow actions (Run Action…).
+    pub has_actions: bool,
 }
 
 impl Command {
@@ -183,6 +197,9 @@ impl Command {
         Command::OpenSettings,
         Command::SwitchFleetd,
         Command::InstallSkill,
+        Command::ShowChanges,
+        Command::RunAction,
+        Command::ArchiveWorktree,
         Command::Quit,
     ];
 
@@ -248,6 +265,9 @@ impl Command {
             Command::SwitchFleetd => "Switch fleetd…",
             Command::InstallSkill => "Install Agent Skill",
             Command::Quit => "Quit fleet",
+            Command::ShowChanges => "Show Changes",
+            Command::RunAction => "Run Action…",
+            Command::ArchiveWorktree => "Archive Worktree…",
         };
         title.to_owned()
     }
@@ -298,6 +318,9 @@ impl Command {
             Command::OpenSettings => "preferences config",
             Command::SwitchFleetd => "connect target",
             Command::ToggleGraph => "tree spawned children satellite",
+            Command::ShowChanges => "diff git worktree review changed",
+            Command::RunAction => "workflow action form git worktree",
+            Command::ArchiveWorktree => "git worktree remove delete clean",
             _ => "",
         }
     }
@@ -340,6 +363,9 @@ impl Command {
             Command::NewTab => s.tabs < MAX_TABS,
             Command::CloseTab | Command::NextTab | Command::PrevTab => s.tabs > 1,
             Command::SelectTab(n) => s.tabs > 1 && n <= s.tabs,
+            Command::ShowChanges => s.can_show_changes,
+            Command::ArchiveWorktree => s.can_archive,
+            Command::RunAction => s.has_actions,
             _ => true,
         }
     }
@@ -355,6 +381,8 @@ pub enum Entry {
     /// "New <preset>…": the New agent sheet with the preset at this index
     /// (ADR 0084).
     Preset(usize),
+    /// "Show Changes: <agent>" (ADR 0094).
+    Changes(u64),
 }
 
 impl Entry {
@@ -365,6 +393,7 @@ impl Entry {
             Entry::Agent(id) => format!("agent:{id}"),
             Entry::Folder(dir) => format!("folder:{dir}"),
             Entry::Preset(i) => format!("preset:{i}"),
+            Entry::Changes(id) => format!("changes:{id}"),
         }
     }
 }
@@ -475,6 +504,26 @@ pub fn palette_items(
         ));
     }
     out
+}
+
+/// "Show Changes: <agent>" for each agent in `agents` (those in a git
+/// checkout, while the daemon has the diff action), newest first.
+pub fn changes_items(agents: &[&AgentRow], home: &Path) -> Vec<(Entry, PickerItem)> {
+    let mut rows = agents.to_vec();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.info.created_unix_ms));
+    rows.into_iter()
+        .map(|r| {
+            let entry = Entry::Changes(r.info.id);
+            let agent = agent_item(r, home);
+            let item = PickerItem {
+                key: entry.key(),
+                title: format!("Show Changes: {}", agent.title),
+                keywords: format!("diff git worktree review {}", agent.keywords),
+                ..agent
+            };
+            (entry, item)
+        })
+        .collect()
 }
 
 /// Modifier keys of a shortcut.
@@ -610,6 +659,9 @@ mod tests {
             any_running: true,
             selected_running: 2,
             selected_ended: 2,
+            can_show_changes: true,
+            can_archive: true,
+            has_actions: true,
         }
     }
 
@@ -664,6 +716,36 @@ mod tests {
         let tab = Command::SelectTab(3);
         assert_eq!(tab.title(), "Go to Tab 3");
         assert_eq!(Entry::Command(tab).key(), "command:SelectTab(3)");
+    }
+
+    #[test]
+    fn workflow_commands_need_what_they_act_on() {
+        let none = PaletteState {
+            can_show_changes: false,
+            can_archive: false,
+            has_actions: false,
+            ..everything()
+        };
+        let listed = shown(&none);
+        for c in [
+            Command::ShowChanges,
+            Command::ArchiveWorktree,
+            Command::RunAction,
+        ] {
+            assert!(!listed.contains(&c), "{c:?}");
+            assert!(shown(&everything()).contains(&c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn changes_rows_name_their_agent_newest_first() {
+        let a = row(1, "claude", "/w/a", 1, AgentState::Running);
+        let b = row(2, "claude", "/w/b", 2, AgentState::Exited);
+        let items = changes_items(&[&a, &b], home());
+        assert_eq!(items[0].0, Entry::Changes(2));
+        assert_eq!(items[0].1.title, "Show Changes: claude in /w/b");
+        assert_eq!(items[1].1.key, "changes:1");
+        assert!(items[1].1.keywords.contains("diff"));
     }
 
     #[test]

@@ -34,11 +34,15 @@ pub const INPUT_ECHO_FLOOD_NS: &str = "input_echo_flood50_ns";
 pub const GUI_COLD_START_NS: &str = "gui_cold_start_ns";
 pub const INPUT_TO_RENDER_NS: &str = "input_to_render_ns";
 pub const INPUT_TO_RENDER_FLOOD_NS: &str = "input_to_render_flood50_ns";
+pub const GUI_DIFF_OPEN_NS: &str = "gui_diff_open_ns";
+pub const GUI_DIFF_SCROLL_FRAME_NS: &str = "gui_diff_scroll_frame_ns";
 /// The metrics of the GUI scenarios, which need fleet-gui (macOS).
 pub const GUI_METRIC_NAMES: &[&str] = &[
     GUI_COLD_START_NS,
     INPUT_TO_RENDER_NS,
     INPUT_TO_RENDER_FLOOD_NS,
+    GUI_DIFF_OPEN_NS,
+    GUI_DIFF_SCROLL_FRAME_NS,
 ];
 /// Every metric the wall suite emits.
 pub const METRIC_NAMES: &[&str] = &[
@@ -58,6 +62,8 @@ pub const METRIC_NAMES: &[&str] = &[
     GUI_COLD_START_NS,
     INPUT_TO_RENDER_NS,
     INPUT_TO_RENDER_FLOOD_NS,
+    GUI_DIFF_OPEN_NS,
+    GUI_DIFF_SCROLL_FRAME_NS,
 ];
 
 const FLOOD_AGENTS: usize = 50;
@@ -438,6 +444,11 @@ pub fn run(quick: bool) -> Result<Results, String> {
                     bytes,
                     quick,
                 )?,
+            ),
+            (GUI_DIFF_OPEN_NS, gui::diff_open_ns(&fleetd, &gui)?),
+            (
+                GUI_DIFF_SCROLL_FRAME_NS,
+                gui::diff_scroll_frame_flood_ns(&fleetd, &gui, &fake_agent, FLOOD_AGENTS, quick)?,
             ),
         ]
     } else {
