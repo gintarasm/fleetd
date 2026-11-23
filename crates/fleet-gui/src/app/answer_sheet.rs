@@ -9,7 +9,10 @@ use gpui::{
     div, px,
 };
 
-use super::controls::{ButtonKind, button, error_text, field_label, sheet_card, sheet_title};
+use super::controls::{
+    ButtonKind, button, error_text, field_label, move_focus, return_is_not_a_click, sheet_card,
+    sheet_title, tab_stop,
+};
 use super::text_field::TextField;
 use super::theme::{Typography, current as theme};
 use crate::core::question::{OpenQuestion, check_answer};
@@ -46,7 +49,7 @@ impl AnswerSheet {
             agent_id,
             what,
             question,
-            reply: cx.new(|cx| TextField::new(String::new(), "Your answer", cx)),
+            reply: cx.new(|cx| TextField::new(String::new(), "Your answer", cx).tab_stop()),
             error: None,
         }
     }
@@ -77,7 +80,11 @@ impl AnswerSheet {
         cx.emit(AnswerEvent::Cancel);
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if move_focus(ev, window) {
+            cx.stop_propagation();
+            return;
+        }
         match ev.keystroke.key.as_str() {
             "enter" => {
                 self.submit(cx);
@@ -102,17 +109,20 @@ impl Render for AnswerSheet {
             .enumerate()
             .map(|(i, c)| {
                 let choice = c.clone();
-                button(
-                    ("answer-choice", i),
-                    SharedString::from(c.clone()),
+                tab_stop(
+                    button(
+                        ("answer-choice", i),
+                        SharedString::from(c.clone()),
+                        &theme,
+                        ButtonKind::Secondary,
+                        true,
+                    ),
                     &theme,
-                    ButtonKind::Secondary,
-                    true,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.send_text(choice.clone(), cx)))
             })
             .collect();
-        sheet_card("answer-sheet", 420.0, &theme)
+        return_is_not_a_click(sheet_card("answer-sheet", 420.0, &theme))
             .debug_selector(|| "answer-sheet".to_owned())
             .on_key_down(cx.listener(Self::key_down))
             .occlude()
@@ -163,12 +173,18 @@ impl Render for AnswerSheet {
                     .gap(px(space::SM))
                     .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                        tab_stop(
+                            button("cancel", "Cancel", &theme, ButtonKind::Secondary, true),
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        button("send-answer", "Send", &theme, ButtonKind::Primary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                        tab_stop(
+                            button("send-answer", "Send", &theme, ButtonKind::Primary, true),
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     ),
             )
     }

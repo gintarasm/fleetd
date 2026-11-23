@@ -14,7 +14,8 @@ use gpui::{
 };
 
 use super::controls::{
-    ButtonKind, button, error_text, field_label, list_row, list_well, sheet_card, sheet_title,
+    ButtonKind, button, error_text, field_label, list_row, list_well, move_focus,
+    return_is_not_a_click, sheet_card, sheet_title, tab_stop,
 };
 use super::text_field::TextField;
 use super::theme::{Typography, current as theme};
@@ -128,18 +129,20 @@ impl NewAgentSheet {
             .unwrap_or_else(|| shell_words::join(&default_command));
         let draft = NameDraft::new(&command, &first, taken);
         let generated = draft.generated().to_owned();
-        let dir = cx.new(|cx| TextField::new(first, "Directory on the fleetd host", cx));
-        let command = cx.new(|cx| TextField::new(command, "Command", cx));
+        let dir = cx.new(|cx| TextField::new(first, "Directory on the fleetd host", cx).tab_stop());
+        let command = cx.new(|cx| TextField::new(command, "Command", cx).tab_stop());
         let prompt = cx.new(|cx| {
             TextField::new(
                 String::new(),
                 "Optional: the agent's first task, as its last argument",
                 cx,
             )
+            .tab_stop()
         });
-        let name = cx.new(|cx| TextField::new(generated, "Name", cx));
-        let labels =
-            cx.new(|cx| TextField::new(prefill.labels.clone(), "key=value, key=value", cx));
+        let name = cx.new(|cx| TextField::new(generated, "Name", cx).tab_stop());
+        let labels = cx.new(|cx| {
+            TextField::new(prefill.labels.clone(), "key=value, key=value", cx).tab_stop()
+        });
         // A field notifies on every edit (and caret blink): each observer
         // only acts on a text that changed.
         let observers = [
@@ -261,7 +264,11 @@ impl NewAgentSheet {
         .detach();
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if move_focus(ev, window) {
+            cx.stop_propagation();
+            return;
+        }
         match ev.keystroke.key.as_str() {
             "enter" => {
                 self.submit(cx);
@@ -286,8 +293,11 @@ impl Render for NewAgentSheet {
             .child(div().flex_1().child(self.dir.clone()));
         if self.can_choose {
             dir_row = dir_row.child(
-                button("choose", "Choose…", &theme, ButtonKind::Secondary, true)
-                    .on_click(cx.listener(|this, _, _, cx| this.choose(cx))),
+                tab_stop(
+                    button("choose", "Choose…", &theme, ButtonKind::Secondary, true),
+                    &theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.choose(cx))),
             );
         }
         let recent = (!self.dirs.is_empty()).then(|| {
@@ -311,12 +321,15 @@ impl Render for NewAgentSheet {
                 .flex_wrap()
                 .gap(px(space::XS))
                 .children(self.presets.iter().enumerate().map(|(i, p)| {
-                    button(
-                        ("preset", i),
-                        p.name.clone(),
+                    tab_stop(
+                        button(
+                            ("preset", i),
+                            p.name.clone(),
+                            &theme,
+                            ButtonKind::Secondary,
+                            true,
+                        ),
                         &theme,
-                        ButtonKind::Secondary,
-                        true,
                     )
                     .debug_selector(move || format!("preset-{i}"))
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -337,7 +350,7 @@ impl Render for NewAgentSheet {
                 }),
             )
         });
-        sheet_card("new-agent-sheet", 520.0, &theme)
+        return_is_not_a_click(sheet_card("new-agent-sheet", 520.0, &theme))
             .debug_selector(|| "new-agent-sheet".to_owned())
             .on_key_down(cx.listener(Self::key_down))
             // Clicks and the wheel stop here, never reaching the panes.
@@ -411,12 +424,19 @@ impl Render for NewAgentSheet {
                     .gap(px(space::SM))
                     .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                        tab_stop(
+                            button("cancel", "Cancel", &theme, ButtonKind::Secondary, true),
+                            &theme,
+                        )
+                        .debug_selector(|| "new-agent-cancel".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        button("spawn", "Spawn", &theme, ButtonKind::Primary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                        tab_stop(
+                            button("spawn", "Spawn", &theme, ButtonKind::Primary, true),
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     ),
             )
     }
