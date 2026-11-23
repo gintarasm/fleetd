@@ -68,7 +68,7 @@ fleetd --stdio              # bridge stdin/stdout to the daemon, starting one if
 - **Stopping.** SIGTERM, SIGINT (Ctrl-C) or SIGHUP stops every agent: each gets SIGTERM, then 2 s later SIGKILL. Their exits are recorded, then the socket is removed.
 - **Crashes.** If `fleetd` is killed hard, the agents it was running are shown as `lost` on the next start.
 - **`--stdio`.** `fleetd --stdio` connects its stdin and stdout to the daemon's socket, so any client that can run a command can talk to it. If no daemon is running it starts one in the background, which keeps running after the bridge exits; concurrent bridges still end up with exactly one daemon. This is how a remote daemon is reached: `ssh host fleetd --stdio` (use the full path, such as `~/.cargo/bin/fleetd`, if it is not on the `PATH` of non-interactive ssh sessions; remote nodes in the client are M6).
-- **Agent environment.** At startup the daemon asks your login shell (`$SHELL -lic`) for its environment, so agents see the same `PATH` and exports as a terminal would, even when `fleetd` was started by `ssh`, launchd or systemd. The capture runs in the background and gives up after 5 s; if it fails, agents get the daemon's own environment. Set `FLEETD_LOGIN_ENV=off` in the daemon's environment to skip it. Every agent also gets `TERM=xterm-256color` and `FLEET_AGENT_ID=<its id>`.
+- **Agent environment.** At startup the daemon asks your login shell (`$SHELL -lic`) for its environment, so agents see the same `PATH` and exports as a terminal would, even when `fleetd` was started by `ssh`, launchd or systemd. The capture runs in the background and gives up after 5 s; if it fails, agents get the daemon's own environment. Set `FLEETD_LOGIN_ENV=off` in the daemon's environment to skip it. Every agent also gets `TERM=xterm-256color`, `FLEET_AGENT_ID=<its id>` and `FLEET_AGENT_TOKEN` (a secret that proves who it is to `fleetd`; see [Agents that spawn agents](#agents-that-spawn-agents)).
 
 The state directory (mode 0700) holds:
 
@@ -116,6 +116,8 @@ fleet spawn --cwd ~/src/app --label project=app --label role=reviewer -- claude
 `fleet spawn` prints the new agent's ID.
 - **Working directory:** the agent starts in your current directory, or in `--cwd DIR` (a relative `DIR` is taken from your current directory).
 - **Labels:** `--label k=v` (repeatable) attaches labels to the agent; see [Labels](#labels).
+- **Name:** `--name NAME` sets the agent's `name` label (default: generated from the command). Other commands take an id or a name.
+- **Priority:** `--priority normal|low` (`low` always lowers the CPU priority; default: the daemon's `FLEETD_AGENT_NICE`).
 - **Terminal size:** defaults to your terminal's size, or use `--cols`/`--rows`.
 - **`TERM`:** set to `xterm-256color` for the agent.
 - **Size limits:** 1–1000 columns or rows each, and at most 250,000 cells in total.
@@ -124,10 +126,12 @@ fleet spawn --cwd ~/src/app --label project=app --label role=reviewer -- claude
 
 ```sh
 $ fleet ls
-ID  STATE    EXIT  PROGRAM
-1   running  -     claude
-2   exited   0     bash -lc npm test
+ID  NAME            STATE    EXIT  REPORTED  PROGRAM
+1   a               running  -     -         claude
+2   readmem3-stoat  exited   0     -         bash -lc npm test
 ```
+
+`REPORTED` is the state the agent last gave with `fleet report` (`-` if none); see [Agents that spawn agents](#agents-that-spawn-agents).
 
 States:
 - `running`: the agent is running.
@@ -195,7 +199,7 @@ In the GUI, **Send to Agents…** (`cmd-shift-m`, ⌘P or the fleet menu) types 
 fleet kill 1
 ```
 
-Sends SIGTERM to the agent's process group. There is no SIGKILL follow-up yet, so an agent that ignores SIGTERM keeps running until `fleetd` stops.
+Sends SIGHUP, then SIGTERM, to the agent's process group. If it is still running 2 s later it gets SIGKILL ([0071](docs/decisions/0071-kill-escalates-and-shells-are-not-agents.md)).
 
 ### Restart and remove agents
 
@@ -225,7 +229,162 @@ fleet skill uninstall                # removes it (takes the same --agent and --
 fleet skill print                    # prints the skill
 ```
 
-The skill teaches an agent (Claude Code or omp) to use `fleet`: list agents (`ls --json`), read another agent's `screen` or `history`, `send` it input, and `spawn` or `kill` agents when you ask it to. Each agent knows its own id from `$FLEET_AGENT_ID`. The skill is built into the `fleet` binary, so re-running `install` after an upgrade updates it. It does not need a running daemon. `--agent` defaults to `claude`. `--project` is Claude Code only: omp has no known project skill folder, so `--agent omp --project` is an error. The GUI's "Install agent skill" runs `--agent detected` on its target and says which agents it installed for.
+The skill teaches an agent (Claude Code or omp) to use `fleet`: list agents (`ls --json`), read another agent's `screen` or `history`, `spawn` or `kill` agents when you ask it to, and coordinate with `report`, `wait`, `message`/`inbox` and `lease` (see [Agents that spawn agents](#agents-that-spawn-agents)); `send` is the fallback for an agent that does not read its inbox. Each agent knows its own id from `$FLEET_AGENT_ID`. The skill is built into the `fleet` binary, so re-running `install` after an upgrade updates it. It does not need a running daemon. `--agent` defaults to `claude`. `--project` is Claude Code only: omp has no known project skill folder, so `--agent omp --project` is an error. The GUI's "Install agent skill" runs `--agent detected` on its target and says which agents it installed for.
+
+### Agents that spawn agents
+
+An agent that runs `fleet` is known to `fleetd` by its session (the process tree under the agent), then by `FLEET_AGENT_TOKEN`. Anything else, such as your own terminal or a GUI terminal, is **you**. Design: [0072](docs/decisions/0072-agent-identity-by-session.md), [0033](docs/decisions/0033-satellite-milestone.md), [0034](docs/decisions/0034-agent-communication.md); the spec is [`docs/superpowers/specs/2026-11-16-m3-satellite-design.md`](docs/superpowers/specs/2026-11-16-m3-satellite-design.md).
+
+- **`fleet.parent`:** an agent's spawn gets the reserved label `fleet.parent=<its id>`. That is how the tree is built. A child keeps running when its parent ends. A parent that is gone (or not visible to the caller) makes the agent a root. Agents started before M3 are roots.
+- **Scope:** an agent may act only on its **descendants** (children, their children, … including ended ones). `ls` and `tree` list only those, with no error. `screen`, `history`, `attach`, `send`, `kill`, `restart` and `rm` on any other agent are refused. `label`, `rename`, `logs` and `daemon` are refused for agents. `spawn` is allowed: the child gets the parent's labels (not `name`) plus new keys; changing a key the parent has is refused. You are never limited.
+- **Refusals** are errors starting `forbidden:` and exit code **3**.
+- **Not a sandbox.** A process of the same OS user that deliberately detaches from the agent's session and drops its token counts as you. For real isolation use another user or a container. An agent in a sandbox needs access to `~/.fleet/fleetd.sock` and the `fleet` binary.
+
+#### Quotas and spawn approval
+
+`~/.fleet/config.toml`, table `[node]`, read when the daemon starts (changing it needs `fleet daemon restart`). They apply to **agents' spawns only**; your own spawns are never refused or held.
+
+| Key | Default | |
+|---|---|---|
+| `max_depth` | `3` | how deep the tree may go (a root is 0, so an agent at depth 3 cannot spawn) |
+| `max_children` | `8` | running children per agent |
+| `max_agents` | `30` | running agents on the node, yours included |
+| `spawn_approval` | `false` | an agent's `fleet spawn` waits until you approve it |
+| `spawn_approval_timeout` | `300` | seconds before a waiting spawn is refused (at least 1) |
+
+A spawn over a quota fails at once with `forbidden: quota …` (exit 3); the graph shows it on the parent's card for a few seconds. With `spawn_approval = true` the quotas are checked first, then the spawn waits, and the asking `fleet spawn` blocks and prints nothing until you answer. An agent may have 8 spawns waiting. A restart by an agent does not ask again. Pending spawns are kept in memory only: `fleet daemon restart` refuses them (the agent can ask again).
+
+```sh
+fleet pending            # who asks, the command, time left, cwd, labels; --json for a JSON array
+fleet approve 3          # start the pending spawn 3
+fleet deny 3             # refuse it: the agent's spawn fails with "forbidden: spawn not approved"
+```
+
+The id is the pending spawn's own number (from `fleet pending`), not an agent id. Exit codes: 0, 1 no such pending spawn, 3 run inside an agent (only you decide). The GUI shows them as cards at the top of the sidebar (see [Agent tree and graph](#agent-tree-and-graph)). With approval off, a new child is only highlighted for a moment. Design: [0079](docs/decisions/0079-spawn-approval.md).
+
+#### See the tree
+
+```sh
+$ fleet tree
+1 planner  claude  running  12m
+├─ 4 impl-api  claude  working "writing handlers"  8m
+└─ 5 impl-ui  claude  waiting "need a design call"  8m
+```
+
+| Flag | |
+|---|---|
+| `--all` | include ended agents (default: ended ones only while they have a running descendant) |
+| `--label k=v` | only agents with this label (repeatable, every pair must match); their ancestors stay |
+| `--json` | an array of root nodes, each with `children` |
+
+Each line is `id name  program  status  run-time`. The status is what the agent reported (with its message in quotes) or `running`; ended agents show `done`, `failed` or `lost`, and a terminal from the GUI shows `shell`. Inside an agent, `tree` shows only its descendants. Design: [0074](docs/decisions/0074-sidebar-tree-and-fleet-tree.md).
+
+#### Report your own status
+
+Run inside an agent. The node learns who you are from the connection, so an agent can only report for itself; you (outside an agent) get exit 3.
+
+```sh
+fleet report working "writing the parser"
+fleet report done "all tests pass"
+fleet report waiting "need a design decision" --question "REST or gRPC?" --choice REST --choice gRPC
+```
+
+| Argument / flag | |
+|---|---|
+| `STATE` | `working`, `waiting`, `done` or `error` |
+| `MESSAGE` | a short note, at most 200 characters |
+| `--question TEXT` | ask you a question (only with `waiting`; 1–500 characters) |
+| `--choice TEXT` | an answer offered as a button (repeatable, at most 6, each at most 60 characters; needs `--question`) |
+
+- A report stands until the agent reports again; nothing expires it. It counts only while the agent runs: an ended agent shows how it ended. A restarted agent starts with no report. A report is stored, so it survives a daemon restart.
+- Each change is also posted to the agent's parent as one `status` message (see the mailbox below), so a parent can `fleet wait` for it.
+- **Without a report**, the GUI and `fleet wait` guess: an agent that has been silent for 30 s with a last line that looks like a prompt is `waiting (inferred)`. A report always wins over the guess. The daemon checks this every 5 s, only while agents run. Design: [0075](docs/decisions/0075-fleet-report-and-inferred-status.md), [0088](docs/decisions/0088-inferred-waiting-sweep.md).
+
+#### Questions
+
+`--question` makes the agent "needs you" until you answer, or until it reports again (or ends). You answer in the GUI (see below) or:
+
+```sh
+fleet answer 7 "REST"      # id or name; the text is at most 4 KiB
+```
+
+Only you can answer: an agent gets exit 3. Exit 1 means no such agent or no open question. The answer reaches the agent as an `answer` message (the parent gets a copy), and the agent is then marked `working`. The agent reads it with `fleet inbox` or `fleet wait --state message`. An agent cannot answer for you, so a question is not a way around the performance rule: only your own answer counts. Design: [0078](docs/decisions/0078-questions.md).
+
+#### Messages and the inbox
+
+Every agent, and you, has a mailbox. Agents coordinate through it instead of typing into each other's terminals.
+
+```sh
+fleet message 7 "use the v2 API"                  # to an agent, by id or name
+fleet message parent "tests are green"            # to your parent (you, for a root agent)
+fleet message user "need the staging password"    # to you
+fleet message --children "stop and report"        # to each running child
+fleet message --label role=reviewer "rebase on main"   # to running descendants with that label
+fleet inbox                                       # the new messages, and marks them read
+fleet inbox --since 0 --json                      # everything kept, as JSON
+```
+
+| `fleet message` flag | |
+|---|---|
+| `--children` | each running child (yours: running roots) |
+| `--descendants` | each running descendant (yours: every running agent) |
+| `--label k=v` | only agents with this label (repeatable); alone it implies `--descendants` |
+| `--json` | print the recipients as JSON |
+
+| `fleet inbox` flag | |
+|---|---|
+| `--since CURSOR` | messages after this message id (default: the unread ones); `--since 0` rereads all |
+| `--json` | an array of `{id, sender, sender_name, recipient, kind, status, exit_code, body, created_unix_ms, trusted}` |
+
+- **Who can be written to:** an agent may message its descendants, its parent and you. A broadcast reaches only running agents, and never a terminal you opened in the GUI. No recipient matched: exit 1. A message is at most 4 KiB.
+- **Automatic reports:** when an agent exits or is lost, its parent gets an `exit` (with the code) or `lost` message. A root agent's reports go to your mailbox.
+- **Messages are data, not instructions.** Text is printed as `[from agent 7 (name)] message: …`, control characters escaped. Only an `answer` from you is `trusted` (your words); a message from an agent saying "approved" is not.
+- **Retention:** the newest 1,000 messages per agent and 10,000 for you. `fleet rm` removes the agent's mailbox; `fleet restart` carries it over. Design: [0076](docs/decisions/0076-mailbox-exit-reports-wait.md).
+
+#### Wait for agents
+
+```sh
+fleet wait                             # news from your descendants, up to 10 minutes
+fleet wait 7 --state done,error        # until agent 7 reports done or error
+fleet wait --state message --timeout 30s
+fleet wait 4 5 --state exited --json
+```
+
+| Flag | |
+|---|---|
+| `AGENTS…` | ids or names (default: all your descendants, **news only**) |
+| `--state S,…` | any of `waiting`, `done`, `error`, `exited`, `lost`, `message` (default: all) |
+| `--timeout D` | give up after this long: `30s`, `10m`, `1h` (default `10m`, at most 24 h; `0` checks once) |
+| `--json` | `{matched, matches: [{agent, name, state, message}], agents: [{id, name, state, exit_code, labels}]}` |
+
+- **Named agents** match on their current state, so `fleet wait 7 --state exited` returns at once if 7 already exited.
+- **Without names** only news matches: an unread message in your mailbox, or a descendant reaching a state while you wait. A child that exited before you started waiting is not missed, since its exit report waits unread in your mailbox. `wait` does not mark anything read; `fleet inbox` does.
+- `waiting` matches both a reported and an inferred wait. `message` matches a message, question or answer (with names: from those agents only).
+- Exit 0 on a match, 1 on a timeout (the current states are printed). Long waits survive a `fleet daemon restart`. Up to 16 waits at once per connection.
+
+#### Leases
+
+A lease is a named lock for a shared resource, such as the benchmark machine. Names are per node and open to everyone.
+
+```sh
+fleet lease perf-wall -- fleet-perf run --suite wall       # hold it while the command runs
+fleet lease --wait --max-load 2 --ttl 1h perf-wall -- cargo bench
+fleet lease acquire perf-wall --ttl 30m                    # hold without a command
+fleet lease release perf-wall
+fleet lease ls [--json]                                    # NAME HOLDER HELD EXPIRES WAITING
+```
+
+| Flag | |
+|---|---|
+| `--wait` | queue behind the holder (first come, first served) instead of failing with exit 1 |
+| `--max-load N` | grant only while the 1-minute load average is below N |
+| `--ttl D` | release after this long (`90s`, `30m`, `1h30m`, `2d`), counted from the grant |
+
+- The command's exit code is yours (128+n for a signal, 127 not found, 126 not executable). `fleet lease` passes SIGTERM and SIGHUP on and ignores Ctrl-C itself, so the lease never outlives the command.
+- Released when: you release it, the holding agent exits or is lost, the connection closes (the `--` form), or the TTL runs out. Your own `acquire` needs `--ttl`; an agent's does not. Only the holder, or you, can release (an agent releasing someone else's gets exit 3).
+- A lease named `acquire`, `release` or `ls` cannot use the `--` form; use `fleet lease acquire <name>`.
+- Leases survive `fleet daemon restart`; waiters re-queue at the back. In `lease ls`, an agent sees a holder outside its subtree only as hidden. The `perf-wall` CI job and `fleet-perf run --suite wall` take the lease `perf-wall`.
+- Exit codes: 0, 1 busy or not held, 2 usage or other error, 3 forbidden. Design: [0077](docs/decisions/0077-leases.md).
 
 ### Read the daemon's log
 
@@ -242,8 +401,9 @@ fleet logs -f              # then follow new lines until Ctrl-C
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | error (for example `fleetd is not running`, or an unknown agent) |
-| 2 | `fleet attach` fell behind the agent's output |
+| 1 | error (for example `fleetd is not running`, or an unknown agent); for `wait`, `lease`, `answer` and `approve`: no match, timeout, busy or not found |
+| 2 | `fleet attach` fell behind the agent's output; also usage errors and other errors from `report`, `wait`, `message`, `inbox` and `lease` |
+| 3 | `forbidden:` an agent tried something outside its scope ([Agents that spawn agents](#agents-that-spawn-agents)) |
 | 128 + n | `fleet attach` was ended by signal n sent to the `fleet` process |
 
 ### Not yet in the CLI (TBD)
@@ -297,6 +457,41 @@ Not yet verified by hand: connecting to a remote host over ssh, the "Start fleet
 | `cmd-n` | new agent |
 | `cmd-shift-m` | send text to agents |
 | `cmd-c` / `cmd-v` | copy / paste |
+
+### Agent tree and graph
+
+Agents that spawn agents (see [Agents that spawn agents](#agents-that-spawn-agents)) show up as a tree in the GUI. Design: [0073](docs/decisions/0073-graph-view.md), [0074](docs/decisions/0074-sidebar-tree-and-fleet-tree.md), [0089](docs/decisions/0089-graph-message-lines.md).
+
+**Sidebar tree.**
+- Children are indented under their parent, within a sidebar group (a child whose parent is in another group starts a tree of its own there).
+- A parent with more than 3 children starts collapsed and shows `▸ N`. Your open/closed choice is kept for the session only.
+- An ended parent stays, greyed, while it has children.
+- A filter keeps the ancestors of a match (dimmed if they do not match themselves) and opens every branch.
+- **Remove Exited Agents** removes ended branches: every ended agent with no running agent below it.
+- A new child (an agent with a parent that appears after you connected) has its row tinted for about 2.5 s, as a notice that an agent spawned an agent.
+
+**Graph view.** ⌘⇧G, the titlebar's graph button or *Show or Hide the Agent Graph* in the palette replaces the sidebar and panes with a full-window graph; the same key goes back. (In a terminal, ⌘⇧G is Find Previous while its find bar is open.)
+- **Cards:** one per agent, with a status dot, name, run time, `program · project`, the last output line and, when collapsed, `N children`. Edges run from parent to child. Cards sit in a box for the machine and one for each project (the `project` label, else the git root of the working directory, else the directory). Ended cards are dimmed. A card that needs you has the warning colour; the accent marks the selected card.
+- **Status dots:** solid when the agent reported its status or has ended, hollow for a running agent whose status is a guess.
+- **Navigation:** pan by dragging the background or scrolling; zoom 25–200 % with ⌘+, ⌘−, ⌘0, ⌘-scroll or a pinch (below 60 % a card shows only its dot, name and run time). `/` filters by name, program, folder, label, status or id (⏎ returns to the graph, Esc clears, a second Esc gives the keys back).
+
+| Key | Action |
+|---|---|
+| ← / → | parent / first child |
+| ↑ / ↓ | the card above / below in the same column |
+| Space | collapse or expand the subtree |
+| ⏎ or click | open the agent (closes the graph and focuses its pane) |
+| Esc | back to the panes without opening |
+| ⌫ | **Stop subtree**: asks first (always), then kills each running agent, deepest first |
+| ⇧⌫ | **Remove subtree**: only when everything in it has ended; asks first when it is more than one agent |
+
+- **Message lines:** while the graph is shown, a line with an arrowhead joins two agents when one messaged the other (`message`, `question` or `answer`; not status or exit reports, and not messages to or from you). Lines are accent-coloured, fade over 5 minutes, and show the newest 24 pairs. They appear within about 2 s. No message text is shown.
+- **Spawn refused:** a spawn over a quota shows on the parent's card for a few seconds.
+
+### Questions and spawn requests
+
+- **Questions.** An agent that asked with `fleet report waiting --question …` is "needs you". Its sidebar row and the strip under its pane header show the question with one button per choice (a click answers at once) and **Reply…**, which opens an Answer sheet with the question, the choices and a text field. A graph card shows the question in place of the last output line, with **Reply…**. The same answer is `fleet answer`. If the agent replaced the question meanwhile, your answer to the old one is refused.
+- **Spawn requests.** With `[node] spawn_approval = true`, each waiting spawn is a card at the top of the sidebar (at the top right in the graph): "*name* (*id*) wants to start an agent", its command, folder and labels, and **Deny** / **Approve**. The same as `fleet pending`, `fleet approve` and `fleet deny`. There is no notification or countdown; `fleet pending` shows the time left. A daemon from before approval shows nothing here.
 
 ### Menu bar
 
