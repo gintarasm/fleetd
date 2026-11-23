@@ -29,6 +29,7 @@ use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::needs_you::{Since, next_after};
 use crate::core::new_children::NewChildren;
 use crate::core::pane::{PaneModel, PaneState};
+use crate::core::pane_sync::{Action, PaneSnap, PaneSync, changes_layout};
 use crate::core::peek::PEEK_PANE;
 use crate::core::presets::{Preset, detect_presets, usable};
 use crate::core::question::open_question;
@@ -434,28 +435,12 @@ pub struct AppState {
     error_is_connection: bool,
     /// A config error from launch, still shown after the first connect.
     config_error: Option<String>,
-    /// Panes a spawn is on its way into (for the "starting…" text only).
-    starting: HashSet<PaneId>,
-    /// The directory of the spawn on its way into a pane; it becomes a
-    /// recent directory once the pane shows the new agent.
-    spawn_dirs: HashMap<PaneId, String>,
-    /// The New agent sheet's command line of the spawn on its way into a
-    /// pane; it becomes a recent command with the directory (ADR 0084).
-    spawn_commands: HashMap<PaneId, String>,
+    /// What is on its way into each pane, and which layout agents the
+    /// latest lists left out.
+    pane_sync: PaneSync,
     /// The presets found on `PATH` for this target, once asked for
     /// (`[gui] presets` unset; ADR 0084).
     detected_presets: Option<(Target, Vec<Preset>)>,
-    /// Agents asked for in a pane (sidebar click) that it does not show
-    /// yet; until then the pane's old agent is not adopted back.
-    requested: HashMap<PaneId, u64>,
-    /// Panes restarting the agent they show (by its old id) on their own
-    /// connection: they show the new agent without attaching to it.
-    restarting: HashMap<PaneId, u64>,
-    /// Agents in the layout the latest list left out, with the number
-    /// ([`SessionApi::lists`]) of the first list in a row that did.
-    unlisted: HashMap<u64, u64>,
-    /// [`SessionApi::lists`] when the layout last followed the list.
-    last_list: u64,
     /// When the control connection retries, while it is down.
     reconnect_at: Option<Instant>,
     /// A newer fleetd binary is on disk (see [`AppState::refresh_update_available`]).
@@ -521,14 +506,8 @@ impl AppState {
             exit_toasts: ExitToasts::default(),
             exit_expiry: None,
             celebrating: None,
-            starting: HashSet::new(),
-            spawn_dirs: HashMap::new(),
-            spawn_commands: HashMap::new(),
+            pane_sync: PaneSync::default(),
             detected_presets: None,
-            requested: HashMap::new(),
-            restarting: HashMap::new(),
-            unlisted: HashMap::new(),
-            last_list: 0,
             reconnect_at: None,
             update_available: false,
             updating: false,
@@ -615,13 +594,7 @@ impl AppState {
         self.exit_toasts = ExitToasts::default();
         self.exit_expiry = None;
         self.celebrating = None;
-        self.starting.clear();
-        self.spawn_dirs.clear();
-        self.spawn_commands.clear();
-        self.requested.clear();
-        self.restarting.clear();
-        self.unlisted.clear();
-        self.last_list = 0;
+        self.pane_sync = PaneSync::default();
         self.reconnect_at = None;
         self.update_available = self.session.update_available();
         self.updating = false;
@@ -1005,8 +978,7 @@ impl AppState {
                     // "starting…". Should it land after all, the pane still
                     // adopts its agent. A pane restart may have failed too:
                     // its pane then attaches to a successor it is told of.
-                    self.starting.clear();
-                    self.restarting.clear();
+                    self.pane_sync.launch_failed();
                     self.error = Some(e);
                     self.error_is_connection = false;
                     chrome = true;
@@ -1033,61 +1005,18 @@ impl AppState {
         view: &Entity<PaneView>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(shown) = lock(view.read(cx).model_handle()).agent_id() else {
-            return false;
-        };
-        if let Some(&want) = self.requested.get(&pane) {
-            if want != shown {
-                return false;
-            }
-            self.requested.remove(&pane);
-        }
-        if self.tabs.agent(pane) == Some(shown) {
-            return false;
-        }
-        self.tabs.set_agent(pane, Some(shown));
-        self.starting.remove(&pane);
-        self.restarting.remove(&pane);
-        if let Some(dir) = self.spawn_dirs.remove(&pane) {
-            let dirs = self
-                .gui_state
-                .recent_dirs
-                .entry(self.target.to_string())
-                .or_default();
-            push_recent(dirs, dir, MAX_RECENT_DIRS);
-        }
-        if let Some(line) = self.spawn_commands.remove(&pane) {
-            let commands = self
-                .gui_state
-                .recent_commands
-                .entry(self.target.to_string())
-                .or_default();
-            push_recent(commands, line, MAX_RECENT_COMMANDS);
-        }
-        true
+        let shown = lock(view.read(cx).model_handle()).agent_id();
+        let actions = self.pane_sync.adopt(pane, self.tabs.agent(pane), shown);
+        self.apply_sync(actions, cx)
     }
 
     /// `old` was removed, restarted as `new` if set: every pane showing it
     /// shows `new` (attaching unless it started `new` itself) or becomes
     /// empty. True if the layout changed.
     fn follow_removed(&mut self, old: u64, new: Option<u64>, cx: &mut Context<Self>) -> bool {
-        let panes = self.tabs.replace_agent(old, new);
-        for &pane in &panes {
-            let restarted_here = self.restarting.get(&pane) == Some(&old);
-            self.forget_pending(pane);
-            match new {
-                Some(new) if self.pane_has(pane, new, cx) => {}
-                Some(new) => {
-                    if !restarted_here {
-                        self.session.attach(pane, new);
-                    }
-                    // Until the pane shows `new`, `old` is not adopted back.
-                    self.requested.insert(pane, new);
-                }
-                None => self.open(pane, None, cx),
-            }
-        }
-        !panes.is_empty()
+        let panes = self.pane_snaps(cx);
+        let actions = self.pane_sync.follow_removed(old, new, &panes);
+        self.apply_sync(actions, cx)
     }
 
     /// `pane`'s connection dropped before its spawn or restart was
@@ -1097,84 +1026,75 @@ impl AppState {
         if !self.panes.contains_key(&pane) {
             return;
         }
-        self.forget_pending(pane);
-        if let Some(agent) = self.tabs.agent(pane) {
-            self.requested.insert(pane, agent);
-            self.session.attach(pane, agent);
-        }
+        let actions = self.pane_sync.launch_dropped(pane, self.tabs.agent(pane));
+        self.apply_sync(actions, cx);
         self.refresh_chrome(cx);
         cx.notify();
     }
 
     /// After a list: panes follow restarts they missed, and a pane whose
-    /// agent the node neither lists nor replaced becomes empty, unless a
-    /// spawn, restart or attach is on its way into it. A lost pane is
-    /// emptied at once; an exited one (its final screen) only once two
-    /// lists in a row left its agent out, since an agent spawned after the
-    /// first was taken may have exited already. True if the layout changed.
+    /// agent the node neither lists nor replaced becomes empty (see
+    /// [`PaneSync::follow_list`]). True if the layout changed.
     fn follow_list(&mut self, cx: &mut Context<Self>) -> bool {
-        let replaced = self.session.replaced();
-        let list = self.session.lists();
-        let fresh = std::mem::replace(&mut self.last_list, list) != list;
-        let mut unlisted = HashMap::new();
-        let mut changed = false;
-        for pane in self.tabs.panes() {
-            let Some(id) = self.tabs.agent(pane) else {
-                continue;
-            };
-            if let Some(&new) = replaced.get(&id) {
-                changed |= self.follow_removed(id, Some(new), cx);
-                continue;
-            }
-            if self.agents.iter().any(|r| r.info.id == id) {
-                continue;
-            }
-            // `requested` names the layout's agent, so a request for `id`
-            // itself does not count: its failed attach is what `Lost` says.
-            let on_its_way = self.starting.contains(&pane)
-                || self.restarting.contains_key(&pane)
-                || self.requested.get(&pane).is_some_and(|&want| want != id);
-            if on_its_way {
-                continue;
-            }
-            let (state, shown) = match self.panes.get(&pane) {
-                Some(v) => {
-                    let m = lock(v.read(cx).model_handle());
-                    (m.state(), m.agent_id())
-                }
-                None => continue,
-            };
-            let gone = match state {
-                PaneState::Lost => true,
-                PaneState::Exited(_) if shown == Some(id) => {
-                    // Counted from a list, not from events applied to an
-                    // older one (which predates agents spawned since).
-                    let first = match self.unlisted.get(&id) {
-                        Some(&n) => n,
-                        None if fresh => list,
-                        None => continue,
-                    };
-                    unlisted.insert(id, first);
-                    first < list
-                }
-                _ => false,
-            };
-            if gone {
-                self.tabs.set_agent(pane, None);
-                self.forget_pending(pane);
-                self.open(pane, None, cx);
-                changed = true;
-            }
-        }
-        self.unlisted = unlisted;
-        changed
+        let panes = self.pane_snaps(cx);
+        let agents = &self.agents;
+        let actions = self.pane_sync.follow_list(
+            &panes,
+            |id| agents.iter().any(|r| r.info.id == id),
+            &self.session.replaced(),
+            self.session.lists(),
+        );
+        self.apply_sync(actions, cx)
     }
 
-    /// `pane`'s grid shows `agent_id` (in any state).
-    fn pane_has(&self, pane: PaneId, agent_id: u64, cx: &App) -> bool {
-        self.panes
-            .get(&pane)
-            .is_some_and(|v| lock(v.read(cx).model_handle()).agent_id() == Some(agent_id))
+    /// Every pane, in any tab: its layout agent and its grid.
+    fn pane_snaps(&self, cx: &App) -> Vec<PaneSnap> {
+        self.tabs
+            .panes()
+            .into_iter()
+            .map(|pane| PaneSnap {
+                pane,
+                layout: self.tabs.agent(pane),
+                view: self.panes.get(&pane).map(|v| {
+                    let m = lock(v.read(cx).model_handle());
+                    (m.state(), m.agent_id())
+                }),
+            })
+            .collect()
+    }
+
+    /// Applies [`PaneSync`]'s actions in order. True if the layout changed.
+    fn apply_sync(&mut self, actions: Vec<Action>, cx: &mut Context<Self>) -> bool {
+        let changed = changes_layout(&actions);
+        for action in actions {
+            match action {
+                Action::Replace { old, new } => {
+                    self.tabs.replace_agent(old, new);
+                }
+                Action::Show(pane, agent) => self.tabs.set_agent(pane, Some(agent)),
+                Action::Attach(pane, agent) => self.session.attach(pane, agent),
+                Action::Empty(pane) => {
+                    self.tabs.set_agent(pane, None);
+                    self.open(pane, None, cx);
+                }
+                Action::RecordRecent { dir, command } => {
+                    let target = self.target.to_string();
+                    if let Some(dir) = dir {
+                        let dirs = self
+                            .gui_state
+                            .recent_dirs
+                            .entry(target.clone())
+                            .or_default();
+                        push_recent(dirs, dir, MAX_RECENT_DIRS);
+                    }
+                    if let Some(line) = command {
+                        let commands = self.gui_state.recent_commands.entry(target).or_default();
+                        push_recent(commands, line, MAX_RECENT_COMMANDS);
+                    }
+                }
+            }
+        }
+        changed
     }
 
     /// Takes the session's agent list if it arrived before its event was
@@ -1325,7 +1245,7 @@ impl AppState {
                 link_dir: row
                     .filter(|_| self.target == Target::Local)
                     .map(|r| r.info.cwd.clone()),
-                starting: self.starting.contains(&pane),
+                starting: self.pane_sync.is_starting(pane),
                 reconnect_in,
                 focused,
                 maximized: t == shown && self.maximized == Some(pane),
@@ -1493,7 +1413,7 @@ impl AppState {
             .closed
             .pop(|id| agents.iter().any(|r| r.info.id == id))?;
         let pane = self.tabs.focused();
-        if self.tabs.agent(pane).is_none() && !self.starting.contains(&pane) {
+        if self.tabs.agent(pane).is_none() && !self.pane_sync.is_starting(pane) {
             self.show_agent(id, cx);
             return Some(pane);
         }
@@ -1583,8 +1503,7 @@ impl AppState {
         if self.tabs.agent(pane) == Some(agent_id) && self.pane_shows(pane, agent_id, cx) {
             return;
         }
-        self.forget_pending(pane);
-        self.requested.insert(pane, agent_id);
+        self.pane_sync.request(pane, agent_id);
         self.tabs.set_agent(pane, Some(agent_id));
         self.session.attach(pane, agent_id);
         self.layout_changed(cx);
@@ -1615,11 +1534,7 @@ impl AppState {
 
     /// Drops what was on its way into `pane`.
     fn forget_pending(&mut self, pane: PaneId) {
-        self.starting.remove(&pane);
-        self.spawn_dirs.remove(&pane);
-        self.spawn_commands.remove(&pane);
-        self.requested.remove(&pane);
-        self.restarting.remove(&pane);
+        self.pane_sync.forget(pane);
     }
 
     /// Splits the focused pane to the right and shows `agent_id` there.
@@ -1692,9 +1607,7 @@ impl AppState {
             ..req
         };
         self.session.spawn(req, cols, rows, pane)?;
-        self.forget_pending(pane);
-        self.starting.insert(pane);
-        self.spawn_dirs.insert(pane, cwd);
+        self.pane_sync.spawn_started(pane, cwd);
         self.refresh_chrome(cx);
         cx.notify();
         Ok(())
@@ -1712,7 +1625,7 @@ impl AppState {
         self.spawn(req, cx)?;
         let command = command.trim().to_owned();
         if !command.is_empty() {
-            self.spawn_commands.insert(self.tabs.focused(), command);
+            self.pane_sync.spawn_command(self.tabs.focused(), command);
         }
         Ok(())
     }
@@ -1763,7 +1676,7 @@ impl AppState {
 
     /// `pane` shows an agent, or a spawn is on its way into it.
     pub(super) fn pane_filled(&self, pane: PaneId) -> bool {
-        self.tabs.agent(pane).is_some() || self.starting.contains(&pane)
+        self.tabs.agent(pane).is_some() || self.pane_sync.is_starting(pane)
     }
 
     /// The agents some pane of the shown tab shows.
@@ -2029,8 +1942,7 @@ impl AppState {
         let (cols, rows) = view.read(cx).grid().unwrap_or((80, 24));
         match self.session.restart_in_pane(pane, agent, cols, rows) {
             Ok(()) => {
-                self.forget_pending(pane);
-                self.restarting.insert(pane, agent);
+                self.pane_sync.restart_started(pane, agent);
             }
             Err(e) => {
                 self.error = Some(e);
