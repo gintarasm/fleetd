@@ -81,6 +81,10 @@ fn main() -> ExitCode {
     // later restart sees them.
     // SAFETY: the first statement of `main`; no other thread exists.
     let handed = unsafe { handoff::take_handed() };
+    // Still before any thread: each starts with this thread's mask, which
+    // must not be the launcher's (issue #152). It cannot fail with a valid
+    // `how`; if it ever did, the freeze still unblocks its own signal.
+    let _ = stop_signal::clear_inherited_mask();
 
     // Before logging or any state dir: the old daemon runs this on the new
     // binary and it must touch nothing (no lock, no log, no directory).

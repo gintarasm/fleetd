@@ -377,6 +377,33 @@ fn install_freeze_handler() -> io::Result<()> {
     installed.map_err(io::Error::from_raw_os_error)
 }
 
+/// Unblocks [`FREEZE_SIGNAL`] in the calling thread's signal mask (once per
+/// thread), so a freeze can interrupt it. A thread starts with its creator's
+/// mask, and a process with its launcher's: a daemon started from a macOS
+/// GCD worker thread (the GUI's "Start fleetd") has every signal blocked, so
+/// `pthread_kill` would leave the signal pending and never interrupt an idle
+/// read (issue #152). Safe before the handler is installed: only a freeze
+/// sends the signal, and it installs the handler first.
+fn accept_freeze_signal() {
+    thread_local! {
+        static ACCEPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    ACCEPTED.with(|accepted| {
+        if accepted.get() {
+            return;
+        }
+        // SAFETY: sigemptyset/sigaddset on a local set; pthread_sigmask
+        // only changes this thread's mask.
+        let unblocked = unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, FREEZE_SIGNAL);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut())
+        };
+        accepted.set(unblocked == 0);
+    });
+}
+
 /// A thread to interrupt. `pthread_t` is a pointer on macOS, so not `Send`;
 /// it is only ever passed to `pthread_kill`, while the thread is known to be
 /// alive (registered under [`Freeze::state`]).
@@ -462,6 +489,7 @@ impl Freeze {
     /// panicking sink): a dead thread left registered would be signalled by
     /// every later freeze and, never parking, make each one time out.
     fn reader_started(&self, id: AgentId) -> ReaderGuard<'_> {
+        accept_freeze_signal();
         if let Some(reader) = lock(&self.state).readers.get_mut(&id) {
             reader.thread = Some(Thread::current());
         }
@@ -502,6 +530,7 @@ impl Freeze {
     /// Runs `write` registered as a writer a freeze interrupts; deregistered
     /// by a guard, so also if `write` unwinds.
     fn as_writer<T>(&self, write: impl FnOnce() -> T) -> T {
+        accept_freeze_signal();
         let token = {
             let mut state = lock(&self.state);
             let token = state.next_writer;
@@ -1514,6 +1543,68 @@ mod tests {
         for (want, line) in complete.iter().enumerate() {
             assert_eq!(line.parse::<usize>().ok(), Some(want), "line {want}");
         }
+    }
+
+    /// Runs `f` on a new thread whose signal mask blocks every signal, as a
+    /// macOS GCD worker thread's does: a daemon launched from one (the GUI's
+    /// "Start fleetd") inherits that mask, and so does each of its threads.
+    fn with_all_signals_blocked<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            // SAFETY: sigfillset/pthread_sigmask on a local set, this thread.
+            unsafe {
+                let mut all: libc::sigset_t = std::mem::zeroed();
+                libc::sigfillset(&mut all);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &all, std::ptr::null_mut()),
+                    0
+                );
+            }
+            f()
+        })
+        .join()
+        .unwrap()
+    }
+
+    /// Issue #152: an idle reader whose thread inherited a mask blocking
+    /// the freeze signal still parks (its read is interrupted).
+    #[test]
+    fn freeze_interrupts_an_idle_reader_started_with_signals_blocked() {
+        let host = Arc::new(PtyHost::new());
+        let id = {
+            let host = Arc::clone(&host);
+            with_all_signals_blocked(move || host.spawn(sh("sleep 30")).unwrap())
+        };
+        // Let the reader block in its read.
+        std::thread::sleep(Duration::from_millis(200));
+        let frozen = host.freeze(Instant::now() + Duration::from_secs(2));
+        host.thaw();
+        host.force_kill(id).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+        assert_eq!(frozen.unwrap().len(), 1);
+    }
+
+    /// Issue #152, for input: a write blocked on a full input queue, on a
+    /// thread that blocks every signal, is released by a freeze.
+    #[test]
+    fn freeze_releases_a_blocked_write_on_a_thread_with_signals_blocked() {
+        let host = Arc::new(PtyHost::new());
+        let id = host.spawn(sh("sleep 30")).unwrap();
+        let writer = {
+            let host = Arc::clone(&host);
+            let input = b"xxxxxxx\n".repeat((1 << 20) / 8);
+            std::thread::spawn(move || {
+                with_all_signals_blocked(move || host.write_input(id, &input))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!writer.is_finished(), "the write did not block");
+        let frozen = host.freeze(Instant::now() + Duration::from_secs(2));
+        host.thaw();
+        host.force_kill(id).unwrap();
+        host.wait_all(Duration::from_secs(5)).unwrap();
+        frozen.unwrap();
+        let err = writer.join().unwrap().unwrap_err();
+        assert_eq!(err.to_string(), "fleetd is restarting");
     }
 
     #[test]
