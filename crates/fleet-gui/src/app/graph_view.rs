@@ -16,17 +16,19 @@ use std::time::Instant;
 use fleet_client::tree::Tree;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext, BorderStyle, Bounds, Context, Entity, EventEmitter, FocusHandle,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, PathBuilder, Pixels, Point, PromptButton, PromptLevel, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, point, px, quad,
+    AnyElement, App, AppContext, BorderStyle, Bounds, ClickEvent, Context, Entity, EventEmitter,
+    FocusHandle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels, Point, PromptButton,
+    PromptLevel, Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, canvas, div, point, px, quad,
 };
 
 use super::app_state::AppState;
 use super::controls;
 use super::graph_lines::{self, GraphLines};
+use super::graph_panel::PanelSlot;
 use super::icons;
+use super::keymap::{OpenAgentPanel, OpenInMainView, ToggleChildren};
 use super::sidebar_view::tab_title;
 use super::status_dot::dot_color;
 use super::text_field::TextField;
@@ -38,6 +40,7 @@ use crate::core::graph::{
 use crate::core::graph_layout::{
     BoxKind, Card, GraphLayout, LayoutInput, Signature, Step, Viewport, ZOOM_STEP, layout, step,
 };
+use crate::core::graph_panel::{GraphEscape, graph_escape};
 use crate::core::icons::Icon;
 use crate::core::layout::Rect;
 use crate::core::peek::{HOVER_HOLD, HoverHold};
@@ -68,6 +71,8 @@ pub enum GraphEvent {
     Answer(u64),
     /// The pointer rested on a card: peek at its agent (ADR 0103).
     Peek(u64),
+    /// The terminal panel's Actions…: the agent's row menu (ADR 0105).
+    Menu(u64),
 }
 
 pub struct GraphView {
@@ -99,6 +104,8 @@ pub struct GraphView {
     /// The card the pointer rests on, and the timer that peeks at it.
     hover: HoverHold,
     hover_timer: Option<gpui::Task<()>>,
+    /// The terminal panel (ADR 0105; `graph_panel.rs`).
+    pub(super) panel: PanelSlot,
     /// Message lines: routes, hover, tooltip (ADR 0106).
     lines: GraphLines,
     _subs: Vec<Subscription>,
@@ -114,6 +121,7 @@ impl GraphView {
             cx.observe(&app, |_, _, cx| cx.notify()),
         ];
         GraphView {
+            panel: PanelSlot::new(app.clone()),
             app,
             focus: cx.focus_handle(),
             filter,
@@ -247,6 +255,7 @@ impl GraphView {
             let size = self.area_size(window);
             self.viewport.reveal(&card.rect, size);
         }
+        self.panel_follow(cx);
         cx.notify();
     }
 
@@ -260,7 +269,7 @@ impl GraphView {
         }
     }
 
-    /// Space: hides or shows the selected agent's children.
+    /// C: hides or shows the selected agent's children.
     pub fn toggle_collapse(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.selected else { return };
         if self.forest.children(id).is_empty() {
@@ -430,21 +439,17 @@ impl GraphView {
             ("right", _) => self.step(Step::Right, window, cx),
             ("up", _) => self.step(Step::Up, window, cx),
             ("down", _) => self.step(Step::Down, window, cx),
-            ("enter", _) => {
-                if let Some(id) = self.selected {
-                    self.open(id, cx);
-                }
-            }
             ("backspace", false) | ("delete", false) => self.stop_subtree(window, cx),
             ("backspace", true) | ("delete", true) => self.remove_subtree(window, cx),
-            ("space", _) => self.toggle_collapse(cx),
             ("/", _) => window.focus(self.filter.read(cx).focus_handle()),
             ("escape", _) => {
-                if self.filter.read(cx).text().is_empty() {
-                    cx.emit(GraphEvent::Close);
-                } else {
-                    self.filter
-                        .update(cx, |f, cx| f.set_text(String::new(), cx));
+                let filter_empty = self.filter.read(cx).text().is_empty();
+                match graph_escape(self.panel.is_open(), filter_empty) {
+                    GraphEscape::ClosePanel => self.close_panel(window, cx),
+                    GraphEscape::ClearFilter => self
+                        .filter
+                        .update(cx, |f, cx| f.set_text(String::new(), cx)),
+                    GraphEscape::Leave => cx.emit(GraphEvent::Close),
                 }
             }
             _ => return,
@@ -659,7 +664,16 @@ impl GraphView {
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.card_hover(id, *hovered, cx);
             }))
-            .on_click(cx.listener(move |this, _, _, cx| this.open(id, cx)))
+            // A click selects (an open panel follows); a double-click opens
+            // in the main view (ADR 0105).
+            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                if ev.click_count() >= 2 {
+                    this.open(id, cx);
+                } else {
+                    this.focus(window);
+                    this.select(id, window, cx);
+                }
+            }))
             .child(name_row)
             .children(meta)
             .children(activity)
@@ -904,7 +918,7 @@ impl Render for GraphView {
                     .type_style(text::CAPTION)
                     .text_color(theme.tertiary)
                     .child(
-                        "Arrows move · ⏎ open · Space collapse · ⌫ stop subtree · ⇧⌫ remove ended · / filter · Esc back",
+                        "Arrows move · Space terminal · ⌘⏎ open · C collapse · ⌫ stop subtree · ⇧⌫ remove ended · / filter · Esc back",
                     ),
             )
             .child(graph_lines::legend(&theme))
@@ -977,15 +991,27 @@ impl Render for GraphView {
             .children(line_tip)
             .child(end);
 
-        div()
+        let graph = div()
             .id("graph")
             .key_context(GRAPH_CONTEXT)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
+            .on_action(cx.listener(|this, _: &OpenAgentPanel, window, cx| {
+                this.open_panel(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenInMainView, _, cx| {
+                if let Some(id) = this.selected {
+                    this.open(id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleChildren, _, cx| {
+                this.toggle_collapse(cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
             .child(header)
-            .child(area)
+            .child(area);
+        self.with_panel(graph, window, cx)
     }
 }

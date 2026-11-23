@@ -901,7 +901,13 @@ impl Session {
     /// types into it. A peek already open is closed. Close it with
     /// [`Session::close_pane`].
     pub fn open_peek(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
-        let pane = super::peek::PEEK_PANE;
+        self.open_observer(super::peek::PEEK_PANE, agent_id)
+    }
+
+    /// Opens `pane`'s connection as a read-only `observe` attach on
+    /// `agent_id`: the peek (ADR 0103) and the graph's terminal panel
+    /// (ADR 0105). One already open under `pane` is closed.
+    pub fn open_observer(&self, pane: PaneId, agent_id: u64) -> Arc<Mutex<PaneModel>> {
         let palette = *lock(&self.inner.palette);
         let mut panes = lock(&self.inner.panes);
         if self.inner.shut_down.load(Ordering::SeqCst) {

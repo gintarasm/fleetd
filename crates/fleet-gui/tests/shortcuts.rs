@@ -84,6 +84,38 @@ fn an_action_the_sheet_never_heard_of_still_shows() {
 }
 
 #[test]
+fn a_narrowed_context_is_listed_under_its_first_name() {
+    // The graph's keys and its terminal panel's (ADR 0105).
+    let sheet = cheat_sheet([
+        b(
+            "space",
+            "fleet::OpenAgentPanel",
+            Some("Graph && !TextField"),
+        ),
+        b(
+            "cmd-enter",
+            "fleet::OpenInMainView",
+            Some("Graph && !TextField"),
+        ),
+        b(
+            "escape",
+            "fleet::BackToGraph",
+            Some("GraphPanel && !finding"),
+        ),
+    ]);
+    assert_eq!(sheet[0].title, "Graph");
+    assert_eq!(
+        sheet[0].rows,
+        [
+            row("Space", "Open Agent Panel"),
+            row("⌘↩", "Open In Main View"),
+        ]
+    );
+    assert_eq!(sheet[1].title, "Graph Panel");
+    assert_eq!(sheet[1].rows, [row("⎋", "Back To Graph")]);
+}
+
+#[test]
 fn a_later_binding_of_the_same_keys_wins_and_duplicates_show_once() {
     // As in gpui, the binding added last takes the keystroke.
     let sheet = cheat_sheet([

@@ -35,6 +35,12 @@ const NOT_IN_PALETTE: &[(&str, &str)] = &[
     ("fleet::Kill", "names an agent (row menu)"),
     ("fleet::Restart", "names an agent (row menu)"),
     ("fleet::Remove", "names an agent (row menu)"),
+    // The graph's keys (ADR 0105): they act on the graph's selected card
+    // or its terminal panel, which the palette takes the focus from.
+    ("fleet::OpenAgentPanel", "graph only"),
+    ("fleet::OpenInMainView", "graph only"),
+    ("fleet::BackToGraph", "graph panel only"),
+    ("fleet::ToggleChildren", "graph only"),
 ];
 
 /// The action a command dispatches.

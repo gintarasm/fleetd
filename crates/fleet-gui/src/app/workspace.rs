@@ -438,12 +438,18 @@ impl Workspace {
         }
         self.graph_shown = !self.graph_shown;
         self.watch_message_lines(cx);
+        self.close_graph_panel(window, cx);
         if self.graph_shown {
             self.graph.0.read(cx).focus(window);
         } else {
             self.focus_current(window, cx);
         }
         cx.notify();
+    }
+
+    /// Closes the graph's terminal panel (ADR 0105): the graph was hidden.
+    fn close_graph_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.graph.0.update(cx, |g, cx| g.close_panel(window, cx));
     }
 
     /// The session asks for message edges only while the graph is shown.
@@ -474,8 +480,13 @@ impl Workspace {
             self.open_peek(id, window, cx);
             return;
         }
+        if let GraphEvent::Menu(id) = *event {
+            self.open_row_menu(id, cx);
+            return;
+        }
         self.graph_shown = false;
         self.watch_message_lines(cx);
+        self.close_graph_panel(window, cx);
         if let GraphEvent::Open(id) = *event {
             self.app.update(cx, |a, cx| a.reveal_agent(id, cx));
         }
@@ -1055,6 +1066,7 @@ impl Workspace {
                 if self.graph_shown {
                     self.graph_shown = false;
                     self.watch_message_lines(cx);
+                    self.close_graph_panel(window, cx);
                 }
                 self.show_agent(id, window, cx);
                 cx.notify();
@@ -7655,7 +7667,9 @@ mod tests {
             assert_eq!(selected(&mut s), Some(3));
             s.cx.simulate_keystrokes("left");
             assert_eq!(selected(&mut s), Some(1));
-            s.cx.simulate_keystrokes("right down enter");
+            // ⏎ opens the terminal panel; ⌘⏎ opens in the main view
+            // (ADR 0105).
+            s.cx.simulate_keystrokes("right down cmd-enter");
             s.cx.run_until_parked();
             assert!(!shown(&mut s));
             let pane = focused(&mut s);
@@ -7677,7 +7691,7 @@ mod tests {
             assert_ne!(first, second);
             let before = fake.calls().len();
             s.cx.simulate_keystrokes("cmd-shift-g");
-            click(&mut s, "graph-card-1");
+            double_click(&mut s, "graph-card-1");
             assert!(!shown(&mut s));
             assert_eq!(focused(&mut s), first);
             let agent = s.app.read_with(s.cx, |a, _| a.layout().agent(second));
@@ -7742,7 +7756,7 @@ mod tests {
         }
 
         #[gpui::test]
-        fn space_collapses_a_subtree(cx: &mut TestAppContext) {
+        fn c_collapses_a_subtree(cx: &mut TestAppContext) {
             let dir = tempfile::tempdir().unwrap();
             let fake = Arc::new(Fake::default());
             let mut s = open_graph(
@@ -7752,14 +7766,14 @@ mod tests {
                 vec![row(1, "/w", 1), child(2, 1), child(3, 1)],
             );
             assert!(drawn(&mut s, 2));
-            s.cx.simulate_keystrokes("space");
+            s.cx.simulate_keystrokes("c");
             assert!(!drawn(&mut s, 2) && !drawn(&mut s, 3) && drawn(&mut s, 1));
             let g = graph(&mut s);
             let card = g
                 .read_with(s.cx, |g, _| g.layout().card(1).cloned())
                 .unwrap();
             assert!(card.collapsed && card.children == 2);
-            s.cx.simulate_keystrokes("space");
+            s.cx.simulate_keystrokes("c");
             assert!(drawn(&mut s, 2));
         }
 
