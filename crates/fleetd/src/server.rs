@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -173,7 +174,14 @@ impl Drop for RequestsStopped {
 }
 
 impl Server {
-    pub(crate) fn new(node: Arc<Node>, identity: Identity, restore: RestoreSummary) -> Self {
+    /// `config` is the node's `config.toml` (`<state_dir>/config.toml`),
+    /// where workflows read their settings when an action runs.
+    pub(crate) fn new(
+        node: Arc<Node>,
+        identity: Identity,
+        restore: RestoreSummary,
+        config: PathBuf,
+    ) -> Self {
         let hello = HelloOk {
             protocol_version: PROTOCOL_VERSION,
             server: "fleetd".into(),
@@ -192,7 +200,7 @@ impl Server {
                 in_flight: AtomicUsize::new(0),
                 settled: Condvar::new(),
                 settle: Mutex::new(()),
-                actions: action::Actions::new(),
+                actions: action::Actions::new(config),
             }),
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
         }
@@ -1492,6 +1500,7 @@ mod tests {
             Arc::clone(&node),
             Identity::current(),
             RestoreSummary::default(),
+            PathBuf::from("/nonexistent/config.toml"),
         );
         let conn = Connection {
             node,

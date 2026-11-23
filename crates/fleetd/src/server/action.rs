@@ -14,7 +14,7 @@
 //! back what it did.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ use fleet_proto::{
     ActionList, ActionResult, AgentInfo, Forgotten, Frame, Response, RunAction, SpawnAgent,
     response,
 };
+use fleet_workflow::git_worktree::{GitWorktree, Settings, SettingsSource};
 use fleet_workflow::{
     ActionError, BoxFuture, Caller, CancelFlag, DirEntry, DirListing, EntryKind, ExecOutput,
     ExecRequest, FileData, Host, HostResult, Labels, ListDirRequest, ReadFileRequest, Registry,
@@ -43,10 +44,15 @@ pub(super) const MAX_PER_CONNECTION: usize = 4;
 /// Actions the daemon runs at once; more wait.
 pub(super) const MAX_PER_DAEMON: usize = 16;
 
-/// The built-in workflows (M4: native only; git-worktree, ADR 0093, joins
-/// here).
-fn builtin_workflows() -> Vec<Arc<dyn Workflow>> {
-    Vec::new()
+/// The built-in workflows (M4: native only): git-worktree (ADR 0093), which
+/// reads `[workflows.git-worktree]` from `config` each time an action runs.
+fn builtin_workflows(config: &Path) -> Vec<Arc<dyn Workflow>> {
+    let config = config.to_path_buf();
+    let settings: SettingsSource = Arc::new(move || Settings {
+        config: std::fs::read_to_string(&config).ok(),
+        home: std::env::var("HOME").unwrap_or_default(),
+    });
+    vec![Arc::new(GitWorktree::new(settings))]
 }
 
 /// The daemon's workflows: the registry (built lazily) and the daemon-wide
@@ -54,13 +60,16 @@ fn builtin_workflows() -> Vec<Arc<dyn Workflow>> {
 pub(super) struct Actions {
     registry: OnceLock<Result<Registry, String>>,
     slots: Arc<Semaphore>,
+    /// The node's `config.toml`, which workflows read their settings from.
+    config: PathBuf,
 }
 
 impl Actions {
-    pub(super) fn new() -> Actions {
+    pub(super) fn new(config: PathBuf) -> Actions {
         Actions {
             registry: OnceLock::new(),
             slots: Arc::new(Semaphore::new(MAX_PER_DAEMON)),
+            config,
         }
     }
 
@@ -69,7 +78,7 @@ impl Actions {
     fn registry(&self) -> Result<&Registry, String> {
         self.registry
             .get_or_init(|| {
-                let built = Registry::new(builtin_workflows());
+                let built = Registry::new(builtin_workflows(&self.config));
                 if let Err(e) = &built {
                     warn!(error = %e, "the workflow registry is malformed");
                 }
@@ -796,7 +805,26 @@ mod tests {
 
     #[tokio::test]
     async fn the_built_in_registry_is_well_formed() {
-        assert!(Registry::new(builtin_workflows()).is_ok());
+        assert!(Registry::new(builtin_workflows(Path::new("/nonexistent/config.toml"))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_git_worktree_workflow_is_built_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(Node::open(dir.path()).unwrap());
+        let (_server, mut conn, mut rx) = test_server_conn(Arc::clone(&node));
+        assert!(
+            conn.handle(Request {
+                id: 1,
+                kind: Some(request::Kind::ListActions(ListActions {}))
+            })
+            .await
+        );
+        let all = names(next_response(&mut rx).await.kind.unwrap());
+        for a in ["new-agent", "diff", "archive", "ls", "prune"] {
+            assert!(all.contains(&format!("git-worktree.{a}")), "{all:?}");
+        }
+        node.shutdown();
     }
 
     #[tokio::test]
@@ -1146,6 +1174,131 @@ mod tests {
             .await,
         );
         assert!(!e.starts_with("forbidden:") && !e.is_empty(), "{e}");
+    }
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn git_worktree_runs_end_to_end_through_the_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let main = root.join("repo");
+        git(&root, &["init", "-q", "-b", "main", "repo"]);
+        std::fs::write(main.join("a.txt"), "a\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "init"]);
+        let config = format!(
+            "[workflows.git-worktree]\nroot = \"{}/wt\"\nfetch_base = false\n",
+            root.display()
+        );
+        let flow = Arc::new(GitWorktree::new(Arc::new(move || Settings {
+            config: Some(config.clone()),
+            home: "/nonexistent".into(),
+        })));
+        let mut f = fixture(Quotas::default());
+        let (server, conn, rx) = test_server_conn(Arc::clone(&f.node));
+        server.shared.actions.preset(vec![flow]);
+        (f._server, f.conn, f.rx) = (server, conn, rx);
+        let main_s = main.to_string_lossy().into_owned();
+
+        let Outcome::Spawned(s) = outcome(
+            call(
+                &mut f,
+                1,
+                run_req(
+                    "git-worktree.new-agent",
+                    vec![
+                        ("slug", Value::String("e2e".into())),
+                        ("command", argv(&["/bin/sh", "-c", "echo hi > made.txt"])),
+                        ("repo", Value::String(main_s.clone())),
+                    ],
+                ),
+            )
+            .await,
+        ) else {
+            panic!("not spawned");
+        };
+        let agent = s.agent.unwrap();
+        let wt = format!("{}/wt/e2e", root.display());
+        assert_eq!(agent.labels.get("git.worktree"), Some(&wt));
+        assert_eq!(agent.labels.get("git.repo"), Some(&main_s));
+        let node = Arc::clone(&f.node);
+        wait_until(|| {
+            node.list()
+                .unwrap()
+                .iter()
+                .any(|a| a.id == agent.id && a.state() == fleet_proto::AgentState::Exited)
+        })
+        .await;
+
+        let id = Value::Int(agent.id as i64);
+        let Outcome::View(v) = outcome(
+            call(
+                &mut f,
+                2,
+                run_req("git-worktree.diff", vec![("agent", id.clone())]),
+            )
+            .await,
+        ) else {
+            panic!("not a view");
+        };
+        let Some(fleet_proto::view::Kind::Diff(d)) = v.kind else {
+            panic!("not a diff");
+        };
+        assert_eq!(d.files.len(), 1);
+        assert_eq!(d.files[0].new_path, "made.txt");
+        assert_eq!(d.title, "e2e · fleet/e2e");
+
+        let Outcome::Refused(r) = outcome(
+            call(
+                &mut f,
+                3,
+                run_req("git-worktree.archive", vec![("agent", id.clone())]),
+            )
+            .await,
+        ) else {
+            panic!("not refused");
+        };
+        assert!(r.reason.contains("untracked"), "{}", r.reason);
+        let Outcome::Done(_) = outcome(
+            call(
+                &mut f,
+                4,
+                run_req(
+                    "git-worktree.archive",
+                    vec![("agent", id), ("force", Value::Bool(true))],
+                ),
+            )
+            .await,
+        ) else {
+            panic!("not archived");
+        };
+        assert!(!std::path::Path::new(&wt).exists());
+        assert!(
+            f.node.list().unwrap().is_empty(),
+            "the ended agent is forgotten"
+        );
+        assert_eq!(
+            f.node.kv_keys("git-worktree", "wt/").unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[tokio::test]
