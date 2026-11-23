@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- fleetd app icon foreground for macOS 26 (ADR 0104): the glyphs of fleetd-icon.svg, scaled
+       1024/824 about the centre so they keep their size relative to the shape. The background is
+       the "fill" gradient in ../icon.json; the system masks the canvas to its squircle. -->
+<defs>
+<linearGradient id="lead" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
+</defs><g transform="translate(512 512) scale(1.2427) translate(-512 -512)"><polyline points="300,268 384,342 300,416" fill="none" stroke="#94a3b8" stroke-width="62" stroke-opacity="0.6" stroke-linecap="round" stroke-linejoin="round"/><polyline points="300,608 384,682 300,756" fill="none" stroke="#94a3b8" stroke-width="62" stroke-opacity="0.6" stroke-linecap="round" stroke-linejoin="round"/><polyline points="480,404 600,512 480,620" fill="none" stroke="url(#lead)" stroke-width="72" stroke-linecap="round" stroke-linejoin="round"/><rect x="636" y="576" width="150" height="56" rx="10" fill="url(#lead)"/></g></svg>

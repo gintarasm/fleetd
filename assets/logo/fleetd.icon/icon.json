@@ -1,0 +1,21 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "srgb:0.10588,0.14118,0.20000,1.00000",
+      "srgb:0.04706,0.06667,0.09804,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "glyph.svg",
+          "name" : "glyph"
+        }
+      ]
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [ "macOS" ]
+  }
+}
