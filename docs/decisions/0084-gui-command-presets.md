@@ -1,6 +1,6 @@
 # 0084 — Command presets, recent commands, a first prompt and Duplicate Agent
 
-**Status:** accepted · 2026-11-16 (issue #96, part of #26)
+**Status:** accepted · 2026-11-16 (issue #96, part of #26). Presets superseded by roles, [0130](0130-roles-v1.md) §2 (M4b); recent commands, the first prompt and Duplicate Agent stand.
 
 Builds on [0044](0044-gui-settings-window.md) (Settings), [0050](0050-gui-split-chooser.md) (the split chooser), [0052](0052-agent-names.md) (agent names), [0080](0080-palette-lists-every-action.md) (every action in the palette) and [0029](0029-gui-core-toolkit-free.md) (core stays toolkit-free).
 
