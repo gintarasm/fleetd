@@ -1,6 +1,6 @@
 # 0035 — Agent roles: scoped, supervised agents handing work to each other
 
-**Status:** proposed · 2026-11-15 (the user's direction; not scheduled. Decide the details when a milestone takes it up.)
+**Status:** phased · 2026-11-23. Templates and spawn/manage scoping are decided in [0130](0130-roles-v1.md) (M4b, M4c); §3 supervision is M5b; the rest of §2 and §4 queues are M7b. Proposed 2026-11-15.
 
 **Builds on:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) (labels, workflows), [0012](0012-credentials.md) and [0019](0019-control-plane-direction.md) (grants by label selector), [0033](0033-satellite-milestone.md) (agent tree, quotas), [0034](0034-agent-communication.md) (the CLI agent channel: `fleet wait`, mailbox, leases, questions).
 
