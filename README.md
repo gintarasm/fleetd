@@ -430,7 +430,7 @@ open target/release/fleetd.app
 
 The bundle holds `fleet-gui`, plus `fleetd` and `fleet` as siblings, so "Start fleetd on this Mac" and "Install agent skill" work without anything on `PATH`. Copy `fleetd.app` to `/Applications` if you like.
 
-The bundle is unsigned. A copy that was downloaded (quarantined) is blocked by Gatekeeper on first open: right-click it and choose Open, or run `xattr -d com.apple.quarantine fleetd.app`. A bundle you built yourself is not quarantined. `scripts/bundle-macos.sh --icon-only` regenerates `assets/logo/fleetd.icns` from `assets/logo/fleetd-icon.svg`.
+The bundle is unsigned. A copy that was downloaded (quarantined) is blocked by Gatekeeper on first open: right-click it and choose Open, or run `xattr -d com.apple.quarantine fleetd.app`. A bundle you built yourself is not quarantined. `scripts/bundle-macos.sh --icon-only` regenerates `assets/logo/fleetd.icns` (macOS 13–15) from `assets/logo/fleetd-icon.svg`; on macOS 26 the icon comes from `assets/logo/fleetd.icon`, compiled with Xcode 26's `actool` while bundling ([ADR 0104](docs/decisions/0104-macos-app-icon.md)).
 
 ### Connecting
 
