@@ -525,10 +525,10 @@ mod tests {
                                 ..Default::default()
                             })
                             .await?;
-                        Ok(Outcome::Spawned(ActionSpawned {
+                        Ok(Outcome::Spawned(Box::new(ActionSpawned {
                             agent: Some(agent),
                             message: "started".into(),
-                        }))
+                        })))
                     }
                     "block" => {
                         let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;

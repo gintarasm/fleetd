@@ -1,6 +1,6 @@
 # 0090 — M4 "Workflows": node primitives, `RunAction`, the git-worktree workflow and the diff view
 
-**Status:** proposed · 2026-11-23 (overseer's design, for the user's review; the detailed design and work breakdown are in [the M4 spec](../superpowers/specs/2026-11-23-m4-workflows-design.md))
+**Status:** accepted · 2026-11-23 (overseer's design, accepted with the user's answers to its open questions in [#166](https://github.com/gintarasm/fleetd/issues/166), below; the detailed design and work breakdown are in [the M4 spec](../superpowers/specs/2026-11-23-m4-workflows-design.md))
 
 **Builds on:** [0025](0025-core-knows-agents-workflows-own-hierarchy.md) (core knows nodes and agents; workflows own the hierarchy), [0007](0007-plugin-system.md) (plugins, declarative UI), [0010](0010-storage-and-layout.md) (worktree layout, archive rule), [0033](0033-satellite-milestone.md) / [0072](0072-agent-identity-by-session.md) (agents spawn agents; scope), [0085](0085-gui-git-branch.md) (`AgentInfo.git`).
 
@@ -45,4 +45,15 @@ M4 is the milestone 0025 described (renumbered by 0033): node primitives, the `R
 - M5's plugin host has a fixed target: the `Workflow` and `Host` traits and the action/view protocol. Changing them after M4 is a protocol and WIT change.
 - M6 adds clone and fetch-back as git-worktree actions, and action progress events in the reserved block; the primitives already are node requests, so a controller can call them on a remote node unchanged.
 - New benchmarks (no baselines until the user records them): `exec_true_roundtrip_ns`, `diff_view_build_10k_lines_instructions`, `gui_diff_open_ns`, `gui_diff_scroll_frame_ns`. Existing gates should not move: nothing runs on the PTY path or at idle.
-- Open decisions for the user are listed at the end of the spec and in the PR.
+- The open decisions for the user were listed at the end of the spec; the answers are below.
+
+## The user's answers (2026-11-23, #166)
+
+1. **Worktree root:** keep 0010's `~/.fleet/worktrees/{repo}` as the default, configurable per repository (fleetd's own: `../fleetd-wt`).
+2. **Branch:** default `fleet/<slug>`, with a configurable prefix.
+3. **Agents and actions:** agents may call `new-agent`, `diff`, `ls` and a non-forced `archive` on their own subtree; `prune`, `force` and the node primitives are the user's only.
+4. **Fresh base:** fetch the base from `origin` by default, falling back to the local ref with a note.
+5. **Diff pane:** a split beside the agent's terminal.
+6. **Per-repo setup hook:** none in M4 (the spec's default).
+7. **Lock and generated files:** shown like any other file (the spec's default).
+8. **Benchmark budgets:** as proposed: `exec_true_roundtrip_ns` 20 ms, `gui_diff_open_ns` 100 ms, `gui_diff_scroll_frame_ns` 16 ms.
