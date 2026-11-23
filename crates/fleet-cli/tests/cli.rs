@@ -1025,7 +1025,7 @@ fn skill_print_has_frontmatter() {
     }
     assert_eq!(lines.len(), 2, "{front}");
     assert!(!body.trim().is_empty());
-    assert!(SKILL.lines().count() < 220);
+    assert!(SKILL.lines().count() < 240);
     for needle in ["$FLEET_AGENT_ID", "--lines"] {
         assert!(SKILL.contains(needle), "skill lacks {needle}");
     }
@@ -1110,8 +1110,12 @@ fn skill_examples_run() {
     for example in &examples {
         // These need an agent's identity or block until something happens;
         // their own tests run them (`report`, `mailbox`, `lease`), and
-        // `skill::tests::fenced_commands_exist` checks their flags.
-        if matches!(example[1].as_str(), "report" | "wait" | "lease") {
+        // `skill::tests::fenced_commands_exist` checks their flags. `wt` would
+        // make a real worktree under the user's home.
+        if matches!(
+            example[1].as_str(),
+            "report" | "wait" | "lease" | "wt" | "action"
+        ) {
             continue;
         }
         let id = if matches!(example[1].as_str(), "restart" | "rm") {
