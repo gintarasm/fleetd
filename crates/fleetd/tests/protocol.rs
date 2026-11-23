@@ -1112,12 +1112,11 @@ fn spawn_attach_of_quickly_exiting_agent_streams_output_then_one_exit() {
         response::Kind::SpawnedAttached(sa) => sa.agent.unwrap(),
         other => panic!("expected SpawnedAttached, got {other:?}"),
     };
-    // Nothing of the agent's stream precedes the reply.
-    assert!(
-        c.pending.is_empty(),
-        "frames before the reply: {:?}",
-        c.pending
-    );
+    // Nothing of the agent's stream (output, exit) precedes the reply.
+    // Activity events go to every connection apart from it, so one for
+    // the agent's output may arrive first.
+    let early = c.pending.iter().any(|f| activity_of(f).is_none());
+    assert!(!early, "frames before the reply: {:?}", c.pending);
     c.output_until(agent.id, "quick-bye");
     assert_eq!(c.exit_event(agent.id).exit_code, 5);
     c.list();
