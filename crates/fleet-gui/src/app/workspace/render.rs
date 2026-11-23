@@ -23,7 +23,7 @@ use crate::app::keymap::{
 use crate::app::kill_sheet::{self};
 use crate::app::peek_view::{self};
 use crate::app::send_sheet::{self};
-use crate::app::sidebar_view::{SidebarData, TabMark, render_pending, render_sidebar};
+use crate::app::sidebar_view::{SidebarData, render_pending, render_sidebar};
 use crate::app::theme::{Theme, Typography};
 use crate::app::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use crate::core::feedback::{self, Tween};
@@ -267,32 +267,27 @@ impl Render for Workspace {
             let app = self.app.read(cx);
             self.agent_mru.observe(app.layout().agent(app.focused()));
         }
-        let theme = self.app.read(cx).theme;
-        let agent_emoji = self.app.read(cx).config.agent_emoji;
-        let (rows, error, notice, titles, marks, update, statuses, bells) = {
-            let app = self.app.read(cx);
-            (
-                app.agents.clone(),
-                app.error.clone(),
-                app.notice.clone(),
-                app.titles.clone(),
-                app.tab_marks(),
-                app.update_button(),
-                app.statuses.clone(),
-                app.bells.clone(),
-            )
-        };
-        let (pending, fresh, next) = {
+        let (fresh, next) = {
             let app = self.app.read(cx);
             let now = Instant::now();
             (
-                app.pending_spawns.clone(),
                 app.new_children.strengths(now, self.reduce_motion),
                 app.new_children.next_change(now, self.reduce_motion),
             )
         };
         self.new_child_timer.schedule(next, window, cx);
-        let mark = move |id: u64| marks.get(&id).copied().unwrap_or(TabMark::None);
+        // From here to the bar the sidebar borrows the app state instead of
+        // cloning the agent list and its maps every frame (#147): the
+        // sidebar renderers only need a shared `Context` for listeners.
+        let app = self.app.read(cx);
+        let theme = app.theme;
+        let agent_emoji = app.config.agent_emoji;
+        let rows = &app.agents;
+        let titles = &app.titles;
+        let pending = &app.pending_spawns;
+        let error = app.error.clone();
+        let notice = app.notice.clone();
+        let update = app.update_button();
         // Rows that went away leave the selection.
         self.row_selection
             .retain(|id| rows.iter().any(|r| r.info.id == id));
@@ -310,12 +305,12 @@ impl Render for Workspace {
                 .collect();
         }
         let data = SidebarData {
-            rows: &rows,
+            rows,
             now_ms: now_ms(),
-            titles: &titles,
-            mark: &mark,
-            statuses: &statuses,
-            bells: &bells,
+            titles,
+            marks: app.tab_marks(),
+            statuses: &app.statuses,
+            bells: &app.bells,
             reduce_motion: self.reduce_motion,
             agent_emoji,
             groups,
@@ -323,14 +318,18 @@ impl Render for Workspace {
             status_filter: self.status_filter,
             focus: self.sidebar_focus.clone(),
             selected: self.row_selection.ids(),
-            pending: &pending,
+            pending,
             fresh: &fresh,
         };
+        #[cfg(test)]
+        {
+            self.drawn_rows = super::DrawnRow::of(&data);
+        }
         let sidebar = render_sidebar(data, &theme, cx);
         // The sidebar is hidden under the graph: its spawn requests float
         // over the graph instead (ADR 0079).
         let graph_pending = if self.graph_shown {
-            render_pending(&pending, &rows, &titles, &theme, cx).map(|block| {
+            render_pending(pending, rows, titles, &theme, cx).map(|block| {
                 div()
                     .id("graph-pending-spawns")
                     .absolute()
@@ -353,9 +352,8 @@ impl Render for Workspace {
         };
         let ended_rows = rows.iter().filter(|r| ended(r)).count();
         // What Clear exited removes (an ended parent of a running agent stays).
-        let removable_rows = removable_ended(&rows);
+        let removable_rows = removable_ended(rows);
         let bar = {
-            let app = self.app.read(cx);
             let link = if !app.is_live() {
                 Link::Connecting
             } else if app.is_reconnecting() {

@@ -326,13 +326,13 @@ fn focused_tab_highlight_follows_the_focused_pane(cx: &mut TestAppContext) {
     click(&mut s, "tab-8");
     let marks = |s: &mut Setup<'_>| s.app.read_with(s.cx, |a, _| a.tab_marks());
     let m = marks(&mut s);
-    assert_eq!(m.get(&8), Some(&TabMark::Focused));
-    assert_eq!(m.get(&7), Some(&TabMark::Shown));
-    assert_eq!(m.get(&9), None);
+    assert_eq!(m.get(8), TabMark::Focused);
+    assert_eq!(m.get(7), TabMark::Shown);
+    assert_eq!(m.get(9), TabMark::None);
     s.cx.simulate_keystrokes("cmd-1");
     let m = marks(&mut s);
-    assert_eq!(m.get(&7), Some(&TabMark::Focused));
-    assert_eq!(m.get(&8), Some(&TabMark::Shown));
+    assert_eq!(m.get(7), TabMark::Focused);
+    assert_eq!(m.get(8), TabMark::Shown);
     // Clicking into a pane moves the highlight too.
     let grid = s.app.read_with(s.cx, |a, cx| {
         a.pane_view(PaneId(2)).unwrap().read(cx).layout.unwrap()
@@ -349,7 +349,7 @@ fn focused_tab_highlight_follows_the_focused_pane(cx: &mut TestAppContext) {
         view.read(cx).focus_handle().is_focused(window)
     });
     assert!(f, "pane 2 focused by the click");
-    assert_eq!(marks(&mut s).get(&8), Some(&TabMark::Focused));
+    assert_eq!(marks(&mut s).get(8), TabMark::Focused);
 }
 
 #[gpui::test]
