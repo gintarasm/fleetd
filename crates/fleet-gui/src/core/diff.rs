@@ -346,7 +346,11 @@ pub fn table_lines(t: &fleet_proto::TableView) -> Vec<String> {
     let header: Vec<String> = t.columns.iter().map(|c| c.to_uppercase()).collect();
     let rows: Vec<Vec<&str>> = std::iter::once(&header)
         .chain(t.rows.iter().map(|r| &r.cells))
-        .map(|cells| (0..n).map(|i| cells.get(i).map_or("", String::as_str)).collect())
+        .map(|cells| {
+            (0..n)
+                .map(|i| cells.get(i).map_or("", String::as_str))
+                .collect()
+        })
         .collect();
     let widths: Vec<usize> = (0..n)
         .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
@@ -402,7 +406,7 @@ pub fn fixture(lines: usize, files: usize) -> DiffView {
                 new_start: start,
                 new_lines: len as u32 - removed,
                 header: format!("fn part_{done}()"),
-                body: body.into_bytes().into(),
+                body: body.into_bytes(),
             });
             done += len;
         }
@@ -457,7 +461,7 @@ mod tests {
             new_start: new.0,
             new_lines: new.1,
             header: header.into(),
-            body: body.as_bytes().to_vec().into(),
+            body: body.as_bytes().to_vec(),
         }
     }
 

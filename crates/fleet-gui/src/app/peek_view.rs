@@ -30,8 +30,8 @@ pub const PEEK_CONTEXT: &str = "Peek";
 const TITLE_H: f32 = 28.0;
 /// What the pane draws around its grid when headless: its side margins,
 /// bottom margin and border, plus a pixel so the last column fits.
-const PAD_W: f32 = 2.0 * space::SM + 3.0;
-const PAD_H: f32 = space::SM - space::XXS + 3.0;
+pub(super) const PAD_W: f32 = 2.0 * space::SM + 3.0;
+pub(super) const PAD_H: f32 = space::SM - space::XXS + 3.0;
 
 /// What the peek asks the workspace to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,38 +80,37 @@ impl PeekView {
         }
         cx.stop_propagation();
     }
+}
 
-    /// The pane's header facts for the peeked agent.
-    fn chrome(&self, cx: &App) -> PaneChrome {
-        let app = self.app.read(cx);
-        let id = self.agent;
-        let row = app.agents.iter().find(|r| r.info.id == id);
-        let status = app.statuses.get(&id).copied();
-        PaneChrome {
-            number: 0,
-            has_agent: true,
-            agent_ended: row.is_some_and(ended),
-            program: row.map(|r| program_name(&r.info.program)),
-            name: row.and_then(|r| name_of(&r.info)).map(str::to_owned),
-            link_dir: row
-                .filter(|_| app.target == Target::Local)
-                .map(|r| r.info.cwd.clone()),
-            focused: true,
-            status,
-            status_fill: row
-                .zip(status)
-                .map_or(DotFill::Hollow, |(r, s)| dot_fill(&r.info, s)),
-            agent: Some(id),
-            local: app.target == Target::Local,
-            ..PaneChrome::default()
-        }
+/// A headless pane's header facts for `id`: the peek's and the graph
+/// panel's (ADR 0105), which draw their own title strip from them.
+pub(super) fn chrome_of(app: &AppState, id: u64) -> PaneChrome {
+    let row = app.agents.iter().find(|r| r.info.id == id);
+    let status = app.statuses.get(&id).copied();
+    PaneChrome {
+        number: 0,
+        has_agent: true,
+        agent_ended: row.is_some_and(ended),
+        program: row.map(|r| program_name(&r.info.program)),
+        name: row.and_then(|r| name_of(&r.info)).map(str::to_owned),
+        link_dir: row
+            .filter(|_| app.target == Target::Local)
+            .map(|r| r.info.cwd.clone()),
+        focused: true,
+        status,
+        status_fill: row
+            .zip(status)
+            .map_or(DotFill::Hollow, |(r, s)| dot_fill(&r.info, s)),
+        agent: Some(id),
+        local: app.target == Target::Local,
+        ..PaneChrome::default()
     }
 }
 
 impl Render for PeekView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        let chrome = self.chrome(cx);
+        let chrome = chrome_of(self.app.read(cx), self.agent);
         let title = chrome
             .name
             .clone()

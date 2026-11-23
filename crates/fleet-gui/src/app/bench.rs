@@ -575,10 +575,15 @@ pub fn fixture_diff() -> fleet_proto::DiffView {
     crate::core::diff::fixture(DIFF_LINES, 20)
 }
 
-fn open_fixture(handle: gpui::WindowHandle<super::workspace::Workspace>, cx: &mut AsyncApp) -> bool {
+fn open_fixture(
+    handle: gpui::WindowHandle<super::workspace::Workspace>,
+    cx: &mut AsyncApp,
+) -> bool {
     let view = fixture_diff();
     cx.update_window(handle.into(), |_, window, cx| {
-        let Some(app) = AppState::global(cx) else { return };
+        let Some(app) = AppState::global(cx) else {
+            return;
+        };
         app.update(cx, |a, cx| a.bench_open_diff(&view, Instant::now(), cx));
         window.refresh();
     })

@@ -343,7 +343,10 @@ mod tests {
         assert!(workflow_entries(false, false, items).is_empty());
         assert_eq!(
             workflow_entries(true, false, items),
-            [MenuEntry::Separator, MenuEntry::Item(RowMenuItem::ShowChanges)]
+            [
+                MenuEntry::Separator,
+                MenuEntry::Item(RowMenuItem::ShowChanges)
+            ]
         );
         assert_eq!(
             workflow_entries(true, true, items),

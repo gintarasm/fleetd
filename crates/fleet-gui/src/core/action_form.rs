@@ -386,10 +386,7 @@ mod tests {
         assert_eq!(
             val(&p, "labels"),
             Some(Value::Map(StringMap {
-                entries: HashMap::from([
-                    ("team".into(), "core".into()),
-                    ("m4".into(), "d".into())
-                ])
+                entries: HashMap::from([("team".into(), "core".into()), ("m4".into(), "d".into())])
             }))
         );
         assert_eq!(val(&p, "p"), Some(Value::String("/Users/me/src".into())));
@@ -446,12 +443,18 @@ mod tests {
 
     #[test]
     fn retry_values_win() {
-        let params = HashMap::from([("force".to_owned(), ParamValue {
-            value: Some(Value::Bool(false)),
-        })]);
-        let retry = HashMap::from([("force".to_owned(), ParamValue {
-            value: Some(Value::Bool(true)),
-        })]);
+        let params = HashMap::from([(
+            "force".to_owned(),
+            ParamValue {
+                value: Some(Value::Bool(false)),
+            },
+        )]);
+        let retry = HashMap::from([(
+            "force".to_owned(),
+            ParamValue {
+                value: Some(Value::Bool(true)),
+            },
+        )]);
         let p = with_retry(params, &retry);
         assert_eq!(val(&p, "force"), Some(Value::Bool(true)));
     }

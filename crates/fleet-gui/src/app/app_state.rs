@@ -25,6 +25,8 @@ use crate::core::drop_paste::{DROP_NEEDS_LOCAL, dropped_text};
 use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::git;
+use crate::core::graph_panel::GRAPH_PANEL_PANE;
+use crate::core::layout::MAX_PANES;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
 use crate::core::needs_you::{Since, next_after};
 use crate::core::new_children::NewChildren;
@@ -36,6 +38,7 @@ use crate::core::row_preview::only_activity_changed;
 use crate::core::session::{AgentRow, ConnState, PaneId, Session, UiEvent, restart_failure_text};
 use crate::core::settings::{Change, save_changes};
 use crate::core::shortcuts::ClosedPanes;
+use crate::core::sidebar::display_name;
 use crate::core::sidebar::{GroupBy, ended, tilde, toggle_collapsed};
 use crate::core::sidebar_tree::{removable_ended, toggle_disclosure};
 use crate::core::spawn::{SpawnRequest, new_terminal, terminal_dir};
@@ -46,12 +49,10 @@ use crate::core::status::{
     AgentStatus, Alerts, DotFill, alert_text, dot_fill, live_report, statuses,
 };
 use crate::core::style::chrome;
-use crate::core::layout::MAX_PANES;
-use crate::core::sidebar::display_name;
 use crate::core::tabs::Tabs;
-use crate::core::worktree::{Actions, can_show_changes, refresh_on};
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
+use crate::core::worktree::{Actions, can_show_changes, refresh_on};
 use crate::core::zoom::{FontZoom, Zoom};
 
 /// Saved state is written once it has been still this long.
@@ -160,6 +161,11 @@ pub trait SessionApi: InputSink {
     /// [`PEEK_PANE`]; closed with `close_pane`.
     fn open_peek(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
         self.open_pane(PEEK_PANE, Some(agent_id))
+    }
+    /// The graph's terminal panel's read-only connection to `agent_id`
+    /// (ADR 0105), under [`GRAPH_PANEL_PANE`]; closed with `close_pane`.
+    fn open_graph_panel(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
+        self.open_pane(GRAPH_PANEL_PANE, Some(agent_id))
     }
     fn attach(&self, pane: PaneId, agent_id: u64);
     fn close_pane(&self, pane: PaneId);
@@ -281,6 +287,10 @@ impl SessionApi for Session {
 
     fn open_peek(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
         Session::open_peek(self, agent_id)
+    }
+
+    fn open_graph_panel(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
+        Session::open_observer(self, GRAPH_PANEL_PANE, agent_id)
     }
 
     fn attach(&self, pane: PaneId, agent_id: u64) {
@@ -407,6 +417,9 @@ pub struct AppState {
     /// The peek (ADR 0103), while open: its agent and its view, on a
     /// read-only connection outside the layout.
     peek: Option<(u64, Entity<PaneView>)>,
+    /// The graph's terminal panel (ADR 0105), while open: its agent and
+    /// its view, on a read-only connection outside the layout.
+    graph_panel: Option<(u64, Entity<PaneView>)>,
     /// The agents of panes closed lately, for ⌘⇧T (not saved).
     closed: ClosedPanes,
     /// The shown tab's pane filling the pane area, if any (not saved).
@@ -519,6 +532,7 @@ impl AppState {
             tabs,
             panes: HashMap::new(),
             peek: None,
+            graph_panel: None,
             zoom: FontZoom::default(),
             disclosure: HashMap::new(),
             closed: ClosedPanes::default(),
@@ -615,6 +629,7 @@ impl AppState {
         self.actions = Actions::Unknown;
         // The old session closed the peek's connection with the rest.
         self.peek = None;
+        self.graph_panel = None;
         self.maximized = None;
         self.closed.clear();
         self.disclosure.clear();
@@ -743,6 +758,48 @@ impl AppState {
     pub(super) fn close_peek(&mut self, cx: &mut Context<Self>) {
         if self.peek.take().is_some() {
             self.session.close_pane(PEEK_PANE);
+            cx.notify();
+        }
+    }
+
+    /// The graph panel's agent and view, while it is open (ADR 0105).
+    pub fn graph_panel(&self) -> Option<(u64, &Entity<PaneView>)> {
+        self.graph_panel.as_ref().map(|(id, v)| (*id, v))
+    }
+
+    /// Opens the graph's terminal panel on `agent_id`, or, already open,
+    /// shows `agent_id` in it on the same connection (detaching the agent
+    /// it showed). Nothing in the layout changes.
+    pub(super) fn show_in_graph_panel(
+        &mut self,
+        agent_id: u64,
+        cx: &mut Context<Self>,
+    ) -> Entity<PaneView> {
+        if let Some((shown, view)) = &mut self.graph_panel {
+            if *shown != agent_id {
+                *shown = agent_id;
+                self.session.attach(GRAPH_PANEL_PANE, agent_id);
+                cx.notify();
+            }
+            return view.clone();
+        }
+        let model = self.session.open_graph_panel(agent_id);
+        let sink: Arc<dyn InputSink> = self.session.clone();
+        let config = self.pane_config();
+        let view = cx.new(|cx| {
+            let mut v = PaneView::new(GRAPH_PANEL_PANE, model, sink, &config, cx);
+            v.headless = true;
+            v
+        });
+        self.graph_panel = Some((agent_id, view.clone()));
+        cx.notify();
+        view
+    }
+
+    /// Closes the graph panel's connection (never the agent).
+    pub(super) fn close_graph_panel(&mut self, cx: &mut Context<Self>) {
+        if self.graph_panel.take().is_some() {
+            self.session.close_pane(GRAPH_PANEL_PANE);
             cx.notify();
         }
     }
@@ -896,6 +953,11 @@ impl AppState {
                 }
                 UiEvent::PaneChanged(PEEK_PANE) => {
                     if let Some((_, view)) = &self.peek {
+                        view.update(cx, |_, cx| cx.notify());
+                    }
+                }
+                UiEvent::PaneChanged(GRAPH_PANEL_PANE) => {
+                    if let Some((_, view)) = &self.graph_panel {
                         view.update(cx, |_, cx| cx.notify());
                     }
                 }
@@ -2178,7 +2240,9 @@ impl AppState {
         }
         let font = super::fonts::terminal_font(&config.font_family, cx);
         for view in self.diff_panes.values() {
-            view.update(cx, |v, cx| v.set_font(font.clone(), px(config.font_size), cx));
+            view.update(cx, |v, cx| {
+                v.set_font(font.clone(), px(config.font_size), cx)
+            });
         }
     }
 

@@ -227,7 +227,12 @@ impl ActionSheet {
     }
 
     /// The action failed: the form (or question) again, with `error`.
-    pub fn failed(&mut self, error: String, params: HashMap<String, ParamValue>, cx: &mut Context<Self>) {
+    pub fn failed(
+        &mut self,
+        error: String,
+        params: HashMap<String, ParamValue>,
+        cx: &mut Context<Self>,
+    ) {
         self.stage = if self.form.is_some() {
             Stage::Form
         } else {
@@ -426,7 +431,9 @@ impl ActionSheet {
             .flex()
             .flex_col()
             .gap(px(space::XXS))
-            .when(!matches!(self.controls[i], Control::Check), |d| d.child(label))
+            .when(!matches!(self.controls[i], Control::Check), |d| {
+                d.child(label)
+            })
             .child(control)
             .when(!f.help.is_empty(), |d| {
                 d.child(
@@ -481,7 +488,11 @@ impl Render for ActionSheet {
             Stage::Choose(actions) => {
                 let rows = actions.iter().enumerate().map(|(i, a)| {
                     let spec = a.clone();
-                    let title = if a.title.is_empty() { a.name.clone() } else { a.title.clone() };
+                    let title = if a.title.is_empty() {
+                        a.name.clone()
+                    } else {
+                        a.title.clone()
+                    };
                     div()
                         .flex()
                         .flex_col()
@@ -563,7 +574,11 @@ impl Render for ActionSheet {
                     .child(SharedString::from(self.title.clone())),
             )
             .child(body)
-            .children(self.error.clone().map(|e| error_text(SharedString::from(e), &theme)))
+            .children(
+                self.error
+                    .clone()
+                    .map(|e| error_text(SharedString::from(e), &theme)),
+            )
             .child(buttons)
     }
 }

@@ -1,5 +1,6 @@
 //! gpui shell (macOS only).
 
+mod action_sheet;
 mod agent_mark;
 mod answer_sheet;
 mod app_state;
@@ -7,12 +8,12 @@ mod attention;
 mod bench;
 mod connect;
 mod context_menu;
-mod action_sheet;
 mod controls;
 mod diff_pane;
 mod ended_view;
 mod fonts;
 mod graph_lines;
+mod graph_panel;
 mod graph_view;
 mod icons;
 mod keymap;

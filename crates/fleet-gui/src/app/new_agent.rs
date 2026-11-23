@@ -67,7 +67,9 @@ pub(crate) struct WorktreeFields {
 /// `dir` with a leading `~` as the home directory (local folders).
 fn expand_home(dir: &str) -> String {
     match (dir.strip_prefix('~'), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => format!("{home}{rest}"),
+        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{home}{rest}")
+        }
         _ => dir.to_owned(),
     }
 }
@@ -199,13 +201,16 @@ impl NewAgentSheet {
         let local = *target == Target::Local;
         let worktree = worktree.map(|on| {
             let slug = cx.new(|cx| {
-                TextField::new(slug_from_name(&generated_name), "Folder name of the worktree", cx)
-                    .tab_stop()
+                TextField::new(
+                    slug_from_name(&generated_name),
+                    "Folder name of the worktree",
+                    cx,
+                )
+                .tab_stop()
             });
             let branch = cx.new(|cx| TextField::new(String::new(), "fleet/<slug>", cx).tab_stop());
-            let base = cx.new(|cx| {
-                TextField::new(String::new(), "The default branch", cx).tab_stop()
-            });
+            let base =
+                cx.new(|cx| TextField::new(String::new(), "The default branch", cx).tab_stop());
             let observers = [
                 cx.observe(&slug, |this, slug, cx| {
                     let name = slug_from_name(this.name.read(cx).text());
@@ -232,7 +237,8 @@ impl NewAgentSheet {
                 branch,
                 base,
                 slug_edited: false,
-                in_checkout: !local || in_git_checkout(std::path::Path::new(&expand_home(&first_dir))),
+                in_checkout: !local
+                    || in_git_checkout(std::path::Path::new(&expand_home(&first_dir))),
                 local,
                 _observers: observers,
             }
@@ -277,7 +283,9 @@ impl NewAgentSheet {
 
     /// "New worktree" is shown and checked: the spawn makes a worktree.
     pub fn in_worktree(&self) -> bool {
-        self.worktree.as_ref().is_some_and(|w| w.on && w.in_checkout)
+        self.worktree
+            .as_ref()
+            .is_some_and(|w| w.on && w.in_checkout)
     }
 
     /// Checks or unchecks "New worktree".
@@ -442,11 +450,7 @@ impl NewAgentSheet {
                 .child(field_label(label, theme))
                 .child(f.clone())
         };
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap(px(space::SM))
-            .child(checkbox);
+        let mut col = div().flex().flex_col().gap(px(space::SM)).child(checkbox);
         if w.on {
             col = col.child(
                 div()

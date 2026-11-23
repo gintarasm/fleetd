@@ -62,7 +62,10 @@ enum Shown {
     Loading,
     Diff(DiffDoc),
     /// A table or text view, as lines.
-    Text { title: String, lines: Vec<String> },
+    Text {
+        title: String,
+        lines: Vec<String>,
+    },
     /// The action failed or refused: the reason.
     Failed(String),
 }
@@ -405,7 +408,13 @@ impl DiffPane {
         cx.stop_propagation();
     }
 
-    fn press_row(&mut self, i: usize, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn press_row(
+        &mut self,
+        i: usize,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus);
         if let Some(row) = self.doc().and_then(|d| d.row(i)).cloned() {
             if row.kind == RowKind::File && !ev.modifiers.shift {
@@ -481,7 +490,11 @@ impl DiffPane {
                 } else {
                     title.clone()
                 },
-                format!("{} line{}", lines.len(), if lines.len() == 1 { "" } else { "s" }),
+                format!(
+                    "{} line{}",
+                    lines.len(),
+                    if lines.len() == 1 { "" } else { "s" }
+                ),
                 String::new(),
             ),
             _ => (self.agent_name.clone(), String::new(), String::new()),
@@ -499,7 +512,9 @@ impl DiffPane {
                 .type_style(text::SUBHEADLINE)
                 .cursor_pointer()
                 .when(on, |d| d.bg(t.selected).text_color(t.text))
-                .when(!on, |d| d.text_color(t.secondary).hover(move |s| s.bg(t.hover)))
+                .when(!on, |d| {
+                    d.text_color(t.secondary).hover(move |s| s.bg(t.hover))
+                })
                 .child(*name)
                 .on_click(cx.listener(move |p, _, _, cx| p.set_against(i, cx)))
         });
@@ -541,15 +556,15 @@ impl DiffPane {
             )
             .when(agent, |d| {
                 d.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_none()
-                    .gap(px(space::XXS))
-                    .p(px(space::XXS))
-                    .rounded(px(radius::MD))
-                    .bg(theme.field)
-                    .children(against),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_none()
+                        .gap(px(space::XXS))
+                        .p(px(space::XXS))
+                        .rounded(px(radius::MD))
+                        .bg(theme.field)
+                        .children(against),
                 )
             })
             .child(
@@ -565,7 +580,12 @@ impl DiffPane {
             )
     }
 
-    fn render_files(&self, doc: &DiffDoc, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_files(
+        &self,
+        doc: &DiffDoc,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let t = *theme;
         let count = doc.files().len();
         let row_h = px(22.0);
@@ -580,7 +600,9 @@ impl DiffPane {
                     "diff-files",
                     count,
                     cx.processor(move |p, range: Range<usize>, _, cx| {
-                        let Some(doc) = p.doc() else { return Vec::new() };
+                        let Some(doc) = p.doc() else {
+                            return Vec::new();
+                        };
                         range
                             .filter_map(|i| {
                                 let f = doc.files().get(i)?;
@@ -641,7 +663,12 @@ impl DiffPane {
             )
     }
 
-    fn render_rows(&self, doc: &DiffDoc, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_rows(
+        &self,
+        doc: &DiffDoc,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let t = *theme;
         let row_h = self.row_height();
         let char_w = self.font_size * 0.62;
@@ -666,7 +693,9 @@ impl DiffPane {
             "diff-rows",
             count,
             cx.processor(move |p, range: Range<usize>, _, cx| {
-                let Some(doc) = p.doc() else { return Vec::new() };
+                let Some(doc) = p.doc() else {
+                    return Vec::new();
+                };
                 let sel = p.selection.map(|(a, b)| (a.min(b), a.max(b)));
                 range
                     .filter_map(|i| {
@@ -741,7 +770,9 @@ impl DiffPane {
             "view-lines",
             count,
             cx.processor(move |p, range: Range<usize>, _, cx| {
-                let Some(lines) = p.text() else { return Vec::new() };
+                let Some(lines) = p.text() else {
+                    return Vec::new();
+                };
                 let sel = p.selection.map(|(a, b)| (a.min(b), a.max(b)));
                 range
                     .filter_map(|i| {
@@ -808,7 +839,9 @@ fn row_element(
             .flex()
             .justify_end()
             .text_color(t.tertiary)
-            .child(SharedString::from(n.map(|n| n.to_string()).unwrap_or_default()))
+            .child(SharedString::from(
+                n.map(|n| n.to_string()).unwrap_or_default(),
+            ))
     };
     let (bg, fg, marker) = match row.kind {
         RowKind::Added => (Some(t.success.opacity(0.14)), t.text, "+"),
@@ -884,16 +917,14 @@ impl Render for DiffPane {
                 .text_color(theme.tertiary)
                 .child("No changes")
                 .into_any_element(),
-            Shown::Diff(doc) => {
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_row()
-                    .child(self.render_files(doc, &theme, cx))
-                    .child(self.render_rows(doc, &theme, cx))
-                    .into_any_element()
-            }
+            Shown::Diff(doc) => div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_row()
+                .child(self.render_files(doc, &theme, cx))
+                .child(self.render_rows(doc, &theme, cx))
+                .into_any_element(),
             Shown::Text { .. } => self.render_text(&theme, cx).into_any_element(),
             Shown::Loading => div()
                 .flex_1()

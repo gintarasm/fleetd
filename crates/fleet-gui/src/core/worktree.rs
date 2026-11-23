@@ -172,7 +172,11 @@ pub fn new_agent_params(
 
 /// The params of `git-worktree.diff` for an agent; `file` asks for one
 /// omitted file.
-pub fn diff_params(agent_id: u64, against: &str, file: Option<&str>) -> HashMap<String, ParamValue> {
+pub fn diff_params(
+    agent_id: u64,
+    against: &str,
+    file: Option<&str>,
+) -> HashMap<String, ParamValue> {
     let mut p = HashMap::from([
         ("agent".to_owned(), int(agent_id)),
         ("against".to_owned(), string(against)),

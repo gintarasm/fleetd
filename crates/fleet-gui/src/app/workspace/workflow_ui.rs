@@ -13,16 +13,16 @@ use gpui::{AppContext, Context, Entity, Window};
 use super::Workspace;
 use crate::app::action_sheet::{ActionSheet, ActionSheetEvent};
 use crate::app::keymap::{ArchiveWorktree, RunAction as RunActionCommand, ShowChanges};
+use crate::app::new_agent::NewAgentSheet;
 use crate::core::menus::{MenuEntry, PaneMenuItem, RowMenuItem, workflow_entries};
 use crate::core::palette::{Entry, changes_items};
 use crate::core::picker::PickerItem;
 use crate::core::sidebar::display_name;
-use crate::core::worktree::{
-    ARCHIVE, NEW_AGENT, NewWorktree, WORKTREE_LABEL, archive_params, can_archive,
-    can_show_changes, new_agent_params,
-};
-use crate::app::new_agent::NewAgentSheet;
 use crate::core::spawn::SpawnRequest;
+use crate::core::worktree::{
+    ARCHIVE, NEW_AGENT, NewWorktree, WORKTREE_LABEL, archive_params, can_archive, can_show_changes,
+    new_agent_params,
+};
 use fleet_client::names::NAME_LABEL;
 
 /// Where an action's result goes.
@@ -165,7 +165,12 @@ impl Workspace {
         let Some(row) = app.agents.iter().find(|r| r.info.id == agent_id) else {
             return;
         };
-        let path = row.info.labels.get(WORKTREE_LABEL).cloned().unwrap_or_default();
+        let path = row
+            .info
+            .labels
+            .get(WORKTREE_LABEL)
+            .cloned()
+            .unwrap_or_default();
         let message = format!(
             "Archive the worktree of {}? {} is removed, and its branch is deleted if it is merged.",
             display_name(&row.info),
@@ -289,11 +294,14 @@ impl Workspace {
             }
             Ok((Some(Outcome::View(_)), result)) => {
                 self.close_action_sheet(window, cx);
-                self.app.update(cx, |a, cx| a.open_view(call, title, result, cx));
+                self.app
+                    .update(cx, |a, cx| a.open_view(call, title, result, cx));
                 self.focus_current(window, cx);
             }
             Ok((Some(Outcome::Refused(r)), _)) => match sheet {
-                Some(sheet) => sheet.update(cx, |s, cx| s.refuse(r.reason, call.params, &r.retry, cx)),
+                Some(sheet) => {
+                    sheet.update(cx, |s, cx| s.refuse(r.reason, call.params, &r.retry, cx))
+                }
                 None => {
                     let sheet = cx.new(|cx| {
                         ActionSheet::refused(call.name, title, r.reason, call.params, &r.retry, cx)
@@ -301,7 +309,9 @@ impl Workspace {
                     self.open_action_sheet(sheet, window, cx);
                 }
             },
-            Ok((None, _)) => self.action_failed(sheet, "the action answered nothing".into(), call, cx),
+            Ok((None, _)) => {
+                self.action_failed(sheet, "the action answered nothing".into(), call, cx)
+            }
             Err(e) => self.action_failed(sheet, e, call, cx),
         }
     }
@@ -366,7 +376,13 @@ impl Workspace {
             params,
             cwd: repo,
         };
-        self.run_call(call, "New Agent in Worktree".to_owned(), Origin::NewAgent, window, cx);
+        self.run_call(
+            call,
+            "New Agent in Worktree".to_owned(),
+            Origin::NewAgent,
+            window,
+            cx,
+        );
     }
 }
 
@@ -397,8 +413,8 @@ mod tests {
     use fleet_proto::param_value::Value;
     use fleet_proto::{
         ActionDone, ActionRefused, ActionResult, ActionSpawned, ActionSpec, AgentInfo, AgentState,
-        DiffView, FileDiff, FileStatus, GitInfo, Hunk, ParamKind, ParamSpec, ParamValue,
-        RunAction, TableRow, TableView, View, view,
+        DiffView, FileDiff, FileStatus, GitInfo, Hunk, ParamKind, ParamSpec, ParamValue, RunAction,
+        TableRow, TableView, View, view,
     };
     use fleet_term::Palette;
     use gpui::{AppContext, Entity, TestAppContext, VisualTestContext};
@@ -517,7 +533,7 @@ mod tests {
                     hunks: vec![Hunk {
                         new_start: 1,
                         new_lines: lines as u32,
-                        body: body.into_bytes().into(),
+                        body: body.into_bytes(),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -648,7 +664,8 @@ mod tests {
         }
 
         fn diff(&mut self, pane: PaneId) -> Option<Entity<crate::app::diff_pane::DiffPane>> {
-            self.app.read_with(self.cx, |a, _| a.diff_pane(pane).cloned())
+            self.app
+                .read_with(self.cx, |a, _| a.diff_pane(pane).cloned())
         }
 
         fn set_rows(&mut self, rows: Vec<AgentRow>) {
@@ -766,7 +783,10 @@ mod tests {
 
         s.ws.update_in(s.cx, |w, window, cx| w.focus_pane(terminal, window, cx));
         // The terminal's agent is gone: ⌘R there restarts it.
-        s.fake.models.lock().unwrap()[&terminal].lock().unwrap().on_lost();
+        s.fake.models.lock().unwrap()[&terminal]
+            .lock()
+            .unwrap()
+            .on_lost();
         s.cx.run_until_parked();
         s.cx.simulate_keystrokes("cmd-r");
         s.cx.run_until_parked();
@@ -814,7 +834,8 @@ mod tests {
         s.cx.run_until_parked();
         let last = s.fake.calls().last().cloned().unwrap();
         assert_eq!(param(&last, "file"), Some(Value::String("big.rs".into())));
-        let (selected, rows) = diff.read_with(s.cx, |d, _| (d.selected_file, d.doc().unwrap().len()));
+        let (selected, rows) =
+            diff.read_with(s.cx, |d, _| (d.selected_file, d.doc().unwrap().len()));
         assert_eq!(selected, 1);
         // a.rs collapsed (1) + big.rs header, hunk and 2 lines.
         assert_eq!(rows, 5);
@@ -827,9 +848,16 @@ mod tests {
     #[gpui::test]
     fn archive_asks_then_offers_archive_anyway_on_a_refusal(cx: &mut TestAppContext) {
         let mut ended = row(1, AgentState::Exited, true);
-        ended.info.labels.insert(WORKTREE_LABEL.into(), "/wt/x".into());
+        ended
+            .info
+            .labels
+            .insert(WORKTREE_LABEL.into(), "/wt/x".into());
         let s = setup(cx, vec![ended], all_actions());
-        assert_eq!(s.ws.read_with(s.cx, |w, cx| w.workflow_row_items(1, cx)).len(), 3);
+        assert_eq!(
+            s.ws.read_with(s.cx, |w, cx| w.workflow_row_items(1, cx))
+                .len(),
+            3
+        );
         s.fake.script(
             ARCHIVE,
             Ok(ActionResult {
@@ -854,8 +882,13 @@ mod tests {
         );
         s.ws.update_in(s.cx, |w, window, cx| w.open_archive(1, window, cx));
         s.cx.run_until_parked();
-        let sheet = s.ws.read_with(s.cx, |w, _| w.action_sheet().cloned()).unwrap();
-        assert!(matches!(sheet.read_with(s.cx, |x, _| x.stage.clone()), Stage::Confirm { .. }));
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.action_sheet().cloned())
+                .unwrap();
+        assert!(matches!(
+            sheet.read_with(s.cx, |x, _| x.stage.clone()),
+            Stage::Confirm { .. }
+        ));
         sheet.update(s.cx, |x, cx| x.submit(cx));
         s.cx.run_until_parked();
         let stage = sheet.read_with(s.cx, |x, _| x.stage.clone());
@@ -880,7 +913,9 @@ mod tests {
         let open_form = |s: &mut Setup<'_>, name: &str| {
             s.cx.dispatch_action(crate::app::keymap::RunAction);
             s.cx.run_until_parked();
-            let sheet = s.ws.read_with(s.cx, |w, _| w.action_sheet().cloned()).unwrap();
+            let sheet =
+                s.ws.read_with(s.cx, |w, _| w.action_sheet().cloned())
+                    .unwrap();
             let Stage::Choose(list) = sheet.read_with(s.cx, |x, _| x.stage.clone()) else {
                 panic!("a list");
             };
@@ -945,7 +980,12 @@ mod tests {
         assert_eq!(lines, Some(vec!["PATH".to_owned(), "/wt/a".to_owned()]));
         s.cx.simulate_keystrokes("cmd-r");
         s.cx.run_until_parked();
-        let ls = s.fake.calls().iter().filter(|c| c.name == "demo.ls").count();
+        let ls = s
+            .fake
+            .calls()
+            .iter()
+            .filter(|c| c.name == "demo.ls")
+            .count();
         assert_eq!(ls, 2);
         // An error stays in the sheet.
         s.fake.script("demo.ls", Err("forbidden: no".into()));
@@ -964,10 +1004,13 @@ mod tests {
         let dir = repo.path().to_string_lossy().into_owned();
         s.ws.update_in(s.cx, |w, window, cx| w.open_new_agent(window, cx));
         s.cx.run_until_parked();
-        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet.as_ref().map(|(x, _)| x.clone())).unwrap();
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.sheet.as_ref().map(|(x, _)| x.clone()))
+                .unwrap();
         sheet.update(s.cx, |x, cx| {
             x.dir.update(cx, |f, cx| f.set_text(dir.clone(), cx));
-            x.command.update(cx, |f, cx| f.set_text("claude --model big".into(), cx));
+            x.command
+                .update(cx, |f, cx| f.set_text("claude --model big".into(), cx));
         });
         s.cx.run_until_parked();
         // Typed after the generated name: the slug follows it.
@@ -979,15 +1022,25 @@ mod tests {
         assert_eq!(shown, Some(true));
         sheet.update(s.cx, |x, cx| {
             x.toggle_worktree(cx);
-            x.worktree.as_ref().unwrap().base.update(cx, |f, cx| f.set_text("origin/dev".into(), cx));
+            x.worktree
+                .as_ref()
+                .unwrap()
+                .base
+                .update(cx, |f, cx| f.set_text("origin/dev".into(), cx));
             x.submit(cx);
         });
         s.cx.run_until_parked();
-        assert!(s.fake.spawns.lock().unwrap().is_empty(), "not a plain spawn");
+        assert!(
+            s.fake.spawns.lock().unwrap().is_empty(),
+            "not a plain spawn"
+        );
         let call = s.fake.calls().pop().unwrap();
         assert_eq!(call.name, NEW_AGENT);
         assert_eq!(param(&call, "slug"), Some(Value::String("fix-it".into())));
-        assert_eq!(param(&call, "base"), Some(Value::String("origin/dev".into())));
+        assert_eq!(
+            param(&call, "base"),
+            Some(Value::String("origin/dev".into()))
+        );
         assert_eq!(param(&call, "repo"), Some(Value::String(dir.clone())));
         assert_eq!(param(&call, "name"), Some(Value::String("Fix It".into())));
         assert_eq!(
