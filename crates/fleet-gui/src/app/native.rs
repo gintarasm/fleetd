@@ -39,6 +39,24 @@ pub fn begin_window_drag() {
     }
 }
 
+/// Which Option keys the event being handled has down, `(left, right)`,
+/// from the device-dependent bits of `NSEvent.modifierFlags`
+/// (`NX_DEVICELALTKEYMASK` 0x20, `NX_DEVICERALTKEYMASK` 0x40). gpui's
+/// `Modifiers` has one `alt` for both. `(false, false)` when there is no
+/// current event.
+pub fn option_sides() -> (bool, bool) {
+    const LEFT: usize = 0x20;
+    const RIGHT: usize = 0x40;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return (false, false);
+    };
+    let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else {
+        return (false, false);
+    };
+    let bits = event.modifierFlags().0;
+    (bits & LEFT != 0, bits & RIGHT != 0)
+}
+
 /// The user's accent colour (System Settings › Appearance) as sRGB
 /// `(r, g, b)` in 0..=1, if AppKit can say.
 pub fn accent_color() -> Option<(f32, f32, f32)> {

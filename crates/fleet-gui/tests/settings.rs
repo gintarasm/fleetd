@@ -8,7 +8,8 @@ use fleet_gui::core::cursor_blink::BlinkChoice;
 use fleet_gui::core::glass::GlassChoice;
 use fleet_gui::core::settings::{
     BLUR_MAX, BLUR_MIN, Change, FONT_SIZE_MAX, FONT_SIZE_MIN, MotionChoice, OPACITY_MAX,
-    OPACITY_MIN, SHORTCUTS, Section, ThemeChoice, key_label, parse_command_line, save_changes,
+    OPACITY_MIN, OptionAsMeta, SHORTCUTS, Section, ThemeChoice, key_label, parse_command_line,
+    save_changes,
 };
 use fleet_gui::core::theme::Appearance;
 
@@ -101,7 +102,7 @@ fn a_change_reports_its_key_only_when_it_changes_something() {
         Some("confirm_kill")
     );
     assert_eq!(
-        Change::OptionAsMeta(false).apply(&mut c),
+        Change::OptionAsMeta(OptionAsMeta::None).apply(&mut c),
         Some("option_as_meta")
     );
     assert_eq!(
@@ -284,4 +285,77 @@ fn cursor_blink_follows_the_app_by_default_and_is_saved() {
     );
     write(dir.path(), "[gui]\ncursor_blink = \"sometimes\"\n");
     assert!(load_config(dir.path()).is_err());
+}
+
+#[test]
+fn option_as_meta_defaults_to_both_and_reads_each_side() {
+    assert_eq!(GuiConfig::default().option_as_meta, OptionAsMeta::Both);
+    for (text, want) in [
+        ("\"left\"", OptionAsMeta::Left),
+        ("\"right\"", OptionAsMeta::Right),
+        ("\"both\"", OptionAsMeta::Both),
+        ("\"none\"", OptionAsMeta::None),
+        ("true", OptionAsMeta::Both),
+        ("false", OptionAsMeta::None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), &format!("[gui]\noption_as_meta = {text}\n"));
+        let c = load_config(dir.path()).unwrap();
+        assert_eq!(c.option_as_meta, want, "option_as_meta = {text}");
+    }
+}
+
+#[test]
+fn option_as_meta_follows_the_pressed_side() {
+    // (left down, right down)
+    let rows = [
+        (
+            OptionAsMeta::Both,
+            [(true, false), (false, true)],
+            [true, true],
+        ),
+        (
+            OptionAsMeta::Left,
+            [(true, false), (false, true)],
+            [true, false],
+        ),
+        (
+            OptionAsMeta::Right,
+            [(true, false), (false, true)],
+            [false, true],
+        ),
+        (
+            OptionAsMeta::None,
+            [(true, false), (false, true)],
+            [false, false],
+        ),
+    ];
+    for (mode, presses, want) in rows {
+        for (i, (l, r)) in presses.into_iter().enumerate() {
+            assert_eq!(mode.applies(l, r), want[i], "{mode:?} left={l} right={r}");
+        }
+    }
+    // Side unknown (neither device bit): only Both can say yes.
+    assert!(OptionAsMeta::Both.applies(false, false));
+    assert!(!OptionAsMeta::Left.applies(false, false));
+    // Both Options held: either side's mode applies.
+    assert!(OptionAsMeta::Left.applies(true, true));
+    assert!(OptionAsMeta::Right.applies(true, true));
+}
+
+#[test]
+fn option_as_meta_is_saved_as_a_string() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "[gui]\noption_as_meta = true\n");
+    let mut c = load_config(dir.path()).unwrap();
+    assert_eq!(
+        Change::OptionAsMeta(OptionAsMeta::Right).apply(&mut c),
+        Some("option_as_meta")
+    );
+    save_changes(dir.path(), &c, &["option_as_meta"]).unwrap();
+    assert!(read(dir.path()).contains("option_as_meta = \"right\""));
+    assert_eq!(
+        load_config(dir.path()).unwrap().option_as_meta,
+        OptionAsMeta::Right
+    );
 }
