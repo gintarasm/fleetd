@@ -1,5 +1,6 @@
 //! Platform-neutral GUI logic: no gpui, no AppKit.
 
+pub mod action_form;
 pub mod approval;
 pub mod backoff;
 pub mod broadcast;
