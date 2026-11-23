@@ -13,6 +13,7 @@ mod search;
 mod skill;
 mod tree;
 mod upgrade;
+mod wt;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -218,6 +219,9 @@ enum Command {
     Wait(mailbox::WaitArgs),
     /// List and run workflow actions
     Action(action::Args),
+    /// Agents in git worktrees: new, ls, diff, archive, prune
+    #[command(name = "wt", alias = "worktree")]
+    Wt(wt::Args),
 }
 
 #[derive(Subcommand)]
@@ -543,6 +547,7 @@ fn run(cli: Cli) -> Result<u8> {
         }
         Command::Report(args) => return report::run(&mut client, &args),
         Command::Action(args) => return action::run(&mut client, args),
+        Command::Wt(args) => return wt::run(&mut client, args),
         Command::Answer(args) => return answer::run(&mut client, &args),
         Command::Pending(args) => return approval::list(&mut client, &args),
         Command::Approve(args) => return approval::decide(&mut client, &args, true),
