@@ -27,6 +27,7 @@ pub mod links;
 pub mod menus;
 pub mod message_lines;
 pub mod mouse;
+pub mod needs_you;
 pub mod new_children;
 pub mod output;
 pub mod palette;

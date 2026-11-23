@@ -37,6 +37,9 @@ pub enum StatusEntry {
     /// last listed agent.
     Header(String),
     Show,
+    /// Shows the agent that has waited longest for you (ADR 0100); listed
+    /// only while some agent needs you.
+    NextNeedsYou,
     Agent {
         id: u64,
         label: String,
@@ -63,6 +66,7 @@ impl StatusEntry {
         match self {
             StatusEntry::Header(text) | StatusEntry::Agent { label: text, .. } => text,
             StatusEntry::Show => "Show fleetd",
+            StatusEntry::NextNeedsYou => "Next agent that needs you",
             StatusEntry::NewAgent => "New agent…",
             StatusEntry::NewTerminal => "New terminal",
             StatusEntry::ClearExited => "Clear exited agents",
@@ -88,11 +92,11 @@ pub fn status_menu(state: &StatusMenuState) -> Vec<StatusEntry> {
     if state.live && state.reconnecting {
         header.push_str(" (reconnecting)");
     }
-    let mut menu = vec![
-        StatusEntry::Header(header),
-        StatusEntry::Show,
-        StatusEntry::Separator,
-    ];
+    let mut menu = vec![StatusEntry::Header(header), StatusEntry::Show];
+    if !state.needs_you.is_empty() {
+        menu.push(StatusEntry::NextNeedsYou);
+    }
+    menu.push(StatusEntry::Separator);
     let mut running: Vec<&AgentRow> = state
         .agents
         .iter()
@@ -354,6 +358,26 @@ mod tests {
         assert_eq!(
             StatusEntry::Notifications(true).title(),
             "Notify when agents need you"
+        );
+    }
+
+    #[test]
+    fn next_needs_you_is_listed_only_while_an_agent_needs_you() {
+        let mut s = state(
+            Target::Local,
+            vec![row(1, "claude", "/tmp", AgentState::Running)],
+        );
+        assert!(!status_menu(&s).contains(&StatusEntry::NextNeedsYou));
+        s.needs_you.insert(1);
+        let menu = status_menu(&s);
+        let at = menu
+            .iter()
+            .position(|e| *e == StatusEntry::NextNeedsYou)
+            .unwrap();
+        assert_eq!(menu[at - 1], StatusEntry::Show);
+        assert_eq!(
+            StatusEntry::NextNeedsYou.title(),
+            "Next agent that needs you"
         );
     }
 }

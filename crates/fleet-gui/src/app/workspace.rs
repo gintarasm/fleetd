@@ -26,8 +26,8 @@ use super::keymap::{
     ClearScrollback, ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, DuplicatePane,
     EditLabelsPane, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
     FocusPane4, FocusRight, FocusUp, Kill, KillPane, KillSelected, NewAgent, NewTab, NewTerminal,
-    NextAgent, NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove, RemoveExited,
-    RemovePane, RemoveSelected, RenamePane, ReopenClosedPane, Restart, RestartPane,
+    NextAgent, NextNeedsYou, NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove,
+    RemoveExited, RemovePane, RemoveSelected, RenamePane, ReopenClosedPane, Restart, RestartPane,
     RestartSelected, SaveOutput, ScrollToBottom, ScrollToTop, SearchAllAgents, SelectAll,
     SelectTab, SendToAgents, ShowShortcuts, SplitDown, SplitRight, ToggleGraph, ToggleMaximize,
     WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
@@ -1684,6 +1684,25 @@ impl Workspace {
         }
     }
 
+    /// ⌘J: shows the next agent that needs you in the focused pane (ADR
+    /// 0100); a short toast when none does. Not over a sheet.
+    pub fn next_needs_you(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let target = {
+            let app = self.app.read(cx);
+            let current = app.layout().agent(app.focused());
+            app.next_needing_you(current)
+        };
+        match target {
+            Some(id) => self.show_agent(id, window, cx),
+            None => self.app.update(cx, |a, cx| {
+                a.show_notice("No agent needs you".to_owned(), cx)
+            }),
+        }
+    }
+
     /// ⇧⌘F: opens Search All Agents (or closes it if open). Not over a
     /// sheet.
     fn search_all_agents(
@@ -3021,6 +3040,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(Self::send_to_agents))
             .on_action(cx.listener(Self::search_all_agents))
+            .on_action(cx.listener(|this, _: &NextNeedsYou, w, cx| this.next_needs_you(w, cx)))
             .on_action(cx.listener(Self::restart_pane))
             .on_action(cx.listener(|this, _: &ZoomIn, w, cx| this.zoom(Zoom::In, w, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, w, cx| this.zoom(Zoom::Out, w, cx)))
@@ -4466,6 +4486,35 @@ mod tests {
             }),
         });
         r
+    }
+
+    /// ⌘J (ADR 0100): shows the agents that need you in turn, wrapping;
+    /// with none, a short toast and the pane unchanged.
+    #[gpui::test]
+    fn cmd_j_walks_the_agents_that_need_you(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let shown = |s: &mut Setup<'_>| s.app.read_with(s.cx, |a, _| a.layout().agent(a.focused()));
+        agents(&mut s, &fake, vec![row(2, "/w", 2)]);
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(
+            s.app.read_with(s.cx, |a, _| a.notice().map(str::to_owned)),
+            Some("No agent needs you".to_owned())
+        );
+        assert_ne!(shown(&mut s), Some(2));
+
+        agents(
+            &mut s,
+            &fake,
+            vec![row(2, "/w", 2), asking(3, 9), asking(4, 10)],
+        );
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(shown(&mut s), Some(3));
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(shown(&mut s), Some(4));
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(shown(&mut s), Some(3));
     }
 
     /// A question (ADR 0078): choices answer from the row and from the
