@@ -14,6 +14,7 @@ use super::controls::{ButtonKind, appear, button, sheet_card};
 use super::icons;
 use super::theme::{Typography, current as theme};
 use super::titlebar_view::sheet_drag_strip;
+use crate::core::bulk::kill_many_question;
 use crate::core::icons::Icon;
 use crate::core::kill::kill_question;
 use crate::core::sidebar::{program_name, tilde};
@@ -31,7 +32,11 @@ pub enum KillEvent {
 }
 
 pub struct KillSheet {
-    pub(crate) agent_id: u64,
+    /// Every agent it kills: one, or the sidebar's selected
+    /// running agents (ADR 0099).
+    pub(crate) agent_ids: Vec<u64>,
+    /// Their names, listed when there are several.
+    pub(crate) names: Vec<SharedString>,
     pub(crate) question: SharedString,
     pub(crate) dont_ask: bool,
     focus: FocusHandle,
@@ -51,11 +56,20 @@ pub fn question(app: &AppState, agent_id: u64) -> String {
 impl KillSheet {
     pub fn new(agent_id: u64, question: String, cx: &mut Context<Self>) -> Self {
         KillSheet {
-            agent_id,
+            agent_ids: vec![agent_id],
+            names: Vec::new(),
             question: question.into(),
             dont_ask: false,
             focus: cx.focus_handle(),
         }
+    }
+
+    /// The sheet for the selection's running agents `ids`, `names` listed.
+    pub fn many(ids: Vec<u64>, names: Vec<String>, cx: &mut Context<Self>) -> Self {
+        let mut sheet = Self::new(0, kill_many_question(ids.len()), cx);
+        sheet.agent_ids = ids;
+        sheet.names = names.into_iter().map(SharedString::from).collect();
+        sheet
     }
 
     /// Takes the keyboard: Return kills, Escape cancels.
@@ -136,6 +150,24 @@ impl Render for KillSheet {
                     .text_color(theme.secondary)
                     .child("Its process is stopped. Closing a pane only detaches."),
             )
+            .when(self.names.len() > 1, |d| {
+                const SHOWN: usize = 8;
+                let more = self.names.len().saturating_sub(SHOWN);
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .type_style(text::CALLOUT)
+                        .children(self.names.iter().take(SHOWN).cloned())
+                        .when(more > 0, |l| {
+                            l.child(
+                                div()
+                                    .text_color(theme.secondary)
+                                    .child(format!("and {more} more")),
+                            )
+                        }),
+                )
+            })
             .child(checkbox)
             .child(
                 div()

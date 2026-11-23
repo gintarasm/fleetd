@@ -25,11 +25,12 @@ use super::graph_view::{GraphEvent, GraphView};
 use super::keymap::{
     ClearScrollback, ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, DuplicatePane,
     EditLabelsPane, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
-    FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent,
-    NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove, RemoveExited, RemovePane,
-    RenamePane, ReopenClosedPane, Restart, RestartPane, SaveOutput, ScrollToBottom, ScrollToTop,
-    SearchAllAgents, SelectAll, SelectTab, SendToAgents, ShowShortcuts, SplitDown, SplitRight,
-    ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+    FocusPane4, FocusRight, FocusUp, Kill, KillPane, KillSelected, NewAgent, NewTab, NewTerminal,
+    NextAgent, NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove, RemoveExited,
+    RemovePane, RemoveSelected, RenamePane, ReopenClosedPane, Restart, RestartPane,
+    RestartSelected, SaveOutput, ScrollToBottom, ScrollToTop, SearchAllAgents, SelectAll,
+    SelectTab, SendToAgents, ShowShortcuts, SplitDown, SplitRight, ToggleGraph, ToggleMaximize,
+    WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::labels_sheet::{LabelsEvent, LabelsSheet};
@@ -52,7 +53,8 @@ use super::text_field::TextField;
 use super::theme::{Theme, Typography, appearance_of};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use super::{controls, keymap};
-use crate::core::broadcast::{RowClick, RowSelection, sendable};
+use crate::core::broadcast::{RowClick, RowSelection, sendable, target_name};
+use crate::core::bulk::{BulkAction, BulkTargets};
 use crate::core::config::{GuiConfig, save_confirm_kill, save_connection};
 use crate::core::drag_drop::DropTarget;
 use crate::core::feedback::{self, Tween};
@@ -61,7 +63,8 @@ use crate::core::kill::{KillFlow, kill_flow};
 use crate::core::labels::chip_filter;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
-    MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, group_menu, pane_menu, row_menu,
+    MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, bulk_entries, group_menu, pane_menu,
+    row_menu,
 };
 use crate::core::palette::{Entry, PaletteState, palette_items, remove_exited_prompt};
 use crate::core::picker::Recents;
@@ -1147,11 +1150,20 @@ impl Workspace {
     /// handled).
     pub fn open_row_menu(&mut self, agent_id: u64, cx: &mut Context<Self>) {
         let items = self.menu_items(agent_id, cx);
-        let lines = context_menu::lines(&items, |item| MenuLine {
-            title: item.title().to_owned(),
-            enabled: true,
-            shortcut: None,
-            checked: false,
+        let bulk = self.bulk_targets(cx);
+        let lines = context_menu::lines(&items, |item| {
+            let action = match item {
+                RowMenuItem::KillSelected => Some(BulkAction::Kill),
+                RowMenuItem::RestartSelected => Some(BulkAction::Restart),
+                RowMenuItem::RemoveSelected => Some(BulkAction::Remove),
+                _ => None,
+            };
+            MenuLine {
+                title: action.map_or_else(|| item.title().to_owned(), |a| a.menu_title(&bulk)),
+                enabled: action.is_none_or(|a| a.disabled_reason(&bulk).is_none()),
+                shortcut: None,
+                checked: false,
+            }
         });
         let epoch = self.epoch;
         context_menu::show(lines, cx, move |index, cx| {
@@ -1195,6 +1207,9 @@ impl Workspace {
             RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
             RowMenuItem::Restart => self.restart(&Restart { agent_id }, window, cx),
             RowMenuItem::Remove => self.remove(&Remove { agent_id }, window, cx),
+            RowMenuItem::KillSelected => self.bulk(BulkAction::Kill, window, cx),
+            RowMenuItem::RestartSelected => self.bulk(BulkAction::Restart, window, cx),
+            RowMenuItem::RemoveSelected => self.bulk(BulkAction::Remove, window, cx),
         }
     }
 
@@ -1655,6 +1670,7 @@ impl Workspace {
         let pane = app.focused();
         let view = app.pane_view(pane).map(|v| v.read(cx));
         let agent = app.layout().agent(pane);
+        let bulk = self.bulk_targets(cx);
         PaletteState {
             panes: app.layout().panes().len(),
             tabs: app.tabs().len(),
@@ -1663,6 +1679,8 @@ impl Workspace {
             restartable: view.is_some_and(|v| v.restartable()),
             has_selection: view.is_some_and(|v| v.has_selection()),
             any_running: app.agents.iter().any(sendable),
+            selected_running: bulk.running.len(),
+            selected_ended: bulk.ended.len(),
         }
     }
 
@@ -1942,7 +1960,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let KillEvent::Kill { dont_ask } = *event {
-            let agent_id = sheet.read(cx).agent_id;
+            let agent_ids = sheet.read(cx).agent_ids.clone();
             self.app.update(cx, |a, _| {
                 if dont_ask {
                     a.config.confirm_kill = false;
@@ -1950,12 +1968,79 @@ impl Workspace {
                         eprintln!("fleet-gui: cannot save confirm_kill: {e}");
                     }
                 }
-                a.kill(agent_id);
+                for id in agent_ids {
+                    a.kill(id);
+                }
             });
         }
         self.kill = None;
         self.focus_current(window, cx);
         cx.notify();
+    }
+
+    /// The sidebar's selection (of several rows) split by what Kill,
+    /// Restart and Remove fit (ADR 0099).
+    fn bulk_targets(&self, cx: &App) -> BulkTargets {
+        if self.row_selection.ids().len() < 2 {
+            return BulkTargets::default();
+        }
+        BulkTargets::of(self.row_selection.ids(), &self.app.read(cx).agents)
+    }
+
+    /// Kill / Restart / Remove for the selected agents each fits. Kill
+    /// asks once, listing the names (unless `[gui] confirm_kill` is off);
+    /// the others act at once, as their single-agent forms do.
+    fn bulk(&mut self, action: BulkAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let targets = self.bulk_targets(cx);
+        let ids = action.targets(&targets).to_vec();
+        if ids.is_empty() {
+            return;
+        }
+        match action {
+            BulkAction::Kill => {
+                let app = self.app.read(cx);
+                match kill_flow(app.config.confirm_kill) {
+                    KillFlow::Kill => ids.iter().for_each(|&id| app.kill(id)),
+                    KillFlow::Ask => {
+                        let names = ids
+                            .iter()
+                            .filter_map(|id| app.agents.iter().find(|r| r.info.id == *id))
+                            .map(target_name)
+                            .collect();
+                        let sheet = cx.new(|cx| KillSheet::many(ids, names, cx));
+                        let sub = cx.subscribe_in(&sheet, window, Self::kill_event);
+                        sheet.read(cx).focus(window);
+                        self.kill = Some((sheet, sub));
+                    }
+                }
+            }
+            BulkAction::Restart => {
+                let app = self.app.read(cx);
+                ids.iter().for_each(|&id| app.restart(id));
+            }
+            BulkAction::Remove => self.app.read(cx).forget_many(ids),
+        }
+        cx.notify();
+    }
+
+    fn kill_selected(&mut self, _: &KillSelected, window: &mut Window, cx: &mut Context<Self>) {
+        self.bulk(BulkAction::Kill, window, cx);
+    }
+
+    fn restart_selected(
+        &mut self,
+        _: &RestartSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bulk(BulkAction::Restart, window, cx);
+    }
+
+    fn remove_selected(&mut self, _: &RemoveSelected, window: &mut Window, cx: &mut Context<Self>) {
+        self.bulk(BulkAction::Remove, window, cx);
     }
 
     /// ⌘⇧W, a pane header's Stop or its menu's Kill Agent: kills `pane`'s
@@ -2337,11 +2422,15 @@ impl Workspace {
         let app = self.app.read(cx);
         let is_ended = app.agents.iter().any(|r| r.info.id == agent_id && ended(r));
         let in_selection = self.row_selection.targets_from(agent_id).len() > 1;
-        row_menu(
+        let mut items = row_menu(
             app.layout().panes().len() < MAX_PANES,
             is_ended,
             in_selection,
-        )
+        );
+        if in_selection {
+            items.extend(bulk_entries());
+        }
+        items
     }
 
     /// The exit toasts (#44), bottom centre, newest at the bottom: what
@@ -2918,6 +3007,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::remove_exited))
+            .on_action(cx.listener(Self::kill_selected))
+            .on_action(cx.listener(Self::restart_selected))
+            .on_action(cx.listener(Self::remove_selected))
             .on_action(cx.listener(|this, _: &SaveOutput, _, cx| {
                 this.output_focused(PaneMenuItem::SaveOutput, cx)
             }))
@@ -3753,7 +3845,10 @@ mod tests {
     /// The agent the kill question is open for.
     fn kill_asked(s: &mut Setup<'_>) -> Option<u64> {
         s.cx.run_until_parked();
-        s.ws.read_with(s.cx, |w, cx| w.kill_sheet().map(|k| k.read(cx).agent_id))
+        s.ws.read_with(s.cx, |w, cx| {
+            w.kill_sheet()
+                .and_then(|k| k.read(cx).agent_ids.first().copied())
+        })
     }
 
     fn hover(s: &mut Setup<'_>, selector: &'static str) {
@@ -5568,6 +5663,85 @@ mod tests {
         assert!(!s.ws.read_with(s.cx, |w, _| w.row_selection().is_empty()));
         s.cx.simulate_keystrokes("escape");
         assert!(s.ws.read_with(s.cx, |w, _| w.row_selection().is_empty()));
+    }
+
+    /// Selects `ids` in the sidebar, as ⌘-clicks do.
+    fn select_rows(s: &mut Setup<'_>, ids: &[u64]) {
+        s.ws.update(s.cx, |w, _| {
+            for &id in ids {
+                w.row_selection.click(id, true, false, ids, None);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn bulk_menu_items_come_with_a_selection_of_several(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        assert!(!row_items(&mut s, 1).contains(&RowMenuItem::KillSelected));
+        select_rows(&mut s, &[1, 2]);
+        let items = row_items(&mut s, 1);
+        assert!(items.contains(&RowMenuItem::KillSelected));
+        assert!(items.contains(&RowMenuItem::RestartSelected));
+        assert!(items.contains(&RowMenuItem::RemoveSelected));
+    }
+
+    #[gpui::test]
+    fn kill_selected_asks_once_and_kills_only_the_running(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                row(1, "/a", 1),
+                row(2, "/b", 2),
+                ended(3, "/c", 3, AgentState::Exited),
+            ],
+        );
+        select_rows(&mut s, &[1, 2, 3]);
+        pick_row(&mut s, 1, RowMenuItem::KillSelected);
+        let question = s.ws.read_with(s.cx, |w, cx| {
+            w.kill_sheet().unwrap().read(cx).question.to_string()
+        });
+        assert_eq!(question, "Kill 2 agents?");
+        assert!(kills(&fake).is_empty());
+        click(&mut s, "kill-confirm");
+        assert_eq!(kill_asked(&mut s), None);
+        assert_eq!(kills(&fake), [1, 2]);
+    }
+
+    #[gpui::test]
+    fn restart_and_remove_selected_act_on_the_exited(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                row(1, "/a", 1),
+                ended(2, "/b", 2, AgentState::Exited),
+                ended(3, "/c", 3, AgentState::Lost),
+            ],
+        );
+        select_rows(&mut s, &[1, 2, 3]);
+        pick_row(&mut s, 1, RowMenuItem::RestartSelected);
+        let restarts: Vec<_> = fake
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Restart(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restarts, [2, 3]);
+        pick_row(&mut s, 1, RowMenuItem::RemoveSelected);
+        assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![2, 3])));
+        assert_eq!(kill_asked(&mut s), None);
     }
 
     #[gpui::test]

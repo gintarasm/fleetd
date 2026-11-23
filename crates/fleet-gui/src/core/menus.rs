@@ -46,6 +46,12 @@ pub enum RowMenuItem {
     Kill,
     Restart,
     Remove,
+    /// Kill every running agent of the sidebar's selection (ADR 0099).
+    KillSelected,
+    /// Restart every exited agent of the selection.
+    RestartSelected,
+    /// Remove every exited agent of the selection.
+    RemoveSelected,
 }
 
 impl RowMenuItem {
@@ -64,8 +70,23 @@ impl RowMenuItem {
             RowMenuItem::Kill => "Kill…",
             RowMenuItem::Restart => "Restart",
             RowMenuItem::Remove => "Remove",
+            // The row menu names the count (`core::bulk`).
+            RowMenuItem::KillSelected => "Kill Selected…",
+            RowMenuItem::RestartSelected => "Restart Selected Exited",
+            RowMenuItem::RemoveSelected => "Remove Selected Exited",
         }
     }
+}
+
+/// What a row in a selection of several adds to its menu (ADR 0099):
+/// Kill, Restart and Remove for the selection.
+pub fn bulk_entries() -> Vec<MenuEntry<RowMenuItem>> {
+    vec![
+        MenuEntry::Separator,
+        MenuEntry::Item(RowMenuItem::KillSelected),
+        MenuEntry::Item(RowMenuItem::RestartSelected),
+        MenuEntry::Item(RowMenuItem::RemoveSelected),
+    ]
 }
 
 /// A row's menu: Open in New Split (while a pane can be added), Rename…,
