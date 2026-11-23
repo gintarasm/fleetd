@@ -77,6 +77,11 @@ actions!(
         SearchAllAgents,
         // ⌘J: the next agent that needs you (ADR 0100).
         NextNeedsYou,
+        // The graph's terminal panel (ADR 0105).
+        OpenAgentPanel,
+        OpenInMainView,
+        BackToGraph,
+        ToggleChildren,
     ]
 );
 
@@ -117,6 +122,12 @@ pub const TERMINAL_CONTEXT: &str = "Terminal";
 pub const FINDING_CONTEXT: &str = "Terminal && finding";
 /// The identifier a pane adds to its key context while its find bar is open.
 pub const FINDING: &str = "finding";
+/// The graph's own keys: in the graph, not in its filter field.
+pub const GRAPH_KEYS_CONTEXT: &str = "Graph && !TextField";
+/// Key context of the graph's terminal panel (ADR 0105).
+pub const GRAPH_PANEL_CONTEXT: &str = "GraphPanel";
+/// The panel's Esc: not while the terminal's find bar is open.
+pub const GRAPH_PANEL_KEYS_CONTEXT: &str = "GraphPanel && !finding";
 /// Key context of a text field.
 pub const TEXT_FIELD_CONTEXT: &str = "TextField";
 
@@ -204,6 +215,16 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-0", ZoomReset, None),
         KeyBinding::new("cmd-shift-t", ReopenClosedPane, None),
         KeyBinding::new("cmd-/", ShowShortcuts, None),
+        // The graph (ADR 0073) and its terminal panel (ADR 0105). Not in
+        // the graph's filter field, which types them.
+        KeyBinding::new("space", OpenAgentPanel, Some(GRAPH_KEYS_CONTEXT)),
+        KeyBinding::new("enter", OpenAgentPanel, Some(GRAPH_KEYS_CONTEXT)),
+        KeyBinding::new("cmd-enter", OpenInMainView, Some(GRAPH_KEYS_CONTEXT)),
+        KeyBinding::new("c", ToggleChildren, Some(GRAPH_KEYS_CONTEXT)),
+        // In the panel: Esc gives the keys back to the graph (unless the
+        // terminal's find bar is open: its Esc closes it).
+        KeyBinding::new("escape", BackToGraph, Some(GRAPH_PANEL_KEYS_CONTEXT)),
+        KeyBinding::new("cmd-enter", OpenInMainView, Some(GRAPH_PANEL_CONTEXT)),
     ]);
 }
 

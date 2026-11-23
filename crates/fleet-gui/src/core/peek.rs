@@ -115,7 +115,18 @@ pub struct Fit {
 }
 
 pub fn fit(grid: (u16, u16), cell: (f32, f32), font: f32, window: (f32, f32)) -> Fit {
-    let (max_w, max_h) = (window.0 * MAX_SHARE, window.1 * MAX_SHARE);
+    fit_within(
+        grid,
+        cell,
+        font,
+        (window.0 * MAX_SHARE, window.1 * MAX_SHARE),
+    )
+}
+
+/// [`fit`] in a room of `room` pixels (all of it, not a share): the graph's
+/// terminal panel (ADR 0105).
+pub fn fit_within(grid: (u16, u16), cell: (f32, f32), font: f32, room: (f32, f32)) -> Fit {
+    let (max_w, max_h) = (room.0.max(0.0), room.1.max(0.0));
     let (cols, rows) = (f32::from(grid.0.max(1)), f32::from(grid.1.max(1)));
     let (w, h) = (cols * cell.0, rows * cell.1);
     if w <= 0.0 || h <= 0.0 || font <= 0.0 {

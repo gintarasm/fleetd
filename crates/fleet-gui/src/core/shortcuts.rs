@@ -47,7 +47,8 @@ pub fn cheat_sheet<'a>(bindings: impl IntoIterator<Item = Binding<'a>>) -> Vec<S
             // A terminal binding narrowed further ("Terminal && finding").
             Some(c) if c == "Terminal" || c.starts_with("Terminal &&") => "Terminal".to_owned(),
             Some("TextField") => "Text Fields".to_owned(),
-            Some(other) => humanize(other),
+            // A narrowed context ("Graph && !TextField") is its first name's.
+            Some(other) => humanize(other.split(" &&").next().unwrap_or(other).trim()),
         };
         let index = match sections.iter().position(|s| s.title == title) {
             Some(i) => i,

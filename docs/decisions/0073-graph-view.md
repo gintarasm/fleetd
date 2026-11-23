@@ -1,6 +1,6 @@
 # 0073 — The graph view
 
-**Status:** accepted · 2026-11-16 (builder's decisions within spec §7 of the [M3 design](../superpowers/specs/2026-11-16-m3-satellite-design.md); issue #103)
+**Status:** accepted · 2026-11-16 (builder's decisions within spec §7 of the [M3 design](../superpowers/specs/2026-11-16-m3-satellite-design.md); issue #103) · keys amended by [0105](0105-gui-graph-terminal-panel.md) (⏎/Space open the terminal panel, ⌘⏎ or a double-click opens, C collapses)
 
 **Builds on:** [0074](0074-sidebar-tree-and-fleet-tree.md) (the shared tree), [0033](0033-satellite-milestone.md) (the view's purpose and keys), [0025](0025-core-knows-agents-workflows-own-hierarchy.md) (`fleet.parent`, `project` label), [0042](0042-gui-agent-status.md) (inferred status), [0071](0071-kill-escalates-and-shells-are-not-agents.md) (kill escalation), [0014](0014-performance-gate.md) (benchmarks).
 

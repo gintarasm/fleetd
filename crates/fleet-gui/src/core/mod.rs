@@ -16,6 +16,7 @@ pub mod git;
 pub mod glass;
 pub mod graph;
 pub mod graph_layout;
+pub mod graph_panel;
 pub mod icons;
 pub mod identity;
 pub mod keyboard_nav;

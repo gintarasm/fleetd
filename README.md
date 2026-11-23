@@ -479,12 +479,15 @@ Agents that spawn agents (see [Agents that spawn agents](#agents-that-spawn-agen
 |---|---|
 | ← / → | parent / first child |
 | ↑ / ↓ | the card above / below in the same column |
-| Space | collapse or expand the subtree |
-| ⏎ or click | open the agent (closes the graph and focuses its pane) |
-| Esc | back to the panes without opening |
+| click | select the card (an open terminal panel follows) |
+| Space or ⏎ | open the **terminal panel** for the selected card, or give it the keys |
+| ⌘⏎ or double-click | open the agent (closes the graph and focuses its pane) |
+| C | collapse or expand the subtree |
+| Esc | close the terminal panel; with no panel, back to the panes without opening |
 | ⌫ | **Stop subtree**: asks first (always), then kills each running agent, deepest first |
 | ⇧⌫ | **Remove subtree**: only when everything in it has ended; asks first when it is more than one agent |
 
+- **Terminal panel:** the selected agent's live terminal, docked to the right of the graph (over it in a narrow window). Type into it, scroll, find (⌘F) and copy as in a pane; it never resizes the agent or changes your panes. Esc in it gives the keys back to the graph, Esc again closes it. Drag its left edge to resize it (kept for the session; double-click resets). Its title shows the agent's state and has *Open in Pane*, *Actions…* (the row menu) and a close button. An agent that exits keeps its last screen, marked *Exited*.
 - **Message lines:** while the graph is shown, a line with an arrowhead joins two agents when one messaged the other (`message`, `question` or `answer`; not status or exit reports, and not messages to or from you). Lines are accent-coloured, fade over 5 minutes, and show the newest 24 pairs. They appear within about 2 s. No message text is shown.
 - **Spawn refused:** a spawn over a quota shows on the parent's card for a few seconds.
 

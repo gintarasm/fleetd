@@ -10,6 +10,7 @@ mod context_menu;
 mod controls;
 mod ended_view;
 mod fonts;
+mod graph_panel;
 mod graph_view;
 mod icons;
 mod keymap;
