@@ -40,7 +40,7 @@ pub(crate) fn ended_bar(
         theme.danger
     };
     let button = |id: &'static str, icon: Option<Icon>, label: &'static str, primary: bool| {
-        let fg = if primary { gpui::white() } else { theme.text };
+        let fg = if primary { theme.on_accent } else { theme.text };
         div()
             .id(id)
             .debug_selector(move || format!("pane-{number}-{id}"))

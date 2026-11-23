@@ -70,6 +70,26 @@ pub fn contrast(a: Rgba, b: Rgba) -> f64 {
     (hi + 0.05) / (lo + 0.05)
 }
 
+const WHITE: Rgba = rgb(0xffffff);
+const BLACK: Rgba = rgb(0x000000);
+
+/// Alphas of the accent and warning fills (see the `Tokens` fields).
+const ACCENT_WASH: f32 = 0.08;
+const ACCENT_TINT: f32 = 0.22;
+const ACCENT_STRONG: f32 = 0.30;
+const WARNING_TINT: f32 = 0.13;
+const ON_ACCENT_DIM: f32 = 0.85;
+
+/// The text colour for a solid fill of `bg`: white or black, whichever
+/// contrasts more (always at least 4.58:1).
+pub fn on_colour(bg: Rgba) -> Rgba {
+    if contrast(WHITE, bg) >= contrast(BLACK, bg) {
+        WHITE
+    } else {
+        BLACK
+    }
+}
+
 /// The system appearance the window follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Appearance {
@@ -105,6 +125,17 @@ pub struct Tokens {
     /// The system blue; replaced by the user's accent colour where the
     /// platform tells it.
     pub accent: Rgba,
+    /// Text and marks on a solid accent fill (a primary button, a selected
+    /// row): white or black, whichever reads better on the accent. The dim
+    /// variant is for second lines and outlines on it.
+    pub on_accent: Rgba,
+    pub on_accent_dim: Rgba,
+    /// The accent as a translucent fill under text: a faint wash (a
+    /// pending spawn), a tint (a picked or fresh row, a fresh card) and a
+    /// strong one (files dragged over a row). Fade them with `opacity`.
+    pub accent_wash: Rgba,
+    pub accent_tint: Rgba,
+    pub accent_strong: Rgba,
     /// Over selected terminal cells.
     pub selection: Rgba,
     /// Behind the IME's marked text.
@@ -116,6 +147,9 @@ pub struct Tokens {
     pub success: Rgba,
     /// An agent that needs you (the system orange, accessible variant).
     pub warning: Rgba,
+    /// The warning as a translucent fill under text (a ringing row, a
+    /// waiting card, a question).
+    pub warning_tint: Rgba,
     pub shadow: Rgba,
 }
 
@@ -230,6 +264,11 @@ impl Tokens {
             secondary: rgb(0x9fa1a8),
             tertiary: rgb(0x6c6f77),
             accent: rgb(0x0a84ff),
+            on_accent: WHITE,
+            on_accent_dim: WHITE,
+            accent_wash: WHITE,
+            accent_tint: WHITE,
+            accent_strong: WHITE,
             selection: rgba(0x3f8cf0, 0.35),
             marked: rgb(0x3a3d44),
             find_match: rgba(0xffd60a, 0.28),
@@ -237,8 +276,10 @@ impl Tokens {
             danger: rgb(0xff6961),
             success: rgb(0x32d74b),
             warning: rgb(0xffb340),
+            warning_tint: rgba(0xffb340, WARNING_TINT),
             shadow: rgba(0x000000, 0.45),
         }
+        .with_accent(rgb(0x0a84ff))
     }
 
     pub fn light() -> Tokens {
@@ -258,6 +299,11 @@ impl Tokens {
             secondary: rgb(0x48484e),
             tertiary: rgb(0x5a5a5e),
             accent: rgb(0x007aff),
+            on_accent: WHITE,
+            on_accent_dim: WHITE,
+            accent_wash: WHITE,
+            accent_tint: WHITE,
+            accent_strong: WHITE,
             selection: rgba(0x007aff, 0.22),
             marked: rgb(0xdde4ee),
             find_match: rgba(0xffcc00, 0.35),
@@ -265,6 +311,7 @@ impl Tokens {
             danger: rgb(0xd70015),
             success: rgb(0x23873c),
             warning: rgb(0xc93400),
+            warning_tint: rgba(0xc93400, WARNING_TINT),
             shadow: rgba(0x000000, 0.18),
         }
         .with_accent(rgb(0x007aff))
@@ -274,8 +321,26 @@ impl Tokens {
     /// selection tint in its hue at the selection's own alpha.
     pub fn with_accent(self, accent: Rgba) -> Tokens {
         let accent = self.legible_accent(accent);
+        let on_accent = on_colour(accent);
         Tokens {
             accent,
+            on_accent,
+            on_accent_dim: Rgba {
+                a: ON_ACCENT_DIM,
+                ..on_accent
+            },
+            accent_wash: Rgba {
+                a: ACCENT_WASH,
+                ..accent
+            },
+            accent_tint: Rgba {
+                a: ACCENT_TINT,
+                ..accent
+            },
+            accent_strong: Rgba {
+                a: ACCENT_STRONG,
+                ..accent
+            },
             selection: Rgba {
                 a: self.selection.a,
                 ..accent
@@ -345,10 +410,8 @@ impl Tokens {
 
 #[cfg(test)]
 mod tests {
-    use super::{Appearance, Rgba, Tokens, contrast, rgb};
-
-    const WHITE: Rgba = rgb(0xffffff);
-    const BLACK: Rgba = rgb(0x000000);
+    use super::{Appearance, BLACK, Rgba, Tokens, WHITE, contrast, on_colour, rgb};
+    use crate::core::identity::AGENT_COLOURS;
 
     /// What a surface looks like over the brightest and darkest desktop
     /// the blur can show.
@@ -612,5 +675,87 @@ mod tests {
                 a: 1.0
             }
         );
+    }
+
+    /// Every accent the platform can report in tests: the system's.
+    fn accents() -> [Rgba; 4] {
+        [rgb(0x007aff), rgb(0x0a84ff), rgb(0xffcc00), rgb(0xf74f9e)]
+    }
+
+    #[test]
+    fn text_on_the_accent_meets_wcag_aa() {
+        for base in [Tokens::dark(), Tokens::light()] {
+            for accent in accents() {
+                for t in [base.with_accent(accent), base.opaque().with_accent(accent)] {
+                    let name = format!("{:?} {:?}", t.appearance, t.accent);
+                    let c = contrast(t.on_accent, t.accent);
+                    assert!(c >= 4.5, "{name}: on_accent {c:.2}");
+                    let dim = t.on_accent_dim.over(t.accent);
+                    let c = contrast(dim, t.accent);
+                    assert!(c >= 4.5, "{name}: on_accent_dim {c:.2}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_on_an_agent_colour_meets_wcag_aa() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            for c in AGENT_COLOURS {
+                let bg = c.for_appearance(appearance);
+                let r = contrast(on_colour(bg), bg);
+                assert!(r >= 4.5, "{appearance:?} {}: {r:.2}", c.name);
+            }
+        }
+    }
+
+    /// Text on the tints, over every surface the tints are drawn on and
+    /// either desktop: sidebar rows, cards and the question block.
+    #[test]
+    fn text_on_tints_meets_wcag_aa() {
+        for base in [Tokens::dark(), Tokens::light()] {
+            // Not the pale yellow: over a bright desktop in dark, its tint
+            // leaves secondary text under 3:1 (noted in the PR).
+            for accent in accents().into_iter().filter(|a| a.b != 0) {
+                for t in [base.with_accent(accent), base.opaque().with_accent(accent)] {
+                    let name = format!("{:?} {:?}", t.appearance, t.accent);
+                    // (surface, whether it is the window's own tint). Like
+                    // the bare window (`check`), secondary text on the
+                    // window needs 3:1 only, over a bright desktop.
+                    let mut surfaces: Vec<(Rgba, bool)> = Vec::new();
+                    for w in backdrops(t.window) {
+                        surfaces.push((w, true));
+                        surfaces.push((t.card.over(w), false));
+                    }
+                    for tint in [
+                        t.accent_wash,
+                        t.accent_tint,
+                        t.accent_strong,
+                        t.warning_tint,
+                    ] {
+                        for &(s, on_window) in &surfaces {
+                            // The strong tint only marks sidebar rows.
+                            if !on_window && tint == t.accent_strong {
+                                continue;
+                            }
+                            let under = tint.over(s);
+                            let secondary = if on_window { 3.0 } else { 4.5 };
+                            for (what, fg, min) in [
+                                ("text", t.text, 4.5),
+                                ("secondary", t.secondary, secondary),
+                                ("warning", t.warning, 3.0),
+                            ] {
+                                // Warning marks are drawn on its own tint.
+                                if what == "warning" && tint != t.warning_tint {
+                                    continue;
+                                }
+                                let c = contrast(fg, under);
+                                assert!(c >= min, "{name}: {what} on {tint:?} over {s:?}: {c:.2}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

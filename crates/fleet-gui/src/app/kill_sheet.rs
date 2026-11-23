@@ -124,7 +124,7 @@ impl Render for KillSheet {
             .border_color(if checked { theme.accent } else { theme.border })
             .when(checked, |b| {
                 b.bg(theme.accent)
-                    .child(icons::sized(Icon::Check, 11.0).text_color(gpui::white()))
+                    .child(icons::sized(Icon::Check, 11.0).text_color(theme.on_accent))
             })
             .when(!checked, |b| b.bg(theme.field));
         let checkbox = tab_stop(div().id("dont-ask"), &theme)

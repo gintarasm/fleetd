@@ -874,7 +874,7 @@ fn pill(
         .child(label)
         .map(|p| {
             if selected {
-                p.bg(theme.accent).text_color(gpui::white())
+                p.bg(theme.accent).text_color(theme.on_accent)
             } else {
                 p.border_1()
                     .border_color(theme.border)
