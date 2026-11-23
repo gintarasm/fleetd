@@ -40,6 +40,7 @@ use super::output;
 use super::palette::{command_action, command_shortcut};
 use super::pane_drag::PaneDrag;
 use super::pane_view::{PaneEvent, PaneView};
+use super::peek_view::{self, PeekEvent, PeekView};
 use super::picker_view::{PickerEvent, PickerView};
 use super::rename::{RenameEvent, RenameSheet};
 use super::search_all_view::{SearchAllEvent, SearchAllView};
@@ -67,6 +68,7 @@ use crate::core::menus::{
     row_menu,
 };
 use crate::core::palette::{Entry, PaletteState, palette_items, remove_exited_prompt};
+use crate::core::peek::sidebar_target;
 use crate::core::picker::Recents;
 use crate::core::presets::{Prefill, preset_request};
 use crate::core::question::open_question;
@@ -226,6 +228,8 @@ pub struct Workspace {
     choosers_drawn: bool,
     /// The agent switcher (⌃Tab), while it is open.
     switcher: Option<Switcher>,
+    /// The peek (ADR 0103), while open.
+    peek: Option<(Entity<PeekView>, Subscription)>,
     /// The agents the focused pane showed, most recent first.
     agent_mru: AgentMru,
     /// The connect sheet, over everything else.
@@ -302,6 +306,7 @@ impl Workspace {
                     | this.send.take().is_some()
                     | this.palette.take().is_some()
                     | this.switcher.take().is_some()
+                    | this.peek.take().is_some()
                 {
                     this.focus_current(window, cx);
                 }
@@ -382,6 +387,7 @@ impl Workspace {
             choosers: HashMap::new(),
             choosers_drawn: false,
             switcher: None,
+            peek: None,
             agent_mru: AgentMru::default(),
             connect: None,
             epoch,
@@ -459,9 +465,13 @@ impl Workspace {
         if !self.graph_shown {
             return;
         }
-        // Answering stays in the graph.
+        // Answering and peeking stay in the graph.
         if let GraphEvent::Answer(id) = *event {
             self.open_answer(id, window, cx);
+            return;
+        }
+        if let GraphEvent::Peek(id) = *event {
+            self.open_peek(id, window, cx);
             return;
         }
         self.graph_shown = false;
@@ -582,6 +592,7 @@ impl Workspace {
             || self.palette.is_some()
             || self.switcher.is_some()
             || self.search_all.is_some()
+            || self.peek.is_some()
     }
 
     pub fn kill_sheet(&self) -> Option<&Entity<KillSheet>> {
@@ -641,6 +652,7 @@ impl Workspace {
         self.palette = None;
         self.switcher = None;
         self.search_all = None;
+        self.close_peek(window, cx);
         if let Some((sheet, _)) = &self.connect {
             let sheet = sheet.clone();
             sheet.update(cx, |s, cx| {
@@ -986,6 +998,70 @@ impl Workspace {
             .update(cx, |a, cx| a.drop_paths_on_agent(agent, &paths, cx));
     }
 
+    /// The peek, while it is open (ADR 0103).
+    pub fn peek(&self) -> Option<&Entity<PeekView>> {
+        self.peek.as_ref().map(|(p, _)| p)
+    }
+
+    /// Peeks at `agent_id` in a popover, without changing the layout. One
+    /// peek at a time: another one open is replaced. Not over a sheet.
+    pub fn open_peek(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.peek.is_none() && self.modal() {
+            return;
+        }
+        if !self
+            .app
+            .read(cx)
+            .agents
+            .iter()
+            .any(|r| r.info.id == agent_id)
+        {
+            return;
+        }
+        let app = self.app.clone();
+        let view = cx.new(|cx| PeekView::new(app, agent_id, cx));
+        let sub = cx.subscribe_in(&view, window, Self::peek_event);
+        view.read(cx).focus(window, cx);
+        self.peek = Some((view, sub));
+        cx.notify();
+    }
+
+    /// Closes the peek, and gives the keyboard back to the graph or the
+    /// focused pane.
+    fn close_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.peek.take().is_none() {
+            return;
+        }
+        self.app.update(cx, |a, cx| a.close_peek(cx));
+        if self.graph_shown {
+            self.graph.0.read(cx).focus(window);
+        } else {
+            self.focus_current(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn peek_event(
+        &mut self,
+        _: &Entity<PeekView>,
+        event: &PeekEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match *event {
+            PeekEvent::Close => self.close_peek(window, cx),
+            PeekEvent::OpenInPane(id) => {
+                self.close_peek(window, cx);
+                if self.graph_shown {
+                    self.graph_shown = false;
+                    self.watch_message_lines(cx);
+                }
+                self.show_agent(id, window, cx);
+                cx.notify();
+            }
+        }
+    }
+
     /// The sidebar's groups under its filter and the target's collapsed
     /// groups.
     fn sidebar_groups(&self, cx: &App) -> Vec<SidebarGroup> {
@@ -1038,6 +1114,16 @@ impl Workspace {
         if ev.keystroke.key == "escape" {
             self.row_selection.clear();
             self.focus_current(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        // Space peeks at the selected row, as Quick Look (ADR 0103).
+        if ev.keystroke.key == "space"
+            && !m.alt
+            && !m.shift
+            && let Some(id) = sidebar_target(&self.row_selection)
+        {
+            self.open_peek(id, window, cx);
             cx.stop_propagation();
             return;
         }
@@ -3058,6 +3144,11 @@ impl Render for Workspace {
             .children(palette)
             .children(search_all)
             .children(switcher)
+            .children(
+                self.peek
+                    .as_ref()
+                    .map(|(p, _)| peek_view::render_over(p, reduce_motion)),
+            )
             .children(sheet)
             .children(rename)
             .children(answer)
@@ -7884,5 +7975,112 @@ mod tests {
         s.cx.run_until_parked();
         assert!(s.cx.debug_bounds("graph-card-3-new").is_some());
         assert!(s.cx.debug_bounds("graph-card-2-new").is_none());
+    }
+
+    fn peeked(s: &mut Setup<'_>) -> Option<u64> {
+        s.ws.read_with(s.cx, |w, cx| w.peek().map(|p| p.read(cx).agent()))
+    }
+
+    #[gpui::test]
+    fn space_peeks_at_the_selected_row_without_changing_the_layout(cx: &mut TestAppContext) {
+        use crate::core::peek::PEEK_PANE;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+        // No selection: Space starts the filter, as before.
+        s.ws.update_in(s.cx, |w, window, cx| w.focus_sidebar(window, cx));
+        s.cx.simulate_keystrokes("space");
+        assert_eq!(peeked(&mut s), None);
+        s.ws.update_in(s.cx, |w, window, cx| {
+            w.filter_field
+                .update(cx, |f, cx| f.set_text(String::new(), cx));
+            w.focus_sidebar(window, cx);
+        });
+        let at = center(&mut s, "tab-2");
+        s.cx.simulate_click(at, Modifiers::command());
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("space");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), Some(2));
+        assert!(s.cx.debug_bounds("peek").is_some());
+        assert!(fake.calls().contains(&Call::Open(PEEK_PANE, Some(2))));
+        assert_eq!(shown(&mut s, PaneId(1)), None, "the layout is unchanged");
+        // Typing goes to the agent, through the peek's connection.
+        s.cx.simulate_keystrokes("y");
+        assert!(
+            fake.pane_inputs
+                .lock()
+                .unwrap()
+                .contains(&(PEEK_PANE, b"y".to_vec()))
+        );
+        // Escape closes it, and does not reach the agent.
+        s.cx.simulate_keystrokes("escape");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None);
+        assert!(fake.calls().contains(&Call::Close(PEEK_PANE)));
+        assert!(
+            !fake
+                .pane_inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, b)| *p == PEEK_PANE && b == b"\x1b")
+        );
+        assert_eq!(shown(&mut s, PaneId(1)), None);
+        // ⌘Return opens it in the focused pane.
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(2, window, cx));
+        s.cx.simulate_keystrokes("cmd-enter");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(2));
+    }
+
+    #[gpui::test]
+    fn one_peek_at_a_time(cx: &mut TestAppContext) {
+        use crate::core::peek::PEEK_PANE;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(1, window, cx));
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(2, window, cx));
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), Some(2));
+        let opens = fake
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Open(p, _) if *p == PEEK_PANE))
+            .count();
+        assert_eq!(opens, 2);
+        assert!(fake.calls().contains(&Call::Close(PEEK_PANE)));
+        // An unknown agent is not peeked at.
+        s.cx.simulate_keystrokes("escape");
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(9, window, cx));
+        assert_eq!(peeked(&mut s), None);
+    }
+
+    #[gpui::test]
+    fn resting_on_a_graph_card_peeks(cx: &mut TestAppContext) {
+        use crate::core::peek::HOVER_HOLD;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+        s.cx.simulate_keystrokes("cmd-shift-g");
+        s.cx.run_until_parked();
+        let at = center(&mut s, "graph-card-2");
+        s.cx.simulate_mouse_move(at, None, Modifiers::none());
+        s.cx.executor().advance_clock(HOVER_HOLD / 2);
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None, "not yet");
+        s.cx.executor().advance_clock(HOVER_HOLD);
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), Some(2));
+        // Escape goes back to the graph, still shown.
+        s.cx.simulate_keystrokes("escape");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None);
+        assert!(s.cx.debug_bounds("graph-card-2").is_some());
     }
 }

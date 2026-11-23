@@ -21,6 +21,7 @@ mod output;
 mod palette;
 mod pane_drag;
 mod pane_view;
+mod peek_view;
 mod picker_view;
 mod question_view;
 mod rename;

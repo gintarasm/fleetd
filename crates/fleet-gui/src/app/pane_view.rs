@@ -440,6 +440,8 @@ pub struct PaneView {
     /// Redraws this pane at each blink toggle, while its cursor blinks
     /// (only the focused pane's can: ADR 0096).
     pub(crate) blink_timer: Option<Task<()>>,
+    /// Drawn without its header: the peek (ADR 0103) titles it.
+    pub(crate) headless: bool,
 }
 
 /// The find bar's field and its subscription.
@@ -521,7 +523,30 @@ impl PaneView {
             cursor_blink: config.cursor_blink,
             blink: Blink::new(Instant::now()),
             blink_timer: None,
+            headless: false,
         }
+    }
+
+    /// Sets the terminal font size alone (the peek shrinks its font to
+    /// fit the agent's grid, ADR 0103).
+    pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        if self.font_size != px(size) {
+            self.font_size = px(size);
+            cx.notify();
+        }
+    }
+
+    /// The width and height of one cell at `size` points, in this view's
+    /// font, as the grid lays it out.
+    pub fn cell_size(&self, size: f32, window: &Window) -> (f32, f32) {
+        let ts = window.text_system();
+        let font_id = ts.resolve_font(&self.font);
+        let size = px(size);
+        let cell_w = ts
+            .advance(font_id, size, 'm')
+            .map_or(size * 0.6, |a| a.width);
+        let line_h = (ts.ascent(font_id, size) + ts.descent(font_id, size).abs()).ceil();
+        (cell_w.into(), line_h.into())
     }
 
     /// Draws `chooser` while the pane has no agent (or no longer).
@@ -2093,8 +2118,8 @@ impl Render for PaneView {
             .border_color(ring_color(&theme, focus_ring(chrome, &theme), ring))
             .bg(theme.card)
             .relative()
-            .child(header)
-            .children(question)
+            .when(!self.headless, |d| d.child(header))
+            .children(question.filter(|_| !self.headless))
             .child(grid)
             .children(self.flash.as_ref().map(|(n, _)| {
                 let ring = div()
