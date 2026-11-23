@@ -1458,6 +1458,7 @@ impl Workspace {
             recent_commands: app.recent_commands(),
             presets,
             prefill,
+            worktree: self.worktree_setup(cx),
         };
         let target = app.target.clone();
         let taken = app.live_names();
@@ -1731,8 +1732,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.remember_worktree(sheet, cx);
         match event {
             SheetEvent::Cancel => {}
+            SheetEvent::SpawnInWorktree {
+                req,
+                command,
+                worktree,
+            } => self.spawn_in_worktree(req, command, worktree, window, cx),
             SheetEvent::Spawn { req, command } => {
                 let result = self.app.update(cx, |a, cx| {
                     a.spawn_from_sheet(req.clone(), command.clone(), cx)

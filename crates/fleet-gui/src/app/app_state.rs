@@ -2394,6 +2394,29 @@ impl AppState {
         self.session.run_action(call)
     }
 
+    /// The New agent sheet's "New worktree" starts checked on this target.
+    pub fn new_worktree_remembered(&self) -> bool {
+        self.gui_state.new_worktree.contains(&self.target_key())
+    }
+
+    /// Remembers "New worktree" for this target.
+    pub fn remember_new_worktree(&mut self, on: bool, cx: &mut Context<Self>) {
+        let key = self.target_key();
+        let changed = if on {
+            self.gui_state.new_worktree.insert(key)
+        } else {
+            self.gui_state.new_worktree.remove(&key)
+        };
+        if changed {
+            self.schedule_save(cx);
+        }
+    }
+
+    /// `dir` as a spawn gets it (`~` expanded for a local daemon).
+    pub fn expand_dir(&self, dir: &str) -> String {
+        self.expand(dir)
+    }
+
     /// `pane` is about to show a terminal: a diff pane there goes, and an
     /// empty terminal pane takes its place.
     fn terminal_in(&mut self, pane: PaneId, cx: &mut Context<Self>) {

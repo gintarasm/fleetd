@@ -83,6 +83,13 @@ pub fn refresh_on(before: Option<AgentStatus>, after: Option<AgentStatus>) -> bo
     before != after && settled(after)
 }
 
+/// `dir` (on this machine) is inside a git checkout: it or a parent has a
+/// `.git` (a folder, or a linked worktree's file). Read when the New
+/// agent sheet's folder changes, never on a timer.
+pub fn in_git_checkout(dir: &std::path::Path) -> bool {
+    dir.is_absolute() && dir.ancestors().any(|d| d.join(".git").exists())
+}
+
 /// Why `slug` is not one the workflow takes, else `None`.
 pub fn slug_error(slug: &str) -> Option<&'static str> {
     if slug.is_empty() {
@@ -253,6 +260,22 @@ mod tests {
         assert!(!refresh_on(Some(Done), Some(Done)));
         assert!(!refresh_on(Some(Idle), Some(Working)));
         assert!(!refresh_on(Some(NeedsYou), Some(Idle)));
+    }
+
+    #[test]
+    fn checkouts_are_found_from_any_folder_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../repo/.git/worktrees/wt").unwrap();
+        assert!(in_git_checkout(&repo));
+        assert!(in_git_checkout(&repo.join("src/deep")));
+        assert!(in_git_checkout(&wt));
+        assert!(!in_git_checkout(dir.path()));
+        assert!(!in_git_checkout(std::path::Path::new("relative")));
     }
 
     #[test]
