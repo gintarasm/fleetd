@@ -8,7 +8,7 @@
 - [0025](0025-core-knows-agents-workflows-own-hierarchy.md): `Exec`'s output cap is 15 MiB (stdout and stderr together), so a reply fits `MAX_FRAME` (16 MiB); a workflow may override inherited labels in the prefix it owns when it spawns for an agent; agents may call actions marked for them.
 - [0010](0010-storage-and-layout.md): the worktree root and branch prefix are configurable per repository (0010's layout stays the default unless the user decides otherwise, spec open question 1).
 
-**Reserves:** ADRs 0091 (node primitives), 0092 (workflow host and `RunAction`), 0093 (git-worktree workflow), 0094 (GUI diff view and actions), 0095 (skill, if needed), 0096–0099 spare. Protocol field blocks 90–114 and `SCHEMA_VERSION` 13–14, per workstream, in the spec.
+**Reserves:** ADRs 0091 (node primitives), 0092 (workflow host and `RunAction`), 0093 (git-worktree workflow), 0094 (GUI diff view and actions), 0120 (skill, if needed), 0121–0129 spare (0095–0119 belong to the parallel GUI batch). Protocol field blocks 90–114 and `SCHEMA_VERSION` 13–14, per workstream, in the spec.
 
 ## Context
 

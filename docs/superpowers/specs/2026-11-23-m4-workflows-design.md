@@ -280,7 +280,7 @@ message Hunk {
 
 **`SCHEMA_VERSION`:** B takes **13** (`workflow_kv`). C takes **14** only if it needs a table of its own (it should not: storage is `workflow_kv`). A, D and E add none. The overseer renumbers at merge time if the order differs.
 
-**ADR numbers** (0090–0099 are M4's): 0090 milestone (this PR), 0091 A, 0092 B, 0093 C, 0094 D, 0095 E if the skill changes need one, 0096–0099 spare for amendments.
+**ADR numbers** (M4 owns 0090–0094 and 0120–0129; 0095–0119 belong to the parallel "UI Improvements 2" GUI batch, #149): 0090 milestone (this PR), 0091 A, 0092 B, 0093 C, 0094 D, 0120 E if the skill changes need one, 0121–0129 spare for amendments.
 
 ## Waves and agents
 
@@ -292,7 +292,7 @@ Each workstream is one agent in its own worktree under `../fleetd-wt/`, branched
 | 1 | **B. Workflow host + `RunAction`** (§2): `fleet-workflow` crate (traits, schema validation, capability checks, scope on `agent` params, owned-prefix label override in `fleet_node::scope`), all action/view proto, `workflow_kv` (schema 13), server task model and limits, `fleet action ls/run`. Tested with a fake workflow and a fake `Host`; the real `Host` adapter calls A's primitives once A merges (stub until then) | — | Opus | 0092 |
 | 2 | **C. git-worktree workflow** (§3): actions, config, labels, rollback, porcelain and diff parsers on fixtures, integration tests against real temp repos, `fleet wt`, `diff_view_build_10k_lines_instructions` | A, B | Opus | 0093 |
 | 2 | **D. GUI diff pane + actions** (§4): `core::diff`, `core::action_form`, diff pane, New-agent "New worktree", context menus, Run Action… sheet, the two GUI benchmarks. Built against B's proto with fixture `DiffView`s; wired to C's actions when C merges | B | Opus | 0094 |
-| 3 | **E. Skill, README, plan** (§6), plus any follow-ups from waves 1–2 | C, D | Sonnet | 0095 if needed |
+| 3 | **E. Skill, README, plan** (§6), plus any follow-ups from waves 1–2 | C, D | Sonnet | 0120 if needed |
 
 - **Why these models:** B sets the interface M5's plugin host must keep, and carries a security rule (agents through actions); C does process orchestration with rollback and parsing of git's formats; D is a new rendering surface under perf gates. Those get Opus. A is a well-bounded node request in the existing pattern, and E is docs, so Sonnet.
 - **Shared-file conflicts.** A and B both touch `fleet.proto`, `fleetd/src/server.rs`, `fleetd/src/scope.rs` and `fleet-cli/src/main.rs`. Each stays in its field block and puts its CLI in its own module (`fleet-cli/src/node.rs`, `action.rs`, later `wt.rs`), so merges are mostly additive. B's change to `fleet_node::scope` (the owned-prefix exception to narrowing) is the one place that touches M3's security code; the overseer reviews it on its own.
