@@ -298,3 +298,157 @@ async fn an_agents_worktree_records_it_as_the_maker() {
     let rec = get_record(&host, &agent.cwd).await.unwrap().unwrap();
     assert_eq!(rec.created_by, "agent:7");
 }
+
+// ---- diff ----
+
+fn diff_view(o: ActionOutcome) -> DiffView {
+    match o {
+        ActionOutcome::View(v) => match v.kind {
+            Some(ViewKind::Diff(d)) => d,
+            other => panic!("not a diff: {other:?}"),
+        },
+        other => panic!("not a view: {other:?}"),
+    }
+}
+
+fn paths(d: &DiffView) -> Vec<String> {
+    d.files
+        .iter()
+        .map(|f| if f.new_path.is_empty() { f.old_path.clone() } else { f.new_path.clone() })
+        .collect()
+}
+
+fn find<'a>(d: &'a DiffView, path: &str) -> &'a fleet_proto::FileDiff {
+    d.files
+        .iter()
+        .find(|f| f.new_path == path || f.old_path == path)
+        .unwrap_or_else(|| panic!("no {path} in {:?}", paths(d)))
+}
+
+/// A worktree made by new-agent with a commit (`c.txt`), an uncommitted
+/// change (`a.txt`), untracked text and binary files, and an ignored one.
+async fn worked(r: &Repos, f: &Arc<GitWorktree>, host: &LocalHost) -> AgentInfo {
+    let (agent, _) = spawned(run(f, host, "new-agent", new_params(r, "work")).await.unwrap());
+    let wt = agent.cwd.clone();
+    r.write(&format!("{wt}/c.txt"), "committed\n");
+    git(&wt, &["add", "c.txt"]);
+    git(&wt, &["commit", "-qm", "c"]);
+    r.write(&format!("{wt}/a.txt"), "one\nTWO\nthree\n");
+    r.write(&format!("{wt}/u.txt"), "untracked\nfile");
+    std::fs::write(format!("{wt}/b.bin"), b"\0\x01\x02").unwrap();
+    r.write(&format!("{wt}/target/debug/x"), "ignored\n");
+    agent
+}
+
+#[tokio::test]
+async fn diff_against_base_is_everything_the_agent_did() {
+    let r = Repos::new();
+    let f = flow(&r, false);
+    let host = LocalHost::new(Caller::User);
+    let agent = worked(&r, &f, &host).await;
+    let d = diff_view(run(&f, &host, "diff", vec![("agent", Value::Int(agent.id as i64))]).await.unwrap());
+    let mut got = paths(&d);
+    got.sort();
+    assert_eq!(got, ["a.txt", "b.bin", "c.txt", "u.txt"]);
+    assert_eq!(d.title, "work · fleet/work");
+    assert!(d.from_label.starts_with("origin/main (merge base "), "{}", d.from_label);
+    assert_eq!(d.to_label, "working tree");
+    assert_eq!(find(&d, "c.txt").status(), FileStatus::FileAdded);
+    assert_eq!(find(&d, "a.txt").status(), FileStatus::FileModified);
+    let u = find(&d, "u.txt");
+    assert_eq!(u.status(), FileStatus::FileAdded);
+    assert_eq!(u.hunks[0].body, b"+untracked\n+file\n\\ No newline at end of file".to_vec());
+    assert!(find(&d, "b.bin").binary);
+    assert_eq!(d.files_changed, 4);
+    assert_eq!((d.additions, d.deletions), (1 + 1 + 2, 1));
+    assert!(!d.truncated);
+}
+
+#[tokio::test]
+async fn diff_uncommitted_and_committed() {
+    let r = Repos::new();
+    let f = flow(&r, false);
+    let host = LocalHost::new(Caller::User);
+    let agent = worked(&r, &f, &host).await;
+    let id = Value::Int(agent.id as i64);
+    let d = diff_view(
+        run(&f, &host, "diff", vec![("agent", id.clone()), ("against", s("uncommitted"))]).await.unwrap(),
+    );
+    let mut got = paths(&d);
+    got.sort();
+    assert_eq!(got, ["a.txt", "b.bin", "u.txt"]);
+    assert!(d.from_label.starts_with("HEAD ("), "{}", d.from_label);
+    let d = diff_view(
+        run(&f, &host, "diff", vec![("agent", id), ("against", s("committed"))]).await.unwrap(),
+    );
+    assert_eq!(paths(&d), ["c.txt"]);
+    assert_eq!(d.to_label, "HEAD");
+}
+
+#[tokio::test]
+async fn diff_by_path_one_file_and_context() {
+    let r = Repos::new();
+    let f = flow(&r, false);
+    let host = LocalHost::new(Caller::User);
+    let agent = worked(&r, &f, &host).await;
+    let sub = format!("{}/target", agent.cwd);
+    let path = Value::String(sub);
+    let d = diff_view(run(&f, &host, "diff", vec![("path", path.clone()), ("file", s("a.txt"))]).await.unwrap());
+    assert_eq!(paths(&d), ["a.txt"]);
+    assert_eq!(
+        String::from_utf8_lossy(&d.files[0].hunks[0].body),
+        " one\n-two\n+TWO\n three"
+    );
+    let d = diff_view(
+        run(&f, &host, "diff", vec![("path", path.clone()), ("file", s("a.txt")), ("context", Value::Int(0))])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(String::from_utf8_lossy(&d.files[0].hunks[0].body), "-two\n+TWO");
+    let d = diff_view(run(&f, &host, "diff", vec![("path", path), ("file", s("u.txt"))]).await.unwrap());
+    assert_eq!(paths(&d), ["u.txt"]);
+}
+
+#[tokio::test]
+async fn a_big_diff_is_capped_and_one_file_can_be_asked_for() {
+    let r = Repos::new();
+    let f = flow(&r, false);
+    let host = LocalHost::new(Caller::User);
+    let (agent, _) = spawned(run(&f, &host, "new-agent", new_params(&r, "big")).await.unwrap());
+    let wt = agent.cwd.clone();
+    let big: String = (0..60_000).map(|i| format!("line {i}\n")).collect();
+    r.write(&format!("{wt}/big.txt"), &big);
+    r.write(&format!("{wt}/small.txt"), "s\n");
+    let id = Value::Int(agent.id as i64);
+    let d = diff_view(run(&f, &host, "diff", vec![("agent", id.clone())]).await.unwrap());
+    assert!(d.truncated);
+    let b = find(&d, "big.txt");
+    assert!(b.hunks_omitted && b.hunks.is_empty());
+    assert_eq!(b.additions, 60_000);
+    let d = diff_view(run(&f, &host, "diff", vec![("agent", id), ("file", s("big.txt"))]).await.unwrap());
+    assert!(!d.truncated);
+    assert_eq!(d.files[0].hunks[0].new_lines, 60_000);
+}
+
+#[tokio::test]
+async fn diff_of_an_agent_without_labels_uses_its_cwd_and_the_default_branch() {
+    let r = Repos::new();
+    let f = flow(&r, false);
+    let host = LocalHost::new(Caller::User);
+    git(&r.main, &["worktree", "add", "-q", "-b", "hand", &format!("{}/hand", r.root), "main"]);
+    let wt = format!("{}/hand", r.root);
+    r.write(&format!("{wt}/h.txt"), "h\n");
+    let id = host.add_agent(&format!("{wt}"), &[], true);
+    let d = diff_view(run(&f, &host, "diff", vec![("agent", Value::Int(id as i64))]).await.unwrap());
+    assert_eq!(paths(&d), ["h.txt"]);
+    assert!(d.from_label.starts_with("origin/main"), "{}", d.from_label);
+}
+
+#[tokio::test]
+async fn diff_needs_an_agent_or_a_path() {
+    let r = Repos::new();
+    let f = flow(&r, false);
+    let host = LocalHost::new(Caller::User);
+    let e = run(&f, &host, "diff", vec![]).await.unwrap_err();
+    assert!(matches!(e, ActionError::Invalid(_)), "{e}");
+}
