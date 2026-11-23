@@ -20,6 +20,15 @@
 //!   the end of the graph's paint (the CPU cost of one frame of the graph);
 //!   print `graph_frame_ns <median>` and exit 0.
 //!
+//! - `diff-open` (ADR 0094): once the window is open, [`OPEN_SAMPLES`]
+//!   times open a diff pane on a [`DIFF_LINES`]-line fixture `DiffView`
+//!   (no git, no daemon round trip) and time it to the pane's first
+//!   presented frame, closing it in between; print `diff_open_ns <median>`.
+//! - `diff-scroll` (with `FLEET_GUI_BENCH_AGENTS=<n>`): once `n` agents
+//!   are listed, open that diff and scroll it three rows a frame for
+//!   [`FLOOD_FRAMES`] frames, each timed from the workspace's render to its
+//!   presentation; print `diff_scroll_frame_ns <median>`.
+//!
 //! In both graph modes the GUI draws a synthetic spawned-by tree (fan-out
 //! 3, by id) over agents that have no `fleet.parent`: fleetd refuses
 //! `fleet.*` labels from a client, and fleet-perf spawns as the user.
@@ -54,6 +63,8 @@ pub const OPEN_SAMPLES: usize = 20;
 /// Frames timed by `graph-flood` (median taken), after [`FLOOD_WARMUP`].
 pub const FLOOD_FRAMES: usize = 100;
 const FLOOD_WARMUP: usize = 20;
+/// Lines of the `diff-open` / `diff-scroll` fixture.
+pub const DIFF_LINES: usize = 10_000;
 /// The graph's children per synthetic parent.
 const SYNTHETIC_FAN_OUT: usize = 3;
 /// Keys timed by the `input` bench (median taken), and the pause between them.
@@ -77,6 +88,8 @@ pub enum Mode {
     Input { agent: u64, extra: Vec<u64> },
     GraphOpen,
     GraphFlood { agents: usize },
+    DiffOpen,
+    DiffScroll { agents: usize },
 }
 
 /// The bench mode from the `FLEET_GUI_BENCH*` values; `None` when off.
@@ -109,6 +122,17 @@ pub fn parse(
             Ok(Some(Mode::Input { agent, extra }))
         }
         Some("graph-open") => Ok(Some(Mode::GraphOpen)),
+        Some("diff-open") => Ok(Some(Mode::DiffOpen)),
+        Some("diff-scroll") => {
+            let agents = match agents {
+                None | Some("") => 1,
+                Some(n) => n
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("{AGENTS_ENV}: not a count: {n:?}"))?,
+            };
+            Ok(Some(Mode::DiffScroll { agents }))
+        }
         Some("graph-flood") => {
             let agents = match agents {
                 None | Some("") => 1,
@@ -120,7 +144,7 @@ pub fn parse(
             Ok(Some(Mode::GraphFlood { agents }))
         }
         Some(other) => Err(format!(
-            "{MODE_ENV}: unknown mode {other:?} (cold-start, input, graph-open or graph-flood)"
+            "{MODE_ENV}: unknown mode {other:?} (cold-start, input, graph-open, graph-flood, diff-open or diff-scroll)"
         )),
     }
 }
@@ -377,6 +401,8 @@ pub fn connected(cx: &mut App) {
     match mode() {
         Some(Mode::GraphOpen) => return graph_open(cx),
         Some(Mode::GraphFlood { agents }) => return graph_flood(*agents, cx),
+        Some(Mode::DiffOpen) => return diff_open(cx),
+        Some(Mode::DiffScroll { agents }) => return diff_scroll(*agents, cx),
         _ => {}
     }
     let Some(Mode::Input { agent, extra }) = mode() else {
@@ -461,7 +487,10 @@ fn synthetic_tree(ids: impl Iterator<Item = u64>) -> Vec<(u64, Option<u64>)> {
 
 /// The workspace starts drawing a frame (cheap when off).
 pub fn frame_started() {
-    if matches!(mode(), Some(Mode::GraphFlood { .. })) {
+    if matches!(
+        mode(),
+        Some(Mode::GraphFlood { .. } | Mode::DiffScroll { .. })
+    ) {
         STATE.with_borrow_mut(|s| {
             if s.flood_armed {
                 s.frame_t0 = Some(Instant::now());
@@ -503,6 +532,107 @@ pub fn graph_painted(window: &mut Window) {
         }
         None => {}
     }
+}
+
+/// A diff pane drew its first diff, `at` being when it was asked to open:
+/// a `diff-open` sample ends when this frame is presented.
+pub fn diff_opened(at: Instant, window: &Window) {
+    if mode() != Some(&Mode::DiffOpen) {
+        return;
+    }
+    window.on_next_frame(move |_, _| {
+        STATE.with_borrow_mut(|s| s.open_ns.push(at.elapsed().as_nanos()));
+    });
+}
+
+/// `diff-scroll` is sampling: the diff pane scrolls a step each frame.
+pub fn diff_scrolling() -> bool {
+    matches!(mode(), Some(Mode::DiffScroll { .. })) && STATE.with_borrow(|s| s.flood_armed)
+}
+
+/// The diff pane drew a scrolled frame: one `diff-scroll` sample once it
+/// is presented, and the next frame is asked for.
+pub fn diff_frame(window: &Window) {
+    let Some(t0) = STATE.with_borrow_mut(|s| s.frame_t0.take()) else {
+        return;
+    };
+    window.on_next_frame(move |window, _| {
+        let done = STATE.with_borrow_mut(|s| {
+            s.frame_ns.push(t0.elapsed().as_nanos());
+            (s.frame_ns.len() >= FLOOD_WARMUP + FLOOD_FRAMES)
+                .then(|| s.frame_ns[FLOOD_WARMUP..].to_vec())
+        });
+        match done {
+            Some(ns) => finish(&format!("diff_scroll_frame_ns {}", median(ns))),
+            None => window.refresh(),
+        }
+    });
+}
+
+/// The fixture diff of `diff-open` and `diff-scroll`: [`DIFF_LINES`]
+/// lines over 20 files of hunks of 50.
+pub fn fixture_diff() -> fleet_proto::DiffView {
+    crate::core::diff::fixture(DIFF_LINES, 20)
+}
+
+fn open_fixture(
+    handle: gpui::WindowHandle<super::workspace::Workspace>,
+    cx: &mut AsyncApp,
+) -> bool {
+    let view = fixture_diff();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let Some(app) = AppState::global(cx) else {
+            return;
+        };
+        app.update(cx, |a, cx| a.bench_open_diff(&view, Instant::now(), cx));
+        window.refresh();
+    })
+    .is_ok()
+}
+
+fn close_focused(handle: gpui::WindowHandle<super::workspace::Workspace>, cx: &mut AsyncApp) {
+    let _ = cx.update_window(handle.into(), |_, _, cx| {
+        if let Some(app) = AppState::global(cx) {
+            app.update(cx, |a, cx| a.close_focused(cx));
+        }
+    });
+}
+
+fn diff_open(cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let Some(handle) = window_with_agents(0, cx).await else {
+            return;
+        };
+        cx.background_executor().timer(SETTLE).await;
+        for i in 0..OPEN_SAMPLES {
+            if !open_fixture(handle, cx) {
+                return;
+            }
+            while STATE.with_borrow(|s| s.open_ns.len()) <= i {
+                cx.background_executor().timer(POLL).await;
+            }
+            close_focused(handle, cx);
+            cx.background_executor().timer(SETTLE).await;
+        }
+        let ns = STATE.with_borrow(|s| s.open_ns.clone());
+        finish(&format!("diff_open_ns {}", median(ns)));
+    })
+    .detach();
+}
+
+fn diff_scroll(agents: usize, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let Some(handle) = window_with_agents(agents, cx).await else {
+            return;
+        };
+        if !open_fixture(handle, cx) {
+            return;
+        }
+        cx.background_executor().timer(SETTLE * 5).await;
+        STATE.with_borrow_mut(|s| s.flood_armed = true);
+        let _ = cx.update_window(handle.into(), |_, window, _| window.refresh());
+    })
+    .detach();
 }
 
 /// Waits for the workspace window and at least `agents` listed agents.
@@ -618,6 +748,15 @@ mod tests {
             Ok(Some(Mode::GraphFlood { agents: 1 }))
         );
         assert!(parse(Some("graph-flood"), None, None, Some("x")).is_err());
+        assert_eq!(
+            parse(Some("diff-open"), None, None, None),
+            Ok(Some(Mode::DiffOpen))
+        );
+        assert_eq!(
+            parse(Some("diff-scroll"), None, None, Some("50")),
+            Ok(Some(Mode::DiffScroll { agents: 50 }))
+        );
+        assert!(parse(Some("diff-scroll"), None, None, Some("x")).is_err());
     }
 
     #[test]

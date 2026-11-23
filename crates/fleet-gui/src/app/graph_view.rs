@@ -71,7 +71,8 @@ pub enum GraphEvent {
     Answer(u64),
     /// The pointer rested on a card: peek at its agent (ADR 0103).
     Peek(u64),
-    /// The terminal panel's Actions…: the agent's row menu (ADR 0105).
+    /// A card's right-click, or the terminal panel's Actions…: the
+    /// agent's row menu (ADR 0094, 0105).
     Menu(u64),
 }
 
@@ -674,6 +675,13 @@ impl GraphView {
                     this.select(id, window, cx);
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(GraphEvent::Menu(id));
+                }),
+            )
             .child(name_row)
             .children(meta)
             .children(activity)

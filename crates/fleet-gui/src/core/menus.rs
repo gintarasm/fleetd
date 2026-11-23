@@ -52,6 +52,10 @@ pub enum RowMenuItem {
     RestartSelected,
     /// Remove every exited agent of the selection.
     RemoveSelected,
+    /// The agent's diff pane (ADR 0094).
+    ShowChanges,
+    /// Archive the ended agent's worktree, after asking (ADR 0094).
+    ArchiveWorktree,
 }
 
 impl RowMenuItem {
@@ -74,6 +78,8 @@ impl RowMenuItem {
             RowMenuItem::KillSelected => "Kill Selected…",
             RowMenuItem::RestartSelected => "Restart Selected Exited",
             RowMenuItem::RemoveSelected => "Remove Selected Exited",
+            RowMenuItem::ShowChanges => "Show Changes",
+            RowMenuItem::ArchiveWorktree => "Archive Worktree…",
         }
     }
 }
@@ -124,6 +130,27 @@ pub fn row_menu(can_split: bool, ended: bool, in_selection: bool) -> Vec<MenuEnt
     out
 }
 
+/// What an agent's menu adds for workflows (ADR 0094): Show Changes for
+/// an agent in a git checkout, Archive Worktree… for an ended one in a
+/// workflow worktree; nothing when neither applies.
+pub fn workflow_entries<T: Copy>(
+    show_changes: bool,
+    archive: bool,
+    items: (T, T),
+) -> Vec<MenuEntry<T>> {
+    let mut out = Vec::new();
+    if show_changes {
+        out.push(MenuEntry::Item(items.0));
+    }
+    if archive {
+        out.push(MenuEntry::Item(items.1));
+    }
+    if !out.is_empty() {
+        out.insert(0, MenuEntry::Separator);
+    }
+    out
+}
+
 /// A sidebar group header's menu (ADR 0085): what the sidebar groups
 /// by, the current choice checked.
 pub fn group_menu(current: GroupBy) -> Vec<(GroupBy, bool)> {
@@ -156,6 +183,10 @@ pub enum PaneMenuItem {
     Restart,
     Kill,
     Close,
+    /// The pane's agent's diff pane (ADR 0094).
+    ShowChanges,
+    /// Archive the pane's ended agent's worktree (ADR 0094).
+    ArchiveWorktree,
 }
 
 impl PaneMenuItem {
@@ -185,6 +216,8 @@ impl PaneMenuItem {
             // It asks first (unless told not to).
             PaneMenuItem::Kill => format!("Kill {what}…"),
             PaneMenuItem::Close => "Close Pane".to_owned(),
+            PaneMenuItem::ShowChanges => "Show Changes".to_owned(),
+            PaneMenuItem::ArchiveWorktree => "Archive Worktree…".to_owned(),
         }
     }
 
@@ -204,11 +237,13 @@ impl PaneMenuItem {
             PaneMenuItem::Kill => cmd_shift("w"),
             PaneMenuItem::Close => cmd("w"),
             PaneMenuItem::SaveOutput => cmd_shift("s"),
+            PaneMenuItem::ShowChanges => cmd_shift("c"),
             PaneMenuItem::Rename
             | PaneMenuItem::EditLabels
             | PaneMenuItem::Duplicate
             | PaneMenuItem::CopyLastOutput
-            | PaneMenuItem::OpenOutput => None,
+            | PaneMenuItem::OpenOutput
+            | PaneMenuItem::ArchiveWorktree => None,
         }
     }
 }
@@ -300,6 +335,28 @@ pub fn pane_menu(s: PaneMenuState) -> Vec<MenuEntry<(PaneMenuItem, bool)>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn workflow_entries_follow_what_applies() {
+        use super::{MenuEntry, RowMenuItem, workflow_entries};
+        let items = (RowMenuItem::ShowChanges, RowMenuItem::ArchiveWorktree);
+        assert!(workflow_entries(false, false, items).is_empty());
+        assert_eq!(
+            workflow_entries(true, false, items),
+            [
+                MenuEntry::Separator,
+                MenuEntry::Item(RowMenuItem::ShowChanges)
+            ]
+        );
+        assert_eq!(
+            workflow_entries(true, true, items),
+            [
+                MenuEntry::Separator,
+                MenuEntry::Item(RowMenuItem::ShowChanges),
+                MenuEntry::Item(RowMenuItem::ArchiveWorktree)
+            ]
+        );
+    }
     use super::{
         GroupBy, MenuEntry, PaneMenuItem as P, PaneMenuState, RowMenuItem as R, group_menu,
         pane_menu, row_menu,

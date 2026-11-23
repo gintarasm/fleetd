@@ -1960,6 +1960,7 @@ dependencies = [
  "fleet-gui",
  "fleet-proto",
  "fleet-term",
+ "fleet-workflow",
  "gpui",
  "libc",
  "objc2",

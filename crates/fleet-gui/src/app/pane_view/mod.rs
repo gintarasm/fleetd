@@ -116,6 +116,8 @@ pub enum PaneEvent {
     },
     /// A message for the toast (a drop or paste that cannot work here).
     Notice(&'static str),
+    /// The ended summary's Show Changes (ADR 0094).
+    ShowChanges,
     /// The first-run welcome's buttons.
     NewAgent,
     NewTerminal,

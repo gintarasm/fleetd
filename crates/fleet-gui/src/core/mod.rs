@@ -1,11 +1,13 @@
 //! Platform-neutral GUI logic: no gpui, no AppKit.
 
+pub mod action_form;
 pub mod approval;
 pub mod backoff;
 pub mod broadcast;
 pub mod bulk;
 pub mod config;
 pub mod cursor_blink;
+pub mod diff;
 pub mod drag_drop;
 pub mod drop_paste;
 pub mod ended;
@@ -65,4 +67,5 @@ pub mod theme;
 pub mod titlebar;
 pub mod truncate;
 pub mod underline;
+pub mod worktree;
 pub mod zoom;

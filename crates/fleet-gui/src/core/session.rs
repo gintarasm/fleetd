@@ -40,6 +40,8 @@ pub const CLIENT_NAME: &str = "gui";
 const OUTPUT_CLIENT_NAME: &str = "gui-output";
 /// How a [`Session::search_output`] connection introduces itself.
 const SEARCH_CLIENT_NAME: &str = "gui-search";
+/// The client name of a workflow action's connection (ADR 0094).
+const ACTION_CLIENT_NAME: &str = "gui-action";
 
 /// What an old daemon answers a request it does not know with.
 const UNKNOWN_REQUEST: &str = "empty request";
@@ -741,6 +743,56 @@ impl Session {
                 }
                 m => m,
             })
+        }
+    }
+
+    /// A job that lists the daemon's workflow actions (ADR 0094) over a
+    /// connection of its own; a daemon from before workflows answers
+    /// [`Actions::Unsupported`](super::worktree::Actions). It blocks: run
+    /// it off the UI thread.
+    pub fn list_actions(
+        &self,
+    ) -> impl FnOnce() -> Result<super::worktree::Actions, String> + Send + use<> {
+        let ctx = Arc::clone(&self.inner.ctx);
+        move || {
+            let mut c = connect(&ctx.target, &ctx.state_dir, ACTION_CLIENT_NAME)
+                .map_err(|e| e.to_string())?;
+            let reply = c
+                .conn
+                .call(fleet_proto::request::Kind::ListActions(Default::default()));
+            drop(c);
+            match reply {
+                Ok(fleet_proto::response::Kind::ActionList(l)) => {
+                    Ok(super::worktree::Actions::Listed(l.actions))
+                }
+                Ok(_) => Err("unexpected reply to list actions".into()),
+                Err(e) if e.to_string().contains(UNKNOWN_REQUEST) => {
+                    Ok(super::worktree::Actions::Unsupported)
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+    }
+
+    /// A job that runs a workflow action as the user (ADR 0094) over a
+    /// connection of its own. It blocks: run it off the UI thread.
+    pub fn run_action(
+        &self,
+        call: fleet_proto::RunAction,
+    ) -> impl FnOnce() -> Result<fleet_proto::ActionResult, String> + Send + use<> {
+        let ctx = Arc::clone(&self.inner.ctx);
+        move || {
+            let mut c = connect(&ctx.target, &ctx.state_dir, ACTION_CLIENT_NAME)
+                .map_err(|e| e.to_string())?;
+            let reply = c
+                .conn
+                .call(fleet_proto::request::Kind::RunAction(Box::new(call)));
+            drop(c);
+            match reply {
+                Ok(fleet_proto::response::Kind::ActionResult(r)) => Ok(*r),
+                Ok(_) => Err("unexpected reply to run action".into()),
+                Err(e) => Err(e.to_string()),
+            }
         }
     }
 

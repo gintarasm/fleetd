@@ -9,6 +9,11 @@ use crate::core::shortcuts::{self, Binding, Section};
 actions!(
     fleet,
     [
+        // ⇧⌘C: the focused pane's agent's diff pane (ADR 0094).
+        ShowChanges,
+        // The palette's Run Action… and Archive Worktree… (ADR 0094).
+        RunAction,
+        ArchiveWorktree,
         SplitRight,
         SplitDown,
         ClosePane,
@@ -225,7 +230,9 @@ pub fn bind_keys(cx: &mut App) {
         // terminal's find bar is open: its Esc closes it).
         KeyBinding::new("escape", BackToGraph, Some(GRAPH_PANEL_KEYS_CONTEXT)),
         KeyBinding::new("cmd-enter", OpenInMainView, Some(GRAPH_PANEL_CONTEXT)),
+        KeyBinding::new("cmd-shift-c", ShowChanges, None),
     ]);
+    super::diff_pane::bind_keys(cx);
 }
 
 /// The ⌘/ cheat sheet: every key binding registered now, whoever bound it.

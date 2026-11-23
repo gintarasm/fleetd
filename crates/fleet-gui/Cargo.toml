@@ -58,5 +58,8 @@ gpui = { version = "=0.2.2", features = ["test-support"] }
 [dev-dependencies]
 bytes = "1.12.1"
 fleet-gui = { path = ".", features = ["test-hooks"] }
+# The git-worktree workflow's real action specs, to check the GUI's params
+# against (ADR 0094).
+fleet-workflow = { version = "0.1.0", path = "../fleet-workflow" }
 tempfile = "3.27.0"
 tokio-util = { version = "0.7.20", features = ["codec"] }
