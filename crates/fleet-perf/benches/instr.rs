@@ -194,4 +194,60 @@ library_benchmark_group!(
     benchmarks = terminal_feed_scroll_64k, history_push_1k_lines, history_read_page
 );
 
-main!(library_benchmark_groups = startup, hot_paths, history);
+/// A fixed unified diff of 10 000 hunk lines: 50 files, each one hunk of
+/// 200 lines (context, removals and additions mixed, ~60 bytes a line).
+/// Runs outside the measured region.
+fn unified_diff_10k_lines() -> Vec<u8> {
+    let mut patch = String::new();
+    for f in 0..50 {
+        let path = format!("crates/module_{f}/src/file_{f}.rs");
+        patch.push_str(&format!(
+            "diff --git a/{path} b/{path}\nindex 1111111..2222222 100644\n--- a/{path}\n+++ b/{path}\n@@ -10,150 +10,150 @@ fn function_{f}() {{\n"
+        ));
+        for l in 0..200 {
+            let kind = match l % 4 {
+                0 => '-',
+                1 => '+',
+                _ => ' ',
+            };
+            patch.push_str(&format!(
+                "{kind}    let value_{l} = compute_something(argument_{l}, other_{f}); // {l:04}\n"
+            ));
+        }
+    }
+    patch.into_bytes()
+}
+
+// `diff_view_build_10k_lines` (ADR 0093): the git-worktree workflow's
+// parse of `git diff` output into a capped `DiffView`, and its encoding.
+#[library_benchmark]
+#[bench::lines_10k(setup = unified_diff_10k_lines)]
+fn diff_view_build_10k_lines(patch: Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    use fleet_workflow::git_worktree::diff::{Caps, apply_caps, view};
+    use fleet_workflow::git_worktree::parse::parse_unified_diff;
+    use prost::Message;
+    let mut files = parse_unified_diff(black_box(&patch));
+    apply_caps(&mut files, Caps::REPLY);
+    let d = view(
+        "wt · branch".into(),
+        "origin/main (merge base 1a2b3c4)".into(),
+        "working tree".into(),
+        files,
+    );
+    assert_eq!(d.files_changed, 50);
+    let v = fleet_proto::View {
+        kind: Some(fleet_proto::view::Kind::Diff(d)),
+    };
+    let encoded = v.encode_to_vec();
+    // Returned so dropping happens after measurement.
+    (patch, encoded)
+}
+
+library_benchmark_group!(name = workflows; benchmarks = diff_view_build_10k_lines);
+
+main!(
+    library_benchmark_groups = startup,
+    hot_paths,
+    history,
+    workflows
+);

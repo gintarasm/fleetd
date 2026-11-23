@@ -123,11 +123,10 @@ fn wait_exited(d: &Daemon, id: &str) {
     loop {
         let out = d.user(&["ls", "--json"]);
         let list: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        let exited = list
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["id"].to_string() == id && a["state"].as_str() == Some("exited"));
+        let exited = list.as_array().unwrap().iter().any(|a| {
+            a["id"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
+                && a["state"].as_str() == Some("exited")
+        });
         if exited {
             return;
         }

@@ -13,6 +13,7 @@ pub const SNAPSHOT_120X40_INSTRUCTIONS: &str = "snapshot_120x40_instructions";
 pub const TERMINAL_FEED_SCROLL_64K_INSTRUCTIONS: &str = "terminal_feed_scroll_64k_instructions";
 pub const HISTORY_PUSH_1K_LINES_INSTRUCTIONS: &str = "history_push_1k_lines_instructions";
 pub const HISTORY_READ_PAGE_INSTRUCTIONS: &str = "history_read_page_instructions";
+pub const DIFF_VIEW_BUILD_10K_LINES_INSTRUCTIONS: &str = "diff_view_build_10k_lines_instructions";
 /// Bench function name -> metric name.
 const METRICS: &[(&str, &str)] = &[
     ("fleetd_startup", STARTUP_INSTRUCTIONS),
@@ -28,6 +29,10 @@ const METRICS: &[(&str, &str)] = &[
     ),
     ("history_push_1k_lines", HISTORY_PUSH_1K_LINES_INSTRUCTIONS),
     ("history_read_page", HISTORY_READ_PAGE_INSTRUCTIONS),
+    (
+        "diff_view_build_10k_lines",
+        DIFF_VIEW_BUILD_10K_LINES_INSTRUCTIONS,
+    ),
 ];
 /// Every metric the instr suite emits.
 pub const METRIC_NAMES: &[&str] = &[
@@ -38,6 +43,7 @@ pub const METRIC_NAMES: &[&str] = &[
     TERMINAL_FEED_SCROLL_64K_INSTRUCTIONS,
     HISTORY_PUSH_1K_LINES_INSTRUCTIONS,
     HISTORY_READ_PAGE_INSTRUCTIONS,
+    DIFF_VIEW_BUILD_10K_LINES_INSTRUCTIONS,
 ];
 
 /// Parse `--output-format=json` output (one summary object per line) into results.
