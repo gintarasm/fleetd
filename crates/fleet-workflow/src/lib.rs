@@ -12,6 +12,7 @@
 
 pub mod checked;
 pub mod error;
+pub mod git_worktree;
 #[cfg(test)]
 mod fake;
 pub mod host;

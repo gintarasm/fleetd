@@ -1,0 +1,71 @@
+diff --git a/added.txt b/added.txt
+new file mode 100644
+index 0000000..07f33c4
+--- /dev/null
++++ b/added.txt
+@@ -0,0 +1,2 @@
++new
++file
+diff --git a/bin.dat b/bin.dat
+index 88768ef..3e3315e 100644
+Binary files a/bin.dat and b/bin.dat differ
+diff --git a/del.txt b/del.txt
+deleted file mode 100644
+index 286c5f5..0000000
+--- a/del.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+diff --git a/exec.sh b/exec.sh
+old mode 100644
+new mode 100755
+diff --git a/mod.txt b/mod.txt
+index 2019eda..91c09ea 100644
+--- a/mod.txt
++++ b/mod.txt
+@@ -1,7 +1,8 @@
+ one
+-two
++TWO
+ three
+ four
+ five
+ six
+ seven
++EIGHT
+diff --git a/nonl.txt b/nonl.txt
+index e32b0df..09d1eeb 100644
+--- a/nonl.txt
++++ b/nonl.txt
+@@ -1 +1,2 @@
+-end
+\ No newline at end of file
++end
++more
+\ No newline at end of file
+diff --git a/ren_old.txt b/ren_new.txt
+similarity index 97%
+rename from ren_old.txt
+rename to ren_new.txt
+index 1c99002..6006ca4 100644
+--- a/ren_old.txt
++++ b/ren_new.txt
+@@ -38,3 +38,4 @@
+ 38
+ 39
+ 40
++41
+diff --git a/sp ace.txt b/sp ace.txt
+index 7898192..6178079 100644
+--- a/sp ace.txt	
++++ b/sp ace.txt	
+@@ -1 +1 @@
+-a
++b
+diff --git "a/tab\t\"q\".txt" "b/tab\t\"q\".txt"
+index bca70f3..4286f42 100644
+--- "a/tab\t\"q\".txt"
++++ "b/tab\t\"q\".txt"
+@@ -1 +1 @@
+-q
++r
