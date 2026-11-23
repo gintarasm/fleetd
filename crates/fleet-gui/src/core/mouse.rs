@@ -1,4 +1,6 @@
-//! Mouse and wheel encoding for the PTY (SGR, UTF-8 and X10 reports).
+//! Mouse, wheel and focus encoding for the PTY (SGR, UTF-8 and X10
+//! reports, DECSET 1004 focus reports), and the drag-select auto-scroll
+//! speed.
 
 use fleet_term::Modes;
 
@@ -90,6 +92,40 @@ pub fn wheel_as_arrows(lines: i32, modes: &Modes) -> Option<Vec<u8>> {
         format!("\x1b[{f}")
     };
     Some(one.repeat(lines.unsigned_abs() as usize).into_bytes())
+}
+
+/// Focus in (`CSI I`) or out (`CSI O`), while the program asked for focus
+/// reports (DECSET 1004; decision 0095).
+pub fn encode_focus(focused: bool, modes: &Modes) -> Option<Vec<u8>> {
+    modes
+        .focus_events
+        .then(|| if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec())
+}
+
+/// How often a drag-select past the grid's edge scrolls the view.
+pub const DRAG_SCROLL_MS: u64 = 50;
+/// The most lines one drag-select auto-scroll tick moves.
+pub const MAX_DRAG_SCROLL_LINES: i32 = 10;
+
+/// Lines one auto-scroll tick moves while a drag-select's pointer is at
+/// `y`, past the grid that spans `top..=bottom` (decision 0095): positive
+/// up (above the grid), negative down, 0 over it. One line just past the
+/// edge, one more for each line height further, up to
+/// [`MAX_DRAG_SCROLL_LINES`].
+pub fn drag_scroll_lines(y: f32, top: f32, bottom: f32, line_h: f32) -> i32 {
+    if line_h.is_nan() || line_h <= 0.0 || y.is_nan() {
+        return 0;
+    }
+    let (dist, up) = if y < top {
+        (top - y, true)
+    } else if y > bottom {
+        (y - bottom, false)
+    } else {
+        return 0;
+    };
+    let max = MAX_DRAG_SCROLL_LINES as f32;
+    let n = (1.0 + (dist / line_h).floor()).min(max) as i32;
+    if up { n } else { -n }
 }
 
 #[cfg(test)]
@@ -233,5 +269,35 @@ mod tests {
             None
         );
         assert_eq!(wheel_as_arrows(0, &on), None);
+    }
+
+    #[test]
+    fn focus_reports_only_while_the_program_asks() {
+        let on = Modes {
+            focus_events: true,
+            ..Modes::default()
+        };
+        assert_eq!(encode_focus(true, &on), Some(b"\x1b[I".to_vec()));
+        assert_eq!(encode_focus(false, &on), Some(b"\x1b[O".to_vec()));
+        assert_eq!(encode_focus(true, &Modes::default()), None);
+        assert_eq!(encode_focus(false, &Modes::default()), None);
+    }
+
+    #[test]
+    fn drag_scroll_speeds_up_with_distance_past_the_grid() {
+        // Grid from y=100 to y=400, lines 20 high.
+        let lines = |y| drag_scroll_lines(y, 100.0, 400.0, 20.0);
+        assert_eq!(lines(100.0), 0, "on the top edge: inside");
+        assert_eq!(lines(250.0), 0);
+        assert_eq!(lines(399.0), 0);
+        assert_eq!(lines(99.0), 1, "just above: one line up");
+        assert_eq!(lines(81.0), 1);
+        assert_eq!(lines(79.0), 2, "a line further: faster");
+        assert_eq!(lines(401.0), -1, "below: down");
+        assert_eq!(lines(441.0), -3);
+        assert_eq!(lines(-1e6), MAX_DRAG_SCROLL_LINES, "capped");
+        assert_eq!(lines(1e6), -MAX_DRAG_SCROLL_LINES);
+        assert_eq!(drag_scroll_lines(50.0, 100.0, 400.0, 0.0), 0, "no layout");
+        assert_eq!(drag_scroll_lines(f32::NAN, 100.0, 400.0, 20.0), 0);
     }
 }

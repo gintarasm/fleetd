@@ -44,7 +44,10 @@ use crate::core::identity::agent_colour;
 use crate::core::keys::{KeyMods, encode_key, encode_paste};
 use crate::core::kill::{AgentButtons, agent_buttons};
 use crate::core::links::{Files, Link, LinkTarget, Osc8, editor_command, link_at, pick_editor};
-use crate::core::mouse::{MouseButton, MouseKind, encode_mouse, wheel_as_arrows};
+use crate::core::mouse::{
+    DRAG_SCROLL_MS, MouseButton, MouseKind, drag_scroll_lines, encode_focus, encode_mouse,
+    wheel_as_arrows,
+};
 use crate::core::pane::{PaneModel, PaneState, ViewRow, ViewScroll};
 use crate::core::question::OpenQuestion;
 use crate::core::scroll_feedback::{
@@ -387,9 +390,18 @@ pub struct PaneView {
     fade_timer: Option<(Instant, Task<()>)>,
     /// Reads Reduce Motion (replaced in tests).
     pub(crate) reduce_motion: fn() -> bool,
-    /// The window whose activation the cursor follows, and that
-    /// subscription (renewed when the view moves to a new window).
-    activation: Option<(AnyWindowHandle, Subscription)>,
+    /// The window whose activation the cursor and focus reports follow,
+    /// and the subscriptions to its activation and to this pane's focus
+    /// (renewed when the view moves to a new window).
+    activation: Option<(AnyWindowHandle, [Subscription; 3])>,
+    /// The focus last told to the program (DECSET 1004, decision 0095):
+    /// the window is active and focus is in this pane.
+    reported_focus: bool,
+    /// Where the pointer was last seen during a drag-select, and the
+    /// repeating timer scrolling the view while it is past the grid's top
+    /// or bottom (decision 0095).
+    drag_at: Point<Pixels>,
+    auto_scroll: Option<Task<()>>,
     /// The focus ring's (and the dim veil's) cross-fade since focus last
     /// moved to or from this pane.
     focus_fade: Option<Tween>,
@@ -481,6 +493,9 @@ impl PaneView {
             fade_timer: None,
             reduce_motion: native::reduce_motion,
             activation: None,
+            reported_focus: false,
+            drag_at: Point::default(),
+            auto_scroll: None,
             focus_fade: None,
             copied: None,
             flash: None,
@@ -883,16 +898,47 @@ impl PaneView {
         f32::from(self.font_size)
     }
 
-    /// The cursor turns hollow when the window loses activation. The view
-    /// outlives its window (the app is resident), so this follows whichever
-    /// window draws it.
+    /// The cursor turns hollow when the window loses activation, and the
+    /// program hears of focus changes (decision 0095). The view outlives
+    /// its window (the app is resident), so this follows whichever window
+    /// draws it.
     fn follow_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = window.window_handle();
         if self.activation.as_ref().is_some_and(|(h, _)| *h == handle) {
             return;
         }
-        let sub = cx.observe_window_activation(window, |_, _, cx| cx.notify());
-        self.activation = Some((handle, sub));
+        let subs = [
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.report_focus(window, cx);
+                cx.notify();
+            }),
+            cx.on_focus_in(&self.focus, window, Self::report_focus),
+            cx.on_focus_out(&self.focus, window, |this, _, window, cx| {
+                this.report_focus(window, cx);
+            }),
+        ];
+        self.activation = Some((handle, subs));
+        // The listeners start after this frame, which may have moved focus
+        // here (a new pane): look again once it is drawn.
+        cx.defer_in(window, Self::report_focus);
+    }
+
+    /// Tells the program when the pane gains or loses focus (focus in this
+    /// pane, find bar included, of the active window), while it asked for
+    /// focus reports (DECSET 1004). The change is noted either way, so a
+    /// program that turns the mode on later hears only later changes.
+    fn report_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Focus in the pane or in it (the find bar, a split's chooser).
+        let focused = window.is_window_active() && self.focus.contains_focused(window, cx);
+        if focused == self.reported_focus {
+            return;
+        }
+        self.reported_focus = focused;
+        let modes = self.model().terminal().modes();
+        if let Some(bytes) = encode_focus(focused, &modes) {
+            // Not `send`: a focus report leaves a scrolled-up view where it is.
+            self.sink.input(self.pane, bytes);
+        }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -1233,12 +1279,15 @@ impl PaneView {
         }
         let p = sel_point(&model, at);
         match ev.click_count {
+            // Shift-click moves the selection's end here (decision 0095).
+            0 | 1 if ev.modifiers.shift && model.has_selection() => model.select_extend(p),
             0 | 1 => model.select_start(p),
             2 => model.select_word(p),
             _ => model.select_line(p),
         }
         drop(model);
         self.drag = Some(Drag::Select);
+        self.drag_at = ev.position;
         cx.notify();
     }
 
@@ -1289,6 +1338,9 @@ impl PaneView {
             Drag::Select => {
                 let p = sel_point(&model, at);
                 model.select_extend(p);
+                drop(model);
+                self.drag_at = ev.position;
+                self.auto_scroll_from_edge(cx);
                 cx.notify();
             }
             Drag::Report { button, .. } if pressed != Some(button) => self.drag = None,
@@ -1305,6 +1357,59 @@ impl PaneView {
                 }
             }
         }
+    }
+
+    /// Lines a drag-select tick scrolls with the pointer where it was last
+    /// seen: none while it is over the grid (decision 0095).
+    fn drag_scroll_lines(&self) -> i32 {
+        let Some(l) = self.layout else {
+            return 0;
+        };
+        let rows = self.model().terminal().size().1;
+        let top = f32::from(l.origin.y);
+        let bottom = top + f32::from(l.line_h) * f32::from(rows);
+        drag_scroll_lines(f32::from(self.drag_at.y), top, bottom, f32::from(l.line_h))
+    }
+
+    /// Starts the repeating drag-select scroll once the pointer is past
+    /// the grid's top or bottom; one timer, stopped by the tick that finds
+    /// the drag over or the pointer back over the grid.
+    fn auto_scroll_from_edge(&mut self, cx: &mut Context<Self>) {
+        if self.auto_scroll.is_some() || self.drag_scroll_lines() == 0 {
+            return;
+        }
+        self.auto_scroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(DRAG_SCROLL_MS))
+                    .await;
+                let more = this.update(cx, |this, cx| this.auto_scroll_tick(cx));
+                if !matches!(more, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// One drag-select scroll: moves the view by the pointer's distance
+    /// past the edge and extends the selection to the row at that edge.
+    /// `false` once the drag ended or the pointer is back over the grid.
+    fn auto_scroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        let lines = self.drag_scroll_lines();
+        if !matches!(self.drag, Some(Drag::Select)) || lines == 0 {
+            self.auto_scroll = None;
+            return false;
+        }
+        let mut model = lock(&self.model);
+        let col = cell_at(self.layout, &model, self.drag_at).map_or(0, |(c, _)| c);
+        let moved = model.drag_scroll(lines, col);
+        drop(model);
+        if moved {
+            self.show_scrollbar();
+            self.sink.check_paging(self.pane);
+            cx.notify();
+        }
+        true
     }
 
     pub(crate) fn mouse_up(
@@ -2433,6 +2538,103 @@ mod tests {
                 b"\x1b[<0;5;1m".to_vec()
             ]
         );
+    }
+
+    #[gpui::test]
+    fn shift_click_extends_the_selection_even_with_mouse_reporting(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"\x1b[?1002h\x1b[?1006hhello world\r\nsecond line");
+        let (view, sink, cx) = pane(cx, model);
+        sink.take();
+        let (from, to) = (cell(&view, cx, 0, 0), cell(&view, cx, 4, 0));
+        drag(cx, from, to, Modifiers::shift());
+        assert_eq!(selected(&view, cx).as_deref(), Some("hello"));
+        let at = cell(&view, cx, 5, 1);
+        cx.simulate_click(at, Modifiers::shift());
+        assert_eq!(selected(&view, cx).as_deref(), Some("hello world\nsecond"));
+        // And back before the anchor.
+        let at = cell(&view, cx, 1, 0);
+        cx.simulate_click(at, Modifiers::shift());
+        assert_eq!(selected(&view, cx).as_deref(), Some("he"));
+        assert!(sink.take().is_empty(), "nothing reported");
+    }
+
+    #[gpui::test]
+    fn dragging_past_the_top_scrolls_the_history_and_keeps_selecting(cx: &mut TestAppContext) {
+        let mut model = model_with_history(50);
+        model.on_output(b"\x1b[1;1Hgrid top");
+        let (view, sink, cx) = pane(cx, model);
+        let l = view.read_with(cx, |v, _| v.layout.unwrap());
+        let at = cell(&view, cx, 3, 0);
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        // Half a line above the grid: one line a tick.
+        let above = point(l.origin.x + l.cell_w * 0.5, l.origin.y - l.line_h * 0.5);
+        cx.simulate_mouse_move(above, MouseButton::Left, Modifiers::none());
+        assert_eq!(offset(&view, cx), 0, "the first move only arms the timer");
+        let tick = Duration::from_millis(crate::core::mouse::DRAG_SCROLL_MS);
+        cx.executor().advance_clock(tick * 3);
+        cx.run_until_parked();
+        assert_eq!(offset(&view, cx), 3);
+        assert_eq!(selected(&view, cx).as_deref(), Some("h47\nh48\nh49\ngrid"));
+        assert!(*sink.paging_checks.lock().unwrap() >= 1, "older pages load");
+
+        // Further away: faster.
+        let far = point(above.x, l.origin.y - l.line_h * 2.5);
+        cx.simulate_mouse_move(far, MouseButton::Left, Modifiers::none());
+        cx.executor().advance_clock(tick);
+        cx.run_until_parked();
+        assert_eq!(offset(&view, cx), 6);
+
+        // Back over the grid it stops; released, it stays stopped.
+        let at = cell(&view, cx, 0, 5);
+        cx.simulate_mouse_move(at, MouseButton::Left, Modifiers::none());
+        cx.executor().advance_clock(tick * 3);
+        cx.run_until_parked();
+        assert_eq!(offset(&view, cx), 6);
+        assert!(view.read_with(cx, |v, _| v.auto_scroll.is_none()));
+        cx.simulate_mouse_move(far, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(far, MouseButton::Left, Modifiers::none());
+        cx.executor().advance_clock(tick * 3);
+        cx.run_until_parked();
+        let after = offset(&view, cx);
+        cx.executor().advance_clock(tick * 3);
+        cx.run_until_parked();
+        assert_eq!(offset(&view, cx), after, "a released drag scrolls no more");
+        assert!(view.read_with(cx, |v, _| v.auto_scroll.is_none()));
+    }
+
+    #[gpui::test]
+    fn focus_changes_are_reported_while_the_program_asks(cx: &mut TestAppContext) {
+        let mut model = blank_model();
+        model.on_output(b"\x1b[?1004h");
+        let (view, sink, cx) = pane(cx, model);
+        // A test window starts inactive: the focused pane is not reported.
+        assert!(sink.take().is_empty());
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(sink.take(), vec![b"\x1b[I".to_vec()], "window activated");
+
+        cx.deactivate_window();
+        assert_eq!(sink.take(), vec![b"\x1b[O".to_vec()], "window deactivated");
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert_eq!(sink.take(), vec![b"\x1b[I".to_vec()], "and again");
+
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        assert_eq!(sink.take(), vec![b"\x1b[O".to_vec()], "focus left the pane");
+        cx.update(|window, cx| window.focus(&view.read(cx).focus_handle().clone()));
+        cx.run_until_parked();
+        assert_eq!(sink.take(), vec![b"\x1b[I".to_vec()], "and came back");
+
+        view.update(cx, |v, _| v.model().on_output(b"\x1b[?1004l"));
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        assert!(sink.take().is_empty(), "mode off: nothing sent");
+        view.update(cx, |v, _| v.model().on_output(b"\x1b[?1004h"));
+        cx.update(|window, cx| window.focus(&view.read(cx).focus_handle().clone()));
+        cx.run_until_parked();
+        assert_eq!(sink.take(), vec![b"\x1b[I".to_vec()]);
     }
 
     fn hovered(view: &Entity<PaneView>, cx: &mut VisualTestContext) -> Option<(LineRef, u16, u16)> {

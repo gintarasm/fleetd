@@ -433,6 +433,33 @@ impl PaneModel {
         }
     }
 
+    /// A drag-select past the grid's edge (decision 0095): scrolls the view
+    /// by `lines` (positive up) and extends the selection to column `col`
+    /// of the row now at that edge, the top going up, the bottom going
+    /// down. `false`, doing nothing, when the view cannot move: no
+    /// selection, the alternate screen, or already at that end.
+    pub fn drag_scroll(&mut self, lines: i32, col: u16) -> bool {
+        if lines == 0 || self.selection.is_none() || !self.can_scroll_view() {
+            return false;
+        }
+        let before = self.scroll_offset;
+        self.scroll_lines(lines);
+        if self.scroll_offset == before {
+            return false;
+        }
+        let row = if lines > 0 {
+            0
+        } else {
+            self.term.size().1.saturating_sub(1)
+        };
+        let line = match self.view_row(row) {
+            ViewRow::History(abs) => LineRef::History(abs),
+            ViewRow::Grid(r) => LineRef::Grid(r),
+        };
+        self.select_extend(SelPoint { line, col });
+        true
+    }
+
     /// Selects the word around `p`.
     pub fn select_word(&mut self, p: SelPoint) {
         let (start, end) = self.word_range(p);
@@ -1452,5 +1479,80 @@ mod tests {
         });
         pane.clear_scrollback();
         assert_eq!(pane.selection_text().as_deref(), Some("only"));
+    }
+
+    fn at(line: LineRef, col: u16) -> SelPoint {
+        SelPoint { line, col }
+    }
+
+    /// 10 history lines `h0..h9` over a 20×3 grid.
+    fn pane_for_drag() -> PaneModel {
+        let mut pane = pane();
+        let tail: Vec<String> = (0..10).map(|i| format!("h{i}")).collect();
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        pane.on_attached(&attach_ok(20, 3, &tail, 0));
+        pane.on_output(b"g0\r\ng1\r\ng2");
+        pane
+    }
+
+    #[test]
+    fn drag_scroll_up_moves_the_view_and_extends_to_its_top_row() {
+        let mut pane = pane_for_drag();
+        pane.select_start(at(LineRef::Grid(1), 2));
+        assert!(pane.drag_scroll(2, 1));
+        assert_eq!(pane.scroll_offset(), 2);
+        // Row 0 now shows h8: the selection runs from there to the anchor.
+        assert_eq!(pane.selection_text().as_deref(), Some("8\nh9\ng0\ng1"));
+        // Past the oldest line it clamps, then stops moving.
+        assert!(pane.drag_scroll(100, 0));
+        assert_eq!(pane.scroll_offset(), 10);
+        assert_eq!(pane.selection_text().unwrap().lines().next(), Some("h0"));
+        assert!(!pane.drag_scroll(1, 0));
+    }
+
+    #[test]
+    fn drag_scroll_down_extends_to_the_bottom_row_and_stops_at_the_grid() {
+        let mut pane = pane_for_drag();
+        pane.scroll_to(5);
+        pane.select_start(at(LineRef::History(5), 0));
+        assert!(pane.drag_scroll(-2, 2));
+        assert_eq!(pane.scroll_offset(), 3);
+        // Row 2 now shows h9.
+        assert_eq!(pane.selection_text().as_deref(), Some("h5\nh6\nh7\nh8\nh9"));
+        assert!(pane.drag_scroll(-10, 1));
+        assert_eq!(pane.scroll_offset(), 0);
+        assert_eq!(pane.selection_text().unwrap().lines().last(), Some("g2"));
+        assert!(
+            !pane.drag_scroll(-1, 1),
+            "following the grid: nothing below"
+        );
+    }
+
+    #[test]
+    fn drag_scroll_needs_a_selection_and_history_off_the_alternate_screen() {
+        let mut pane = pane_for_drag();
+        assert!(!pane.drag_scroll(1, 0), "no selection");
+        assert_eq!(pane.scroll_offset(), 0);
+        pane.select_start(at(LineRef::Grid(0), 0));
+        pane.on_output(b"\x1b[?1049h");
+        pane.select_start(at(LineRef::Grid(0), 0));
+        assert!(
+            !pane.drag_scroll(1, 0),
+            "the alternate screen has no history"
+        );
+        assert_eq!(pane.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn shift_click_extends_a_selection_from_its_anchor() {
+        let mut pane = pane_for_drag();
+        pane.select_start(at(LineRef::Grid(0), 1));
+        pane.select_extend(at(LineRef::Grid(1), 1));
+        assert_eq!(pane.selection_text().as_deref(), Some("0\ng1"));
+        // A later Shift-click moves the moving end, the anchor stays.
+        pane.select_extend(at(LineRef::Grid(2), 0));
+        assert_eq!(pane.selection_text().as_deref(), Some("0\ng1\ng"));
+        pane.select_extend(at(LineRef::History(9), 0));
+        assert_eq!(pane.selection_text().as_deref(), Some("h9\ng0"));
     }
 }
