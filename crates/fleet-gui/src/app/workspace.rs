@@ -3960,6 +3960,88 @@ mod tests {
         assert_eq!(kills(&fake), [7, 8]);
     }
 
+    /// A key pressed and released (gpui's keyboard click is on key up).
+    fn press(s: &mut Setup<'_>, key: &str) {
+        s.cx.simulate_keystrokes(key);
+        s.cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+        });
+        s.cx.run_until_parked();
+    }
+
+    fn dont_ask(s: &mut Setup<'_>) -> bool {
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.kill_sheet().cloned())
+                .unwrap();
+        sheet.read_with(s.cx, |k, _| k.dont_ask)
+    }
+
+    #[gpui::test]
+    fn kill_sheet_tabs_to_its_controls_and_space_clicks_them(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        s.cx.dispatch_action(Kill { agent_id: 7 });
+        // As it opens, Space toggles the checkbox.
+        press(&mut s, "space");
+        assert!(dont_ask(&mut s));
+        press(&mut s, "space");
+        assert!(!dont_ask(&mut s));
+        // Tab: the checkbox, which Space toggles once.
+        press(&mut s, "tab");
+        press(&mut s, "space");
+        assert!(dont_ask(&mut s));
+        // Tab: Cancel, which Space presses.
+        press(&mut s, "tab");
+        press(&mut s, "space");
+        assert_eq!(kill_asked(&mut s), None, "cancelled");
+        assert!(kills(&fake).is_empty());
+
+        // Return is the default button (Kill) even on a focused Cancel.
+        s.cx.dispatch_action(Kill { agent_id: 7 });
+        press(&mut s, "tab");
+        press(&mut s, "tab");
+        press(&mut s, "enter");
+        assert_eq!(kills(&fake), [7]);
+        assert!(
+            crate::core::config::load_config(dir.path())
+                .unwrap()
+                .confirm_kill
+        );
+    }
+
+    #[gpui::test]
+    fn new_agent_sheet_tabs_through_its_fields(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        s.cx.simulate_keystrokes("cmd-n");
+        s.cx.run_until_parked();
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
+        let focused = |s: &mut Setup<'_>, f: fn(&NewAgentSheet) -> &Entity<TextField>| {
+            s.cx.update(|window, cx| f(sheet.read(cx)).read(cx).focus_handle().is_focused(window))
+        };
+        assert!(focused(&mut s, |sh| &sh.command));
+        press(&mut s, "tab");
+        assert!(focused(&mut s, |sh| &sh.prompt));
+        s.cx.simulate_input("fix it");
+        let prompt = sheet.read_with(s.cx, |sh, cx| sh.prompt.read(cx).text().to_owned());
+        assert_eq!(prompt, "fix it");
+        press(&mut s, "tab");
+        assert!(focused(&mut s, |sh| &sh.name));
+        press(&mut s, "tab");
+        assert!(focused(&mut s, |sh| &sh.labels));
+        // Back past Name, Prompt, Command and Choose… to the directory.
+        for _ in 0..5 {
+            press(&mut s, "shift-tab");
+        }
+        assert!(focused(&mut s, |sh| &sh.dir));
+        // ⌘Tab is not focus movement.
+        s.cx.simulate_keystrokes("cmd-tab");
+        assert!(focused(&mut s, |sh| &sh.dir));
+    }
+
     #[gpui::test]
     fn confirm_kill_off_kills_at_once(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

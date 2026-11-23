@@ -18,6 +18,7 @@ pub mod graph;
 pub mod graph_layout;
 pub mod icons;
 pub mod identity;
+pub mod keyboard_nav;
 pub mod keys;
 pub mod kill;
 pub mod labels;

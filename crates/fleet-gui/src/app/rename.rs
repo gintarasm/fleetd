@@ -8,7 +8,10 @@ use gpui::{
     div, px,
 };
 
-use super::controls::{ButtonKind, button, error_text, field_label, sheet_card, sheet_title};
+use super::controls::{
+    ButtonKind, button, error_text, field_label, move_focus, return_is_not_a_click, sheet_card,
+    sheet_title, tab_stop,
+};
 use super::text_field::TextField;
 use super::theme::{Typography, current as theme};
 use crate::core::status::Subject;
@@ -43,7 +46,7 @@ impl RenameSheet {
             agent_id,
             what,
             subject,
-            name: cx.new(|cx| TextField::new(name, "Name", cx)),
+            name: cx.new(|cx| TextField::new(name, "Name", cx).tab_stop()),
             error: None,
         }
     }
@@ -69,7 +72,11 @@ impl RenameSheet {
         cx.emit(RenameEvent::Cancel);
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if move_focus(ev, window) {
+            cx.stop_propagation();
+            return;
+        }
         match ev.keystroke.key.as_str() {
             "enter" => {
                 self.submit(cx);
@@ -87,7 +94,7 @@ impl RenameSheet {
 impl Render for RenameSheet {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        sheet_card("rename-sheet", 380.0, &theme)
+        return_is_not_a_click(sheet_card("rename-sheet", 380.0, &theme))
             .debug_selector(|| "rename-sheet".to_owned())
             .on_key_down(cx.listener(Self::key_down))
             .occlude()
@@ -119,12 +126,18 @@ impl Render for RenameSheet {
                     .gap(px(space::SM))
                     .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                        tab_stop(
+                            button("cancel", "Cancel", &theme, ButtonKind::Secondary, true),
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        button("rename", "Rename", &theme, ButtonKind::Primary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                        tab_stop(
+                            button("rename", "Rename", &theme, ButtonKind::Primary, true),
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     ),
             )
     }

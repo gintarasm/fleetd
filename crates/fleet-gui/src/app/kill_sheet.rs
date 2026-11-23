@@ -10,7 +10,9 @@ use gpui::{
 };
 
 use super::app_state::AppState;
-use super::controls::{ButtonKind, appear, button, sheet_card};
+use super::controls::{
+    ButtonKind, appear, button, move_focus, return_is_not_a_click, sheet_card, tab_stop,
+};
 use super::icons;
 use super::theme::{Typography, current as theme};
 use super::titlebar_view::sheet_drag_strip;
@@ -91,11 +93,16 @@ impl KillSheet {
         cx.notify();
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if move_focus(ev, window) {
+            cx.stop_propagation();
+            return;
+        }
         match ev.keystroke.key.as_str() {
             "enter" => self.kill(cx),
             "escape" => self.answer(KillEvent::Cancel, cx),
-            "space" => self.toggle(cx),
+            // A focused control takes Space itself (ADR 0101).
+            "space" if self.focus.is_focused(window) => self.toggle(cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -120,8 +127,7 @@ impl Render for KillSheet {
                     .child(icons::sized(Icon::Check, 11.0).text_color(gpui::white()))
             })
             .when(!checked, |b| b.bg(theme.field));
-        let checkbox = div()
-            .id("dont-ask")
+        let checkbox = tab_stop(div().id("dont-ask"), &theme)
             .debug_selector(|| "kill-dont-ask".to_owned())
             .flex()
             .flex_row()
@@ -132,7 +138,7 @@ impl Render for KillSheet {
             .child(box_)
             .child("Don't ask again")
             .on_click(cx.listener(|this, _, _, cx| this.toggle(cx)));
-        sheet_card("kill-sheet", 380.0, &theme)
+        return_is_not_a_click(sheet_card("kill-sheet", 380.0, &theme))
             .debug_selector(|| "kill-sheet".to_owned())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
@@ -177,16 +183,20 @@ impl Render for KillSheet {
                     .gap(px(space::SM))
                     .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
-                            .debug_selector(|| "kill-cancel".to_owned())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.answer(KillEvent::Cancel, cx)),
-                            ),
+                        tab_stop(
+                            button("cancel", "Cancel", &theme, ButtonKind::Secondary, true),
+                            &theme,
+                        )
+                        .debug_selector(|| "kill-cancel".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.answer(KillEvent::Cancel, cx))),
                     )
                     .child(
-                        button("kill", "Kill", &theme, ButtonKind::Primary, true)
-                            .debug_selector(|| "kill-confirm".to_owned())
-                            .on_click(cx.listener(|this, _, _, cx| this.kill(cx))),
+                        tab_stop(
+                            button("kill", "Kill", &theme, ButtonKind::Primary, true),
+                            &theme,
+                        )
+                        .debug_selector(|| "kill-confirm".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.kill(cx))),
                     ),
             )
     }
