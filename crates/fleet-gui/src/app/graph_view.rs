@@ -68,6 +68,8 @@ pub enum GraphEvent {
     Answer(u64),
     /// The pointer rested on a card: peek at its agent (ADR 0103).
     Peek(u64),
+    /// A right-click on a card: its agent's menu, as its sidebar row's.
+    Menu(u64),
 }
 
 pub struct GraphView {
@@ -660,6 +662,13 @@ impl GraphView {
                 this.card_hover(id, *hovered, cx);
             }))
             .on_click(cx.listener(move |this, _, _, cx| this.open(id, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(GraphEvent::Menu(id));
+                }),
+            )
             .child(name_row)
             .children(meta)
             .children(activity)

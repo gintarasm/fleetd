@@ -4,6 +4,9 @@
 
 use fleet_proto::{DiffView, FileDiff, FileStatus};
 
+use super::session::PaneId;
+use super::tabs::Tabs;
+
 /// A line longer than this is cut, with an ellipsis (no horizontal scroll
 /// in M4).
 pub const MAX_LINE_CHARS: usize = 2_000;
@@ -313,6 +316,62 @@ fn cut(text: &str) -> String {
     }
 }
 
+/// `tabs` without `panes` (the diff panes), as saved: a diff pane is not
+/// restored after a relaunch. Which tab is shown, and each tab's focus
+/// where it was not a removed pane, stay.
+pub fn without_panes(tabs: &Tabs, panes: &[PaneId]) -> Tabs {
+    let mut t = tabs.clone();
+    let active = t.active();
+    for &pane in panes {
+        let Some(tab) = t.tab_of(pane) else { continue };
+        t.select(tab);
+        let keep = t.focused();
+        t.focus(pane);
+        t.close_focused();
+        if keep != pane {
+            t.focus(keep);
+        }
+    }
+    t.select(active);
+    t
+}
+
+/// A table as aligned text lines (header first, columns two spaces
+/// apart), as `fleet action run` prints one.
+pub fn table_lines(t: &fleet_proto::TableView) -> Vec<String> {
+    let n = t
+        .columns
+        .len()
+        .max(t.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0));
+    let header: Vec<String> = t.columns.iter().map(|c| c.to_uppercase()).collect();
+    let rows: Vec<Vec<&str>> = std::iter::once(&header)
+        .chain(t.rows.iter().map(|r| &r.cells))
+        .map(|cells| (0..n).map(|i| cells.get(i).map_or("", String::as_str)).collect())
+        .collect();
+    let widths: Vec<usize> = (0..n)
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
+    rows.iter()
+        .map(|r| {
+            let mut line = String::new();
+            for (i, cell) in r.iter().enumerate() {
+                if i > 0 {
+                    line.push_str("  ");
+                }
+                line.push_str(cell);
+                let pad = widths[i] - cell.chars().count();
+                line.extend(std::iter::repeat_n(' ', pad));
+            }
+            cut(line.trim_end())
+        })
+        .collect()
+}
+
+/// A text view's lines, each cut at [`MAX_LINE_CHARS`].
+pub fn text_lines(text: &str) -> Vec<String> {
+    text.lines().map(cut).collect()
+}
+
 /// `+` / `-` and the counts, for headers: `+12 −3`.
 pub fn stat_text(additions: u64, deletions: u64) -> String {
     format!("+{additions} \u{2212}{deletions}")
@@ -547,6 +606,53 @@ mod tests {
         )]));
         assert_eq!(d.copy_text(1, 4), "@@ -1,2 +1,2 @@\n a\n-b\n+c\n");
         assert_eq!(d.copy_text(4, 2), " a\n-b\n+c\n");
+    }
+
+    #[test]
+    fn saved_tabs_leave_diff_panes_out() {
+        use crate::core::layout::Dir;
+        let mut tabs = Tabs::single();
+        let first = tabs.focused();
+        let diff = tabs.split_toward(first, Dir::Right).unwrap();
+        tabs.set_agent(first, Some(7));
+        let second_tab = tabs.new_tab().unwrap();
+        tabs.select(0);
+        tabs.focus(first);
+        let saved = without_panes(&tabs, &[diff]);
+        assert_eq!(saved.panes(), [first, second_tab]);
+        assert_eq!(saved.active(), 0);
+        assert_eq!(saved.focused(), first);
+        assert_eq!(saved.agent(first), Some(7));
+        // Nothing to leave out: the same tabs.
+        assert_eq!(without_panes(&tabs, &[]), tabs);
+    }
+
+    #[test]
+    fn tables_align_their_columns() {
+        use fleet_proto::{TableRow, TableView};
+        let t = TableView {
+            title: "worktrees".into(),
+            columns: vec!["path".into(), "branch".into()],
+            rows: vec![
+                TableRow {
+                    cells: vec!["/wt/a".into(), "fleet/a".into()],
+                    ..Default::default()
+                },
+                TableRow {
+                    cells: vec!["/wt/long-name".into(), "b".into()],
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(
+            table_lines(&t),
+            [
+                "PATH           BRANCH",
+                "/wt/a          fleet/a",
+                "/wt/long-name  b",
+            ]
+        );
+        assert_eq!(text_lines("a\nb\n"), ["a", "b"]);
     }
 
     #[test]

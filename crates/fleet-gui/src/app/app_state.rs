@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use fleet_client::names::{live_names, name_of};
 use fleet_proto::PendingSpawn;
 use fleet_term::Palette;
-use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle};
+use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle, px};
 
+use super::diff_pane::DiffPane;
 use super::new_agent::dir_choices;
 use super::pane_view::{InputSink, PaneChrome, PaneView};
 use super::sidebar_view::{TabMark, program_name};
@@ -45,7 +46,10 @@ use crate::core::status::{
     AgentStatus, Alerts, DotFill, alert_text, dot_fill, live_report, statuses,
 };
 use crate::core::style::chrome;
+use crate::core::layout::MAX_PANES;
+use crate::core::sidebar::display_name;
 use crate::core::tabs::Tabs;
+use crate::core::worktree::{Actions, can_show_changes, refresh_on};
 use crate::core::target::Target;
 use crate::core::titlebar::{UpdateButton, update_button};
 use crate::core::zoom::{FontZoom, Zoom};
@@ -477,6 +481,10 @@ pub struct AppState {
     /// Saved state not yet written.
     dirty: bool,
     save_task: Option<Task<()>>,
+    /// Diff panes (ADR 0094): layout leaves with no terminal behind them.
+    diff_panes: HashMap<PaneId, Entity<DiffPane>>,
+    /// The daemon's workflow actions (ADR 0094), asked once per connect.
+    actions: Actions,
     _events: Task<()>,
 }
 
@@ -545,6 +553,8 @@ impl AppState {
             window: None,
             dirty: false,
             save_task: None,
+            diff_panes: HashMap::new(),
+            actions: Actions::Unknown,
             _events: events,
         };
         for pane in s.tabs.panes() {
@@ -601,6 +611,8 @@ impl AppState {
         self._events = follow(ui, cx);
         self.tabs = self.gui_state.saved_tabs(&self.target);
         self.panes.clear();
+        self.diff_panes.clear();
+        self.actions = Actions::Unknown;
         // The old session closed the peek's connection with the rest.
         self.peek = None;
         self.maximized = None;
@@ -918,7 +930,18 @@ impl AppState {
                 UiEvent::AgentRemoved {
                     agent_id,
                     replaced_by,
-                } => layout |= self.follow_removed(agent_id, replaced_by, cx),
+                } => {
+                    if let Some(new) = replaced_by {
+                        for view in self.diff_panes.values() {
+                            view.update(cx, |v, _| {
+                                if v.agent_id == agent_id {
+                                    v.agent_id = new;
+                                }
+                            });
+                        }
+                    }
+                    layout |= self.follow_removed(agent_id, replaced_by, cx);
+                }
                 UiEvent::LaunchDropped(pane) => self.launch_dropped(pane, cx),
                 UiEvent::Connection(state) => {
                     self.reconnect_at = match state {
@@ -927,6 +950,7 @@ impl AppState {
                     };
                     if state == ConnState::Connected {
                         self.refresh_update_available(cx);
+                        self.list_actions(cx);
                     }
                     if state == ConnState::Connected && self.error_is_connection {
                         self.error = None;
@@ -1169,6 +1193,7 @@ impl AppState {
         let alerts = self.alerts.update(&now);
         self.since.update(&now, unix_ms());
         if now != self.statuses {
+            self.refresh_diffs_on(&now, cx);
             self.statuses = now;
             self.refresh_chrome(cx);
             cx.notify();
@@ -1302,6 +1327,7 @@ impl AppState {
                 no_agents,
                 run_time: row.and_then(|r| run_time(r.info.created_unix_ms, r.info.exited_unix_ms)),
                 question: row.and_then(|r| open_question(&r.info)),
+                show_changes: row.is_some_and(|r| can_show_changes(&r.info, &self.actions)),
             };
             if let Some(view) = self.panes.get(&pane) {
                 view.update(cx, |v, cx| v.set_chrome(chrome, cx));
@@ -1313,7 +1339,9 @@ impl AppState {
     fn layout_changed(&mut self, cx: &mut Context<Self>) {
         // Unconnected, the layout is a placeholder: the target's saved one stays.
         if self.live {
-            self.gui_state.set_tabs(&self.target, &self.tabs);
+            let panes: Vec<PaneId> = self.diff_panes.keys().copied().collect();
+            let saved = crate::core::diff::without_panes(&self.tabs, &panes);
+            self.gui_state.set_tabs(&self.target, &saved);
             self.schedule_save(cx);
         }
         self.refresh_chrome(cx);
@@ -1340,7 +1368,8 @@ impl AppState {
     }
 
     pub fn set_focused(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        if self.panes.contains_key(&pane) && self.tabs.set_focused(pane) {
+        let known = self.panes.contains_key(&pane) || self.diff_panes.contains_key(&pane);
+        if known && self.tabs.set_focused(pane) {
             // Focus moving elsewhere restores the split view.
             if self.maximized.is_some_and(|m| m != pane) {
                 self.maximized = None;
@@ -1432,7 +1461,9 @@ impl AppState {
         if let Some(id) = agent {
             self.closed.push(id);
         }
-        self.session.close_pane(pane);
+        if self.diff_panes.remove(&pane).is_none() {
+            self.session.close_pane(pane);
+        }
         self.panes.remove(&pane);
         self.maximized = None;
         self.forget_pending(pane);
@@ -1492,6 +1523,9 @@ impl AppState {
         }
         for pane in panes {
             self.panes.remove(&pane);
+            if self.diff_panes.remove(&pane).is_some() {
+                continue;
+            }
             self.session.close_pane(pane);
             self.forget_pending(pane);
         }
@@ -1542,6 +1576,7 @@ impl AppState {
     /// is meant to show it but does not, for example after a failed spawn).
     pub fn show_agent(&mut self, agent_id: u64, cx: &mut Context<Self>) {
         let pane = self.tabs.focused();
+        self.terminal_in(pane, cx);
         if self.tabs.agent(pane) == Some(agent_id) && self.pane_shows(pane, agent_id, cx) {
             return;
         }
@@ -1643,6 +1678,7 @@ impl AppState {
     /// recent one once the pane shows the new agent.
     pub fn spawn(&mut self, req: SpawnRequest, cx: &mut Context<Self>) -> Result<(), String> {
         let pane = self.tabs.focused();
+        self.terminal_in(pane, cx);
         let (cols, rows) = self
             .panes
             .get(&pane)
@@ -2140,6 +2176,10 @@ impl AppState {
         for view in self.panes.values() {
             view.update(cx, |v, cx| v.apply_config(&config, cx));
         }
+        let font = super::fonts::terminal_font(&config.font_family, cx);
+        for view in self.diff_panes.values() {
+            view.update(cx, |v, cx| v.set_font(font.clone(), px(config.font_size), cx));
+        }
     }
 
     /// ⌘+ / ⌘− / ⌘0: every pane's font follows at once (the next layout
@@ -2224,4 +2264,160 @@ fn unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Diff panes and workflow actions (ADR 0094).
+impl AppState {
+    /// The daemon's workflow actions, as last listed.
+    pub fn actions(&self) -> &Actions {
+        &self.actions
+    }
+
+    /// Asks the daemon for its actions (once per connect); a daemon from
+    /// before workflows hides every workflow item.
+    pub fn list_actions(&mut self, cx: &mut Context<Self>) {
+        let job = self.session.list_actions();
+        let epoch = self.session_epoch;
+        cx.spawn(async move |this, cx| {
+            let listed = cx.background_executor().spawn(async move { job() }).await;
+            let _ = this.update(cx, |s, cx| {
+                if s.session_epoch != epoch {
+                    return;
+                }
+                match listed {
+                    Ok(actions) => {
+                        s.actions = actions;
+                        s.refresh_chrome(cx);
+                        cx.notify();
+                    }
+                    Err(e) => eprintln!("fleet-gui: cannot list actions: {e}"),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Sets the actions as if listed (tests).
+    #[cfg(test)]
+    pub fn set_actions(&mut self, actions: Actions) {
+        self.actions = actions;
+    }
+
+    /// The diff pane in `pane`, if it is one.
+    pub fn diff_pane(&self, pane: PaneId) -> Option<&Entity<DiffPane>> {
+        self.diff_panes.get(&pane)
+    }
+
+    /// Show Changes for `agent_id`: focuses its diff pane (in any tab) and
+    /// refreshes it, else opens one in a split beside the pane showing the
+    /// agent, else beside the focused pane. `None` when no pane fits.
+    pub fn show_changes(&mut self, agent_id: u64, cx: &mut Context<Self>) -> Option<PaneId> {
+        let opened_at = std::time::Instant::now();
+        let existing = self
+            .diff_panes
+            .iter()
+            .find(|(_, v)| v.read(cx).agent_id == agent_id)
+            .map(|(p, v)| (*p, v.clone()));
+        if let Some((pane, view)) = existing {
+            if let Some(tab) = self.tabs.tab_of(pane) {
+                self.select_tab(tab, cx);
+            }
+            self.set_focused(pane, cx);
+            view.update(cx, |v, cx| v.refresh(cx));
+            return Some(pane);
+        }
+        let layout = self.tabs.layout();
+        let beside = layout
+            .panes()
+            .into_iter()
+            .find(|p| layout.agent(*p) == Some(agent_id))
+            .unwrap_or(self.tabs.focused());
+        let Some(pane) = self.tabs.split_toward(beside, Dir::Right) else {
+            self.show_error(
+                format!("No room for the changes: a tab holds {MAX_PANES} panes at most"),
+                cx,
+            );
+            return None;
+        };
+        self.maximized = None;
+        let name = self
+            .agents
+            .iter()
+            .find(|r| r.info.id == agent_id)
+            .map_or_else(|| format!("agent {agent_id}"), |r| display_name(&r.info));
+        let config = self.pane_config();
+        let font = super::fonts::terminal_font(&config.font_family, cx);
+        let session = self.session.clone();
+        let view = cx.new(|cx| {
+            let mut v = DiffPane::new(agent_id, name, session, font, px(config.font_size), cx);
+            v.opened_at = Some(opened_at);
+            v.refresh(cx);
+            v
+        });
+        self.diff_panes.insert(pane, view);
+        self.layout_changed(cx);
+        Some(pane)
+    }
+
+    /// A Run Action… result's view (diff, table or text) in a split beside
+    /// the focused pane, which refreshes by running `call` again. `None`
+    /// when no pane fits.
+    pub fn open_view(
+        &mut self,
+        call: fleet_proto::RunAction,
+        title: String,
+        result: fleet_proto::ActionResult,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
+        let Some(pane) = self.tabs.split_toward(self.tabs.focused(), Dir::Right) else {
+            self.show_error(
+                format!("No room for the result: a tab holds {MAX_PANES} panes at most"),
+                cx,
+            );
+            return None;
+        };
+        self.maximized = None;
+        let config = self.pane_config();
+        let font = super::fonts::terminal_font(&config.font_family, cx);
+        let session = self.session.clone();
+        let view = cx.new(|cx| {
+            DiffPane::for_view(call, title, result, session, font, px(config.font_size), cx)
+        });
+        self.diff_panes.insert(pane, view);
+        self.layout_changed(cx);
+        Some(pane)
+    }
+
+    /// The session's job running `call` (Run Action…, the New agent
+    /// sheet's worktree, Archive Worktree…).
+    pub fn run_action_job(&self, call: fleet_proto::RunAction) -> ActionJob {
+        self.session.run_action(call)
+    }
+
+    /// `pane` is about to show a terminal: a diff pane there goes, and an
+    /// empty terminal pane takes its place.
+    fn terminal_in(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.diff_panes.remove(&pane).is_some() {
+            self.open(pane, None, cx);
+        }
+    }
+
+    /// Shown diff panes refresh once when their agent turns waiting, done
+    /// or ended (`now` is the new statuses).
+    fn refresh_diffs_on(&mut self, now: &HashMap<u64, AgentStatus>, cx: &mut Context<Self>) {
+        if self.diff_panes.is_empty() {
+            return;
+        }
+        let shown = self.tabs.layout().panes();
+        for (pane, view) in &self.diff_panes {
+            if !shown.contains(pane) || self.maximized.is_some_and(|m| m != *pane) {
+                continue;
+            }
+            let id = view.read(cx).agent_id;
+            let before = self.statuses.get(&id).copied();
+            if refresh_on(before, now.get(&id).copied()) {
+                view.update(cx, |v, cx| v.refresh(cx));
+            }
+        }
+    }
 }

@@ -171,6 +171,9 @@ enum Drag {
 pub struct PaneChrome {
     /// 1-based, in reading order.
     pub number: usize,
+    /// The agent's changes can be shown (ADR 0094): the ended summary
+    /// offers Show Changes.
+    pub show_changes: bool,
     /// The layout puts an agent here.
     pub has_agent: bool,
     /// The agent list says that agent exited or is lost.
@@ -355,6 +358,8 @@ pub enum PaneEvent {
     },
     /// A message for the toast (a drop or paste that cannot work here).
     Notice(&'static str),
+    /// The ended summary's Show Changes (ADR 0094).
+    ShowChanges,
     /// The first-run welcome's buttons.
     NewAgent,
     NewTerminal,

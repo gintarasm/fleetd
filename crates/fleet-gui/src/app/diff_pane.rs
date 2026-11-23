@@ -1,5 +1,6 @@
 //! The diff pane (ADR 0094): what an agent changed, read-only, in a split
-//! beside its terminal. It asks `git-worktree.diff` for a `DiffView` on
+//! beside its terminal. The same pane shows a view a Run Action… result
+//! opened (a diff, a table or text), refreshed by running its call again. It asks `git-worktree.diff` for a `DiffView` on
 //! open, on ⌘R or the refresh button, and once when its agent turns
 //! waiting, done or ended while it is shown; never on a timer or output.
 //! `core::diff` lays the view out once per refresh, and the pane draws
@@ -23,7 +24,7 @@ use gpui::{
 use super::app_state::SessionApi;
 use super::controls::icon_button;
 use super::theme::{Theme, Typography, current as theme};
-use crate::core::diff::{DiffDoc, Row, RowKind, stat_text};
+use crate::core::diff::{DiffDoc, Row, RowKind, stat_text, table_lines, text_lines};
 use crate::core::icons::Icon;
 use crate::core::style::{radius, space, text};
 use crate::core::worktree::{AGAINST, DIFF, diff_params};
@@ -60,12 +61,17 @@ pub enum DiffPaneEvent {
 enum Shown {
     Loading,
     Diff(DiffDoc),
+    /// A table or text view, as lines.
+    Text { title: String, lines: Vec<String> },
     /// The action failed or refused: the reason.
     Failed(String),
 }
 
 pub struct DiffPane {
+    /// The agent whose changes it shows (Show Changes); 0 for a view a
+    /// Run Action… result opened, which `call` refreshes.
     pub agent_id: u64,
+    call: Option<RunAction>,
     /// Index into [`AGAINST`].
     pub against: usize,
     /// The agent's name, for the header while loading.
@@ -111,6 +117,7 @@ impl DiffPane {
     ) -> Self {
         DiffPane {
             agent_id,
+            call: None,
             against: 0,
             agent_name,
             shown: Shown::Loading,
@@ -127,6 +134,32 @@ impl DiffPane {
             font,
             font_size,
             opened_at: None,
+        }
+    }
+
+    /// A pane showing `result`'s view of `call` (Run Action…); a refresh
+    /// runs `call` again.
+    pub fn for_view(
+        call: RunAction,
+        title: String,
+        result: ActionResult,
+        session: Arc<dyn SessionApi>,
+        font: Font,
+        font_size: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut p = DiffPane::new(0, title, session, font, font_size, cx);
+        p.call = Some(call);
+        p.request += 1;
+        p.apply(None, Ok(result), cx);
+        p
+    }
+
+    /// The lines of a table or text view.
+    pub fn text(&self) -> Option<&[String]> {
+        match &self.shown {
+            Shown::Text { lines, .. } => Some(lines),
+            _ => None,
         }
     }
 
@@ -182,16 +215,20 @@ impl DiffPane {
         if file.is_none() {
             self.loading = true;
         }
-        let params = diff_params(
-            self.agent_id,
-            AGAINST[self.against],
-            file.as_ref().map(|(_, k)| k.as_str()),
-        );
-        let job = self.session.run_action(RunAction {
-            name: DIFF.to_owned(),
-            params,
-            cwd: String::new(),
-        });
+        let call = match &self.call {
+            Some(call) if file.is_none() => call.clone(),
+            Some(_) => return,
+            None => RunAction {
+                name: DIFF.to_owned(),
+                params: diff_params(
+                    self.agent_id,
+                    AGAINST[self.against],
+                    file.as_ref().map(|(_, k)| k.as_str()),
+                ),
+                cwd: String::new(),
+            },
+        };
+        let job = self.session.run_action(call);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { job() }).await;
@@ -217,6 +254,18 @@ impl DiffPane {
             Ok(Some(Outcome::View(fleet_proto::View {
                 kind: Some(view::Kind::Diff(d)),
             }))) => Ok(d),
+            Ok(Some(Outcome::View(fleet_proto::View {
+                kind: Some(view::Kind::Table(t)),
+            }))) if file.is_none() => {
+                self.show_text(t.title.clone(), table_lines(&t), cx);
+                return;
+            }
+            Ok(Some(Outcome::View(fleet_proto::View {
+                kind: Some(view::Kind::Text(t)),
+            }))) if file.is_none() => {
+                self.show_text(t.title.clone(), text_lines(&t.text), cx);
+                return;
+            }
             Ok(Some(Outcome::Refused(r))) => Err(r.reason),
             Ok(Some(Outcome::Done(d))) => Err(d.message),
             Ok(_) => Err("the diff action answered something else".to_owned()),
@@ -257,6 +306,23 @@ impl DiffPane {
         cx.notify();
     }
 
+    fn show_text(&mut self, title: String, lines: Vec<String>, cx: &mut Context<Self>) {
+        self.shown = Shown::Text { title, lines };
+        self.selection = None;
+        self.loading = false;
+        self.loads += 1;
+        cx.notify();
+    }
+
+    /// How many rows the list shows.
+    fn row_count(&self) -> usize {
+        match &self.shown {
+            Shown::Diff(d) => d.len(),
+            Shown::Text { lines, .. } => lines.len(),
+            _ => 0,
+        }
+    }
+
     /// Collapses or expands file `i`; an omitted file is asked for.
     pub fn toggle_file(&mut self, i: usize, cx: &mut Context<Self>) {
         let Shown::Diff(doc) = &mut self.shown else {
@@ -287,7 +353,16 @@ impl DiffPane {
     /// The selected rows' text, as a unified diff writes them.
     pub fn selected_text(&self) -> Option<String> {
         let (a, b) = self.selection?;
-        Some(self.doc()?.copy_text(a, b))
+        match &self.shown {
+            Shown::Diff(d) => Some(d.copy_text(a, b)),
+            Shown::Text { lines, .. } => {
+                let (a, b) = (a.min(b), a.max(b).min(lines.len().checked_sub(1)?));
+                let mut out = lines.get(a..=b)?.join("\n");
+                out.push('\n');
+                Some(out)
+            }
+            _ => None,
+        }
     }
 
     fn copy(&mut self, _: &CopyDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -297,7 +372,8 @@ impl DiffPane {
     }
 
     fn select_all(&mut self, _: &SelectAllDiff, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(n) = self.doc().map(DiffDoc::len).filter(|n| *n > 0) {
+        let n = self.row_count();
+        if n > 0 {
             self.selection = Some((0, n - 1));
             cx.notify();
         }
@@ -331,15 +407,16 @@ impl DiffPane {
 
     fn press_row(&mut self, i: usize, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
-        let Some(row) = self.doc().and_then(|d| d.row(i)).cloned() else {
-            return;
-        };
-        if row.kind == RowKind::File && !ev.modifiers.shift {
+        if let Some(row) = self.doc().and_then(|d| d.row(i)).cloned() {
+            if row.kind == RowKind::File && !ev.modifiers.shift {
+                self.selected_file = row.file;
+                self.toggle_file(row.file, cx);
+                return;
+            }
             self.selected_file = row.file;
-            self.toggle_file(row.file, cx);
+        } else if i >= self.row_count() {
             return;
         }
-        self.selected_file = row.file;
         self.selection = match (self.selection, ev.modifiers.shift) {
             (Some((anchor, _)), true) => Some((anchor, i)),
             _ => Some((i, i)),
@@ -385,8 +462,18 @@ impl DiffPane {
                     format!("{} \u{2192} {}", d.from_label, d.to_label)
                 },
             ),
+            Shown::Text { title, lines } => (
+                if title.is_empty() {
+                    self.agent_name.clone()
+                } else {
+                    title.clone()
+                },
+                format!("{} line{}", lines.len(), if lines.len() == 1 { "" } else { "s" }),
+                String::new(),
+            ),
             _ => (self.agent_name.clone(), String::new(), String::new()),
         };
+        let agent = self.call.is_none();
         let against = AGAINST.iter().enumerate().map(|(i, name)| {
             let on = i == self.against;
             let t = *theme;
@@ -439,7 +526,8 @@ impl DiffPane {
                             )),
                     ),
             )
-            .child(
+            .when(agent, |d| {
+                d.child(
                 div()
                     .flex()
                     .flex_row()
@@ -449,7 +537,8 @@ impl DiffPane {
                     .rounded(px(radius::MD))
                     .bg(theme.field)
                     .children(against),
-            )
+                )
+            })
             .child(
                 icon_button("diff-refresh", Icon::Restart, theme, true)
                     .debug_selector(|| "diff-refresh".to_owned())
@@ -630,6 +719,65 @@ impl DiffPane {
     }
 }
 
+impl DiffPane {
+    fn render_text(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let t = *theme;
+        let row_h = self.row_height();
+        let count = self.row_count();
+        let list = uniform_list(
+            "view-lines",
+            count,
+            cx.processor(move |p, range: Range<usize>, _, cx| {
+                let Some(lines) = p.text() else { return Vec::new() };
+                let sel = p.selection.map(|(a, b)| (a.min(b), a.max(b)));
+                range
+                    .filter_map(|i| {
+                        let line = lines.get(i)?;
+                        let selected = sel.is_some_and(|(a, b)| (a..=b).contains(&i));
+                        Some(
+                            div()
+                                .id(("view-line", i))
+                                .h(row_h)
+                                .w_full()
+                                .px(px(space::SM))
+                                .flex()
+                                .items_center()
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_color(t.text)
+                                .when(i == 0, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                                .when(selected, |d| d.bg(t.selection))
+                                .child(SharedString::from(line.clone()))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |p, ev: &MouseDownEvent, window, cx| {
+                                        p.press_row(i, ev, window, cx);
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(move |p, ev: &MouseMoveEvent, _, cx| {
+                                    p.drag_row(i, ev, cx);
+                                }))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|p, _, _, _| p.dragging = false),
+                                ),
+                        )
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(self.scroll.clone())
+        .size_full();
+        div()
+            .flex_1()
+            .min_h_0()
+            .font(self.font.clone())
+            .text_size(self.font_size)
+            .line_height(row_h)
+            .child(list)
+    }
+}
+
 /// One display row: gutters, marker and text, on its colour.
 fn row_element(
     row: &Row,
@@ -729,6 +877,7 @@ impl Render for DiffPane {
                     .child(self.render_rows(doc, &theme, cx))
                     .into_any_element()
             }
+            Shown::Text { .. } => self.render_text(&theme, cx).into_any_element(),
             Shown::Loading => div()
                 .flex_1()
                 .flex()

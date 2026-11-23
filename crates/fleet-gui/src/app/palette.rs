@@ -7,6 +7,7 @@
 
 use gpui::{Action, Window};
 
+use super::keymap::{ArchiveWorktree, RunAction, ShowChanges};
 use super::keymap::{
     ClearScrollback, ClosePane, CloseTab, Copy, CopyLastOutput, DuplicatePane, EditLabelsPane,
     Find, FindNext, FindPrevious, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2,
@@ -99,6 +100,9 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::SwitchFleetd => Box::new(SwitchFleetd),
         Command::InstallSkill => Box::new(InstallSkill),
         Command::Quit => Box::new(Quit),
+        Command::ShowChanges => Box::new(ShowChanges),
+        Command::RunAction => Box::new(RunAction),
+        Command::ArchiveWorktree => Box::new(ArchiveWorktree),
     }
 }
 

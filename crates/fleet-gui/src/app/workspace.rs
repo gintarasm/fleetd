@@ -16,7 +16,11 @@ use gpui::{
     relative, size,
 };
 
+mod workflow_ui;
+
+use super::action_sheet::{self, ActionSheet};
 use super::answer_sheet::{AnswerEvent, AnswerSheet};
+use super::diff_pane::{DiffPane, DiffPaneEvent};
 use super::app_state::AppState;
 use super::connect::{ConnectEvent, ConnectSheet, StartupAttempt, new_sheet, switch_target};
 use super::context_menu::{self, MenuLine};
@@ -212,6 +216,8 @@ pub struct Workspace {
     kill: Option<(Entity<KillSheet>, Subscription)>,
     /// Send to Agents… (ADR 0083).
     send: Option<(Entity<SendSheet>, Subscription)>,
+    /// Run Action…, Archive Worktree… or a refusal (ADR 0094).
+    action_sheet: Option<(Entity<ActionSheet>, Subscription)>,
     /// The sidebar rows picked with ⌘-click and ⇧-click (ADR 0083).
     row_selection: RowSelection,
     /// Search All Agents (⇧⌘F, ADR 0098), while it is open.
@@ -304,6 +310,7 @@ impl Workspace {
                     | this.labels.take().is_some()
                     | this.kill.take().is_some()
                     | this.send.take().is_some()
+                    | this.action_sheet.take().is_some()
                     | this.palette.take().is_some()
                     | this.switcher.take().is_some()
                     | this.peek.take().is_some()
@@ -379,6 +386,7 @@ impl Workspace {
             answer: None,
             labels: None,
             kill: None,
+            action_sheet: None,
             send: None,
             row_selection: RowSelection::default(),
             search_all: None,
@@ -468,6 +476,10 @@ impl Workspace {
         // Answering and peeking stay in the graph.
         if let GraphEvent::Answer(id) = *event {
             self.open_answer(id, window, cx);
+            return;
+        }
+        if let GraphEvent::Menu(id) = *event {
+            self.open_row_menu(id, cx);
             return;
         }
         if let GraphEvent::Peek(id) = *event {
@@ -587,6 +599,7 @@ impl Workspace {
             || self.labels.is_some()
             || self.kill.is_some()
             || self.send.is_some()
+            || self.action_sheet.is_some()
             || self.connect.is_some()
             || self.shortcuts.is_some()
             || self.palette.is_some()
@@ -741,6 +754,9 @@ impl Workspace {
 
     fn pane_focus_handle(&self, pane: PaneId, cx: &App) -> Option<FocusHandle> {
         let app = self.app.read(cx);
+        if let Some(diff) = app.diff_pane(pane) {
+            return Some(diff.read(cx).focus_handle().clone());
+        }
         app.pane_view(pane)
             .map(|v| v.read(cx).focus_handle().clone())
     }
@@ -1296,6 +1312,8 @@ impl Workspace {
             RowMenuItem::KillSelected => self.bulk(BulkAction::Kill, window, cx),
             RowMenuItem::RestartSelected => self.bulk(BulkAction::Restart, window, cx),
             RowMenuItem::RemoveSelected => self.bulk(BulkAction::Remove, window, cx),
+            RowMenuItem::ShowChanges => self.show_changes(agent_id, window, cx),
+            RowMenuItem::ArchiveWorktree => self.open_archive(agent_id, window, cx),
         }
     }
 
@@ -1329,7 +1347,11 @@ impl Workspace {
             };
             (state, subject)
         };
-        let items = pane_menu(state);
+        let mut items = pane_menu(state);
+        // Show Changes and Archive Worktree… before Close Pane.
+        let agent = self.app.read(cx).layout().agent(pane);
+        let close = items.len().saturating_sub(2);
+        items.splice(close..close, self.workflow_pane_items(agent, cx));
         let lines = context_menu::lines(&items, |(item, enabled)| MenuLine {
             title: item.title(subject),
             enabled,
@@ -1387,6 +1409,16 @@ impl Workspace {
             PaneMenuItem::Duplicate => PaneEvent::Duplicate,
             PaneMenuItem::Kill => PaneEvent::Kill,
             PaneMenuItem::Close => PaneEvent::Close,
+            PaneMenuItem::ShowChanges | PaneMenuItem::ArchiveWorktree => {
+                if let Some(agent) = self.app.read(cx).layout().agent(pane) {
+                    if item == PaneMenuItem::ShowChanges {
+                        self.show_changes(agent, window, cx);
+                    } else {
+                        self.open_archive(agent, window, cx);
+                    }
+                }
+                return;
+            }
             PaneMenuItem::CopyLastOutput | PaneMenuItem::SaveOutput | PaneMenuItem::OpenOutput => {
                 self.output_in_pane(pane, item, cx);
                 return;
@@ -1730,16 +1762,16 @@ impl Workspace {
         let state = self.palette_state(cx);
         let presets = self.app.update(cx, |a, _| a.presets());
         let app = self.app.read(cx);
-        let (entries, items): (Vec<Entry>, Vec<_>) = palette_items(
+        let mut rows = palette_items(
             |c| command_shortcut(c, window),
             &state,
             &presets,
             &app.agents,
             &app.dir_choices(),
             &app.home,
-        )
-        .into_iter()
-        .unzip();
+        );
+        rows.extend(self.palette_changes(cx));
+        let (entries, items): (Vec<Entry>, Vec<_>) = rows.into_iter().unzip();
         let recents = self.palette_recents.clone();
         let palette =
             cx.new(|cx| PickerView::new(items, recents, "Search actions, agents and folders", cx));
@@ -1767,6 +1799,9 @@ impl Workspace {
             any_running: app.agents.iter().any(sendable),
             selected_running: bulk.running.len(),
             selected_ended: bulk.ended.len(),
+            can_show_changes: agent.is_some_and(|id| self.offers_changes(id, cx)),
+            can_archive: agent.is_some_and(|id| self.offers_archive(id, cx)),
+            has_actions: !app.actions().all().is_empty(),
         }
     }
 
@@ -1873,6 +1908,7 @@ impl Workspace {
         match entry {
             Entry::Command(c) => window.dispatch_action(command_action(c), cx),
             Entry::Agent(id) => self.show_agent(id, window, cx),
+            Entry::Changes(id) => self.show_changes(id, window, cx),
             Entry::Folder(dir) => self.spawn_default_in(dir, window, cx),
             Entry::Preset(index) => {
                 let presets = self.app.update(cx, |a, _| a.presets());
@@ -2329,11 +2365,22 @@ impl Workspace {
         // A pane id can get a new view (closing the last pane, or its
         // agent removed): subscriptions follow the view, not the id, and
         // the keyboard follows a focused view's replacement.
+        let diffs: Vec<(PaneId, Entity<DiffPane>)> = {
+            let app = self.app.read(cx);
+            app.tabs()
+                .panes()
+                .into_iter()
+                .filter_map(|p| Some((p, app.diff_pane(p)?.clone())))
+                .collect()
+        };
         let mut refocus = false;
         self.pane_focus.retain(|p, (id, handle, _)| {
             let kept = views
                 .iter()
-                .any(|(pane, view)| pane == p && view.entity_id() == *id);
+                .any(|(pane, view)| pane == p && view.entity_id() == *id)
+                || diffs
+                    .iter()
+                    .any(|(pane, view)| pane == p && view.entity_id() == *id);
             refocus |= !kept && handle.is_focused(window);
             kept
         });
@@ -2356,6 +2403,25 @@ impl Workspace {
             });
             let events = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
                 this.pane_event(pane, *event, window, cx);
+            });
+            self.pane_focus
+                .insert(pane, (view.entity_id(), handle, [focus, events]));
+        }
+        for (pane, view) in diffs {
+            if self.pane_focus.contains_key(&pane) {
+                continue;
+            }
+            let handle = view.read(cx).focus_handle().clone();
+            let focus = cx.on_focus_in(&handle, window, move |this, _, cx| {
+                this.app.update(cx, |a, cx| a.set_focused(pane, cx));
+            });
+            let events = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
+                let DiffPaneEvent::Close = *event;
+                this.app.update(cx, |a, cx| {
+                    a.set_focused(pane, cx);
+                    a.close_focused(cx);
+                });
+                this.focus_current(window, cx);
             });
             self.pane_focus
                 .insert(pane, (view.entity_id(), handle, [focus, events]));
@@ -2423,6 +2489,11 @@ impl Workspace {
             PaneEvent::Kill => self.kill_in_pane(pane, window, cx),
             PaneEvent::Remove => self.app.read(cx).remove_in_pane(pane, cx),
             PaneEvent::ContextMenu { on_grid } => self.open_pane_menu(pane, on_grid, cx),
+            PaneEvent::ShowChanges => {
+                if let Some(agent) = self.app.read(cx).layout().agent(pane) {
+                    self.show_changes(agent, window, cx);
+                }
+            }
             PaneEvent::Notice(text) => self
                 .app
                 .update(cx, |a, cx| a.show_notice(text.to_owned(), cx)),
@@ -2485,7 +2556,10 @@ impl Workspace {
         let children: Vec<_> = rects
             .into_iter()
             .filter_map(|(pane, r)| {
-                let view = app.pane_view(pane)?.clone();
+                let view: gpui::AnyView = match app.diff_pane(pane) {
+                    Some(diff) => diff.clone().into(),
+                    None => app.pane_view(pane)?.clone().into(),
+                };
                 // 1 when settled; grows from an inset while fading in.
                 let t = entering
                     .get(&pane)
@@ -2535,6 +2609,7 @@ impl Workspace {
         if in_selection {
             items.extend(bulk_entries());
         }
+        items.extend(self.workflow_row_items(agent_id, cx));
         items
     }
 
@@ -3135,6 +3210,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::reopen_closed_pane))
             .on_action(cx.listener(|this, _: &ShowShortcuts, w, cx| this.toggle_shortcuts(w, cx)))
             .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(Self::show_changes_command))
+            .on_action(cx.listener(Self::run_action_command))
+            .on_action(cx.listener(Self::archive_worktree_command))
             .on_action(cx.listener(|this, _: &NextAgent, w, cx| this.switch_agent(false, w, cx)))
             .on_action(cx.listener(|this, _: &PreviousAgent, w, cx| this.switch_agent(true, w, cx)))
             .on_modifiers_changed(cx.listener(Self::switcher_modifiers))
@@ -3182,6 +3260,11 @@ impl Render for Workspace {
                 self.send
                     .as_ref()
                     .map(|(sheet, _)| send_sheet::render_over(sheet, reduce_motion)),
+            )
+            .children(
+                self.action_sheet
+                    .as_ref()
+                    .map(|(sheet, _)| action_sheet::render_over(sheet, reduce_motion)),
             )
             .children(shortcuts)
             .children(connect)

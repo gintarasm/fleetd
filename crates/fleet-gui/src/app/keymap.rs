@@ -9,6 +9,11 @@ use crate::core::shortcuts::{self, Binding, Section};
 actions!(
     fleet,
     [
+        // ⇧⌘C: the focused pane's agent's diff pane (ADR 0094).
+        ShowChanges,
+        // The palette's Run Action… and Archive Worktree… (ADR 0094).
+        RunAction,
+        ArchiveWorktree,
         SplitRight,
         SplitDown,
         ClosePane,
@@ -204,7 +209,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-0", ZoomReset, None),
         KeyBinding::new("cmd-shift-t", ReopenClosedPane, None),
         KeyBinding::new("cmd-/", ShowShortcuts, None),
+        KeyBinding::new("cmd-shift-c", ShowChanges, None),
     ]);
+    super::diff_pane::bind_keys(cx);
 }
 
 /// The ⌘/ cheat sheet: every key binding registered now, whoever bound it.
