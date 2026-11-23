@@ -3,7 +3,8 @@
 # ~/.local/bin or ~/.fleet): a fresh install, an install over a running
 # daemon with an agent, the same with relative dirs from another directory
 # and with CARGO_TARGET_DIR set, a daemon socket that does not answer, a
-# stale socket from a killed daemon, and a non-fleet file at the link path.
+# stale socket from a killed daemon, a non-fleet file at the link path, and
+# the refresh of an installed agent skill (in a temp home, never ~/.claude).
 # Not wired into CI; run it by hand: sh scripts/install-test.sh
 set -eu
 cd "$(dirname "$0")/.."
@@ -20,9 +21,12 @@ cleanup() {
 trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-install() { sh "$root/scripts/install.sh" --app-dir "$tmp/apps" --bin-dir "$tmp/bin" --state-dir "$tmp/state" "$@"; }
+install() { sh "$root/scripts/install.sh" --app-dir "$tmp/apps" --bin-dir "$tmp/bin" --state-dir "$tmp/state" --skill-home "$tmp/home" "$@"; }
 
 mkdir -p "$tmp/state"
+# A stale Claude skill to refresh; no omp skill, which must not appear.
+mkdir -p "$tmp/home/.claude/skills/fleet" "$tmp/home/.omp"
+echo "stale skill" >"$tmp/home/.claude/skills/fleet/SKILL.md"
 
 echo "== fresh install, no daemon"
 out=$(install 2>&1) || { echo "$out"; fail "install.sh failed"; }
@@ -36,6 +40,9 @@ else
 fi
 "$tmp/bin/fleet" --help >/dev/null || fail "fleet --help does not run"
 case "$out" in *"no fleetd running"*) ;; *) fail "output lacks 'no fleetd running'" ;; esac
+"$tmp/bin/fleet" skill print | cmp -s - "$tmp/home/.claude/skills/fleet/SKILL.md" || fail "installed claude skill was not refreshed"
+case "$out" in *"updated the claude skill"*) ;; *) fail "output lacks 'updated the claude skill'" ;; esac
+[ ! -e "$tmp/home/.omp/agent/skills/fleet" ] || fail "install.sh installed an omp skill nobody asked for"
 
 echo "== install over a running daemon"
 "$tmp/bin/fleetd" --state-dir "$tmp/state" >/dev/null 2>&1 &
@@ -51,7 +58,7 @@ case "$out" in *"fleetd restarted: 1 agents kept"*) ;; *) fail "output lacks 'fl
 "$tmp/bin/fleet" --state-dir "$tmp/state" ls | grep -q running || fail "agent is not running after restart"
 
 echo "== relative --app-dir, --bin-dir and --state-dir, run from another directory"
-out=$(cd "$tmp" && sh "$root/scripts/install.sh" --app-dir apps --bin-dir bin --state-dir state 2>&1) || { echo "$out"; fail "install.sh with relative dirs failed"; }
+out=$(cd "$tmp" && sh "$root/scripts/install.sh" --app-dir apps --bin-dir bin --state-dir state --skill-home home 2>&1) || { echo "$out"; fail "install.sh with relative dirs failed"; }
 echo "$out"
 case "$out" in *"fleetd restarted: 1 agents kept"*) ;; *) fail "relative dirs: output lacks 'fleetd restarted: 1 agents kept'" ;; esac
 for d in apps bin state; do
