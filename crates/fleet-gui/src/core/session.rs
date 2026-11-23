@@ -20,7 +20,8 @@ use fleet_client::{
 use fleet_proto::{
     AgentInfo, AgentState, BinaryIdentity, DecideSpawn, ForgetAgents, Frame, HelloOk, KillAgent,
     ListAgents, ListMessageEdges, ListPendingSpawns, PendingSpawn, Response, RestartAgent,
-    RestartDaemon, SendInput, SetLabels, SpawnAgent, event, request, response,
+    RestartDaemon, SearchHits, SearchOutput, SendInput, SetLabels, SpawnAgent, event, request,
+    response,
 };
 use fleet_term::Palette;
 
@@ -29,6 +30,7 @@ use super::launch::{find_tool, update_available};
 use super::message_lines::{self, Edge as MessageEdge};
 use super::pane::PaneModel;
 use super::pane_link::PaneLink;
+use super::search_all;
 use super::spawn::SpawnRequest;
 use super::target::{Connected, Target, connect};
 
@@ -36,6 +38,8 @@ use super::target::{Connected, Target, connect};
 pub const CLIENT_NAME: &str = "gui";
 /// How a [`Session::read_output`] connection introduces itself.
 const OUTPUT_CLIENT_NAME: &str = "gui-output";
+/// How a [`Session::search_output`] connection introduces itself.
+const SEARCH_CLIENT_NAME: &str = "gui-search";
 
 /// What an old daemon answers a request it does not know with.
 const UNKNOWN_REQUEST: &str = "empty request";
@@ -708,6 +712,35 @@ impl Session {
             let read = fleet_client::history::read(&mut c.conn, agent_id, None);
             drop(c);
             read.map(|t| t.plain_text()).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A job that searches every agent's output for `query` (ADR 0098)
+    /// over a connection of its own, as `fleet search` does. It blocks:
+    /// run it off the UI thread.
+    pub fn search_output(
+        &self,
+        query: String,
+        case_sensitive: bool,
+    ) -> impl FnOnce() -> Result<SearchHits, String> + Send + use<> {
+        let ctx = Arc::clone(&self.inner.ctx);
+        move || {
+            let mut c = connect(&ctx.target, &ctx.state_dir, SEARCH_CLIENT_NAME)
+                .map_err(|e| e.to_string())?;
+            let req = SearchOutput {
+                text: query,
+                case_sensitive,
+                limit: search_all::LIMIT,
+                per_agent: search_all::PER_AGENT,
+            };
+            let hits = fleet_client::search::search(&mut c.conn, req);
+            drop(c);
+            hits.map_err(|e| match e.to_string() {
+                m if m.contains(UNKNOWN_REQUEST) => {
+                    "this fleetd is too old to search; restart it to update".to_owned()
+                }
+                m => m,
+            })
         }
     }
 

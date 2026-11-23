@@ -11,6 +11,7 @@ pub mod priority;
 pub mod pty;
 pub mod scope;
 pub mod scrollback;
+pub mod search;
 pub mod store;
 pub mod token;
 pub mod term {

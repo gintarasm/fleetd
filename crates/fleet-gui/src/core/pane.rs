@@ -505,6 +505,15 @@ impl PaneModel {
         self.find = Some(Search::new(needle, &self.scrollback));
     }
 
+    /// Opens find for `query` on the match on `line` (numbered as the
+    /// search numbers lines), or the next one below it: Search All Agents
+    /// (ADR 0098). The line may be in history not loaded yet; the search
+    /// pages it in.
+    pub fn find_open_at(&mut self, query: &str, case_sensitive: bool, line: u64) {
+        let needle = Needle::new(query, case_sensitive);
+        self.find = Some(Search::new_at(needle, &self.scrollback, Some(line)));
+    }
+
     pub fn find_close(&mut self) {
         self.find = None;
     }
@@ -1121,6 +1130,58 @@ mod tests {
         find_all(&mut pane, "", false);
         let status = pane.find_status().unwrap();
         assert_eq!((status.index, status.count), (None, 0));
+    }
+
+    #[test]
+    fn find_at_a_line_picks_the_match_there_after_the_attach() {
+        let mut pane = pane();
+        // Opened before the agent's history arrives (Search All Agents).
+        pane.find_open_at("x", false, 1);
+        while pane.find_step(1000).more {}
+        pane.on_attached(&attach_ok(20, 2, &["x 0", "x 1", "y", "x 3"], 0));
+        while pane.find_step(1000).more {}
+        assert_eq!(pane.find_status().unwrap().index, Some(2));
+        assert_eq!(found_on(&pane, LineRef::History(1)), [(0, 1, true)]);
+        // No match on the line itself: the next one below it.
+        pane.find_open_at("x", false, 2);
+        while pane.find_step(1000).more {}
+        assert_eq!(found_on(&pane, LineRef::History(3)), [(0, 1, true)]);
+        // On the grid: numbered past the history's end.
+        pane.on_output(b"x grid");
+        pane.find_open_at("x", false, 4);
+        while pane.find_step(1000).more {}
+        assert_eq!(found_on(&pane, LineRef::Grid(0)), [(0, 1, true)]);
+        // Past every match: the last one.
+        pane.find_open_at("x", false, 99);
+        while pane.find_step(1000).more {}
+        assert_eq!(found_on(&pane, LineRef::Grid(0)), [(0, 1, true)]);
+    }
+
+    #[test]
+    fn find_at_an_older_line_waits_for_its_page() {
+        let mut pane = pane();
+        pane.on_attached(&attach_ok(20, 2, &["x 50", "x 51"], 50));
+        pane.find_open_at("x", false, 10);
+        while pane.find_step(1000).more {}
+        assert_eq!(
+            pane.find_status().unwrap().index,
+            None,
+            "line 10 is not loaded yet"
+        );
+        assert_eq!(pane.next_page_request(), Some((0, 50)));
+        let lines: Vec<_> = (0..50)
+            .map(|i| format!("x {i}").into_bytes().into())
+            .collect();
+        pane.on_page(
+            &HistoryPage {
+                agent_id: 1,
+                first_line: 0,
+                lines,
+            },
+            0,
+        );
+        while pane.find_step(1000).more {}
+        assert_eq!(found_on(&pane, LineRef::History(10)), [(0, 1, true)]);
     }
 
     #[test]

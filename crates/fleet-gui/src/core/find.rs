@@ -13,75 +13,9 @@
 use std::collections::VecDeque;
 
 use fleet_term::{Cell, Terminal};
+pub use fleet_term::{Needle, row_matches};
 
 use super::scrollback::Scrollback;
-
-/// What to look for: the query's characters, lower-cased unless the
-/// search is case sensitive.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Needle {
-    chars: Vec<char>,
-    case_sensitive: bool,
-}
-
-impl Needle {
-    /// `None` for an empty query.
-    pub fn new(text: &str, case_sensitive: bool) -> Option<Needle> {
-        if text.is_empty() {
-            return None;
-        }
-        let chars = text
-            .chars()
-            .map(|c| if case_sensitive { c } else { fold(c) })
-            .collect();
-        Some(Needle {
-            chars,
-            case_sensitive,
-        })
-    }
-
-    fn matches(&self, a: char, b: char) -> bool {
-        if self.case_sensitive {
-            a == b
-        } else {
-            fold(a) == b
-        }
-    }
-}
-
-/// One character, lower-cased (its first lower-case character).
-fn fold(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
-
-/// Appends to `out` the columns `start..end` of every match of `needle`
-/// in `cells`, left to right, not overlapping.
-pub fn row_matches(cells: &[Cell], needle: &Needle, out: &mut Vec<(u16, u16)>) {
-    let n = needle.chars.len();
-    if cells.len() < n {
-        return;
-    }
-    let mut cols = Vec::with_capacity(cells.len() + 1);
-    let mut col = 0u16;
-    for c in cells {
-        cols.push(col);
-        col = col.saturating_add(if c.wide { 2 } else { 1 });
-    }
-    cols.push(col);
-    let mut i = 0;
-    while i + n <= cells.len() {
-        let hit = cells[i..i + n]
-            .iter()
-            .zip(&needle.chars)
-            .all(|(c, &q)| c.extra.is_none() && needle.matches(c.ch, q));
-        if hit {
-            out.push((cols[i], cols[i + n]));
-            i += n;
-        } else {
-            i += 1;
-        }
-    }
-}
 
 /// A match: columns `start..end` of line `line` (in the search's
 /// numbering).
@@ -145,6 +79,9 @@ pub struct Search {
     current: Option<Match>,
     /// The current match is to be picked once the search has found it.
     pick: bool,
+    /// Pick the match on this line (or the next below it) rather than the
+    /// newest in view (Search All Agents, ADR 0098).
+    target: Option<u64>,
     cells: Vec<Cell>,
     found: Vec<(u16, u16)>,
 }
@@ -152,6 +89,12 @@ pub struct Search {
 impl Search {
     /// A search for `needle`, starting at the newest line.
     pub fn new(needle: Option<Needle>, sb: &Scrollback) -> Search {
+        Search::new_at(needle, sb, None)
+    }
+
+    /// A search for `needle` whose first current match is the one on
+    /// `target` or the next below it (else the last).
+    pub fn new_at(needle: Option<Needle>, sb: &Scrollback, target: Option<u64>) -> Search {
         let end = sb.end_line();
         Search {
             needle,
@@ -163,6 +106,7 @@ impl Search {
             grid_dirty: true,
             current: None,
             pick: true,
+            target,
             cells: Vec::new(),
             found: Vec::new(),
         }
@@ -176,7 +120,7 @@ impl Search {
     /// history was rebuilt or cleared).
     pub fn restart(&mut self, sb: &Scrollback) {
         let needle = self.needle.take();
-        *self = Search::new(needle, sb);
+        *self = Search::new_at(needle, sb, self.target);
     }
 
     /// The grid changed: scan it again on the next step.
@@ -351,6 +295,21 @@ impl Search {
     /// everything between it and `bottom` is scanned, else (when the search
     /// is done and none is above) the first below.
     fn try_pick(&mut self, sb: &Scrollback, bottom: u64) -> bool {
+        if let Some(target) = self.target {
+            // Certain once scanned down to it, or nothing older can come.
+            let more_pages = !sb.fully_loaded() && !sb.is_full();
+            if self.lo > target && !(self.done(sb) && !more_pages) {
+                return false;
+            }
+            let pick = self
+                .matches()
+                .find(|m| m.line >= target)
+                .or_else(|| self.matches().last())
+                .copied();
+            self.pick = false;
+            self.current = pick;
+            return pick.is_some();
+        }
         let above = self
             .matches()
             .take_while(|m| m.line <= bottom)
@@ -409,24 +368,7 @@ impl Search {
 
 #[cfg(test)]
 mod tests {
-    use super::{FindStatus, Needle, row_matches, status_label};
-    use fleet_term::Cell;
-
-    fn cells(s: &str) -> Vec<Cell> {
-        s.chars()
-            .map(|ch| Cell {
-                ch,
-                wide: ch == '界',
-                ..Cell::default()
-            })
-            .collect()
-    }
-
-    fn found(row: &str, q: &str, case: bool) -> Vec<(u16, u16)> {
-        let mut out = Vec::new();
-        row_matches(&cells(row), &Needle::new(q, case).unwrap(), &mut out);
-        out
-    }
+    use super::{FindStatus, status_label};
 
     #[test]
     fn status_label_counts_matches() {
@@ -443,31 +385,5 @@ mod tests {
         assert_eq!(status_label(s(None, 0, false), true), "No matches");
         assert_eq!(status_label(s(None, 0, true), true), "Searching…");
         assert_eq!(status_label(s(None, 0, false), false), "");
-    }
-
-    #[test]
-    fn empty_query_is_no_needle() {
-        assert_eq!(Needle::new("", false), None);
-    }
-
-    #[test]
-    fn finds_every_match_left_to_right_without_overlap() {
-        assert_eq!(found("abcabc", "abc", false), vec![(0, 3), (3, 6)]);
-        assert_eq!(found("aaaa", "aa", false), vec![(0, 2), (2, 4)]);
-        assert_eq!(found("ab", "abc", false), vec![]);
-    }
-
-    #[test]
-    fn case_folds_unless_case_sensitive() {
-        assert_eq!(found("Error ERROR error", "error", false).len(), 3);
-        assert_eq!(found("Error ERROR error", "error", true), vec![(12, 17)]);
-        assert_eq!(found("Error", "ERROR", false), vec![(0, 5)]);
-        assert_eq!(found("error", "Error", true), vec![]);
-    }
-
-    #[test]
-    fn wide_characters_take_two_columns() {
-        assert_eq!(found("界x界x", "x", false), vec![(2, 3), (5, 6)]);
-        assert_eq!(found("a界b", "界b", false), vec![(1, 4)]);
     }
 }

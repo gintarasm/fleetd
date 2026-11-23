@@ -72,6 +72,8 @@ pub struct Picker {
     query: String,
     ranked: Vec<Ranked>,
     selected: usize,
+    /// The rows are given ([`Picker::set_listed`]), not ranked by the query.
+    listed: bool,
 }
 
 impl Picker {
@@ -111,13 +113,33 @@ impl Picker {
         self.ranked.get(self.selected).map(|r| &self.items[r.item])
     }
 
-    /// Sets the query; the best match is selected.
+    /// Sets the query; the best match is selected. A listed picker keeps
+    /// its rows (its owner lists new ones).
     pub fn set_query(&mut self, query: &str) {
         if self.query == query {
             return;
         }
         self.query = query.to_owned();
-        self.rank();
+        if !self.listed {
+            self.rank();
+        }
+    }
+
+    /// Shows `items` as they are, in order, each title highlighted at the
+    /// byte offsets `title_hits[i]`; the query no longer ranks them. The
+    /// first row is selected.
+    pub fn set_listed(&mut self, items: Vec<PickerItem>, title_hits: Vec<Vec<usize>>) {
+        self.listed = true;
+        self.ranked = (0..items.len())
+            .map(|i| Ranked {
+                item: i,
+                score: 0,
+                title_hits: title_hits.get(i).cloned().unwrap_or_default(),
+                detail_hits: Vec::new(),
+            })
+            .collect();
+        self.items = items;
+        self.selected = 0;
     }
 
     /// Moves the selection by `delta` rows, wrapping around.
@@ -213,6 +235,28 @@ mod tests {
             .iter()
             .map(|r| p.items()[r.item].key.as_str())
             .collect()
+    }
+
+    #[test]
+    fn a_listed_picker_keeps_its_rows_whatever_the_query() {
+        let mut p = Picker::new(Vec::new(), Recents::default());
+        p.set_listed(
+            vec![item("b", "zzz", ""), item("a", "error", "")],
+            vec![vec![], vec![0, 1]],
+        );
+        p.set_query("error");
+        let keys: Vec<&str> = p
+            .ranked()
+            .iter()
+            .map(|r| p.items()[r.item].key.as_str())
+            .collect();
+        assert_eq!(keys, ["b", "a"]);
+        assert_eq!(p.ranked()[1].title_hits, [0, 1]);
+        assert_eq!(p.selected_item().unwrap().key, "b");
+        p.move_selection(1);
+        assert_eq!(p.selected_item().unwrap().key, "a");
+        p.set_listed(Vec::new(), Vec::new());
+        assert_eq!(p.selected_item(), None);
     }
 
     #[test]

@@ -69,8 +69,9 @@ pub use self::mailbox::{
     INBOX_PAGE_MAX, WaitSpec, mailbox_of, message_proto, wait_state_from_proto, wait_state_proto,
 };
 use crate::scrollback::{self, Scrollback};
+use crate::search::{self as output_search, Hits};
 use crate::store::{self, AgentRecord, Labels, NewAgent, Store};
-use crate::term::{HistoryEvent, Terminal};
+use crate::term::{HistoryEvent, Needle, Terminal};
 use crate::token::{self, AgentToken};
 use bytes::{Bytes, BytesMut};
 use fleet_proto::handoff::{HandoffAgent, handoff_agent};
@@ -998,6 +999,16 @@ impl AgentPipeline {
     /// The agent's exit code, once it has exited.
     pub fn exit_code(&self) -> Option<i32> {
         self.lock().exit_code
+    }
+
+    /// What a search of the agent's output reads first, under one lock:
+    /// the screen rows and where its history lies (ADR 0098).
+    fn search_view(&self) -> (Vec<String>, Option<HistoryInfo>) {
+        let state = self.lock();
+        (
+            state.term.visible_text(),
+            state.history.as_ref().map(History::info),
+        )
     }
 
     /// The grid's visible text (see [`Terminal::visible_text`]).
@@ -2977,6 +2988,58 @@ impl Node {
             return page;
         }
         lock(&self.histories).with(id, |h| h.read_page(generation, before_line, max_lines))?
+    }
+
+    /// Searches every agent's output for `needle` (ADR 0098): newest agent
+    /// first, each its screen bottom up, then its history newest line first,
+    /// within the hit caps and [`output_search::SEARCH_BUDGET_BYTES`]. An exited agent's
+    /// screen is its kept final screen, if any. History pages are read one
+    /// at a time, so no lock is held for the whole scan.
+    pub fn search(&self, needle: Needle, limit: u32, per_agent: u32) -> io::Result<Hits> {
+        let (records, _bad) = lock(&self.store)
+            .list_agents_lossy_unlabeled()
+            .map_err(store_err)?;
+        let mut ids: Vec<u64> = records.iter().map(|r| r.id).collect();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let mut scan = output_search::Scan::new(needle, limit, per_agent);
+        for id in ids {
+            if scan.done() {
+                break;
+            }
+            let (screen, info) = self.search_view(id);
+            let range = info.map(|i| (i.first_line, i.next_line));
+            let generation = info.map_or(0, |i| i.generation);
+            scan.agent(id, &screen, range, |before, max| {
+                self.read_history(id, generation, before, max)
+            });
+        }
+        Ok(scan.finish())
+    }
+
+    /// The agent's screen rows and history range, for [`Node::search`].
+    fn search_view(&self, id: u64) -> (Vec<String>, Option<HistoryInfo>) {
+        let screen = {
+            let agents = lock(&self.agents);
+            if let Some(live) = agents.live.get(&id) {
+                let pipeline = live.pipeline.clone();
+                drop(agents);
+                let (screen, info) = pipeline.search_view();
+                if info.is_some() {
+                    return (screen, info);
+                }
+                screen
+            } else if let Some(a) = agents.exited(id).filter(|a| a.cols > 0 && a.rows > 0) {
+                let (snapshot, cols, rows) = (a.snapshot.clone(), a.cols, a.rows);
+                drop(agents);
+                let mut term = Terminal::new(cols, rows);
+                term.feed(&snapshot);
+                term.visible_text()
+            } else {
+                Vec::new()
+            }
+        };
+        let info = lock(&self.histories).with(id, History::info).ok();
+        (screen, info)
     }
 
     /// Exited agents whose final screen is kept (at most [`RETAINED_EXITED`]).

@@ -175,6 +175,33 @@ fn send_then_attach_snapshot_contains_text() {
 }
 
 #[test]
+fn search_prints_hits_and_exits_1_without_any() {
+    let d = Daemon::start();
+    let id = d
+        .ok(&[
+            "spawn",
+            "--",
+            "sh",
+            "-c",
+            "echo Build FAILED here; exec sleep 600",
+        ])
+        .trim()
+        .to_string();
+    let mut out = String::new();
+    wait_for("the search hit", || {
+        // Exit code 1 (no hit) until the agent has printed.
+        out = String::from_utf8_lossy(&d.fleet(&["search", "build failed"]).stdout).into_owned();
+        !out.is_empty()
+    });
+    assert_eq!(out, format!("{id}:0:Build FAILED here\n"));
+    let none = d.fleet(&["search", "--case-sensitive", "build failed"]);
+    assert_eq!(none.status.code(), Some(1));
+    assert!(none.stdout.is_empty());
+    let json = d.ok(&["search", "--json", "failed"]);
+    assert!(json.contains("\"truncated\":false"), "{json}");
+}
+
+#[test]
 fn unknown_agent_errors_exit_1() {
     let d = Daemon::start();
     for args in [&["kill", "999"][..], &["attach", "--snapshot-only", "999"]] {

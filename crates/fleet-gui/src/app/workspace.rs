@@ -28,8 +28,8 @@ use super::keymap::{
     FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent,
     NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove, RemoveExited, RemovePane,
     RenamePane, ReopenClosedPane, Restart, RestartPane, SaveOutput, ScrollToBottom, ScrollToTop,
-    SelectAll, SelectTab, SendToAgents, ShowShortcuts, SplitDown, SplitRight, ToggleGraph,
-    ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+    SearchAllAgents, SelectAll, SelectTab, SendToAgents, ShowShortcuts, SplitDown, SplitRight,
+    ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::labels_sheet::{LabelsEvent, LabelsSheet};
@@ -41,6 +41,7 @@ use super::pane_drag::PaneDrag;
 use super::pane_view::{PaneEvent, PaneView};
 use super::picker_view::{PickerEvent, PickerView};
 use super::rename::{RenameEvent, RenameSheet};
+use super::search_all_view::{SearchAllEvent, SearchAllView};
 use super::send_sheet::{self, SendEvent, SendSheet};
 use super::sidebar_view::{
     SidebarData, TabMark, program_name, render_pending, render_sidebar, tab_title,
@@ -208,6 +209,8 @@ pub struct Workspace {
     send: Option<(Entity<SendSheet>, Subscription)>,
     /// The sidebar rows picked with ⌘-click and ⇧-click (ADR 0083).
     row_selection: RowSelection,
+    /// Search All Agents (⇧⌘F, ADR 0098), while it is open.
+    search_all: Option<(Entity<SearchAllView>, Subscription)>,
     /// The command palette (⌘P) and what its rows stand for.
     palette: Option<(Entity<PickerView>, Vec<Entry>, Subscription)>,
     /// The palette's recent picks, most recent first.
@@ -240,7 +243,7 @@ pub struct Workspace {
     /// Motion is reduced: System Settings' Reduce Motion (read at launch
     /// and on appearance changes) unless `[gui] reduce_motion` overrides it.
     reduce_motion: bool,
-    /// The sidebar's filter field (⌘⇧F), its status filter, and the
+    /// The sidebar's filter field (⌥⌘F), its status filter, and the
     /// tabs' focus (issue #40).
     pub(crate) filter_field: Entity<TextField>,
     status_filter: StatusFilter,
@@ -368,6 +371,7 @@ impl Workspace {
             kill: None,
             send: None,
             row_selection: RowSelection::default(),
+            search_all: None,
             palette: None,
             palette_recents: Recents::default(),
             choosers: HashMap::new(),
@@ -539,6 +543,11 @@ impl Workspace {
         self.choosers.get(&pane).map(|(c, _, _)| c)
     }
 
+    /// Search All Agents, while it is open.
+    pub fn search_all(&self) -> Option<&Entity<SearchAllView>> {
+        self.search_all.as_ref().map(|(v, _)| v)
+    }
+
     /// The agent switcher, while it is open.
     pub fn switcher(&self) -> Option<&Entity<PickerView>> {
         self.switcher.as_ref().map(|s| &s.view)
@@ -567,6 +576,7 @@ impl Workspace {
             || self.shortcuts.is_some()
             || self.palette.is_some()
             || self.switcher.is_some()
+            || self.search_all.is_some()
     }
 
     pub fn kill_sheet(&self) -> Option<&Entity<KillSheet>> {
@@ -625,6 +635,7 @@ impl Workspace {
         self.send = None;
         self.palette = None;
         self.switcher = None;
+        self.search_all = None;
         if let Some((sheet, _)) = &self.connect {
             let sheet = sheet.clone();
             sheet.update(cx, |s, cx| {
@@ -990,7 +1001,7 @@ impl Workspace {
         )
     }
 
-    /// ⌘⇧F: the keyboard goes to the sidebar's filter field.
+    /// ⌥⌘F: the keyboard goes to the sidebar's filter field.
     fn focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal() {
             return;
@@ -1650,6 +1661,62 @@ impl Workspace {
             restartable: view.is_some_and(|v| v.restartable()),
             has_selection: view.is_some_and(|v| v.has_selection()),
             any_running: app.agents.iter().any(sendable),
+        }
+    }
+
+    /// ⇧⌘F: opens Search All Agents (or closes it if open). Not over a
+    /// sheet.
+    fn search_all_agents(
+        &mut self,
+        _: &SearchAllAgents,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_all.take().is_some() {
+            self.focus_current(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.modal() {
+            return;
+        }
+        let app = self.app.clone();
+        let view = cx.new(|cx| SearchAllView::new(app, cx));
+        let sub = cx.subscribe_in(&view, window, Self::search_all_event);
+        view.read(cx).focus(window, cx);
+        self.search_all = Some((view, sub));
+        cx.notify();
+    }
+
+    /// A Search All Agents pick shows the agent in the focused pane and
+    /// finds the line there.
+    fn search_all_event(
+        &mut self,
+        _view: &Entity<SearchAllView>,
+        event: &SearchAllEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_all.take().is_none() {
+            return;
+        }
+        self.focus_current(window, cx);
+        cx.notify();
+        let SearchAllEvent::Show {
+            agent_id,
+            line,
+            query,
+            case_sensitive,
+        } = event
+        else {
+            return;
+        };
+        self.show_agent(*agent_id, window, cx);
+        let app = self.app.read(cx);
+        if let Some(view) = app.pane_view(app.focused()).cloned() {
+            view.update(cx, |v, cx| {
+                v.find_hit(query, *case_sensitive, *line, window, cx)
+            });
         }
     }
 
@@ -2656,6 +2723,37 @@ impl Render for Workspace {
             )
             .with_priority(2)
         });
+        let search_all = self.search_all.as_ref().map(|(view, _)| {
+            // Placed as the palette is; a click beside it closes it.
+            deferred(
+                div()
+                    .id("search-all-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .flex()
+                    .items_start()
+                    .justify_center()
+                    .pt(px(chrome::BAR_HEIGHT + space::XL))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.search_all.take().is_some() {
+                                this.focus_current(window, cx);
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(appear(
+                        div().child(view.clone()),
+                        "search-all-appear",
+                        -motion::SHEET_OFFSET,
+                        motion::SHEET_MS,
+                        reduce_motion,
+                    )),
+            )
+            .with_priority(2)
+        });
         let switcher = self.switcher.as_ref().map(|s| {
             // Centred, like ⌘Tab; a click beside it cancels.
             deferred(
@@ -2828,6 +2926,7 @@ impl Render for Workspace {
                 this.output_focused(PaneMenuItem::CopyLastOutput, cx)
             }))
             .on_action(cx.listener(Self::send_to_agents))
+            .on_action(cx.listener(Self::search_all_agents))
             .on_action(cx.listener(Self::restart_pane))
             .on_action(cx.listener(|this, _: &ZoomIn, w, cx| this.zoom(Zoom::In, w, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, w, cx| this.zoom(Zoom::Out, w, cx)))
@@ -2863,6 +2962,7 @@ impl Render for Workspace {
             .children(graph_pending)
             .children(toast)
             .children(palette)
+            .children(search_all)
             .children(switcher)
             .children(sheet)
             .children(rename)
@@ -3132,6 +3232,9 @@ mod tests {
         restart_pending: std::sync::atomic::AtomicBool,
         /// What `read_output` gives per agent (unset: an error).
         outputs: Mutex<HashMap<u64, Result<String, String>>>,
+        /// What `search_output` gives, and the searches asked for.
+        search_hits: Mutex<Vec<fleet_proto::SearchHit>>,
+        searches: Mutex<Vec<(String, bool)>>,
         pending: Mutex<Vec<fleet_proto::PendingSpawn>>,
     }
 
@@ -3226,6 +3329,21 @@ mod tests {
 
         fn forget(&self, ids: Vec<u64>) {
             self.calls.lock().unwrap().push(Call::Forget(ids));
+        }
+
+        fn search_output(
+            &self,
+            query: String,
+            case_sensitive: bool,
+        ) -> crate::app::app_state::SearchJob {
+            self.searches.lock().unwrap().push((query, case_sensitive));
+            let hits = self.search_hits.lock().unwrap().clone();
+            Box::new(move || {
+                Ok(fleet_proto::SearchHits {
+                    hits,
+                    truncated: false,
+                })
+            })
         }
 
         fn read_output(&self, agent_id: u64) -> crate::app::app_state::OutputJob {
@@ -6017,6 +6135,101 @@ mod tests {
         assert_eq!(tabs_drawn(&mut s), [1]);
     }
 
+    /// The Search All Agents rows: (heading, title).
+    fn search_rows(s: &mut Setup<'_>) -> Vec<(Option<String>, String)> {
+        s.ws.read_with(s.cx, |w, cx| {
+            let view = w.search_all().expect("search open").read(cx);
+            let picker = view.picker().read(cx);
+            let titles: Vec<String> = picker
+                .picker()
+                .items()
+                .iter()
+                .map(|i| i.title.clone())
+                .collect();
+            picker.sections().iter().cloned().zip(titles).collect()
+        })
+    }
+
+    #[gpui::test]
+    fn search_all_agents_lists_hits_by_agent_and_finds_the_pick(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+        let hit = |agent_id, line, text: &str| fleet_proto::SearchHit {
+            agent_id,
+            line,
+            text: text.into(),
+        };
+        *fake.search_hits.lock().unwrap() = vec![
+            hit(2, 7, "  error: two"),
+            hit(1, 3, "error in one"),
+            hit(1, 1, "more error"),
+        ];
+        s.cx.simulate_keystrokes("cmd-shift-f");
+        assert!(s.ws.read_with(s.cx, |w, _| w.search_all().is_some()));
+        s.cx.simulate_input("err");
+        s.cx.run_until_parked();
+        assert!(fake.searches.lock().unwrap().is_empty(), "debounced");
+        s.cx.simulate_input("or");
+        s.cx.executor()
+            .advance_clock(crate::core::search_all::DEBOUNCE);
+        s.cx.run_until_parked();
+        assert_eq!(
+            *fake.searches.lock().unwrap(),
+            [("error".to_owned(), false)],
+            "one search, for the latest query"
+        );
+        let rows = search_rows(&mut s);
+        let titles: Vec<&str> = rows.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(titles, ["error: two", "error in one", "more error"]);
+        let headed: Vec<bool> = rows.iter().map(|(h, _)| h.is_some()).collect();
+        assert_eq!(headed, [true, true, false], "grouped by agent");
+
+        // The second row: agent 1 in the focused pane, find on line 3.
+        s.cx.simulate_keystrokes("down enter");
+        s.cx.run_until_parked();
+        assert!(s.ws.read_with(s.cx, |w, _| w.search_all().is_none()));
+        let pane = focused(&mut s);
+        assert_eq!(
+            s.app.read_with(s.cx, |a, _| a.layout().agent(pane)),
+            Some(1)
+        );
+        let lines: Vec<bytes::Bytes> = ["error 0", "error 1", "x", "error 3", "error 4"]
+            .iter()
+            .map(|l| bytes::Bytes::from(l.as_bytes().to_vec()))
+            .collect();
+        fake.model(pane).lock().unwrap().on_attached(&AttachOk {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            primary: true,
+            history_tail: lines,
+            ..Default::default()
+        });
+        let view = s
+            .app
+            .read_with(s.cx, |a, _| a.pane_view(pane).cloned())
+            .unwrap();
+        // The model changed under the view: a redraw scans it.
+        view.update(s.cx, |_, cx| cx.notify());
+        s.cx.run_until_parked();
+        let label = view.read_with(s.cx, |v, _| v.find_label());
+        assert_eq!(label.as_deref(), Some("3 of 4"), "on line 3");
+    }
+
+    #[gpui::test]
+    fn filter_agents_moved_to_option_command_f(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let rows = palette_rows(&mut s);
+        assert!(rows.contains(&("Search All Agents…".to_owned(), Some("⇧⌘F".to_owned()))));
+        assert!(rows.contains(&("Filter Agents".to_owned(), Some("⌥⌘F".to_owned()))));
+        s.cx.simulate_keystrokes("cmd-shift-f escape");
+        assert!(s.ws.read_with(s.cx, |w, _| w.search_all().is_none()));
+    }
+
     /// The palette's rows now, as (title, shortcut); closes it again.
     fn palette_rows(s: &mut Setup<'_>) -> Vec<(String, Option<String>)> {
         s.cx.simulate_keystrokes("cmd-p");
@@ -6348,7 +6561,7 @@ mod tests {
         );
         assert_eq!(tabs_drawn(&mut s), [1, 2]);
 
-        s.cx.simulate_keystrokes("cmd-shift-f");
+        s.cx.simulate_keystrokes("cmd-alt-f");
         assert!(filter_focused(&mut s));
         s.cx.simulate_input("coder");
         assert_eq!(tabs_drawn(&mut s), [2]);
@@ -6383,7 +6596,7 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let mut s = setup(cx, &fake, dir.path());
         agents(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
-        s.cx.simulate_keystrokes("cmd-shift-f");
+        s.cx.simulate_keystrokes("cmd-alt-f");
         s.cx.simulate_input("/b");
         s.cx.simulate_keystrokes("enter");
         s.cx.run_until_parked();
@@ -6470,7 +6683,7 @@ mod tests {
         assert_eq!(saved["local"].iter().collect::<Vec<_>>(), ["alpha"]);
 
         // Typing shows what matched inside it, without forgetting it.
-        s.cx.simulate_keystrokes("cmd-shift-f");
+        s.cx.simulate_keystrokes("cmd-alt-f");
         s.cx.simulate_input("/a");
         assert_eq!(tabs_drawn(&mut s), [2, 1]);
         s.cx.simulate_keystrokes("escape");
@@ -6535,7 +6748,7 @@ mod tests {
             crate::core::sidebar::GroupBy::Repo
         );
 
-        s.cx.simulate_keystrokes("cmd-shift-f");
+        s.cx.simulate_keystrokes("cmd-alt-f");
         s.cx.simulate_input("feat/git");
         assert_eq!(tabs_drawn(&mut s), [2]);
     }
