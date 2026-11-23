@@ -267,7 +267,7 @@ pub fn parse_duration(s: &str) -> std::result::Result<i64, String> {
 
 /// `path` against `cwd`, with `.` and `..` resolved by name (the daemon
 /// takes plain absolute paths only).
-fn absolute(cwd: &Path, path: &str) -> String {
+pub fn absolute(cwd: &Path, path: &str) -> String {
     let mut out = PathBuf::from("/");
     for c in cwd.join(path).components() {
         match c {
@@ -439,7 +439,7 @@ fn view_json(v: &View) -> serde_json::Value {
     }
 }
 
-fn outcome_json(o: &Outcome) -> serde_json::Value {
+pub fn outcome_json(o: &Outcome) -> serde_json::Value {
     match o {
         Outcome::Done(d) => serde_json::json!({"done": {"message": d.message}}),
         Outcome::Spawned(s) => serde_json::json!({"spawned": {

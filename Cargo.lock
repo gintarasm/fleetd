@@ -2002,9 +2002,11 @@ dependencies = [
  "clap",
  "fleet-node",
  "fleet-proto",
+ "fleet-workflow",
  "fleetd",
  "gungraun",
  "libc",
+ "prost",
  "serde",
  "serde_json",
  "tempfile",
@@ -2037,7 +2039,11 @@ name = "fleet-workflow"
 version = "0.1.0"
 dependencies = [
  "fleet-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "toml 1.2.1+spec-1.1.0",
 ]
 
 [[package]]

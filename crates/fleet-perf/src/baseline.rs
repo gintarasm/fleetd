@@ -581,7 +581,10 @@ baseline = 100
             .collect();
         // Emitted, but with no baseline yet: the user records them (see
         // `bench/README.md`); a shipped baseline needs no edit here.
-        const UNRECORDED: &[&str] = &["exec_true_roundtrip_ns"];
+        const UNRECORDED: &[&str] = &[
+            "exec_true_roundtrip_ns",
+            "diff_view_build_10k_lines_instructions",
+        ];
         assert!(shipped.is_subset(&emitted), "{shipped:?} vs {emitted:?}");
         let missing: std::collections::BTreeSet<&str> =
             emitted.difference(&shipped).copied().collect();
