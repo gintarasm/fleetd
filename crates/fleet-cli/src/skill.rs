@@ -228,4 +228,27 @@ mod tests {
         }
         assert!(SKILL.starts_with("---\nname: fleet\n"));
     }
+
+    #[test]
+    fn covers_the_m4_worktree_contract() {
+        for needle in [
+            "## Work in parallel: worktrees",
+            "fleet wt new",
+            "fleet wt diff",
+            "fleet wt ls",
+            "fleet wt archive",
+            "--reuse",
+            "--shared",
+            "--stat",
+            "`refused`",
+            "cannot `--force`",
+            "`prune`",
+            "fleet action ls",
+            "fleet action run",
+        ] {
+            assert!(SKILL.contains(needle), "skill does not mention {needle}");
+        }
+        // Agents are refused `fleet node …`; the skill must not teach it.
+        assert!(!SKILL.contains("fleet node"), "skill mentions fleet node");
+    }
 }

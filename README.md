@@ -386,6 +386,73 @@ fleet lease ls [--json]                                    # NAME HOLDER HELD EX
 - Leases survive `fleet daemon restart`; waiters re-queue at the back. In `lease ls`, an agent sees a holder outside its subtree only as hidden. The `perf-wall` CI job and `fleet-perf run --suite wall` take the lease `perf-wall`.
 - Exit codes: 0, 1 busy or not held, 2 usage or other error, 3 forbidden. Design: [0077](docs/decisions/0077-leases.md).
 
+### Worktrees: `fleet wt`
+
+One worktree and branch per agent, so agents working in parallel on one repository do not trip over each other. `fleet wt` (alias `fleet worktree`) runs the built-in `git-worktree` workflow in the daemon; agents may use all of it except `--force` and `prune` (see [the agent skill](crates/fleet-cli/skill/SKILL.md)).
+
+```sh
+fleet wt new issue-140 --branch feat/x --name m4-a --label m4=a -- claude "…brief…"
+fleet wait --state done,error,exited
+fleet wt diff m4-a --stat
+fleet wt ls
+fleet wt archive m4-a
+fleet wt prune --dry-run && fleet wt prune
+```
+
+- **`new <slug> -- <program> [args…]`** makes the worktree `<root>/<slug>` on a new branch and starts the agent in it, printing the agent's ID. Slug: letters, digits, `.`, `_`, `-`. `--branch B` (default: `branch_prefix` + slug, `fleet/<slug>`), `--base REF` (default: the remote's default branch, fetched first unless `fetch_base = false`), `--name N`, `--label k=v` (repeatable), `--repo D` (any checkout of the repository; default: the current folder), `--json`. The branch has no upstream, so a `git push` from it never targets the base. The agent gets the labels `git.repo`, `git.worktree` and `git.base`.
+- **`--reuse`** starts the agent in the slug's existing worktree (restarting work in place); it is refused while another agent runs there unless you add **`--shared`**. Without `--reuse`, a taken slug is refused.
+- **`diff [<agent>] [--path D] [--against base|uncommitted|committed] [--stat] [--file F] [-U N] [--json]`** shows what changed in the agent's worktree (default: the current folder's), since the merge base with its base ref and with untracked files included. `--stat` prints file names with `+/-` counts. Output is coloured on a terminal (`NO_COLOR` respected).
+- **`ls [--repo D] [--json]`** lists every worktree of the repository with its branch, base, ahead/behind, whether it is dirty or merged, and its agents.
+- **`archive <agent>|--path D [--force] [--keep-branch]`** removes a worktree (ignored files such as `target/` go with it) and deletes its branch when merged. It is refused while an agent runs in it (even with `--force`), and with uncommitted changes or commits that are on no remote and not merged into the base; `--force` overrides those two (and deletes the branch).
+- **`prune [--repo D] [--dry-run]`** (user only) archives every worktree `fleet` made that is clean, merged and idle, and prints a table of what it kept and why.
+
+A refusal prints `fleet: refused: <reason>` with the flags to add, and exits 1 (as does an unknown agent or a folder that is not a git checkout).
+
+#### Configuration
+
+`~/.fleet/config.toml`, table `[workflows.git-worktree]`, read each time an action runs (all optional; an unknown key is an error naming it):
+
+| Key | Default | |
+|---|---|---|
+| `root` | `"~/.fleet/worktrees/{repo}"` | where new worktrees go; `~` and `{repo}` (the repository folder's name) are expanded, and a relative root is relative to the main checkout |
+| `branch_prefix` | `"fleet/"` | prefix of the default branch name |
+| `fetch_base` | `true` | `git fetch` a `<remote>/<branch>` base before branching (30 s; on failure the local ref is used and the result says so) |
+
+`[workflows.git-worktree.repos.<name>]` overrides the same keys for one repository (`<name>` is the main checkout's folder name):
+
+```toml
+[workflows.git-worktree]
+branch_prefix = "agent/"
+
+[workflows.git-worktree.repos.fleetd]
+root = "../{repo}-wt"
+fetch_base = false
+```
+
+### Actions: `fleet action`
+
+`fleet wt` is a thin client of the daemon's workflow actions; every action, from any workflow, can be listed and run generically (the GUI's Run Action… uses the same calls):
+
+```sh
+fleet action ls [--json]
+fleet action run git-worktree.diff agent=m4-a against=uncommitted
+fleet action run git-worktree.new-agent slug=try-it -- claude
+```
+
+`run <workflow>.<action> [key=value]… [-- argv…] [--json]`: a bare key sets a bool, `labels=k=v` repeats, durations take `ms`, `s`, `m` or `h`, and the words after `--` fill the action's `argv` param. Tables print as aligned columns and diffs as unified diffs. Exit 0 on success, 1 when refused, 3 when forbidden. `fleet action ls --json` shows each action's params.
+
+### Run a program or read a file on the node: `fleet node` (user only)
+
+```sh
+fleet node exec --cwd ~/src/app --timeout 5m -- git status
+fleet node cat /etc/hosts
+fleet node ls /tmp
+```
+
+The primitives the workflows are built on, exposed for scripting and for testing against a remote node (M6). Agents are refused (`forbidden:`).
+- **`exec [--cwd DIR] [--timeout 30s] [--env K=V]… -- argv…`** prints the program's stdout and stderr to the matching streams and exits with its code: 124 on a timeout (default 10 minutes, at most 1 hour), 128 + n when signal n ended it. The program runs with the node's login-shell environment plus `--env`.
+- **`cat <path>`** writes a file (absolute path) to stdout. **`ls <dir> [--json]`** prints `kind size name` per entry, sorted by name, directories ending in `/`.
+
 ### Read the daemon's log
 
 ```sh
@@ -401,14 +468,13 @@ fleet logs -f              # then follow new lines until Ctrl-C
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | error (for example `fleetd is not running`, or an unknown agent); for `wait`, `lease`, `answer` and `approve`: no match, timeout, busy or not found |
+| 1 | error (for example `fleetd is not running`, or an unknown agent); for `wait`, `lease`, `answer` and `approve`: no match, timeout, busy or not found; for `wt` and `action`: refused or not found |
 | 2 | `fleet attach` fell behind the agent's output; also usage errors and other errors from `report`, `wait`, `message`, `inbox` and `lease` |
 | 3 | `forbidden:` an agent tried something outside its scope ([Agents that spawn agents](#agents-that-spawn-agents)) |
 | 128 + n | `fleet attach` was ended by signal n sent to the `fleet` process |
 
 ### Not yet in the CLI (TBD)
 
-- Workflows (git worktree per agent, diff view; `RunAction`): **TBD** (M4, [0025](docs/decisions/0025-core-knows-agents-workflows-own-hierarchy.md))
 - Remote nodes (`fleet node add user@host`): **TBD** (M6)
 - Plugins and agent adapters: **TBD** (M5)
 - Credentials and secret grants: **TBD** (M7)
@@ -456,7 +522,17 @@ Not yet verified by hand: connecting to a remote host over ssh, the "Start fleet
 | `cmd-1` … `cmd-4` | focus pane 1 to 4 |
 | `cmd-n` | new agent |
 | `cmd-shift-m` | send text to agents |
+| `cmd-shift-c` | Show Changes: the focused agent's diff, in a split beside it |
 | `cmd-c` / `cmd-v` | copy / paste |
+
+### Changes and worktrees
+
+For agents in a git checkout (and a daemon with the `git-worktree` workflow):
+
+- **Show Changes** (⇧⌘C; the sidebar, graph and pane menus; the palette's "Show Changes: <agent>"; an ended agent's summary) opens a read-only **diff pane** in a split beside the agent's terminal, or focuses the one it already has. The header shows the worktree and branch, what it is against, files changed and `+/−`, a refresh button and the base / uncommitted / committed choice; a file list on the left (↑/↓ or click to jump, space to collapse) and the unified diff on the right with line numbers. It refreshes on open, with ⌘R or the button, and when the agent turns waiting, done or ended; never on a timer. Huge diffs stay cheap: only the rows on screen are drawn, and files past the caps start collapsed and load on expand. Diff panes are not saved across a relaunch.
+- **New agent** with a folder in a git checkout has a **New worktree** checkbox (remembered per target) with Slug, Branch (placeholder `fleet/<slug>`) and Base (placeholder: the default branch). Spawn then runs `git-worktree.new-agent` instead of a plain spawn.
+- **Archive Worktree…** (the sidebar, graph and pane menus, for an ended agent in a worktree, and the palette) asks first. A refusal shows its reason with **Archive Anyway**, except when an agent is still running there.
+- **Run Action…** (palette) lists every action the daemon offers and renders a form from each one's parameters; results show as a toast, a new agent, or a pane (diff, table or text); a refusal offers "Run Anyway" where a retry makes sense.
 
 ### Agent tree and graph
 

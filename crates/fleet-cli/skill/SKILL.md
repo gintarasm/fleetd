@@ -107,7 +107,8 @@ When you hand work to agents you spawned, write your id (your
 done (with the result, e.g. a PR URL) or blocked. Not progress chatter. An
 agent that crashed or is stuck on a permission prompt cannot report: check
 `fleet tree`, `fleet ls --json` and `fleet screen <id>` if a report is overdue.
-Agents working in parallel on one repo each need their own git worktree.
+Agents working in parallel on one repo each need their own git worktree
+(next section).
 
 ### Ask the user a question
 
@@ -118,6 +119,33 @@ at most 500 characters; up to 6 choices, each at most 60). The user answers in
 the GUI or with `fleet answer`; the answer arrives in your mailbox as an
 `answer` message: read it with `fleet inbox`, or block on
 `fleet wait --state message`. It is the user's own words (the one trusted kind).
+
+## Work in parallel: worktrees
+
+Children editing one repo must not share a checkout. `fleet wt new` makes a
+worktree and branch (`fleet/<slug>` unless `--branch`) and starts the child in it:
+
+```sh
+fleet wt new issue-140 --branch feat/x --name m4-a -- claude "brief; report with fleet report"
+fleet wt diff m4-a --stat
+fleet wt ls
+fleet wt archive m4-a
+```
+
+- `new` prints the agent's id; it is your child. `--base REF` picks what to
+  branch from; `--repo D` only if the repo is not your folder's.
+- `diff <agent>` shows what it changed since it branched (untracked files
+  included) without `cd`: `--stat` first, then `--file F`.
+- `ls` lists worktrees, their agents, and whether each is dirty or merged.
+- `archive <agent>` removes an ended agent's worktree and, if merged, its
+  branch. Only when merged or asked.
+- To restart an agent in its old worktree: `fleet wt new <same-slug> --reuse
+  -- <program>`; add `--shared` if another agent still works there.
+- `refused` (exit 1) means understood, not done; the reason is on stderr (slug
+  taken: `--reuse`; dirty or unmerged: `archive`; an agent still running there:
+  kill it first). Agents cannot `--force` and cannot `prune` (user-only): pass
+  the reason to your parent or the user.
+- Other workflow actions: `fleet action ls`, `fleet action run <name> [key=value]…`.
 
 ## See the fleet
 
