@@ -11,11 +11,12 @@ use super::keymap::{
     ClearScrollback, ClosePane, CloseTab, Copy, CopyLastOutput, DuplicatePane, EditLabelsPane,
     Find, FindNext, FindPrevious, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2,
     FocusPane3, FocusPane4, FocusRight, FocusUp, InstallSkill, KillPane, KillSelected, NewAgent,
-    NewTab, NewTerminal, NextAgent, NextTab, OpenOutput, OpenSettings, Paste, PrevTab,
-    PreviousAgent, Quit, RemoveExited, RemovePane, RemoveSelected, RenamePane, ReopenClosedPane,
-    RestartPane, RestartSelected, SaveOutput, ScrollPageDown, ScrollPageUp, ScrollToBottom,
-    ScrollToTop, SearchAllAgents, SelectAll, SelectTab, SendToAgents, ShowShortcuts, SplitDown,
-    SplitRight, SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn, ZoomOut, ZoomReset,
+    NewTab, NewTerminal, NextAgent, NextNeedsYou, NextTab, OpenOutput, OpenSettings, Paste,
+    PrevTab, PreviousAgent, Quit, RemoveExited, RemovePane, RemoveSelected, RenamePane,
+    ReopenClosedPane, RestartPane, RestartSelected, SaveOutput, ScrollPageDown, ScrollPageUp,
+    ScrollToBottom, ScrollToTop, SearchAllAgents, SelectAll, SelectTab, SendToAgents,
+    ShowShortcuts, SplitDown, SplitRight, SwitchFleetd, ToggleGraph, ToggleMaximize, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 use crate::core::palette::{Command, Mods, shortcut_text};
 
@@ -70,6 +71,7 @@ pub fn command_action(c: Command) -> Box<dyn Action> {
         Command::FocusPane3 => Box::new(FocusPane3),
         Command::FocusPane4 => Box::new(FocusPane4),
         Command::NextAgent => Box::new(NextAgent),
+        Command::NextNeedsYou => Box::new(NextNeedsYou),
         Command::PreviousAgent => Box::new(PreviousAgent),
         Command::FocusFilter => Box::new(FocusFilter),
         Command::NewTab => Box::new(NewTab),

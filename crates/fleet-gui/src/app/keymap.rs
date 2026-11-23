@@ -75,6 +75,8 @@ actions!(
         SendToAgents,
         // ⇧⌘F: search every agent's output (ADR 0098).
         SearchAllAgents,
+        // ⌘J: the next agent that needs you (ADR 0100).
+        NextNeedsYou,
     ]
 );
 
@@ -139,6 +141,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-alt-f", FocusFilter, None),
         KeyBinding::new("cmd-p", CommandPalette, None),
         KeyBinding::new("cmd-shift-m", SendToAgents, None),
+        KeyBinding::new("cmd-j", NextNeedsYou, None),
         KeyBinding::new("ctrl-tab", NextAgent, None),
         KeyBinding::new("ctrl-shift-tab", PreviousAgent, None),
         KeyBinding::new("cmd-shift-enter", ToggleMaximize, None),

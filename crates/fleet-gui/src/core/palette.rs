@@ -57,6 +57,8 @@ pub enum Command {
     FocusPane4,
     NextAgent,
     PreviousAgent,
+    /// Next Agent That Needs You (ADR 0100).
+    NextNeedsYou,
     FocusFilter,
     NewTab,
     CloseTab,
@@ -147,6 +149,7 @@ impl Command {
         Command::FocusPane4,
         Command::NextAgent,
         Command::PreviousAgent,
+        Command::NextNeedsYou,
         Command::FocusFilter,
         Command::NewTab,
         Command::CloseTab,
@@ -217,6 +220,7 @@ impl Command {
             Command::FocusPane3 => "Focus Pane 3",
             Command::FocusPane4 => "Focus Pane 4",
             Command::NextAgent => "Switch to Next Agent…",
+            Command::NextNeedsYou => "Next Agent That Needs You",
             Command::PreviousAgent => "Switch to Previous Agent…",
             Command::FocusFilter => "Filter Agents",
             Command::NewTab => "New Tab",
@@ -266,6 +270,7 @@ impl Command {
             Command::SearchAllAgents => "find grep every output history scrollback",
             Command::Copy | Command::Paste => "clipboard",
             Command::NextAgent | Command::PreviousAgent => "switcher recent",
+            Command::NextNeedsYou => "jump waiting attention failed badge",
             Command::FocusFilter => "sidebar search",
             Command::NewTab
             | Command::CloseTab

@@ -90,7 +90,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
 
     let app = Application::new().with_assets(icons::Assets);
     // Unconnected, the reopened window asks again.
-    app.on_reopen(resident::show);
+    app.on_reopen(resident::reopen);
     app.run(move |cx| {
         keymap::bind_keys(cx);
         cx.on_action(|_: &keymap::Quit, cx| cx.quit());
@@ -106,6 +106,7 @@ pub fn run(state_dir: PathBuf, target: Option<Target>) {
                     MenuItem::action("Settings…", keymap::OpenSettings),
                     MenuItem::action("Command Palette…", keymap::CommandPalette),
                     MenuItem::action("Send to Agents…", keymap::SendToAgents),
+                    MenuItem::action("Next Agent That Needs You", keymap::NextNeedsYou),
                     MenuItem::separator(),
                     MenuItem::action("Remove Exited Agents…", keymap::RemoveExited),
                     MenuItem::separator(),

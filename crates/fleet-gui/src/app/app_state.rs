@@ -25,6 +25,7 @@ use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::git;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
+use crate::core::needs_you::{Since, next_after};
 use crate::core::new_children::NewChildren;
 use crate::core::pane::{PaneModel, PaneState};
 use crate::core::peek::PEEK_PANE;
@@ -399,6 +400,9 @@ pub struct AppState {
     /// Children spawned while the GUI watched, highlighted briefly.
     pub(super) new_children: NewChildren,
     alerts: Alerts,
+    /// Since when each agent has had its status: what "next agent that
+    /// needs you" orders by (ADR 0100).
+    since: Since,
     /// The window is open and has focus: no notifications then.
     window_active: bool,
     /// The last error, shown until dismissed or replaced.
@@ -494,6 +498,7 @@ impl AppState {
             pending_spawns: Vec::new(),
             new_children: NewChildren::default(),
             alerts: Alerts::default(),
+            since: Since::default(),
             window_active: false,
             error: None,
             error_is_connection: false,
@@ -588,6 +593,7 @@ impl AppState {
         // The new target's children are not news either.
         self.new_children = NewChildren::default();
         self.alerts = Alerts::default();
+        self.since.clear();
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
         self.error_is_connection = false;
@@ -1137,6 +1143,7 @@ impl AppState {
     pub fn refresh_status(&mut self, cx: &mut Context<Self>) {
         let now = statuses(&self.agents, &self.bells, unix_ms());
         let alerts = self.alerts.update(&now);
+        self.since.update(&now, unix_ms());
         if now != self.statuses {
             self.statuses = now;
             self.refresh_chrome(cx);
@@ -1171,6 +1178,13 @@ impl AppState {
             }
             super::attention::post(self.session_epoch, id, &title, &body, cx);
         }
+    }
+
+    /// The agent "Next agent that needs you" goes to from `current`
+    /// (ADR 0100): the next of those that need you, longest waiting
+    /// first, then the failed ones; `None` when there are none.
+    pub fn next_needing_you(&self, current: Option<u64>) -> Option<u64> {
+        next_after(&self.since.queue(), current)
     }
 
     /// Agents that need you, for the Dock badge and the menu bar.
