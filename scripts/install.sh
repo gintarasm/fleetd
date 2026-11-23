@@ -8,6 +8,8 @@
 #   --state-dir <dir>  state directory of the daemon to restart (default ~/.fleet)
 #   --force-stop       if the running daemon is too old to restart itself, stop
 #                      it (its agents end) instead of leaving it for you to stop
+#   --skill-home <dir> home whose installed agent skills are refreshed
+#                      (default $HOME; only skills already installed there)
 #
 # Every step prints one line saying what it did.
 set -eu
@@ -21,19 +23,21 @@ app_dir=/Applications
 bin_dir=$HOME/.local/bin
 state_dir=$HOME/.fleet
 force_stop=0
+skill_home=$HOME
 while [ $# -gt 0 ]; do
   case "$1" in
-    --app-dir | --bin-dir | --state-dir)
+    --app-dir | --bin-dir | --state-dir | --skill-home)
       [ $# -ge 2 ] || { echo "install: $1 needs a directory" >&2; exit 64; }
       case "$1" in
         --app-dir) app_dir=$2 ;;
         --bin-dir) bin_dir=$2 ;;
         --state-dir) state_dir=$2 ;;
+        --skill-home) skill_home=$2 ;;
       esac
       shift 2
       ;;
     --force-stop) force_stop=1; shift ;;
-    -h | --help) sed -n '2,12p' "$repo/scripts/install.sh" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,14p' "$repo/scripts/install.sh" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "install: unknown option $1 (see --help)" >&2; exit 64 ;;
   esac
 done
@@ -50,6 +54,7 @@ from_caller() {
 app_dir=$(from_caller "$app_dir")
 bin_dir=$(from_caller "$bin_dir")
 state_dir=$(from_caller "$state_dir")
+skill_home=$(from_caller "$skill_home")
 
 # Where cargo builds: a relative CARGO_TARGET_DIR is taken from the repo,
 # where cargo runs. Copying from ./target instead would install a stale (or
@@ -134,6 +139,26 @@ case ":$PATH:" in
 esac
 
 fleet="$bin_dir/fleet"
+
+# The agent skill is embedded in `fleet` (0024), but agents read the copy
+# `fleet skill install` wrote, which an upgrade would otherwise leave stale:
+# agents then follow the old commands (pre-M3 `fleet send` to their parent,
+# which M3's scope refuses). Refresh every copy already installed; never
+# install one the user did not ask for. Project skills (--project) are not
+# found from here and stay as they are.
+for agent in claude omp; do
+  case "$agent" in
+    claude) dir="$skill_home/.claude/skills/fleet" ;;
+    omp) dir="$skill_home/.omp/agent/skills/fleet" ;;
+  esac
+  [ -f "$dir/SKILL.md" ] || continue
+  if HOME=$skill_home "$fleet" skill install --agent "$agent" >/dev/null 2>&1; then
+    echo "updated the $agent skill in $dir"
+  else
+    echo "warning: could not update the $agent skill in $dir; run: fleet skill install --agent $agent" >&2
+  fi
+done
+
 sock="$state_dir/fleetd.sock"
 if ! ls_err=$("$fleet" --state-dir "$state_dir" ls 2>&1 >/dev/null); then
   # Nothing listening (no socket, or a stale one a killed daemon left):

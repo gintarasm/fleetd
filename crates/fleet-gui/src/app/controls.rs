@@ -5,14 +5,15 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Context, Div, ElementId, Global, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    Animation, AnimationExt, AnyElement, App, BoxShadow, Context, Div, ElementId, Global,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, point, px,
 };
 
 use super::icons;
 use super::theme::{Theme, Typography};
 use crate::core::icons::Icon;
+use crate::core::keyboard_nav::{FocusMove, focus_move};
 use crate::core::style::{chrome, motion, radius, space, text};
 
 /// A plain text tooltip.
@@ -68,7 +69,7 @@ pub fn button(
     let b = match kind {
         ButtonKind::Primary => b
             .bg(theme.accent)
-            .text_color(gpui::white())
+            .text_color(theme.on_accent)
             .font_weight(gpui::FontWeight::MEDIUM),
         ButtonKind::Secondary => b
             .border_1()
@@ -86,6 +87,51 @@ pub fn button(
     } else {
         b.opacity(0.45).cursor_default()
     }
+}
+
+/// The accent halo around a focused control (as around a focused text
+/// field).
+pub fn focus_ring(theme: &Theme) -> BoxShadow {
+    BoxShadow {
+        color: theme.accent.opacity(0.35),
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(3.),
+    }
+}
+
+/// Makes `el` a stop in the Tab order of its sheet or of Settings, drawn
+/// with [`focus_ring`] while it has the focus (ADR 0101). Space clicks it.
+pub fn tab_stop(el: Stateful<Div>, theme: &Theme) -> Stateful<Div> {
+    let ring = focus_ring(theme);
+    el.tab_index(0).focus(move |s| s.shadow(vec![ring]))
+}
+
+/// Tab and Shift-Tab in a sheet or Settings: the focus moves to the next
+/// or previous stop, wrapping. True when the key was one of them.
+pub fn move_focus(ev: &KeyDownEvent, window: &mut Window) -> bool {
+    let m = &ev.keystroke.modifiers;
+    match focus_move(
+        &ev.keystroke.key,
+        m.shift,
+        m.platform || m.control || m.alt || m.function,
+    ) {
+        Some(FocusMove::Next) => window.focus_next(),
+        Some(FocusMove::Prev) => window.focus_prev(),
+        None => return false,
+    }
+    true
+}
+
+/// Return never clicks the focused control (gpui does, on key up): in a
+/// sheet Return is the default button, in Settings it applies a field.
+/// Space clicks it, as on macOS.
+pub fn return_is_not_a_click<E: InteractiveElement>(el: E) -> E {
+    el.capture_key_up(|ev, window, _| {
+        if ev.keystroke.key == "enter" {
+            window.prevent_default();
+        }
+    })
 }
 
 /// The card of a sheet over the window.
@@ -172,7 +218,7 @@ pub fn check_box(checked: bool, theme: &Theme) -> Div {
         .border_color(if checked { theme.accent } else { theme.border })
         .when(checked, |b| {
             b.bg(theme.accent)
-                .child(icons::sized(Icon::Check, 11.0).text_color(gpui::white()))
+                .child(icons::sized(Icon::Check, 11.0).text_color(theme.on_accent))
         })
         .when(!checked, |b| b.bg(theme.field))
 }

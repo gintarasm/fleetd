@@ -10,10 +10,13 @@ use gpui::{
 };
 
 use super::app_state::AppState;
-use super::controls::{ButtonKind, appear, button, sheet_card};
+use super::controls::{
+    ButtonKind, appear, button, move_focus, return_is_not_a_click, sheet_card, tab_stop,
+};
 use super::icons;
 use super::theme::{Typography, current as theme};
 use super::titlebar_view::sheet_drag_strip;
+use crate::core::bulk::kill_many_question;
 use crate::core::icons::Icon;
 use crate::core::kill::kill_question;
 use crate::core::sidebar::{program_name, tilde};
@@ -31,7 +34,11 @@ pub enum KillEvent {
 }
 
 pub struct KillSheet {
-    pub(crate) agent_id: u64,
+    /// Every agent it kills: one, or the sidebar's selected
+    /// running agents (ADR 0099).
+    pub(crate) agent_ids: Vec<u64>,
+    /// Their names, listed when there are several.
+    pub(crate) names: Vec<SharedString>,
     pub(crate) question: SharedString,
     pub(crate) dont_ask: bool,
     focus: FocusHandle,
@@ -51,11 +58,20 @@ pub fn question(app: &AppState, agent_id: u64) -> String {
 impl KillSheet {
     pub fn new(agent_id: u64, question: String, cx: &mut Context<Self>) -> Self {
         KillSheet {
-            agent_id,
+            agent_ids: vec![agent_id],
+            names: Vec::new(),
             question: question.into(),
             dont_ask: false,
             focus: cx.focus_handle(),
         }
+    }
+
+    /// The sheet for the selection's running agents `ids`, `names` listed.
+    pub fn many(ids: Vec<u64>, names: Vec<String>, cx: &mut Context<Self>) -> Self {
+        let mut sheet = Self::new(0, kill_many_question(ids.len()), cx);
+        sheet.agent_ids = ids;
+        sheet.names = names.into_iter().map(SharedString::from).collect();
+        sheet
     }
 
     /// Takes the keyboard: Return kills, Escape cancels.
@@ -77,11 +93,16 @@ impl KillSheet {
         cx.notify();
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if move_focus(ev, window) {
+            cx.stop_propagation();
+            return;
+        }
         match ev.keystroke.key.as_str() {
             "enter" => self.kill(cx),
             "escape" => self.answer(KillEvent::Cancel, cx),
-            "space" => self.toggle(cx),
+            // A focused control takes Space itself (ADR 0101).
+            "space" if self.focus.is_focused(window) => self.toggle(cx),
             _ => return,
         }
         cx.stop_propagation();
@@ -103,11 +124,10 @@ impl Render for KillSheet {
             .border_color(if checked { theme.accent } else { theme.border })
             .when(checked, |b| {
                 b.bg(theme.accent)
-                    .child(icons::sized(Icon::Check, 11.0).text_color(gpui::white()))
+                    .child(icons::sized(Icon::Check, 11.0).text_color(theme.on_accent))
             })
             .when(!checked, |b| b.bg(theme.field));
-        let checkbox = div()
-            .id("dont-ask")
+        let checkbox = tab_stop(div().id("dont-ask"), &theme)
             .debug_selector(|| "kill-dont-ask".to_owned())
             .flex()
             .flex_row()
@@ -118,7 +138,7 @@ impl Render for KillSheet {
             .child(box_)
             .child("Don't ask again")
             .on_click(cx.listener(|this, _, _, cx| this.toggle(cx)));
-        sheet_card("kill-sheet", 380.0, &theme)
+        return_is_not_a_click(sheet_card("kill-sheet", 380.0, &theme))
             .debug_selector(|| "kill-sheet".to_owned())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
@@ -136,6 +156,24 @@ impl Render for KillSheet {
                     .text_color(theme.secondary)
                     .child("Its process is stopped. Closing a pane only detaches."),
             )
+            .when(self.names.len() > 1, |d| {
+                const SHOWN: usize = 8;
+                let more = self.names.len().saturating_sub(SHOWN);
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .type_style(text::CALLOUT)
+                        .children(self.names.iter().take(SHOWN).cloned())
+                        .when(more > 0, |l| {
+                            l.child(
+                                div()
+                                    .text_color(theme.secondary)
+                                    .child(format!("and {more} more")),
+                            )
+                        }),
+                )
+            })
             .child(checkbox)
             .child(
                 div()
@@ -145,16 +183,20 @@ impl Render for KillSheet {
                     .gap(px(space::SM))
                     .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
-                            .debug_selector(|| "kill-cancel".to_owned())
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.answer(KillEvent::Cancel, cx)),
-                            ),
+                        tab_stop(
+                            button("cancel", "Cancel", &theme, ButtonKind::Secondary, true),
+                            &theme,
+                        )
+                        .debug_selector(|| "kill-cancel".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.answer(KillEvent::Cancel, cx))),
                     )
                     .child(
-                        button("kill", "Kill", &theme, ButtonKind::Primary, true)
-                            .debug_selector(|| "kill-confirm".to_owned())
-                            .on_click(cx.listener(|this, _, _, cx| this.kill(cx))),
+                        tab_stop(
+                            button("kill", "Kill", &theme, ButtonKind::Primary, true),
+                            &theme,
+                        )
+                        .debug_selector(|| "kill-confirm".to_owned())
+                        .on_click(cx.listener(|this, _, _, cx| this.kill(cx))),
                     ),
             )
     }

@@ -14,7 +14,9 @@ use gpui::{
 };
 
 use super::app_state::AppState;
-use super::controls::{ButtonKind, button, error_text};
+use super::controls::{
+    ButtonKind, button, error_text, move_focus, return_is_not_a_click, tab_stop,
+};
 use super::keymap::ClosePane;
 use super::native;
 use super::status_item::set_accessory;
@@ -22,6 +24,7 @@ use super::text_field::TextField;
 use super::theme::{Theme, Typography, current as theme};
 use crate::core::cursor_blink::BlinkChoice;
 use crate::core::glass::GlassChoice;
+use crate::core::keyboard_nav::{Axis, arrow_step, step_choice};
 use crate::core::presets::{Preset, presets_note};
 use crate::core::settings::{
     BLUR_MAX, BLUR_MIN, BLUR_STEP, Change, FONT_SIZE_MAX, FONT_SIZE_MIN, FONT_SIZE_STEP,
@@ -133,11 +136,14 @@ impl SettingsWindow {
         let c = app.read(cx).config().clone();
         let presets = app.update(cx, |a, _| a.presets());
         let presets_detected = app.read(cx).presets_detected();
-        let font_family = cx.new(|cx| TextField::new(c.font_family.clone(), "SF Mono", cx));
-        let command =
-            cx.new(|cx| TextField::new(shell_words::join(&c.default_command), "claude", cx));
-        let folder =
-            cx.new(|cx| TextField::new(c.default_dir.clone(), "The most recent folder", cx));
+        let font_family =
+            cx.new(|cx| TextField::new(c.font_family.clone(), "SF Mono", cx).tab_stop());
+        let command = cx.new(|cx| {
+            TextField::new(shell_words::join(&c.default_command), "claude", cx).tab_stop()
+        });
+        let folder = cx.new(|cx| {
+            TextField::new(c.default_dir.clone(), "The most recent folder", cx).tab_stop()
+        });
         let mut subs = vec![cx.observe(&app, |_, _, cx| cx.notify())];
         for (field, which) in [&font_family, &command, &folder]
             .into_iter()
@@ -261,6 +267,10 @@ impl SettingsWindow {
     }
 
     fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if move_focus(ev, window) {
+            cx.stop_propagation();
+            return;
+        }
         if ev.keystroke.key != "enter" {
             return;
         }
@@ -274,23 +284,151 @@ impl SettingsWindow {
     }
 
     fn tabs(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let mut row = div()
+        let tabs = self
+            .choices(
+                Choices {
+                    id: "tabs",
+                    all: &Section::ALL,
+                    current: self.section,
+                    enabled: true,
+                    label: Section::title,
+                    selector: |s| format!("settings-tab-{}", s.title()),
+                    pick: |this, s, cx| this.show_section(s, cx),
+                },
+                theme,
+                cx,
+            )
+            .gap(px(space::XS));
+        div()
             .flex()
             .flex_row()
             .justify_center()
-            .gap(px(space::XS))
             .pb(px(space::MD))
             .border_b_1()
-            .border_color(theme.separator);
-        for section in Section::ALL {
-            let selected = section == self.section;
-            row = row.child(
-                pill(("tab", section as usize), section.title(), selected, theme)
-                    .debug_selector(move || format!("settings-tab-{}", section.title()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.show_section(section, cx))),
-            );
+            .border_color(theme.separator)
+            .child(tabs)
+    }
+
+    /// A segmented control (ADR 0101): one Tab stop; ← and → pick the
+    /// previous or next choice, a click picks one. A disabled one is
+    /// dimmed and takes neither.
+    fn choices<T: Copy + PartialEq + 'static>(
+        &self,
+        c: Choices<'_, T>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let Choices {
+            id,
+            all,
+            current,
+            enabled,
+            label,
+            selector,
+            pick,
+        } = c;
+        let mut row = div()
+            .id(id)
+            .debug_selector(move || format!("choices-{id}"))
+            .flex()
+            .flex_row()
+            .gap(px(space::XXS))
+            .rounded(px(radius::MD));
+        for (i, &choice) in all.iter().enumerate() {
+            let p = pill((id, i), label(choice), choice == current, theme)
+                .debug_selector(move || selector(choice));
+            row = row.child(if enabled {
+                p.on_click(cx.listener(move |this, _, _, cx| pick(this, choice, cx)))
+            } else {
+                p.opacity(0.5)
+            });
         }
-        row
+        if !enabled {
+            return row;
+        }
+        let all = all.to_vec();
+        tab_stop(row, theme).on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+            let step = arrow_step(
+                &ev.keystroke.key,
+                ev.keystroke.modifiers.modified(),
+                Axis::Row,
+            );
+            if let Some(next) = step.and_then(|d| step_choice(&all, current, d)) {
+                pick(this, next, cx);
+                cx.stop_propagation();
+            }
+        }))
+    }
+
+    /// `−  value  +` (ADR 0101): one Tab stop; ← and ↓ step down, → and ↑
+    /// up. A button at the end of the range is dimmed.
+    fn stepper(
+        &self,
+        s: Stepper,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        step: impl Fn(&mut Self, f32, &mut Context<Self>) + Clone + 'static,
+    ) -> Stateful<Div> {
+        let Stepper {
+            id,
+            value,
+            can_down,
+            can_up,
+        } = s;
+        let side = |suffix: &'static str, label: &'static str, sign: f32, enabled: bool| {
+            let b = button(
+                SharedString::from(format!("{id}-{suffix}")),
+                label,
+                theme,
+                ButtonKind::Secondary,
+                enabled,
+            )
+            .w(px(chrome::CONTROL_HEIGHT))
+            .debug_selector(move || format!("{id}-{suffix}"));
+            let step = step.clone();
+            if enabled {
+                b.on_click(cx.listener(move |this, _, _, cx| step(this, sign, cx)))
+            } else {
+                b
+            }
+        };
+        let down = side("down", "−", -1.0, can_down);
+        let up = side("up", "+", 1.0, can_up);
+        let row = div()
+            .id(id)
+            .debug_selector(move || format!("{id}-stepper"))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::SM))
+            .rounded(px(radius::MD))
+            .child(down)
+            .child(
+                div()
+                    .min_w(px(56.))
+                    .flex()
+                    .justify_center()
+                    .debug_selector(move || format!("{id}-value"))
+                    .child(SharedString::from(value)),
+            )
+            .child(up);
+        if !can_down && !can_up {
+            return row;
+        }
+        tab_stop(row, theme).on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+            let d = arrow_step(
+                &ev.keystroke.key,
+                ev.keystroke.modifiers.modified(),
+                Axis::Stepper,
+            );
+            match d {
+                Some(-1) if can_down => step(this, -1.0, cx),
+                Some(1) if can_up => step(this, 1.0, cx),
+                Some(_) => {}
+                None => return,
+            }
+            cx.stop_propagation();
+        }))
     }
 
     fn appearance(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -298,43 +436,43 @@ impl SettingsWindow {
         // Reduce Transparency draws the window opaque: no blur, no tint.
         let solid = native::reduce_transparency();
         let solid_hint = solid.then_some("Off while Reduce Transparency is on in System Settings");
-        let mut themes = segmented();
-        for choice in ThemeChoice::ALL {
-            themes = themes.child(
-                pill(
-                    ("theme", choice as usize),
-                    choice.title(),
-                    c.theme == choice,
-                    theme,
-                )
-                .debug_selector(move || format!("theme-{}", choice.title()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.change(Change::Theme(choice), cx);
-                })),
-            );
-        }
-        let blur = stepper(
-            "blur",
-            format!("{} pt", c.blur),
-            !solid && c.blur > BLUR_MIN,
-            !solid && c.blur < BLUR_MAX,
+        let themes = self.choices(
+            Choices {
+                id: "theme",
+                all: &ThemeChoice::ALL,
+                current: c.theme,
+                enabled: true,
+                label: ThemeChoice::title,
+                selector: |t| format!("theme-{}", t.title()),
+                pick: |this, t, cx| this.change(Change::Theme(t), cx),
+            },
             theme,
-            cx.listener(move |this, _, _, cx| this.change(Change::Blur(c.blur - BLUR_STEP), cx)),
-            cx.listener(move |this, _, _, cx| this.change(Change::Blur(c.blur + BLUR_STEP), cx)),
+            cx,
+        );
+        let blur = self.stepper(
+            Stepper {
+                id: "blur",
+                value: format!("{} pt", c.blur),
+                can_down: !solid && c.blur > BLUR_MIN,
+                can_up: !solid && c.blur < BLUR_MAX,
+            },
+            theme,
+            cx,
+            move |this, sign, cx| this.change(Change::Blur(c.blur + sign * BLUR_STEP), cx),
         );
         let opacity = c.window_opacity;
-        let opacity_stepper = stepper(
-            "opacity",
-            format!("{} %", (opacity * 100.0).round()),
-            !solid && opacity > OPACITY_MIN,
-            !solid && opacity < OPACITY_MAX,
+        let opacity_stepper = self.stepper(
+            Stepper {
+                id: "opacity",
+                value: format!("{} %", (opacity * 100.0).round()),
+                can_down: !solid && opacity > OPACITY_MIN,
+                can_up: !solid && opacity < OPACITY_MAX,
+            },
             theme,
-            cx.listener(move |this, _, _, cx| {
-                this.change(Change::WindowOpacity(opacity - OPACITY_STEP), cx);
-            }),
-            cx.listener(move |this, _, _, cx| {
-                this.change(Change::WindowOpacity(opacity + OPACITY_STEP), cx);
-            }),
+            cx,
+            move |this, sign, cx| {
+                this.change(Change::WindowOpacity(opacity + sign * OPACITY_STEP), cx);
+            },
         );
         // Liquid glass (ADR 0049): macOS 26 only, and not under Reduce
         // Transparency.
@@ -346,36 +484,30 @@ impl SettingsWindow {
         } else {
             "Liquid glass behind the window or only its sidebar and bar"
         };
-        let mut glass = segmented();
-        for choice in GlassChoice::ALL {
-            let pill = pill(
-                ("glass", choice as usize),
-                choice.title(),
-                c.glass == choice,
-                theme,
-            )
-            .debug_selector(move || format!("glass-{}", choice.title()));
-            glass = glass.child(if solid || !has_glass {
-                pill.opacity(0.5)
-            } else {
-                pill.on_click(cx.listener(move |this, _, _, cx| {
-                    this.change(Change::Glass(choice), cx);
-                }))
-            });
-        }
-        let size = c.font_size;
-        let font_size = stepper(
-            "font-size",
-            format!("{size} pt"),
-            size > FONT_SIZE_MIN,
-            size < FONT_SIZE_MAX,
+        let glass = self.choices(
+            Choices {
+                id: "glass",
+                all: &GlassChoice::ALL,
+                current: c.glass,
+                enabled: !solid && has_glass,
+                label: GlassChoice::title,
+                selector: |g| format!("glass-{}", g.title()),
+                pick: |this, g, cx| this.change(Change::Glass(g), cx),
+            },
             theme,
-            cx.listener(move |this, _, _, cx| {
-                this.change(Change::FontSize(size - FONT_SIZE_STEP), cx);
-            }),
-            cx.listener(move |this, _, _, cx| {
-                this.change(Change::FontSize(size + FONT_SIZE_STEP), cx);
-            }),
+            cx,
+        );
+        let size = c.font_size;
+        let font_size = self.stepper(
+            Stepper {
+                id: "font-size",
+                value: format!("{size} pt"),
+                can_down: size > FONT_SIZE_MIN,
+                can_up: size < FONT_SIZE_MAX,
+            },
+            theme,
+            cx,
+            move |this, sign, cx| this.change(Change::FontSize(size + sign * FONT_SIZE_STEP), cx),
         );
         section_body()
             .child(setting_row("Theme", None, themes, theme))
@@ -398,51 +530,45 @@ impl SettingsWindow {
 
     fn behaviour(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let c = self.app.read(cx).config().clone();
-        let mut motion = segmented();
-        for choice in MotionChoice::ALL {
-            motion = motion.child(
-                pill(
-                    ("motion", choice as usize),
-                    choice.title(),
-                    c.reduce_motion == choice,
-                    theme,
-                )
-                .debug_selector(move || format!("motion-{}", choice.title()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.change(Change::ReduceMotion(choice), cx);
-                })),
-            );
-        }
-        let mut blink = segmented();
-        for choice in BlinkChoice::ALL {
-            blink = blink.child(
-                pill(
-                    ("cursor-blink", choice as usize),
-                    choice.title(),
-                    c.cursor_blink == choice,
-                    theme,
-                )
-                .debug_selector(move || format!("cursor-blink-{}", choice.as_str()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.change(Change::CursorBlink(choice), cx);
-                })),
-            );
-        }
-        let mut option_meta = segmented();
-        for choice in OptionAsMeta::ALL {
-            option_meta = option_meta.child(
-                pill(
-                    ("option-as-meta", choice as usize),
-                    choice.title(),
-                    c.option_as_meta == choice,
-                    theme,
-                )
-                .debug_selector(move || format!("option-as-meta-{}", choice.title()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.change(Change::OptionAsMeta(choice), cx);
-                })),
-            );
-        }
+        let motion = self.choices(
+            Choices {
+                id: "motion",
+                all: &MotionChoice::ALL,
+                current: c.reduce_motion,
+                enabled: true,
+                label: MotionChoice::title,
+                selector: |m| format!("motion-{}", m.title()),
+                pick: |this, m, cx| this.change(Change::ReduceMotion(m), cx),
+            },
+            theme,
+            cx,
+        );
+        let blink = self.choices(
+            Choices {
+                id: "cursor-blink",
+                all: &BlinkChoice::ALL,
+                current: c.cursor_blink,
+                enabled: true,
+                label: BlinkChoice::title,
+                selector: |b| format!("cursor-blink-{}", b.as_str()),
+                pick: |this, b, cx| this.change(Change::CursorBlink(b), cx),
+            },
+            theme,
+            cx,
+        );
+        let option_meta = self.choices(
+            Choices {
+                id: "option-as-meta",
+                all: &OptionAsMeta::ALL,
+                current: c.option_as_meta,
+                enabled: true,
+                label: OptionAsMeta::title,
+                selector: |o| format!("option-as-meta-{}", o.title()),
+                pick: |this, o, cx| this.change(Change::OptionAsMeta(o), cx),
+            },
+            theme,
+            cx,
+        );
         let system_hint = if native::reduce_motion() {
             "System: Reduce Motion is on in System Settings"
         } else {
@@ -508,12 +634,15 @@ impl SettingsWindow {
             .child(div().flex_1().child(self.folder.clone()));
         if local {
             folder = folder.child(
-                button(
-                    "choose-folder",
-                    "Choose…",
+                tab_stop(
+                    button(
+                        "choose-folder",
+                        "Choose…",
+                        theme,
+                        ButtonKind::Secondary,
+                        true,
+                    ),
                     theme,
-                    ButtonKind::Secondary,
-                    true,
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.choose_folder(cx))),
             );
@@ -640,8 +769,7 @@ impl Render for SettingsWindow {
             Section::Keys => self.keys(&theme),
         };
         let tabs = self.tabs(&theme, cx);
-        div()
-            .id("settings")
+        return_is_not_a_click(div().id("settings"))
             .debug_selector(|| "settings-window".to_owned())
             .track_focus(&self.focus)
             .size_full()
@@ -706,9 +834,23 @@ fn setting_row(
         .child(div().flex_1().flex().flex_row().child(control))
 }
 
-/// A row of [`pill`]s on one well (a segmented control).
-fn segmented() -> Div {
-    div().flex().flex_row().gap(px(space::XXS))
+/// What a segmented control offers ([`SettingsWindow::choices`]).
+struct Choices<'a, T> {
+    id: &'static str,
+    all: &'a [T],
+    current: T,
+    enabled: bool,
+    label: fn(T) -> &'static str,
+    selector: fn(T) -> String,
+    pick: fn(&mut SettingsWindow, T, &mut Context<SettingsWindow>),
+}
+
+/// What a stepper shows ([`SettingsWindow::stepper`]).
+struct Stepper {
+    id: &'static str,
+    value: String,
+    can_down: bool,
+    can_up: bool,
 }
 
 /// One segment or tab: filled when selected.
@@ -732,7 +874,7 @@ fn pill(
         .child(label)
         .map(|p| {
             if selected {
-                p.bg(theme.accent).text_color(gpui::white())
+                p.bg(theme.accent).text_color(theme.on_accent)
             } else {
                 p.border_1()
                     .border_color(theme.border)
@@ -742,12 +884,11 @@ fn pill(
         })
 }
 
-/// An on/off switch.
+/// An on/off switch: a Tab stop that Space toggles (ADR 0101).
 fn switch(id: &'static str, on: bool, theme: &Theme) -> Stateful<Div> {
     let (w, h) = (32.0, 18.0);
     let knob = h - 4.0;
-    div()
-        .id(id)
+    tab_stop(div().id(id), theme)
         .debug_selector(move || format!("switch-{id}"))
         .w(px(w))
         .h(px(h))
@@ -766,47 +907,6 @@ fn switch(id: &'static str, on: bool, theme: &Theme) -> Stateful<Div> {
                 .bg(gpui::white())
                 .shadow_sm(),
         )
-}
-
-type Click = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static>;
-
-/// `−  value  +`; a button at the end of the range is dimmed.
-fn stepper(
-    id: &'static str,
-    value: String,
-    can_down: bool,
-    can_up: bool,
-    theme: &Theme,
-    down: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    up: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> Div {
-    let side = |suffix: &'static str, label: &'static str, enabled: bool, f: Click| {
-        let b = button(
-            SharedString::from(format!("{id}-{suffix}")),
-            label,
-            theme,
-            ButtonKind::Secondary,
-            enabled,
-        )
-        .w(px(chrome::CONTROL_HEIGHT))
-        .debug_selector(move || format!("{id}-{suffix}"));
-        if enabled { b.on_click(f) } else { b }
-    };
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(space::SM))
-        .child(side("down", "−", can_down, Box::new(down)))
-        .child(
-            div()
-                .min_w(px(56.))
-                .flex()
-                .justify_center()
-                .debug_selector(move || format!("{id}-value"))
-                .child(SharedString::from(value)),
-        )
-        .child(side("up", "+", can_up, Box::new(up)))
 }
 
 #[cfg(test)]

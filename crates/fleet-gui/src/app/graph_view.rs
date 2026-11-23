@@ -40,6 +40,7 @@ use crate::core::graph_layout::{
 use crate::core::icons::Icon;
 use crate::core::layout::Rect;
 use crate::core::message_lines;
+use crate::core::peek::{HOVER_HOLD, HoverHold};
 use crate::core::session::AgentRow;
 use crate::core::sidebar::ended;
 use crate::core::style::{chrome, radius, space, text};
@@ -65,6 +66,8 @@ pub enum GraphEvent {
     /// Reply… on a card with a question: the Answer sheet, in the graph
     /// (ADR 0078).
     Answer(u64),
+    /// The pointer rested on a card: peek at its agent (ADR 0103).
+    Peek(u64),
 }
 
 pub struct GraphView {
@@ -93,6 +96,9 @@ pub struct GraphView {
     pub(super) built: Vec<u64>,
     /// Redraws while a new child's highlight shows (ADR 0079).
     new_child_timer: controls::RedrawTimer,
+    /// The card the pointer rests on, and the timer that peeks at it.
+    hover: HoverHold,
+    hover_timer: Option<gpui::Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -122,6 +128,8 @@ impl GraphView {
             layouts: 0,
             built: Vec::new(),
             new_child_timer: controls::RedrawTimer::default(),
+            hover: HoverHold::default(),
+            hover_timer: None,
             _subs: subs,
         }
     }
@@ -372,7 +380,33 @@ impl GraphView {
         (f32::from(p.x - o.x), f32::from(p.y - o.y))
     }
 
+    /// The pointer entered or left card `id`: once it rests there for
+    /// [`HOVER_HOLD`] (no button held), the graph asks for a peek.
+    fn card_hover(&mut self, id: u64, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            self.hover.leave(id);
+            return;
+        }
+        if self.drag.is_some() {
+            return;
+        }
+        let Some(token) = self.hover.enter(id) else {
+            return;
+        };
+        self.hover_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_HOLD).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.drag.is_none()
+                    && let Some(id) = this.hover.fire(token)
+                {
+                    cx.emit(GraphEvent::Peek(id));
+                }
+            });
+        }));
+    }
+
     fn open(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.hover.cancel();
         self.selected = Some(id);
         cx.emit(GraphEvent::Open(id));
     }
@@ -550,7 +584,7 @@ impl GraphView {
                         .bg(theme.accent)
                         .text_size(cap)
                         .line_height(cap_lh)
-                        .text_color(gpui::white())
+                        .text_color(theme.on_accent)
                         .cursor_pointer()
                         .child("Reply…")
                         // Not the card's click, which opens the agent.
@@ -590,9 +624,9 @@ impl GraphView {
             .rounded(size(radius::LG))
             .overflow_hidden()
             .bg(if fresh > 0.0 {
-                theme.card.blend(theme.accent.opacity(0.22 * fresh))
+                theme.card.blend(theme.accent_tint.opacity(fresh))
             } else if c.waiting {
-                theme.card.blend(theme.warning.opacity(0.12))
+                theme.card.blend(theme.warning_tint)
             } else {
                 theme.card
             })
@@ -606,8 +640,17 @@ impl GraphView {
             .text_color(theme.text)
             .cursor_pointer()
             .hover(|s| s.border_color(theme.accent.opacity(0.6)))
-            // Not a pan.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // Not a pan; no peek after a press.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.hover.cancel();
+                    cx.stop_propagation();
+                }),
+            )
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.card_hover(id, *hovered, cx);
+            }))
             .on_click(cx.listener(move |this, _, _, cx| this.open(id, cx)))
             .child(name_row)
             .children(meta)
@@ -888,6 +931,7 @@ impl Render for GraphView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                    this.hover.cancel();
                     this.drag = Some(ev.position);
                     window.focus(&this.focus);
                 }),

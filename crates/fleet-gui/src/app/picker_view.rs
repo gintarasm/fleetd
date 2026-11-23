@@ -238,7 +238,7 @@ impl PickerView {
         let selected = row == self.picker.selected();
         let hit = HighlightStyle {
             font_weight: Some(FontWeight::BOLD),
-            color: Some(if selected { gpui::white() } else { t.text }),
+            color: Some(if selected { t.on_accent } else { t.text }),
             ..HighlightStyle::default()
         };
         let title = StyledText::new(item.title.clone()).with_highlights(
@@ -254,7 +254,7 @@ impl PickerView {
             )
         });
         let (fg, dim) = if selected {
-            (gpui::white(), gpui::white().opacity(0.8))
+            (t.on_accent, t.on_accent_dim)
         } else {
             (t.text, t.secondary)
         };

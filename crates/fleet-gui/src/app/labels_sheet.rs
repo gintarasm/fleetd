@@ -11,7 +11,10 @@ use gpui::{
     div, px,
 };
 
-use super::controls::{ButtonKind, button, error_text, field_label, sheet_card, sheet_title};
+use super::controls::{
+    ButtonKind, button, error_text, field_label, move_focus, return_is_not_a_click, sheet_card,
+    sheet_title, tab_stop,
+};
 use super::icons;
 use super::text_field::TextField;
 use super::theme::{Typography, current as theme};
@@ -108,7 +111,11 @@ impl LabelsSheet {
         cx.emit(LabelsEvent::Cancel);
     }
 
-    fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if move_focus(ev, window) {
+            cx.stop_propagation();
+            return;
+        }
         match ev.keystroke.key.as_str() {
             "enter" => {
                 self.submit(cx);
@@ -124,15 +131,14 @@ impl LabelsSheet {
 }
 
 fn new_row(text: String, cx: &mut Context<LabelsSheet>) -> Entity<TextField> {
-    cx.new(|cx| TextField::new(text, "key=value", cx))
+    cx.new(|cx| TextField::new(text, "key=value", cx).tab_stop())
 }
 
 impl Render for LabelsSheet {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let rows = self.rows.iter().enumerate().map(|(i, field)| {
-            let remove = div()
-                .id(("label-remove", i))
+            let remove = tab_stop(div().id(("label-remove", i)), &theme)
                 .debug_selector(move || format!("label-remove-{i}"))
                 .flex()
                 .flex_none()
@@ -174,7 +180,7 @@ impl Render for LabelsSheet {
                         .child("The name changes with Rename…; fleet.* labels are fleetd's."),
                 )
         });
-        sheet_card("labels-sheet", 420.0, &theme)
+        return_is_not_a_click(sheet_card("labels-sheet", 420.0, &theme))
             .debug_selector(|| "labels-sheet".to_owned())
             .on_key_down(cx.listener(Self::key_down))
             .occlude()
@@ -189,12 +195,15 @@ impl Render for LabelsSheet {
                     .children(rows)
                     .child(
                         div().flex().flex_row().child(
-                            button(
-                                "add-label",
-                                "Add Label",
+                            tab_stop(
+                                button(
+                                    "add-label",
+                                    "Add Label",
+                                    &theme,
+                                    ButtonKind::Secondary,
+                                    true,
+                                ),
                                 &theme,
-                                ButtonKind::Secondary,
-                                true,
                             )
                             .on_click(cx.listener(|this, _, window, cx| this.add_row(window, cx))),
                         ),
@@ -216,12 +225,18 @@ impl Render for LabelsSheet {
                     .gap(px(space::SM))
                     .pt(px(space::XS))
                     .child(
-                        button("cancel", "Cancel", &theme, ButtonKind::Secondary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                        tab_stop(
+                            button("cancel", "Cancel", &theme, ButtonKind::Secondary, true),
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        button("save", "Save", &theme, ButtonKind::Primary, true)
-                            .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                        tab_stop(
+                            button("save", "Save", &theme, ButtonKind::Primary, true),
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                     ),
             )
     }

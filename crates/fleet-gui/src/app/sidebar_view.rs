@@ -209,7 +209,7 @@ pub fn render_pending(
                 .rounded(px(radius::MD))
                 .border_1()
                 .border_color(theme.accent.opacity(0.6))
-                .bg(theme.accent.opacity(0.08))
+                .bg(theme.accent_wash)
                 .child(
                     div()
                         .type_style(text::CAPTION)
@@ -642,16 +642,16 @@ fn render_tab(
         .when(layout.context, |s| s.opacity(0.55))
         .when(mark == TabMark::Focused, |s| s.bg(theme.selected))
         .when(rang && mark != TabMark::Focused, |s| {
-            s.bg(theme.warning.opacity(0.14))
+            s.bg(theme.warning_tint)
         })
         // Spawned just now by another agent (ADR 0079): an accent tint
         // that fades.
         .when_some(fresh, |s, f| {
             s.debug_selector(move || format!("tab-{id}-new"))
-                .bg(theme.accent.opacity(0.26 * f))
+                .bg(theme.accent_tint.opacity(f))
         })
         // Picked for Send to Selected…: an accent tint over the rest.
-        .when(picked, |s| s.bg(theme.accent.opacity(0.22)))
+        .when(picked, |s| s.bg(theme.accent_tint))
         .hover(|s| s.bg(theme.hover))
         .active(|s| s.bg(theme.pressed))
         .child(bar)
@@ -679,7 +679,7 @@ fn render_tab(
         // Files from Finder: tinted while over the row (stronger than a
         // picked row's tint), typed into its agent when dropped (ADR 0081).
         .drag_over::<ExternalPaths>({
-            let tint = theme.accent.opacity(0.34);
+            let tint = theme.accent_strong;
             move |s, _, _, _| s.bg(tint)
         })
         .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {

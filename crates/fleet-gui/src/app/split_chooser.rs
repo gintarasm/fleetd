@@ -148,7 +148,7 @@ impl SplitChooserView {
         let t = theme(cx);
         let selected = row == self.chooser.selected() && choice.enabled;
         let (fg, dim) = match (selected, choice.enabled) {
-            (true, _) => (gpui::white(), gpui::white().opacity(0.8)),
+            (true, _) => (t.on_accent, t.on_accent_dim),
             (false, true) => (t.text, t.secondary),
             (false, false) => (t.tertiary, t.tertiary),
         };
@@ -192,11 +192,7 @@ impl SplitChooserView {
                     .justify_center()
                     .rounded(px(radius::SM))
                     .border_1()
-                    .border_color(if selected {
-                        gpui::white().opacity(0.5)
-                    } else {
-                        t.border
-                    })
+                    .border_color(if selected { t.on_accent_dim } else { t.border })
                     .type_style(text::CALLOUT)
                     .text_color(dim)
                     .child(SharedString::from(number.to_string())),

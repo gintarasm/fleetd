@@ -25,11 +25,12 @@ use super::graph_view::{GraphEvent, GraphView};
 use super::keymap::{
     ClearScrollback, ClosePane, CloseTab, CommandPalette, Copy, CopyLastOutput, DuplicatePane,
     EditLabelsPane, FocusDown, FocusFilter, FocusLeft, FocusPane1, FocusPane2, FocusPane3,
-    FocusPane4, FocusRight, FocusUp, Kill, KillPane, NewAgent, NewTab, NewTerminal, NextAgent,
-    NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove, RemoveExited, RemovePane,
-    RenamePane, ReopenClosedPane, Restart, RestartPane, SaveOutput, ScrollToBottom, ScrollToTop,
-    SearchAllAgents, SelectAll, SelectTab, SendToAgents, ShowShortcuts, SplitDown, SplitRight,
-    ToggleGraph, ToggleMaximize, WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
+    FocusPane4, FocusRight, FocusUp, Kill, KillPane, KillSelected, NewAgent, NewTab, NewTerminal,
+    NextAgent, NextNeedsYou, NextTab, OpenOutput, Paste, PrevTab, PreviousAgent, Remove,
+    RemoveExited, RemovePane, RemoveSelected, RenamePane, ReopenClosedPane, Restart, RestartPane,
+    RestartSelected, SaveOutput, ScrollToBottom, ScrollToTop, SearchAllAgents, SelectAll,
+    SelectTab, SendToAgents, ShowShortcuts, SplitDown, SplitRight, ToggleGraph, ToggleMaximize,
+    WORKSPACE_CONTEXT, ZoomIn, ZoomOut, ZoomReset,
 };
 use super::kill_sheet::{self, KillEvent, KillSheet};
 use super::labels_sheet::{LabelsEvent, LabelsSheet};
@@ -39,6 +40,7 @@ use super::output;
 use super::palette::{command_action, command_shortcut};
 use super::pane_drag::PaneDrag;
 use super::pane_view::{PaneEvent, PaneView};
+use super::peek_view::{self, PeekEvent, PeekView};
 use super::picker_view::{PickerEvent, PickerView};
 use super::rename::{RenameEvent, RenameSheet};
 use super::search_all_view::{SearchAllEvent, SearchAllView};
@@ -52,7 +54,8 @@ use super::text_field::TextField;
 use super::theme::{Theme, Typography, appearance_of};
 use super::titlebar_view::{BarData, render_bar, sheet_drag_strip};
 use super::{controls, keymap};
-use crate::core::broadcast::{RowClick, RowSelection, sendable};
+use crate::core::broadcast::{RowClick, RowSelection, sendable, target_name};
+use crate::core::bulk::{BulkAction, BulkTargets};
 use crate::core::config::{GuiConfig, save_confirm_kill, save_connection};
 use crate::core::drag_drop::DropTarget;
 use crate::core::feedback::{self, Tween};
@@ -61,9 +64,11 @@ use crate::core::kill::{KillFlow, kill_flow};
 use crate::core::labels::chip_filter;
 use crate::core::layout::{Axis, Dir, MAX_PANES, Rect};
 use crate::core::menus::{
-    MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, group_menu, pane_menu, row_menu,
+    MenuEntry, PaneMenuItem, PaneMenuState, RowMenuItem, bulk_entries, group_menu, pane_menu,
+    row_menu,
 };
 use crate::core::palette::{Entry, PaletteState, palette_items, remove_exited_prompt};
+use crate::core::peek::sidebar_target;
 use crate::core::picker::Recents;
 use crate::core::presets::{Prefill, preset_request};
 use crate::core::question::open_question;
@@ -223,6 +228,8 @@ pub struct Workspace {
     choosers_drawn: bool,
     /// The agent switcher (⌃Tab), while it is open.
     switcher: Option<Switcher>,
+    /// The peek (ADR 0103), while open.
+    peek: Option<(Entity<PeekView>, Subscription)>,
     /// The agents the focused pane showed, most recent first.
     agent_mru: AgentMru,
     /// The connect sheet, over everything else.
@@ -299,6 +306,7 @@ impl Workspace {
                     | this.send.take().is_some()
                     | this.palette.take().is_some()
                     | this.switcher.take().is_some()
+                    | this.peek.take().is_some()
                 {
                     this.focus_current(window, cx);
                 }
@@ -379,6 +387,7 @@ impl Workspace {
             choosers: HashMap::new(),
             choosers_drawn: false,
             switcher: None,
+            peek: None,
             agent_mru: AgentMru::default(),
             connect: None,
             epoch,
@@ -456,9 +465,13 @@ impl Workspace {
         if !self.graph_shown {
             return;
         }
-        // Answering stays in the graph.
+        // Answering and peeking stay in the graph.
         if let GraphEvent::Answer(id) = *event {
             self.open_answer(id, window, cx);
+            return;
+        }
+        if let GraphEvent::Peek(id) = *event {
+            self.open_peek(id, window, cx);
             return;
         }
         self.graph_shown = false;
@@ -579,6 +592,7 @@ impl Workspace {
             || self.palette.is_some()
             || self.switcher.is_some()
             || self.search_all.is_some()
+            || self.peek.is_some()
     }
 
     pub fn kill_sheet(&self) -> Option<&Entity<KillSheet>> {
@@ -638,6 +652,7 @@ impl Workspace {
         self.palette = None;
         self.switcher = None;
         self.search_all = None;
+        self.close_peek(window, cx);
         if let Some((sheet, _)) = &self.connect {
             let sheet = sheet.clone();
             sheet.update(cx, |s, cx| {
@@ -983,6 +998,70 @@ impl Workspace {
             .update(cx, |a, cx| a.drop_paths_on_agent(agent, &paths, cx));
     }
 
+    /// The peek, while it is open (ADR 0103).
+    pub fn peek(&self) -> Option<&Entity<PeekView>> {
+        self.peek.as_ref().map(|(p, _)| p)
+    }
+
+    /// Peeks at `agent_id` in a popover, without changing the layout. One
+    /// peek at a time: another one open is replaced. Not over a sheet.
+    pub fn open_peek(&mut self, agent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.peek.is_none() && self.modal() {
+            return;
+        }
+        if !self
+            .app
+            .read(cx)
+            .agents
+            .iter()
+            .any(|r| r.info.id == agent_id)
+        {
+            return;
+        }
+        let app = self.app.clone();
+        let view = cx.new(|cx| PeekView::new(app, agent_id, cx));
+        let sub = cx.subscribe_in(&view, window, Self::peek_event);
+        view.read(cx).focus(window, cx);
+        self.peek = Some((view, sub));
+        cx.notify();
+    }
+
+    /// Closes the peek, and gives the keyboard back to the graph or the
+    /// focused pane.
+    fn close_peek(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.peek.take().is_none() {
+            return;
+        }
+        self.app.update(cx, |a, cx| a.close_peek(cx));
+        if self.graph_shown {
+            self.graph.0.read(cx).focus(window);
+        } else {
+            self.focus_current(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn peek_event(
+        &mut self,
+        _: &Entity<PeekView>,
+        event: &PeekEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match *event {
+            PeekEvent::Close => self.close_peek(window, cx),
+            PeekEvent::OpenInPane(id) => {
+                self.close_peek(window, cx);
+                if self.graph_shown {
+                    self.graph_shown = false;
+                    self.watch_message_lines(cx);
+                }
+                self.show_agent(id, window, cx);
+                cx.notify();
+            }
+        }
+    }
+
     /// The sidebar's groups under its filter and the target's collapsed
     /// groups.
     fn sidebar_groups(&self, cx: &App) -> Vec<SidebarGroup> {
@@ -1035,6 +1114,16 @@ impl Workspace {
         if ev.keystroke.key == "escape" {
             self.row_selection.clear();
             self.focus_current(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        // Space peeks at the selected row, as Quick Look (ADR 0103).
+        if ev.keystroke.key == "space"
+            && !m.alt
+            && !m.shift
+            && let Some(id) = sidebar_target(&self.row_selection)
+        {
+            self.open_peek(id, window, cx);
             cx.stop_propagation();
             return;
         }
@@ -1147,11 +1236,20 @@ impl Workspace {
     /// handled).
     pub fn open_row_menu(&mut self, agent_id: u64, cx: &mut Context<Self>) {
         let items = self.menu_items(agent_id, cx);
-        let lines = context_menu::lines(&items, |item| MenuLine {
-            title: item.title().to_owned(),
-            enabled: true,
-            shortcut: None,
-            checked: false,
+        let bulk = self.bulk_targets(cx);
+        let lines = context_menu::lines(&items, |item| {
+            let action = match item {
+                RowMenuItem::KillSelected => Some(BulkAction::Kill),
+                RowMenuItem::RestartSelected => Some(BulkAction::Restart),
+                RowMenuItem::RemoveSelected => Some(BulkAction::Remove),
+                _ => None,
+            };
+            MenuLine {
+                title: action.map_or_else(|| item.title().to_owned(), |a| a.menu_title(&bulk)),
+                enabled: action.is_none_or(|a| a.disabled_reason(&bulk).is_none()),
+                shortcut: None,
+                checked: false,
+            }
         });
         let epoch = self.epoch;
         context_menu::show(lines, cx, move |index, cx| {
@@ -1195,6 +1293,9 @@ impl Workspace {
             RowMenuItem::Kill => self.kill(&Kill { agent_id }, window, cx),
             RowMenuItem::Restart => self.restart(&Restart { agent_id }, window, cx),
             RowMenuItem::Remove => self.remove(&Remove { agent_id }, window, cx),
+            RowMenuItem::KillSelected => self.bulk(BulkAction::Kill, window, cx),
+            RowMenuItem::RestartSelected => self.bulk(BulkAction::Restart, window, cx),
+            RowMenuItem::RemoveSelected => self.bulk(BulkAction::Remove, window, cx),
         }
     }
 
@@ -1655,6 +1756,7 @@ impl Workspace {
         let pane = app.focused();
         let view = app.pane_view(pane).map(|v| v.read(cx));
         let agent = app.layout().agent(pane);
+        let bulk = self.bulk_targets(cx);
         PaletteState {
             panes: app.layout().panes().len(),
             tabs: app.tabs().len(),
@@ -1663,6 +1765,27 @@ impl Workspace {
             restartable: view.is_some_and(|v| v.restartable()),
             has_selection: view.is_some_and(|v| v.has_selection()),
             any_running: app.agents.iter().any(sendable),
+            selected_running: bulk.running.len(),
+            selected_ended: bulk.ended.len(),
+        }
+    }
+
+    /// ⌘J: shows the next agent that needs you in the focused pane (ADR
+    /// 0100); a short toast when none does. Not over a sheet.
+    pub fn next_needs_you(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let target = {
+            let app = self.app.read(cx);
+            let current = app.layout().agent(app.focused());
+            app.next_needing_you(current)
+        };
+        match target {
+            Some(id) => self.show_agent(id, window, cx),
+            None => self.app.update(cx, |a, cx| {
+                a.show_notice("No agent needs you".to_owned(), cx)
+            }),
         }
     }
 
@@ -1942,7 +2065,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let KillEvent::Kill { dont_ask } = *event {
-            let agent_id = sheet.read(cx).agent_id;
+            let agent_ids = sheet.read(cx).agent_ids.clone();
             self.app.update(cx, |a, _| {
                 if dont_ask {
                     a.config.confirm_kill = false;
@@ -1950,12 +2073,79 @@ impl Workspace {
                         eprintln!("fleet-gui: cannot save confirm_kill: {e}");
                     }
                 }
-                a.kill(agent_id);
+                for id in agent_ids {
+                    a.kill(id);
+                }
             });
         }
         self.kill = None;
         self.focus_current(window, cx);
         cx.notify();
+    }
+
+    /// The sidebar's selection (of several rows) split by what Kill,
+    /// Restart and Remove fit (ADR 0099).
+    fn bulk_targets(&self, cx: &App) -> BulkTargets {
+        if self.row_selection.ids().len() < 2 {
+            return BulkTargets::default();
+        }
+        BulkTargets::of(self.row_selection.ids(), &self.app.read(cx).agents)
+    }
+
+    /// Kill / Restart / Remove for the selected agents each fits. Kill
+    /// asks once, listing the names (unless `[gui] confirm_kill` is off);
+    /// the others act at once, as their single-agent forms do.
+    fn bulk(&mut self, action: BulkAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal() {
+            return;
+        }
+        let targets = self.bulk_targets(cx);
+        let ids = action.targets(&targets).to_vec();
+        if ids.is_empty() {
+            return;
+        }
+        match action {
+            BulkAction::Kill => {
+                let app = self.app.read(cx);
+                match kill_flow(app.config.confirm_kill) {
+                    KillFlow::Kill => ids.iter().for_each(|&id| app.kill(id)),
+                    KillFlow::Ask => {
+                        let names = ids
+                            .iter()
+                            .filter_map(|id| app.agents.iter().find(|r| r.info.id == *id))
+                            .map(target_name)
+                            .collect();
+                        let sheet = cx.new(|cx| KillSheet::many(ids, names, cx));
+                        let sub = cx.subscribe_in(&sheet, window, Self::kill_event);
+                        sheet.read(cx).focus(window);
+                        self.kill = Some((sheet, sub));
+                    }
+                }
+            }
+            BulkAction::Restart => {
+                let app = self.app.read(cx);
+                ids.iter().for_each(|&id| app.restart(id));
+            }
+            BulkAction::Remove => self.app.read(cx).forget_many(ids),
+        }
+        cx.notify();
+    }
+
+    fn kill_selected(&mut self, _: &KillSelected, window: &mut Window, cx: &mut Context<Self>) {
+        self.bulk(BulkAction::Kill, window, cx);
+    }
+
+    fn restart_selected(
+        &mut self,
+        _: &RestartSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bulk(BulkAction::Restart, window, cx);
+    }
+
+    fn remove_selected(&mut self, _: &RemoveSelected, window: &mut Window, cx: &mut Context<Self>) {
+        self.bulk(BulkAction::Remove, window, cx);
     }
 
     /// ⌘⇧W, a pane header's Stop or its menu's Kill Agent: kills `pane`'s
@@ -2337,11 +2527,15 @@ impl Workspace {
         let app = self.app.read(cx);
         let is_ended = app.agents.iter().any(|r| r.info.id == agent_id && ended(r));
         let in_selection = self.row_selection.targets_from(agent_id).len() > 1;
-        row_menu(
+        let mut items = row_menu(
             app.layout().panes().len() < MAX_PANES,
             is_ended,
             in_selection,
-        )
+        );
+        if in_selection {
+            items.extend(bulk_entries());
+        }
+        items
     }
 
     /// The exit toasts (#44), bottom centre, newest at the bottom: what
@@ -2918,6 +3112,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::restart))
             .on_action(cx.listener(Self::remove))
             .on_action(cx.listener(Self::remove_exited))
+            .on_action(cx.listener(Self::kill_selected))
+            .on_action(cx.listener(Self::restart_selected))
+            .on_action(cx.listener(Self::remove_selected))
             .on_action(cx.listener(|this, _: &SaveOutput, _, cx| {
                 this.output_focused(PaneMenuItem::SaveOutput, cx)
             }))
@@ -2929,6 +3126,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(Self::send_to_agents))
             .on_action(cx.listener(Self::search_all_agents))
+            .on_action(cx.listener(|this, _: &NextNeedsYou, w, cx| this.next_needs_you(w, cx)))
             .on_action(cx.listener(Self::restart_pane))
             .on_action(cx.listener(|this, _: &ZoomIn, w, cx| this.zoom(Zoom::In, w, cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, w, cx| this.zoom(Zoom::Out, w, cx)))
@@ -2966,6 +3164,11 @@ impl Render for Workspace {
             .children(palette)
             .children(search_all)
             .children(switcher)
+            .children(
+                self.peek
+                    .as_ref()
+                    .map(|(p, _)| peek_view::render_over(p, reduce_motion)),
+            )
             .children(sheet)
             .children(rename)
             .children(answer)
@@ -3753,7 +3956,10 @@ mod tests {
     /// The agent the kill question is open for.
     fn kill_asked(s: &mut Setup<'_>) -> Option<u64> {
         s.cx.run_until_parked();
-        s.ws.read_with(s.cx, |w, cx| w.kill_sheet().map(|k| k.read(cx).agent_id))
+        s.ws.read_with(s.cx, |w, cx| {
+            w.kill_sheet()
+                .and_then(|k| k.read(cx).agent_ids.first().copied())
+        })
     }
 
     fn hover(s: &mut Setup<'_>, selector: &'static str) {
@@ -3863,6 +4069,88 @@ mod tests {
         s.cx.dispatch_action(Kill { agent_id: 8 });
         assert_eq!(kill_asked(&mut s), None);
         assert_eq!(kills(&fake), [7, 8]);
+    }
+
+    /// A key pressed and released (gpui's keyboard click is on key up).
+    fn press(s: &mut Setup<'_>, key: &str) {
+        s.cx.simulate_keystrokes(key);
+        s.cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse(key).unwrap(),
+        });
+        s.cx.run_until_parked();
+    }
+
+    fn dont_ask(s: &mut Setup<'_>) -> bool {
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.kill_sheet().cloned())
+                .unwrap();
+        sheet.read_with(s.cx, |k, _| k.dont_ask)
+    }
+
+    #[gpui::test]
+    fn kill_sheet_tabs_to_its_controls_and_space_clicks_them(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(7, "/w", 1)]);
+        s.cx.dispatch_action(Kill { agent_id: 7 });
+        // As it opens, Space toggles the checkbox.
+        press(&mut s, "space");
+        assert!(dont_ask(&mut s));
+        press(&mut s, "space");
+        assert!(!dont_ask(&mut s));
+        // Tab: the checkbox, which Space toggles once.
+        press(&mut s, "tab");
+        press(&mut s, "space");
+        assert!(dont_ask(&mut s));
+        // Tab: Cancel, which Space presses.
+        press(&mut s, "tab");
+        press(&mut s, "space");
+        assert_eq!(kill_asked(&mut s), None, "cancelled");
+        assert!(kills(&fake).is_empty());
+
+        // Return is the default button (Kill) even on a focused Cancel.
+        s.cx.dispatch_action(Kill { agent_id: 7 });
+        press(&mut s, "tab");
+        press(&mut s, "tab");
+        press(&mut s, "enter");
+        assert_eq!(kills(&fake), [7]);
+        assert!(
+            crate::core::config::load_config(dir.path())
+                .unwrap()
+                .confirm_kill
+        );
+    }
+
+    #[gpui::test]
+    fn new_agent_sheet_tabs_through_its_fields(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        s.cx.simulate_keystrokes("cmd-n");
+        s.cx.run_until_parked();
+        let sheet = s.ws.read_with(s.cx, |w, _| w.sheet().cloned()).unwrap();
+        let focused = |s: &mut Setup<'_>, f: fn(&NewAgentSheet) -> &Entity<TextField>| {
+            s.cx.update(|window, cx| f(sheet.read(cx)).read(cx).focus_handle().is_focused(window))
+        };
+        assert!(focused(&mut s, |sh| &sh.command));
+        press(&mut s, "tab");
+        assert!(focused(&mut s, |sh| &sh.prompt));
+        s.cx.simulate_input("fix it");
+        let prompt = sheet.read_with(s.cx, |sh, cx| sh.prompt.read(cx).text().to_owned());
+        assert_eq!(prompt, "fix it");
+        press(&mut s, "tab");
+        assert!(focused(&mut s, |sh| &sh.name));
+        press(&mut s, "tab");
+        assert!(focused(&mut s, |sh| &sh.labels));
+        // Back past Name, Prompt, Command and Choose… to the directory.
+        for _ in 0..5 {
+            press(&mut s, "shift-tab");
+        }
+        assert!(focused(&mut s, |sh| &sh.dir));
+        // ⌘Tab is not focus movement.
+        s.cx.simulate_keystrokes("cmd-tab");
+        assert!(focused(&mut s, |sh| &sh.dir));
     }
 
     #[gpui::test]
@@ -4371,6 +4659,35 @@ mod tests {
             }),
         });
         r
+    }
+
+    /// ⌘J (ADR 0100): shows the agents that need you in turn, wrapping;
+    /// with none, a short toast and the pane unchanged.
+    #[gpui::test]
+    fn cmd_j_walks_the_agents_that_need_you(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        let shown = |s: &mut Setup<'_>| s.app.read_with(s.cx, |a, _| a.layout().agent(a.focused()));
+        agents(&mut s, &fake, vec![row(2, "/w", 2)]);
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(
+            s.app.read_with(s.cx, |a, _| a.notice().map(str::to_owned)),
+            Some("No agent needs you".to_owned())
+        );
+        assert_ne!(shown(&mut s), Some(2));
+
+        agents(
+            &mut s,
+            &fake,
+            vec![row(2, "/w", 2), asking(3, 9), asking(4, 10)],
+        );
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(shown(&mut s), Some(3));
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(shown(&mut s), Some(4));
+        s.cx.simulate_keystrokes("cmd-j");
+        assert_eq!(shown(&mut s), Some(3));
     }
 
     /// A question (ADR 0078): choices answer from the row and from the
@@ -5568,6 +5885,85 @@ mod tests {
         assert!(!s.ws.read_with(s.cx, |w, _| w.row_selection().is_empty()));
         s.cx.simulate_keystrokes("escape");
         assert!(s.ws.read_with(s.cx, |w, _| w.row_selection().is_empty()));
+    }
+
+    /// Selects `ids` in the sidebar, as ⌘-clicks do.
+    fn select_rows(s: &mut Setup<'_>, ids: &[u64]) {
+        s.ws.update(s.cx, |w, _| {
+            for &id in ids {
+                w.row_selection.click(id, true, false, ids, None);
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn bulk_menu_items_come_with_a_selection_of_several(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/a", 1), row(2, "/b", 2)]);
+        assert!(!row_items(&mut s, 1).contains(&RowMenuItem::KillSelected));
+        select_rows(&mut s, &[1, 2]);
+        let items = row_items(&mut s, 1);
+        assert!(items.contains(&RowMenuItem::KillSelected));
+        assert!(items.contains(&RowMenuItem::RestartSelected));
+        assert!(items.contains(&RowMenuItem::RemoveSelected));
+    }
+
+    #[gpui::test]
+    fn kill_selected_asks_once_and_kills_only_the_running(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                row(1, "/a", 1),
+                row(2, "/b", 2),
+                ended(3, "/c", 3, AgentState::Exited),
+            ],
+        );
+        select_rows(&mut s, &[1, 2, 3]);
+        pick_row(&mut s, 1, RowMenuItem::KillSelected);
+        let question = s.ws.read_with(s.cx, |w, cx| {
+            w.kill_sheet().unwrap().read(cx).question.to_string()
+        });
+        assert_eq!(question, "Kill 2 agents?");
+        assert!(kills(&fake).is_empty());
+        click(&mut s, "kill-confirm");
+        assert_eq!(kill_asked(&mut s), None);
+        assert_eq!(kills(&fake), [1, 2]);
+    }
+
+    #[gpui::test]
+    fn restart_and_remove_selected_act_on_the_exited(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(
+            &mut s,
+            &fake,
+            vec![
+                row(1, "/a", 1),
+                ended(2, "/b", 2, AgentState::Exited),
+                ended(3, "/c", 3, AgentState::Lost),
+            ],
+        );
+        select_rows(&mut s, &[1, 2, 3]);
+        pick_row(&mut s, 1, RowMenuItem::RestartSelected);
+        let restarts: Vec<_> = fake
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Restart(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restarts, [2, 3]);
+        pick_row(&mut s, 1, RowMenuItem::RemoveSelected);
+        assert_eq!(fake.calls().last(), Some(&Call::Forget(vec![2, 3])));
+        assert_eq!(kill_asked(&mut s), None);
     }
 
     #[gpui::test]
@@ -6809,6 +7205,12 @@ mod tests {
             vec![exited(1, 0), exited(2, 0), exited(3, 0)],
         );
         assert_eq!(exit_ids(&mut s), vec![1, 2, 3]);
+        // Let the toasts finish sliding in: a click at their bounds
+        // mid-animation can miss the close button.
+        s.cx.executor().advance_clock(Duration::from_millis(
+            crate::core::style::motion::TOAST_MS + 50,
+        ));
+        s.cx.run_until_parked();
         click(&mut s, "exit-toast-1-close");
         assert_eq!(exit_ids(&mut s), vec![2, 3]);
         // Agent 2 restarted elsewhere: it left the list, its toast goes.
@@ -7622,5 +8024,112 @@ mod tests {
         s.cx.run_until_parked();
         assert!(s.cx.debug_bounds("graph-card-3-new").is_some());
         assert!(s.cx.debug_bounds("graph-card-2-new").is_none());
+    }
+
+    fn peeked(s: &mut Setup<'_>) -> Option<u64> {
+        s.ws.read_with(s.cx, |w, cx| w.peek().map(|p| p.read(cx).agent()))
+    }
+
+    #[gpui::test]
+    fn space_peeks_at_the_selected_row_without_changing_the_layout(cx: &mut TestAppContext) {
+        use crate::core::peek::PEEK_PANE;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+        // No selection: Space starts the filter, as before.
+        s.ws.update_in(s.cx, |w, window, cx| w.focus_sidebar(window, cx));
+        s.cx.simulate_keystrokes("space");
+        assert_eq!(peeked(&mut s), None);
+        s.ws.update_in(s.cx, |w, window, cx| {
+            w.filter_field
+                .update(cx, |f, cx| f.set_text(String::new(), cx));
+            w.focus_sidebar(window, cx);
+        });
+        let at = center(&mut s, "tab-2");
+        s.cx.simulate_click(at, Modifiers::command());
+        s.cx.run_until_parked();
+        s.cx.simulate_keystrokes("space");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), Some(2));
+        assert!(s.cx.debug_bounds("peek").is_some());
+        assert!(fake.calls().contains(&Call::Open(PEEK_PANE, Some(2))));
+        assert_eq!(shown(&mut s, PaneId(1)), None, "the layout is unchanged");
+        // Typing goes to the agent, through the peek's connection.
+        s.cx.simulate_keystrokes("y");
+        assert!(
+            fake.pane_inputs
+                .lock()
+                .unwrap()
+                .contains(&(PEEK_PANE, b"y".to_vec()))
+        );
+        // Escape closes it, and does not reach the agent.
+        s.cx.simulate_keystrokes("escape");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None);
+        assert!(fake.calls().contains(&Call::Close(PEEK_PANE)));
+        assert!(
+            !fake
+                .pane_inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, b)| *p == PEEK_PANE && b == b"\x1b")
+        );
+        assert_eq!(shown(&mut s, PaneId(1)), None);
+        // ⌘Return opens it in the focused pane.
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(2, window, cx));
+        s.cx.simulate_keystrokes("cmd-enter");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None);
+        assert_eq!(shown(&mut s, PaneId(1)), Some(2));
+    }
+
+    #[gpui::test]
+    fn one_peek_at_a_time(cx: &mut TestAppContext) {
+        use crate::core::peek::PEEK_PANE;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(1, window, cx));
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(2, window, cx));
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), Some(2));
+        let opens = fake
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Open(p, _) if *p == PEEK_PANE))
+            .count();
+        assert_eq!(opens, 2);
+        assert!(fake.calls().contains(&Call::Close(PEEK_PANE)));
+        // An unknown agent is not peeked at.
+        s.cx.simulate_keystrokes("escape");
+        s.ws.update_in(s.cx, |w, window, cx| w.open_peek(9, window, cx));
+        assert_eq!(peeked(&mut s), None);
+    }
+
+    #[gpui::test]
+    fn resting_on_a_graph_card_peeks(cx: &mut TestAppContext) {
+        use crate::core::peek::HOVER_HOLD;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let mut s = setup(cx, &fake, dir.path());
+        agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+        s.cx.simulate_keystrokes("cmd-shift-g");
+        s.cx.run_until_parked();
+        let at = center(&mut s, "graph-card-2");
+        s.cx.simulate_mouse_move(at, None, Modifiers::none());
+        s.cx.executor().advance_clock(HOVER_HOLD / 2);
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None, "not yet");
+        s.cx.executor().advance_clock(HOVER_HOLD);
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), Some(2));
+        // Escape goes back to the graph, still shown.
+        s.cx.simulate_keystrokes("escape");
+        s.cx.run_until_parked();
+        assert_eq!(peeked(&mut s), None);
+        assert!(s.cx.debug_bounds("graph-card-2").is_some());
     }
 }

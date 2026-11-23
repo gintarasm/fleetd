@@ -65,6 +65,21 @@ pub fn show(cx: &mut App) {
     cx.activate(true);
 }
 
+/// A Dock click: "Show fleetd", and when agents need you (the badge on
+/// the icon), the one waiting longest (ADR 0100).
+pub fn reopen(cx: &mut App) {
+    show(cx);
+    if AppState::global(cx).is_some_and(|a| a.read(cx).needs_you_count() > 0) {
+        next_needs_you(cx);
+    }
+}
+
+/// Opens (or raises) the window and goes to the next agent that needs you.
+pub fn next_needs_you(cx: &mut App) {
+    show_window(cx);
+    with_workspace(cx, |ws, window, cx| ws.next_needs_you(window, cx));
+}
+
 /// Opens (or raises) the window without the unconnected detour.
 fn show_window(cx: &mut App) {
     set_accessory(false);
@@ -77,6 +92,7 @@ pub fn handle(entry: StatusEntry, cx: &mut App) {
     match entry {
         StatusEntry::Header(_) | StatusEntry::Separator => {}
         StatusEntry::Show => show(cx),
+        StatusEntry::NextNeedsYou => next_needs_you(cx),
         StatusEntry::Agent { id, .. } => show_agent(id, cx),
         StatusEntry::NewAgent => {
             show_window(cx);

@@ -153,6 +153,9 @@ struct Link {
     model: Arc<Mutex<PaneModel>>,
     shared: Mutex<Shared>,
     stop: Stop,
+    /// A read-only attach (ADR 0022) that never resizes the agent: the
+    /// peek (ADR 0103). Input still goes to the agent.
+    observe: bool,
 }
 
 impl Link {
@@ -174,6 +177,18 @@ impl PaneLink {
         agent: Option<u64>,
         palette: Palette,
     ) -> PaneLink {
+        Self::open_as(ctx, pane, agent, palette, false)
+    }
+
+    /// Opens a link that attaches as an observer (`observe`): it never
+    /// takes the primary role nor resizes the agent.
+    pub(crate) fn open_as(
+        ctx: Arc<Ctx>,
+        pane: PaneId,
+        agent: Option<u64>,
+        palette: Palette,
+        observe: bool,
+    ) -> PaneLink {
         let link = Arc::new(Link {
             ctx,
             pane,
@@ -183,6 +198,7 @@ impl PaneLink {
                 ..Shared::default()
             }),
             stop: Stop::default(),
+            observe,
         });
         let (out, rx) = mpsc::channel();
         let w = Arc::clone(&link);
@@ -657,6 +673,8 @@ impl Writer {
             Outgoing::Reply(agent_id, data) => {
                 self.send(request::Kind::Input(SendInput { agent_id, data }));
             }
+            // An observer draws at the agent's size and never sets it.
+            Outgoing::Resize(..) if self.link.observe => {}
             Outgoing::Resize(cols, rows) => {
                 self.size = Some((cols, rows));
                 self.resize_due = Some(Instant::now() + RESIZE_DEBOUNCE);
@@ -728,7 +746,7 @@ impl Writer {
             .push_back((id, Pending::Attach(agent_id)));
         self.send(request::Kind::Attach(Attach {
             agent_id,
-            observe: false,
+            observe: self.link.observe,
         }));
         // Keep the agent at this pane's size.
         if self.size.is_some() {
@@ -897,6 +915,10 @@ mod tests {
     }
 
     fn link_with(ctx: Arc<Ctx>) -> Arc<Link> {
+        link_as(ctx, false)
+    }
+
+    fn link_as(ctx: Arc<Ctx>, observe: bool) -> Arc<Link> {
         Arc::new(Link {
             ctx,
             pane: PaneId(1),
@@ -906,6 +928,7 @@ mod tests {
                 ..Shared::default()
             }),
             stop: Stop::default(),
+            observe,
         })
     }
 
@@ -1202,6 +1225,65 @@ mod tests {
             "resize at {resize:?}, last input at {last_input:?}"
         );
         writer.join().unwrap();
+    }
+
+    /// Sends `msgs` through a writer on `l` and returns what reached the
+    /// server.
+    fn written(l: &Arc<Link>, msgs: Vec<Outgoing>) -> Vec<request::Kind> {
+        let (sender, mut srv) = connected();
+        let (tx, rx) = mpsc::channel();
+        let w = Writer::new(Arc::clone(l));
+        let writer = thread::spawn(move || w.run(&rx));
+        tx.send(Outgoing::Connected(sender)).unwrap();
+        for m in msgs {
+            tx.send(m).unwrap();
+        }
+        // Past the resize debounce, so a resize would have gone out.
+        thread::sleep(RESIZE_DEBOUNCE * 4);
+        tx.send(Outgoing::Close).unwrap();
+        let reqs = srv.requests(SHORT);
+        writer.join().unwrap();
+        reqs
+    }
+
+    #[test]
+    fn observer_attaches_read_only_never_resizes_and_still_types() {
+        let l = link_as(Ctx::for_test(), true);
+        let reqs = written(
+            &l,
+            vec![
+                Outgoing::Resize(100, 30),
+                Outgoing::Attach(1),
+                Outgoing::Resize(90, 20),
+                Outgoing::Input(b"y".to_vec()),
+            ],
+        );
+        assert!(reqs.iter().any(|k| matches!(
+            k,
+            request::Kind::Attach(Attach {
+                agent_id: 1,
+                observe: true
+            })
+        )));
+        assert!(
+            !reqs.iter().any(|k| matches!(k, request::Kind::Resize(_))),
+            "{reqs:?}"
+        );
+        assert!(reqs.iter().any(|k| matches!(k, request::Kind::Input(_))));
+    }
+
+    #[test]
+    fn primary_link_attaches_as_primary_and_resizes() {
+        let l = link();
+        let reqs = written(&l, vec![Outgoing::Attach(1), Outgoing::Resize(90, 20)]);
+        assert!(reqs.iter().any(|k| matches!(
+            k,
+            request::Kind::Attach(Attach {
+                agent_id: 1,
+                observe: false
+            })
+        )));
+        assert!(reqs.iter().any(|k| matches!(k, request::Kind::Resize(_))));
     }
 
     #[test]

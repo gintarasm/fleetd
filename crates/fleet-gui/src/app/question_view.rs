@@ -57,7 +57,7 @@ pub fn question_block(
         .gap(px(space::XS))
         .p(px(space::SM))
         .rounded(px(radius::MD))
-        .bg(theme.warning.opacity(0.12))
+        .bg(theme.warning_tint)
         .child(
             div()
                 .debug_selector({

@@ -25,8 +25,10 @@ use crate::core::ended::run_time;
 use crate::core::feedback::{self, ExitNote, ExitToasts};
 use crate::core::git;
 use crate::core::layout::{Axis, Dir, Layout, SplitId};
+use crate::core::needs_you::{Since, next_after};
 use crate::core::new_children::NewChildren;
 use crate::core::pane::{PaneModel, PaneState};
+use crate::core::peek::PEEK_PANE;
 use crate::core::presets::{Preset, detect_presets, usable};
 use crate::core::question::open_question;
 use crate::core::row_preview::only_activity_changed;
@@ -134,6 +136,11 @@ pub trait SessionApi: InputSink {
     /// Approves or denies a pending spawn.
     fn decide_spawn(&self, _id: u64, _approve: bool) {}
     fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>>;
+    /// The peek's read-only connection to `agent_id` (ADR 0103), under
+    /// [`PEEK_PANE`]; closed with `close_pane`.
+    fn open_peek(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
+        self.open_pane(PEEK_PANE, Some(agent_id))
+    }
     fn attach(&self, pane: PaneId, agent_id: u64);
     fn close_pane(&self, pane: PaneId);
     fn set_palette(&self, palette: Palette);
@@ -242,6 +249,10 @@ impl SessionApi for Session {
 
     fn open_pane(&self, pane: PaneId, agent_id: Option<u64>) -> Arc<Mutex<PaneModel>> {
         Session::open_pane(self, pane, agent_id)
+    }
+
+    fn open_peek(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
+        Session::open_peek(self, agent_id)
     }
 
     fn attach(&self, pane: PaneId, agent_id: u64) {
@@ -365,6 +376,9 @@ pub struct AppState {
     /// Every tab's panes are open; only the shown tab's are drawn.
     tabs: Tabs,
     panes: HashMap<PaneId, Entity<PaneView>>,
+    /// The peek (ADR 0103), while open: its agent and its view, on a
+    /// read-only connection outside the layout.
+    peek: Option<(u64, Entity<PaneView>)>,
     /// The agents of panes closed lately, for ⌘⇧T (not saved).
     closed: ClosedPanes,
     /// The shown tab's pane filling the pane area, if any (not saved).
@@ -386,6 +400,9 @@ pub struct AppState {
     /// Children spawned while the GUI watched, highlighted briefly.
     pub(super) new_children: NewChildren,
     alerts: Alerts,
+    /// Since when each agent has had its status: what "next agent that
+    /// needs you" orders by (ADR 0100).
+    since: Since,
     /// The window is open and has focus: no notifications then.
     window_active: bool,
     /// The last error, shown until dismissed or replaced.
@@ -469,6 +486,7 @@ impl AppState {
             gui_state,
             tabs,
             panes: HashMap::new(),
+            peek: None,
             zoom: FontZoom::default(),
             disclosure: HashMap::new(),
             closed: ClosedPanes::default(),
@@ -480,6 +498,7 @@ impl AppState {
             pending_spawns: Vec::new(),
             new_children: NewChildren::default(),
             alerts: Alerts::default(),
+            since: Since::default(),
             window_active: false,
             error: None,
             error_is_connection: false,
@@ -558,6 +577,8 @@ impl AppState {
         self._events = follow(ui, cx);
         self.tabs = self.gui_state.saved_tabs(&self.target);
         self.panes.clear();
+        // The old session closed the peek's connection with the rest.
+        self.peek = None;
         self.maximized = None;
         self.closed.clear();
         self.disclosure.clear();
@@ -572,6 +593,7 @@ impl AppState {
         // The new target's children are not news either.
         self.new_children = NewChildren::default();
         self.alerts = Alerts::default();
+        self.since.clear();
         // A launch config error outlives the first connect only.
         self.error = self.config_error.take();
         self.error_is_connection = false;
@@ -657,6 +679,41 @@ impl AppState {
 
     pub fn pane_view(&self, pane: PaneId) -> Option<&Entity<PaneView>> {
         self.panes.get(&pane)
+    }
+
+    /// The peek's agent and view, while one is open (ADR 0103).
+    pub fn peek(&self) -> Option<(u64, &Entity<PaneView>)> {
+        self.peek.as_ref().map(|(id, v)| (*id, v))
+    }
+
+    /// Peeks at `agent_id`: one peek at a time, so one already open
+    /// closes first. Nothing in the layout changes.
+    pub(super) fn open_peek(&mut self, agent_id: u64, cx: &mut Context<Self>) -> Entity<PaneView> {
+        self.close_peek(cx);
+        let model = self.session.open_peek(agent_id);
+        let sink: Arc<dyn InputSink> = self.session.clone();
+        let config = self.pane_config();
+        let view = cx.new(|cx| {
+            let mut v = PaneView::new(PEEK_PANE, model, sink, &config, cx);
+            v.headless = true;
+            v
+        });
+        self.peek = Some((agent_id, view.clone()));
+        cx.notify();
+        view
+    }
+
+    /// Closes the peek's connection (never the agent).
+    pub(super) fn close_peek(&mut self, cx: &mut Context<Self>) {
+        if self.peek.take().is_some() {
+            self.session.close_pane(PEEK_PANE);
+            cx.notify();
+        }
+    }
+
+    /// The panes' font size, zoom included (the peek shrinks from it).
+    pub(super) fn pane_font_size(&self) -> f32 {
+        self.pane_config().font_size
     }
 
     pub fn gui_state(&self) -> &GuiState {
@@ -800,6 +857,11 @@ impl AppState {
                 UiEvent::MessageEdgesChanged => {
                     self.message_edges = self.session.message_edges();
                     cx.notify();
+                }
+                UiEvent::PaneChanged(PEEK_PANE) => {
+                    if let Some((_, view)) = &self.peek {
+                        view.update(cx, |_, cx| cx.notify());
+                    }
                 }
                 UiEvent::PaneChanged(pane) => {
                     let Some(view) = self.panes.get(&pane).cloned() else {
@@ -1081,6 +1143,7 @@ impl AppState {
     pub fn refresh_status(&mut self, cx: &mut Context<Self>) {
         let now = statuses(&self.agents, &self.bells, unix_ms());
         let alerts = self.alerts.update(&now);
+        self.since.update(&now, unix_ms());
         if now != self.statuses {
             self.statuses = now;
             self.refresh_chrome(cx);
@@ -1115,6 +1178,13 @@ impl AppState {
             }
             super::attention::post(self.session_epoch, id, &title, &body, cx);
         }
+    }
+
+    /// The agent "Next agent that needs you" goes to from `current`
+    /// (ADR 0100): the next of those that need you, longest waiting
+    /// first, then the failed ones; `None` when there are none.
+    pub fn next_needing_you(&self, current: Option<u64>) -> Option<u64> {
+        next_after(&self.since.queue(), current)
     }
 
     /// Agents that need you, for the Dock badge and the menu bar.

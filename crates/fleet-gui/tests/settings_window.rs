@@ -8,11 +8,15 @@ use fleet_gui::app::{
     AppState, SettingsWindow, TextSetting, Theme, Workspace, open_settings, settings_window,
 };
 use fleet_gui::core::config::{GuiConfig, load_config};
+use fleet_gui::core::cursor_blink::BlinkChoice;
 use fleet_gui::core::glass::{Backdrop, GlassChoice};
-use fleet_gui::core::settings::{OptionAsMeta, Section};
+use fleet_gui::core::settings::{OptionAsMeta, Section, ThemeChoice};
 use fleet_gui::core::target::Target;
 use fleet_gui::core::theme::Appearance;
-use gpui::{AppContext, Entity, Modifiers, TestAppContext, VisualTestContext, WindowHandle};
+use gpui::{
+    AppContext, Entity, KeyUpEvent, Keystroke, Modifiers, TestAppContext, VisualTestContext,
+    WindowHandle,
+};
 
 struct Setup {
     app: Entity<AppState>,
@@ -280,4 +284,60 @@ fn option_as_meta_has_a_four_way_picker(cx: &mut TestAppContext) {
         assert_eq!(config(cx, &s).option_as_meta, want);
         assert_eq!(load_config(dir.path()).unwrap().option_as_meta, want);
     }
+}
+
+/// Keys pressed and released in Settings, one after another (gpui's
+/// keyboard click is on key up).
+fn press(cx: &mut TestAppContext, s: &Setup, keys: &str) {
+    let mut vcx = VisualTestContext::from_window(s.settings.into(), cx);
+    vcx.update(|window, _| window.activate_window());
+    for key in keys.split(' ') {
+        vcx.simulate_keystrokes(key);
+        vcx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse(key).unwrap(),
+        });
+        vcx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn tab_reaches_the_switches_and_space_toggles_them(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let s = setup(cx, dir.path(), GuiConfig::default());
+    show(cx, &s, "settings-tab-Behaviour");
+    // The section tabs, Motion, Cursor blink, then Confirm before killing.
+    press(cx, &s, "tab tab tab tab space");
+    assert!(!config(cx, &s).confirm_kill);
+    assert!(!load_config(dir.path()).unwrap().confirm_kill);
+    // Return does not click a switch.
+    press(cx, &s, "enter");
+    assert!(!config(cx, &s).confirm_kill);
+    press(cx, &s, "tab space");
+    assert!(config(cx, &s).notifications);
+    // Back to Cursor blink: → picks the next choice, stopping at the end.
+    press(cx, &s, "shift-tab shift-tab right");
+    assert_eq!(config(cx, &s).cursor_blink, BlinkChoice::On);
+    press(cx, &s, "right right");
+    assert_eq!(config(cx, &s).cursor_blink, BlinkChoice::Off);
+    press(cx, &s, "left");
+    assert_eq!(config(cx, &s).cursor_blink, BlinkChoice::On);
+}
+
+#[gpui::test]
+fn arrows_switch_sections_pick_choices_and_step_steppers(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let s = setup(cx, dir.path(), GuiConfig::default());
+    let section = |cx: &mut TestAppContext| s.settings.read_with(cx, |w, _| w.section()).unwrap();
+    press(cx, &s, "tab right");
+    assert_eq!(section(cx), Section::Behaviour);
+    press(cx, &s, "left");
+    assert_eq!(section(cx), Section::Appearance);
+    press(cx, &s, "tab right");
+    assert_eq!(config(cx, &s).theme, ThemeChoice::Light);
+    // Shift-Tab past the section tabs wraps to the last stop: Font size.
+    press(cx, &s, "shift-tab shift-tab up");
+    assert_eq!(config(cx, &s).font_size, 14.0);
+    press(cx, &s, "left left right");
+    assert_eq!(config(cx, &s).font_size, 13.0);
+    assert_eq!(load_config(dir.path()).unwrap().font_size, 13.0);
 }

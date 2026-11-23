@@ -74,6 +74,12 @@ impl TextField {
         }
     }
 
+    /// The field is a stop in its sheet's or Settings' Tab order (ADR 0101).
+    pub fn tab_stop(mut self) -> Self {
+        self.focus = self.focus.clone().tab_stop(true);
+        self
+    }
+
     /// A text box `rows` rows tall: line breaks are kept, Return types
     /// one (⌘Return still reaches the sheet).
     pub fn multiline(text: String, placeholder: &str, rows: usize, cx: &mut Context<Self>) -> Self {
