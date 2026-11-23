@@ -372,6 +372,62 @@ pub fn text_lines(text: &str) -> Vec<String> {
     text.lines().map(cut).collect()
 }
 
+/// A fixture diff of `lines` changed lines over `files` modified files,
+/// in hunks of 50 (the GUI benchmarks, ADR 0094).
+pub fn fixture(lines: usize, files: usize) -> DiffView {
+    let files = files.max(1);
+    let per_file = lines.div_ceil(files);
+    let mut out = Vec::new();
+    let mut left = lines;
+    for f in 0..files {
+        let n = per_file.min(left);
+        left -= n;
+        let mut hunks = Vec::new();
+        let mut done = 0;
+        while done < n {
+            let len = 50.min(n - done);
+            let start = (done * 2 + 1) as u32;
+            let body: String = (0..len)
+                .map(|i| match i % 5 {
+                    0 => format!("-let old_{i} = compute({i}, \"before\");\n"),
+                    1 => format!("+let new_{i} = compute({i}, \"after\");\n"),
+                    _ => format!(" let same_{i} = keep({i});\n"),
+                })
+                .collect();
+            let removed = (0..len).filter(|i| i % 5 == 0).count() as u32;
+            let added = (0..len).filter(|i| i % 5 == 1).count() as u32;
+            hunks.push(fleet_proto::Hunk {
+                old_start: start,
+                old_lines: len as u32 - added,
+                new_start: start,
+                new_lines: len as u32 - removed,
+                header: format!("fn part_{done}()"),
+                body: body.into_bytes().into(),
+            });
+            done += len;
+        }
+        out.push(FileDiff {
+            old_path: format!("src/file_{f}.rs"),
+            new_path: format!("src/file_{f}.rs"),
+            status: FileStatus::FileModified as i32,
+            additions: (n / 5) as u32,
+            deletions: (n / 5) as u32,
+            hunks,
+            ..Default::default()
+        });
+    }
+    DiffView {
+        title: "fixture · fleet/bench".into(),
+        from_label: "origin/main".into(),
+        to_label: "working tree".into(),
+        files_changed: out.len() as u32,
+        additions: (lines / 5) as u64,
+        deletions: (lines / 5) as u64,
+        files: out,
+        truncated: false,
+    }
+}
+
 /// `+` / `-` and the counts, for headers: `+12 −3`.
 pub fn stat_text(additions: u64, deletions: u64) -> String {
     format!("+{additions} \u{2212}{deletions}")
@@ -653,6 +709,15 @@ mod tests {
             ]
         );
         assert_eq!(text_lines("a\nb\n"), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_benchmark_fixture_has_its_lines() {
+        let v = fixture(10_000, 20);
+        assert_eq!(v.files.len(), 20);
+        let d = DiffDoc::new(&v);
+        // Every line, plus a header per file and per hunk of 50.
+        assert_eq!(d.len(), 10_000 + 20 + 200);
     }
 
     #[test]

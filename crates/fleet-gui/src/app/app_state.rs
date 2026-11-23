@@ -2417,6 +2417,29 @@ impl AppState {
         self.expand(dir)
     }
 
+    /// A diff pane on `view` beside the focused pane, as Show Changes
+    /// opens one but with no daemon call (`gui_diff_open_ns`).
+    pub(super) fn bench_open_diff(
+        &mut self,
+        view: &fleet_proto::DiffView,
+        at: std::time::Instant,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
+        let pane = self.tabs.split_toward(self.tabs.focused(), Dir::Right)?;
+        let config = self.pane_config();
+        let font = super::fonts::terminal_font(&config.font_family, cx);
+        let session = self.session.clone();
+        let diff = cx.new(|cx| {
+            let mut v = DiffPane::new(0, "fixture".into(), session, font, px(config.font_size), cx);
+            v.opened_at = Some(at);
+            v.show_view(view, cx);
+            v
+        });
+        self.diff_panes.insert(pane, diff);
+        self.layout_changed(cx);
+        Some(pane)
+    }
+
     /// `pane` is about to show a terminal: a diff pane there goes, and an
     /// empty terminal pane takes its place.
     fn terminal_in(&mut self, pane: PaneId, cx: &mut Context<Self>) {

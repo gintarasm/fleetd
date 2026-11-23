@@ -36,6 +36,11 @@ const NOT_IN_PALETTE: &[(&str, &str)] = &[
     ("fleet::Kill", "names an agent (row menu)"),
     ("fleet::Restart", "names an agent (row menu)"),
     ("fleet::Remove", "names an agent (row menu)"),
+    // The diff pane's own keys (ADR 0094); the palette takes the focus
+    // from the pane they act on, and Show Changes refreshes an open one.
+    ("diff_pane::RefreshDiff", "the focused diff pane's ⌘R"),
+    ("diff_pane::CopyDiff", "the focused diff pane's ⌘C"),
+    ("diff_pane::SelectAllDiff", "the focused diff pane's ⌘A"),
 ];
 
 /// The action a command dispatches.

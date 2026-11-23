@@ -376,6 +376,60 @@ pub(super) fn graph_frame_flood_ns(
     parse_ns(&line, "graph_frame_ns")
 }
 
+/// `gui_diff_open_ns` (ADR 0094): an idle daemon; the GUI's `diff-open`
+/// hook opens a diff pane on a 10,000-line fixture `DiffView` (no git) and
+/// times it from the open to its first presented frame (median of its
+/// samples, the pane closed in between).
+pub(super) fn diff_open_ns(fleetd: &Path, gui: &Path) -> Result<f64, String> {
+    let daemon = Daemon::start(fleetd)?;
+    let run = GuiRun {
+        gui,
+        state_dir: daemon.state_dir(),
+        mode: "diff-open",
+        env: vec![],
+    };
+    parse_ns(&run.run("diff_open_ns ")?.0, "diff_open_ns")
+}
+
+/// `gui_diff_scroll_frame_ns` (ADR 0094): that fixture diff scrolled
+/// three rows a frame while `agents` `fake-agent --ansi --forever` flood;
+/// the GUI's `diff-scroll` hook times each frame from the workspace's
+/// render to its presentation (median). As [`graph_frame_flood_ns`], the
+/// floods are killed once the GUI has printed.
+pub(super) fn diff_scroll_frame_flood_ns(
+    fleetd: &Path,
+    gui: &Path,
+    fake_agent: &Path,
+    agents: usize,
+    quick: bool,
+) -> Result<f64, String> {
+    let daemon = Daemon::start(fleetd)?;
+    let mut client = Client::connect(&daemon.sock)?;
+    let mut streams = Streams::default();
+    let flood = ForeverFlood::start(&daemon, fake_agent, agents)?;
+    let run = GuiRun {
+        gui,
+        state_dir: daemon.state_dir(),
+        mode: "diff-scroll",
+        env: vec![("FLEET_GUI_BENCH_AGENTS", agents.to_string())],
+    };
+    let result = run.run("diff_scroll_frame_ns ");
+    let early = flood.stop(&mut client, &mut streams, "diff scroll")?;
+    let line = result?.0;
+    if !early.is_empty() {
+        let msg = format!(
+            "diff scroll: {} of {agents} flood agents exited before the GUI \
+             finished its samples (agent id, exit code): {early:?}",
+            early.len()
+        );
+        if !quick {
+            return Err(msg);
+        }
+        eprintln!("fleet-perf: {msg}");
+    }
+    parse_ns(&line, "diff_scroll_frame_ns")
+}
+
 /// `agents` `fake-agent --forever` spawned on their own connection, whose
 /// output a thread consumes until they all exit.
 struct ForeverFlood {

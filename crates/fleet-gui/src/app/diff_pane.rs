@@ -438,6 +438,19 @@ impl DiffPane {
         }
     }
 
+    /// `diff-scroll`: three rows further down, back to the top at the end.
+    fn bench_scroll_step(&mut self) {
+        let step = self.row_height() * 3.0;
+        let total = self.row_height() * self.row_count() as f32;
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let offset = handle.offset();
+        let mut y = offset.y - step;
+        if -y > total - step * 20.0 {
+            y = px(0.);
+        }
+        handle.set_offset(point(offset.x, y));
+    }
+
     fn row_height(&self) -> Pixels {
         (self.font_size * 1.45).round()
     }
@@ -854,7 +867,11 @@ impl Render for DiffPane {
         if self.doc().is_some()
             && let Some(at) = self.opened_at.take()
         {
-            super::bench::diff_opened(at);
+            super::bench::diff_opened(at, window);
+        }
+        if super::bench::diff_scrolling() {
+            self.bench_scroll_step();
+            super::bench::diff_frame(window);
         }
         let header = self.render_header(&theme, cx);
         let body = match &self.shown {
