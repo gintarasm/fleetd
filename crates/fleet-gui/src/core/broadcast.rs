@@ -281,6 +281,11 @@ impl RowSelection {
         self.ids.is_empty()
     }
 
+    /// The last row clicked (with or without ⌘ or ⇧), if still listed.
+    pub fn anchor(&self) -> Option<u64> {
+        self.anchor
+    }
+
     /// A click on row `id` with ⌘ (`cmd`) or ⇧ (`shift`) held; `order`
     /// is the sidebar's rows as drawn, `current` the row shown focused
     /// (a ⌘-click adds to it, as to Finder's selected row).

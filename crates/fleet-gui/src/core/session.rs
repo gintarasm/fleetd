@@ -895,6 +895,34 @@ impl Session {
         model
     }
 
+    /// Opens the peek's connection on `agent_id` (ADR 0103): a read-only
+    /// `observe` attach under [`PEEK_PANE`](super::peek::PEEK_PANE) that
+    /// never resizes the agent; [`Session::input`] on that pane still
+    /// types into it. A peek already open is closed. Close it with
+    /// [`Session::close_pane`].
+    pub fn open_peek(&self, agent_id: u64) -> Arc<Mutex<PaneModel>> {
+        let pane = super::peek::PEEK_PANE;
+        let palette = *lock(&self.inner.palette);
+        let mut panes = lock(&self.inner.panes);
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            let mut model = PaneModel::new(palette);
+            model.on_disconnected();
+            return Arc::new(Mutex::new(model));
+        }
+        let link = PaneLink::open_as(
+            Arc::clone(&self.inner.ctx),
+            pane,
+            Some(agent_id),
+            palette,
+            true,
+        );
+        let model = link.model();
+        if let Some(old) = panes.insert(pane, link) {
+            old.close();
+        }
+        model
+    }
+
     /// Shows `agent_id` in `pane` (detaching what it showed).
     pub fn attach(&self, pane: PaneId, agent_id: u64) {
         if let Some(link) = lock(&self.inner.panes).get(&pane) {

@@ -31,6 +31,7 @@ pub mod output;
 pub mod palette;
 pub mod pane;
 mod pane_link;
+pub mod peek;
 pub mod picker;
 pub mod presets;
 pub mod question;
