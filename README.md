@@ -6,7 +6,7 @@
 
 A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Code, Codex, Gemini CLI, …) in terminals that survive client crashes, on your machine and, later, on remote hosts. The design is in [`docs/plan.md`](docs/plan.md) and the decisions behind it are in [`docs/decisions/`](docs/decisions/).
 
-**Status:** M1 (local node), M2a (the daemon side of the GUI: agent history, protocol v2, labels, `fleetd --stdio`, the agent skill) and M2b (the macOS GUI) are done. Today you get a daemon (`fleetd`), a command-line client (`fleet`) and a macOS app (`fleetd.app`). Anything marked **TBD** below is planned but not implemented yet.
+**Status:** M0 through M3 are done: the local node, the macOS GUI and its daily-drive polish, and Satellite (agents spawning agents, `fleet tree`, the graph view, reports, mailbox, leases and questions). M4 (workflows: git worktrees and a diff view) is next. Today you get a daemon (`fleetd`), a command-line client (`fleet`) and a macOS app (`fleetd.app`). Anything marked **TBD** below is planned but not implemented yet.
 
 | Milestone | What | Status |
 |---|---|---|
@@ -14,10 +14,11 @@ A fast agent fleet manager written in Rust. It runs CLI coding agents (Claude Co
 | M1 | Local node: PTYs, terminal state, scrollback, SQLite, protocol, `fleet` CLI | done |
 | M2a | Daemon side of the GUI: agent history, protocol v2, labels, flood fix, `fleetd --stdio`, login-shell env, agent skill | done |
 | M2b | GUI (gpui): sidebar, terminal panes, splits, menu-bar app, connect sheet | done |
-| M2c | Daily-drive polish: native-feeling GUI, restart and remove exited agents | TBD |
-| M3 | Satellite: agents spawning agents (MCP), spawn quotas, a graph view of what's running | TBD |
+| M2c | Daily-drive polish: native-feeling GUI, restart and remove exited agents, `fleet daemon restart` | done |
+| M2d | GUI polish: new terminal, command palette, workspace tabs, find, ended-pane summary, motion | done |
+| M3 | Satellite: agents spawning agents through the `fleet` CLI, spawn quotas and approval, `fleet tree`, graph view, reports, mailbox, leases, questions | done |
 | M4 | Projects, workspaces, worktrees, tasks; diff view | TBD |
-| M5 | Plugins, Claude Code and Codex adapters, status detection, notifications, agent messaging | TBD |
+| M5 | Plugins, Claude Code and Codex adapters, hook-based status detection, notifications | TBD |
 | M6 | Remote nodes over SSH | TBD |
 | M7 | Credentials | TBD |
 
@@ -251,7 +252,6 @@ fleet logs -f              # then follow new lines until Ctrl-C
 - Remote nodes (`fleet node add user@host`): **TBD** (M6)
 - Plugins and agent adapters: **TBD** (M5)
 - Credentials and secret grants: **TBD** (M7)
-- Agent-to-agent messages (`fleet msg`) and status reporting (`fleet status`): **TBD** (M4, [0019](docs/decisions/0019-control-plane-direction.md))
 - Setting environment variables for an agent from the CLI: **TBD** (the protocol supports it)
 
 ## GUI
