@@ -34,6 +34,7 @@ pub mod new_children;
 pub mod output;
 pub mod palette;
 pub mod pane;
+pub mod pane_chrome;
 mod pane_link;
 pub mod pane_sync;
 pub mod peek;

@@ -352,7 +352,12 @@ impl Daemon {
         let instance = identity.instance;
         // What a restart with no binary named restarts onto.
         let own_binary = identity.binary.path.clone();
-        let server = Server::new(Arc::clone(&node), identity, restore);
+        let server = Server::new(
+            Arc::clone(&node),
+            identity,
+            restore,
+            state_dir.join("config.toml"),
+        );
         let leases = tokio::spawn(server::lease::drive(Arc::clone(&node)));
         let restarts = server.restarts();
         // The restart whose binary is being checked.
