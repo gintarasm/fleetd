@@ -56,6 +56,10 @@ actions!(
         FindPrevious,
         CommandPalette,
         RemoveExited,
+        // The palette's Kill / Restart / Remove Selected (ADR 0099).
+        KillSelected,
+        RestartSelected,
+        RemoveSelected,
         NextAgent,
         PreviousAgent,
         ToggleGraph,

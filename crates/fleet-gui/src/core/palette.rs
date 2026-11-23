@@ -74,6 +74,10 @@ pub enum Command {
     SelectAll,
     ClearScrollback,
     RemoveExited,
+    /// Kill / Restart / Remove the sidebar's selection (ADR 0099).
+    KillSelected,
+    RestartSelected,
+    RemoveSelected,
     ToggleGraph,
     /// Send to Agents… (ADR 0083).
     SendToAgents,
@@ -101,6 +105,11 @@ pub struct PaletteState {
     pub has_selection: bool,
     /// Some agent is running (Send to Agents…).
     pub any_running: bool,
+    /// Running agents in the sidebar's selection of several (Kill
+    /// Selected, ADR 0099); 0 with fewer than two rows picked.
+    pub selected_running: usize,
+    /// Exited or lost agents in that selection (Restart, Remove).
+    pub selected_ended: usize,
 }
 
 impl Command {
@@ -162,6 +171,9 @@ impl Command {
         Command::SelectAll,
         Command::ClearScrollback,
         Command::RemoveExited,
+        Command::KillSelected,
+        Command::RestartSelected,
+        Command::RemoveSelected,
         Command::ToggleGraph,
         Command::SendToAgents,
         Command::ShowShortcuts,
@@ -222,6 +234,9 @@ impl Command {
             Command::SelectAll => "Select All in Pane",
             Command::ClearScrollback => "Clear Scrollback",
             Command::RemoveExited => "Remove Exited Agents…",
+            Command::KillSelected => "Kill Selected Agents…",
+            Command::RestartSelected => "Restart Selected Exited Agents",
+            Command::RemoveSelected => "Remove Selected Exited Agents",
             Command::ToggleGraph => "Show or Hide the Agent Graph",
             Command::SendToAgents => "Send to Agents…",
             Command::ShowShortcuts => "Keyboard Shortcuts",
@@ -270,6 +285,9 @@ impl Command {
             Command::SelectAll => "copy text",
             Command::ClearScrollback => "erase history buffer",
             Command::RemoveExited => "clear forget rm lost",
+            Command::KillSelected | Command::RestartSelected | Command::RemoveSelected => {
+                "bulk selection stop multi rm"
+            }
             Command::SendToAgents => "broadcast message type input fleet send",
             Command::ShowShortcuts => "cheat sheet keys help",
             Command::OpenSettings => "preferences config",
@@ -312,6 +330,8 @@ impl Command {
             Command::RestartPane | Command::RemovePane => s.restartable,
             Command::Copy => s.has_selection,
             Command::SendToAgents => s.any_running,
+            Command::KillSelected => s.selected_running > 0,
+            Command::RestartSelected | Command::RemoveSelected => s.selected_ended > 0,
             Command::NewTab => s.tabs < MAX_TABS,
             Command::CloseTab | Command::NextTab | Command::PrevTab => s.tabs > 1,
             Command::SelectTab(n) => s.tabs > 1 && n <= s.tabs,
@@ -583,6 +603,8 @@ mod tests {
             restartable: true,
             has_selection: true,
             any_running: true,
+            selected_running: 2,
+            selected_ended: 2,
         }
     }
 
@@ -703,6 +725,29 @@ mod tests {
         assert!(listed.contains(&Command::RestartPane));
         assert!(listed.contains(&Command::RemovePane));
         assert!(!listed.contains(&Command::KillPane));
+    }
+
+    #[test]
+    fn bulk_commands_need_something_selected_that_they_fit() {
+        let listed = shown(&everything());
+        assert!(listed.contains(&Command::KillSelected));
+        assert!(listed.contains(&Command::RestartSelected));
+        assert!(listed.contains(&Command::RemoveSelected));
+        let none = PaletteState {
+            selected_running: 0,
+            selected_ended: 0,
+            ..everything()
+        };
+        let listed = shown(&none);
+        assert!(!listed.contains(&Command::KillSelected));
+        assert!(!listed.contains(&Command::RestartSelected));
+        assert!(!listed.contains(&Command::RemoveSelected));
+        let only_ended = PaletteState {
+            selected_running: 0,
+            ..everything()
+        };
+        assert!(!shown(&only_ended).contains(&Command::KillSelected));
+        assert!(shown(&only_ended).contains(&Command::RemoveSelected));
     }
 
     #[test]
