@@ -51,10 +51,13 @@ pub enum Stage {
     },
     /// The action is running.
     Running,
-    /// The action refused: `reason`, and the params "… Anyway" resends.
+    /// The action refused: `reason`, and the params "… Anyway" resends;
+    /// `retry` is false when the refusal named nothing to override (the
+    /// same call would be refused again): no "… Anyway" then.
     Refused {
         reason: String,
         params: HashMap<String, ParamValue>,
+        retry: bool,
     },
 }
 
@@ -222,6 +225,7 @@ impl ActionSheet {
         self.stage = Stage::Refused {
             reason,
             params: with_retry(params, retry),
+            retry: !retry.is_empty(),
         };
         cx.notify();
     }
@@ -287,6 +291,11 @@ impl ActionSheet {
         }
     }
 
+    /// "… Anyway" is offered: a refusal that named params to override.
+    pub fn can_retry(&self) -> bool {
+        matches!(self.stage, Stage::Refused { retry: true, .. })
+    }
+
     /// The run button (or Return).
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         let params = match &self.stage {
@@ -305,6 +314,7 @@ impl ActionSheet {
                 }
                 params
             }
+            Stage::Refused { retry: false, .. } => return,
             Stage::Confirm { params, .. } | Stage::Refused { params, .. } => params.clone(),
             Stage::Choose(_) | Stage::Running => return,
         };
@@ -453,7 +463,11 @@ impl ActionSheet {
             Stage::Running => ("Running…".to_owned(), false),
             _ => (self.verb.clone(), true),
         };
-        let choosing = matches!(self.stage, Stage::Choose(_));
+        // Nothing to run: picking an action, or a refusal with no retry.
+        let choosing = matches!(
+            self.stage,
+            Stage::Choose(_) | Stage::Refused { retry: false, .. }
+        );
         div()
             .flex()
             .flex_row()

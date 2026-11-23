@@ -282,6 +282,97 @@ mod tests {
         assert!(!in_git_checkout(std::path::Path::new("relative")));
     }
 
+    /// `v` is what a param of `kind` takes (ADR 0092).
+    fn fits(kind: fleet_proto::ParamKind, v: &Value) -> bool {
+        use fleet_proto::ParamKind::*;
+        matches!(
+            (kind, v),
+            (
+                ParamString | ParamText | ParamChoice | ParamPath,
+                Value::String(_)
+            ) | (ParamBool, Value::Bool(_))
+                | (ParamInt | ParamDuration, Value::Int(_))
+                | (ParamAgent, Value::Int(_) | Value::String(_))
+                | (ParamArgv, Value::List(_))
+                | (ParamLabels, Value::Map(_))
+        )
+    }
+
+    /// Every param the GUI sends is one the action has, of its kind (and
+    /// among its choices).
+    fn check(specs: &[ActionSpec], name: &str, params: &HashMap<String, ParamValue>) {
+        let spec = specs
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("git-worktree has no {name}"));
+        for (key, value) in params {
+            let p = spec
+                .params
+                .iter()
+                .find(|p| p.key == *key)
+                .unwrap_or_else(|| panic!("{name} has no param {key}"));
+            let v = value.value.as_ref().unwrap();
+            assert!(fits(p.kind(), v), "{name}.{key}: {v:?} for {:?}", p.kind());
+            if let Value::String(s) = v
+                && !p.choices.is_empty()
+            {
+                assert!(
+                    p.choices.contains(s),
+                    "{name}.{key}: {s} not in {:?}",
+                    p.choices
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_gui_calls_match_the_git_worktree_workflows_specs() {
+        let specs = fleet_workflow::git_worktree::specs();
+        let wt = NewWorktree {
+            slug: "fix-1".into(),
+            branch: "feat/x".into(),
+            base: "origin/main".into(),
+        };
+        let labels = HashMap::from([("team".to_owned(), "core".to_owned())]);
+        let p = new_agent_params(&wt, "/src/repo", vec!["claude".into()], Some("n"), labels);
+        assert_eq!(p.len(), 7, "every new-agent field is sent: {p:?}");
+        check(&specs, NEW_AGENT, &p);
+        for against in AGAINST {
+            check(&specs, DIFF, &diff_params(1, against, Some("src/a.rs")));
+        }
+        check(&specs, ARCHIVE, &archive_params(1));
+        // Show Changes and Archive Worktree… fill the action's target param.
+        for name in [DIFF, ARCHIVE] {
+            let spec = specs.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(spec.target_param, "agent", "{name}");
+        }
+        // The refusals' retries name params the actions have ("… Anyway"
+        // resends them): new-agent's reuse and shared, archive's force.
+        let retries = [
+            (NEW_AGENT, "reuse"),
+            (NEW_AGENT, "shared"),
+            (ARCHIVE, "force"),
+        ];
+        for (name, key) in retries {
+            let retry = HashMap::from([(
+                key.to_owned(),
+                ParamValue {
+                    value: Some(Value::Bool(true)),
+                },
+            )]);
+            check(&specs, name, &retry);
+        }
+        // The generic form renders every action, its required fields
+        // marked, and an untouched form of diff sends nothing.
+        for spec in &specs {
+            let form = crate::core::action_form::ActionForm::new(spec);
+            assert_eq!(form.fields.len(), spec.params.len(), "{}", spec.name);
+        }
+        let diff = specs.iter().find(|s| s.name == DIFF).unwrap();
+        let form = crate::core::action_form::ActionForm::new(diff);
+        assert_eq!(form.params("/h"), Ok(HashMap::new()));
+    }
+
     #[test]
     fn slugs_follow_the_workflows_rule() {
         assert_eq!(slug_error("issue-140"), None);

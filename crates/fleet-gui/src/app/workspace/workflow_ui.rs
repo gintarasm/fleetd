@@ -910,6 +910,41 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_refusal_without_retry_offers_no_anyway(cx: &mut TestAppContext) {
+        let mut ended = row(1, AgentState::Exited, true);
+        ended
+            .info
+            .labels
+            .insert(WORKTREE_LABEL.into(), "/wt/x".into());
+        let s = setup(cx, vec![ended], all_actions());
+        s.fake.script(
+            ARCHIVE,
+            Ok(ActionResult {
+                outcome: Some(Outcome::Refused(ActionRefused {
+                    reason: "agent 4 is working inside /wt/x".into(),
+                    retry: HashMap::new(),
+                })),
+            }),
+        );
+        s.ws.update_in(s.cx, |w, window, cx| w.open_archive(1, window, cx));
+        s.cx.run_until_parked();
+        let sheet =
+            s.ws.read_with(s.cx, |w, _| w.action_sheet().cloned())
+                .unwrap();
+        sheet.update(s.cx, |x, cx| x.submit(cx));
+        s.cx.run_until_parked();
+        assert!(matches!(
+            sheet.read_with(s.cx, |x, _| x.stage.clone()),
+            Stage::Refused { .. }
+        ));
+        assert!(!sheet.read_with(s.cx, |x, _| x.can_retry()));
+        // Return resends nothing: it would be refused the same way.
+        sheet.update(s.cx, |x, cx| x.submit(cx));
+        s.cx.run_until_parked();
+        assert_eq!(s.fake.calls().len(), 1);
+    }
+
+    #[gpui::test]
     fn run_action_renders_a_form_and_handles_each_result(cx: &mut TestAppContext) {
         let mut s = setup(cx, vec![row(1, AgentState::Running, true)], all_actions());
         let open_form = |s: &mut Setup<'_>, name: &str| {

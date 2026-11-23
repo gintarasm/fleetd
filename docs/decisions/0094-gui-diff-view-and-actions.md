@@ -36,13 +36,13 @@
   - `done`: the sheet closes, the message (else "<action>: done") is the toast;
   - `spawned`: the new agent shows in the focused pane;
   - `view`: a view pane opens beside the focused pane: a diff in the diff pane, a table or text as lines in the same pane, which refreshes by running the call again;
-  - `refused`: the reason and "<verb> Anyway", which resends with `retry` merged (Archive Anyway, Run Anyway);
+  - `refused`: the reason and "<verb> Anyway", which resends with `retry` merged (Archive Anyway, Run Anyway); a refusal with an empty `retry` (an agent still working in the worktree, an agent caller's dirty archive) shows the reason only, since the same call would be refused again;
   - an error stays in the sheet (or, from the New agent sheet, the error toast).
 - **New agent sheet.** While the daemon has `git-worktree.new-agent` and the folder is in a git checkout (a local folder: a `.git` in it or a parent, checked when the folder changes; a remote one is assumed to be), a "New worktree" checkbox adds Slug (following the agent's name until edited, `[A-Za-z0-9._-]`, ≤ 64), Branch (placeholder `fleet/<slug>`) and Base (placeholder: the default branch). Spawn then runs `new-agent` with the folder as `repo`, the command line as `command`, and the sheet's name and labels; blank Branch and Base are left to the workflow. The checkbox is remembered per target (`gui-state.toml`, `new_worktree`). Presets fill the sheet as before.
 
 ### Where the code is
 
-`core::diff`, `core::action_form`, `core::worktree`; `app::diff_pane` (the pane, its key context and actions), `app::action_sheet`, and `app::workspace::workflow_ui` (the workspace's side: menus, palette rows, the sheet, results, the worktree spawn). `workspace.rs`, `pane_view.rs` and `app_state.rs` get hooks only. `Session::list_actions` / `run_action` are blocking jobs like `search_output`.
+`core::diff`, `core::action_form`, `core::worktree`; `app::diff_pane` (the pane, its key context and actions), `app::action_sheet`, and `app::workspace::workflow_ui` (the workspace's side: menus, palette rows, the sheet, results, the worktree spawn). `workspace.rs`, `pane_view.rs` and `app_state.rs` get hooks only. A test checks every param the GUI sends (`new-agent`, `diff`, `archive`, and the refusals' `reuse`, `shared` and `force` retries) against git-worktree's real `specs()` (0093): the key exists, the value fits its kind, a choice is among its choices (`fleet-workflow` is a dev-dependency of `fleet-gui` for it). `Session::list_actions` / `run_action` are blocking jobs like `search_output`.
 
 ## Consequences
 
