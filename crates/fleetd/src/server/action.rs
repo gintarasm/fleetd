@@ -14,20 +14,23 @@
 //! back what it did.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fleet_node::approval as node_approval;
 use fleet_node::lease::now_ms;
 use fleet_node::node::Node;
+use fleet_node::primitives;
 use fleet_node::scope::{Caller as NodeCaller, FORBIDDEN_PREFIX, forbidden};
 use fleet_proto::{
     ActionList, ActionResult, AgentInfo, Forgotten, Frame, Response, RunAction, SpawnAgent,
     response,
 };
 use fleet_workflow::{
-    ActionError, BoxFuture, Caller, CancelFlag, DirListing, ExecOutput, ExecRequest, FileData,
-    Host, HostResult, Labels, ListDirRequest, ReadFileRequest, Registry, Storage, Workflow,
+    ActionError, BoxFuture, Caller, CancelFlag, DirEntry, DirListing, EntryKind, ExecOutput,
+    ExecRequest, FileData, Host, HostResult, Labels, ListDirRequest, ReadFileRequest, Registry,
+    Storage, Workflow,
 };
 use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{info, warn};
@@ -253,12 +256,49 @@ struct NodeHost {
     storage: NodeStorage,
 }
 
-/// The node primitives are workstream A's (#161); until they merge, the
-/// host has none.
-fn unavailable<'a, T: Send + 'a>(what: &str) -> BoxFuture<'a, HostResult<T>> {
-    // TODO(#161): call the node's Exec / ReadFile / ListDir.
-    let e = ActionError::failed(format!("{what} is unavailable on this node"));
-    Box::pin(std::future::ready(Err(e)))
+fn to_exec(req: ExecRequest) -> primitives::ExecRequest {
+    primitives::ExecRequest {
+        argv: req.argv,
+        cwd: PathBuf::from(req.cwd),
+        env: req.env.into_iter().collect(),
+        clear_env: req.clear_env,
+        stdin: req.stdin.unwrap_or_default(),
+        timeout: Duration::from_millis(req.timeout_ms),
+        max_output: usize::try_from(req.max_output).unwrap_or(usize::MAX),
+    }
+}
+
+fn from_exec(r: primitives::ExecResult) -> ExecOutput {
+    ExecOutput {
+        // A signal or the timeout ended it: no exit code.
+        exit_code: (r.signal == 0 && !r.timed_out).then_some(r.exit_code),
+        stdout: r.stdout,
+        stderr: r.stderr,
+        timed_out: r.timed_out,
+        stdout_truncated: r.stdout_truncated,
+        stderr_truncated: r.stderr_truncated,
+    }
+}
+
+fn from_listing(l: primitives::DirListing) -> DirListing {
+    DirListing {
+        entries: l
+            .entries
+            .into_iter()
+            .map(|e| DirEntry {
+                name: e.name,
+                kind: match e.kind {
+                    primitives::EntryKind::File => EntryKind::File,
+                    primitives::EntryKind::Dir => EntryKind::Dir,
+                    primitives::EntryKind::Symlink => EntryKind::Symlink,
+                    primitives::EntryKind::Other => EntryKind::Other,
+                },
+                size: e.size,
+                mtime_unix_ms: e.mtime_unix_ms,
+            })
+            .collect(),
+        truncated: l.truncated,
+    }
 }
 
 impl NodeHost {
@@ -315,16 +355,43 @@ impl Host for NodeHost {
         to_caller(self.caller)
     }
 
-    fn exec(&self, _req: ExecRequest) -> BoxFuture<'_, HostResult<ExecOutput>> {
-        unavailable("exec")
+    fn exec(&self, req: ExecRequest) -> BoxFuture<'_, HostResult<ExecOutput>> {
+        // The node's own Exec (ADR 0091): its concurrency limit, process
+        // group and timeout; dropping the future (the action's task ends)
+        // kills the child.
+        let env = self.node.login_env();
+        Box::pin(async move {
+            primitives::exec(to_exec(req), env)
+                .await
+                .map(from_exec)
+                .map_err(|e| from_io(&e))
+        })
     }
 
-    fn read_file(&self, _req: ReadFileRequest) -> BoxFuture<'_, HostResult<FileData>> {
-        unavailable("read_file")
+    fn read_file(&self, req: ReadFileRequest) -> BoxFuture<'_, HostResult<FileData>> {
+        Box::pin(blocking(&self.node, move |_| {
+            let d = primitives::read_file(&primitives::ReadFileRequest {
+                path: PathBuf::from(req.path),
+                offset: req.offset,
+                max_bytes: usize::try_from(req.max_bytes).unwrap_or(usize::MAX),
+            })?;
+            Ok(FileData {
+                data: d.data,
+                size: d.size,
+                mtime_unix_ms: d.mtime_unix_ms,
+                eof: d.eof,
+            })
+        }))
     }
 
-    fn list_dir(&self, _req: ListDirRequest) -> BoxFuture<'_, HostResult<DirListing>> {
-        unavailable("list_dir")
+    fn list_dir(&self, req: ListDirRequest) -> BoxFuture<'_, HostResult<DirListing>> {
+        Box::pin(blocking(&self.node, move |_| {
+            primitives::list_dir(&primitives::ListDirRequest {
+                path: PathBuf::from(req.path),
+                max_entries: req.max_entries as usize,
+            })
+            .map(from_listing)
+        }))
     }
 
     fn spawn(&self, req: SpawnAgent) -> BoxFuture<'_, HostResult<AgentInfo>> {
@@ -450,6 +517,8 @@ mod tests {
         most_running: AtomicUsize,
         /// What `block`'s host call after the gate returned.
         after_gate: Mutex<Vec<String>>,
+        /// The workflow's `fs:read:` prefix.
+        read_root: String,
     }
 
     impl Default for TestFlow {
@@ -459,6 +528,7 @@ mod tests {
                 running: AtomicUsize::new(0),
                 most_running: AtomicUsize::new(0),
                 after_gate: Mutex::new(Vec::new()),
+                read_root: "/nowhere".into(),
             }
         }
     }
@@ -488,7 +558,15 @@ mod tests {
             "t"
         }
         fn manifest(&self) -> Result<Manifest, String> {
-            Manifest::parse(&["exec:git", "spawn", "labels:t.", "storage:own"])
+            let read = format!("fs:read:{}", self.read_root);
+            Manifest::parse(&[
+                "exec:git",
+                "exec:sh",
+                "spawn",
+                "labels:t.",
+                "storage:own",
+                &read,
+            ])
         }
         fn actions(&self) -> Vec<ActionSpec> {
             use ActionCallers::{User, UserAndAgents as Both};
@@ -498,7 +576,9 @@ mod tests {
                 spec("spawn", Both, &[("labels", ParamKind::ParamLabels)]),
                 spec("block", Both, &[]),
                 spec("store", Both, &[]),
-                spec("exec", Both, &[]),
+                spec("exec", Both, &[("argv", ParamKind::ParamArgv)]),
+                spec("read", Both, &[("path", ParamKind::ParamPath)]),
+                spec("ls", Both, &[("path", ParamKind::ParamPath)]),
             ]
         }
         fn run<'a>(
@@ -546,13 +626,52 @@ mod tests {
                         Ok(done(String::from_utf8_lossy(&v).into_owned()))
                     }
                     "exec" => {
-                        host.exec(ExecRequest {
-                            argv: vec!["git".into(), "status".into()],
-                            cwd: "/".into(),
-                            ..Default::default()
-                        })
-                        .await?;
-                        Ok(done("ran".into()))
+                        let out = host
+                            .exec(ExecRequest {
+                                argv: call.params.list("argv").unwrap_or_default().to_vec(),
+                                cwd: "/".into(),
+                                env: [("T_VAR".to_string(), "set".to_string())].into(),
+                                timeout_ms: 5_000,
+                                ..Default::default()
+                            })
+                            .await?;
+                        Ok(done(format!(
+                            "{:?} {:?} {:?} {}",
+                            out.exit_code,
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr),
+                            out.timed_out
+                        )))
+                    }
+                    "read" => {
+                        let d = host
+                            .read_file(ReadFileRequest {
+                                path: call.params.string("path").unwrap_or_default().into(),
+                                offset: 1,
+                                max_bytes: 3,
+                            })
+                            .await?;
+                        Ok(done(format!(
+                            "{} {} {}",
+                            String::from_utf8_lossy(&d.data),
+                            d.size,
+                            d.eof
+                        )))
+                    }
+                    "ls" => {
+                        let l = host
+                            .list_dir(ListDirRequest {
+                                path: call.params.string("path").unwrap_or_default().into(),
+                                max_entries: 0,
+                            })
+                            .await?;
+                        let mut names: Vec<String> = l
+                            .entries
+                            .iter()
+                            .map(|e| format!("{}:{:?}", e.name, e.kind))
+                            .collect();
+                        names.sort();
+                        Ok(done(names.join(" ")))
                     }
                     other => Err(ActionError::invalid(format!("no {other}"))),
                 }
@@ -948,11 +1067,85 @@ mod tests {
         assert_eq!(f.node.kv_get("t", "k").unwrap().as_deref(), Some(&b"v"[..]));
     }
 
+    fn argv(items: &[&str]) -> Value {
+        Value::List(fleet_proto::StringList {
+            items: items.iter().map(|s| (*s).to_string()).collect(),
+        })
+    }
+
     #[tokio::test]
-    async fn exec_is_unavailable_until_the_node_primitives_land() {
+    async fn exec_runs_on_the_node_with_the_workflows_env() {
         let mut f = fixture(Quotas::default());
-        let e = error_text(call(&mut f, 1, run_req("t.exec", vec![])).await);
-        assert!(e.contains("unavailable"), "{e}");
+        let got = outcome(
+            call(
+                &mut f,
+                1,
+                run_req(
+                    "t.exec",
+                    vec![(
+                        "argv",
+                        argv(&["sh", "-c", "echo $T_VAR; echo err >&2; exit 3"]),
+                    )],
+                ),
+            )
+            .await,
+        );
+        assert_eq!(got, done(r#"Some(3) "set\n" "err\n" false"#.into()));
+    }
+
+    #[tokio::test]
+    async fn exec_is_held_to_the_workflows_capabilities() {
+        let mut f = fixture(Quotas::default());
+        let e = error_text(call(&mut f, 1, run_req("t.exec", vec![("argv", argv(&["ls"]))])).await);
+        assert!(e.starts_with("forbidden:") && e.contains("exec:ls"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn read_file_and_list_dir_read_the_node_under_the_workflows_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("f.txt"), b"hello").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let mut f = fixture(Quotas::default());
+        f.flow = Arc::new(TestFlow {
+            read_root: root.to_string_lossy().into_owned(),
+            ..TestFlow::default()
+        });
+        let (server, conn, rx) = test_server_conn(Arc::clone(&f.node));
+        server.shared.actions.preset(vec![f.flow.clone()]);
+        (f._server, f.conn, f.rx) = (server, conn, rx);
+        let file = root.join("f.txt").to_string_lossy().into_owned();
+        let got = outcome(
+            call(
+                &mut f,
+                1,
+                run_req("t.read", vec![("path", Value::String(file))]),
+            )
+            .await,
+        );
+        assert_eq!(got, done("ell 5 false".into()));
+        let d = root.to_string_lossy().into_owned();
+        let got = outcome(call(&mut f, 2, run_req("t.ls", vec![("path", Value::String(d))])).await);
+        assert_eq!(got, done("f.txt:File sub:Dir".into()));
+        let e = error_text(
+            call(
+                &mut f,
+                3,
+                run_req("t.read", vec![("path", Value::String("/etc/hosts".into()))]),
+            )
+            .await,
+        );
+        assert!(e.starts_with("forbidden:"), "{e}");
+        let missing = root.join("nope").to_string_lossy().into_owned();
+        let e = error_text(
+            call(
+                &mut f,
+                4,
+                run_req("t.read", vec![("path", Value::String(missing))]),
+            )
+            .await,
+        );
+        assert!(!e.starts_with("forbidden:") && !e.is_empty(), "{e}");
     }
 
     #[tokio::test]
