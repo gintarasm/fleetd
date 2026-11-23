@@ -47,6 +47,25 @@ fn set_errno(v: libc::c_int) {
     }
 }
 
+/// Unblocks every signal in the calling thread's mask. Call it first in
+/// `main`, before any thread exists, so every thread starts from it. A
+/// process inherits its launcher's mask, and the GUI launches fleetd from a
+/// macOS GCD worker thread, which blocks every signal: fleetd then never
+/// took a stop signal, and a restart's freeze never interrupted an idle
+/// reader (issue #152).
+pub fn clear_inherited_mask() -> io::Result<()> {
+    // SAFETY: sigemptyset on a local set; pthread_sigmask on this thread.
+    let r = unsafe {
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut())
+    };
+    match r {
+        0 => Ok(()),
+        e => Err(io::Error::from_raw_os_error(e)),
+    }
+}
+
 /// The armed stop signals: the pipe's read end. Pass it to
 /// [`crate::Daemon::serve`]. The write end stays open for the life of the
 /// process (or until [`disarm`]), so a late signal never writes to a
