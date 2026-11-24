@@ -218,17 +218,7 @@ fn clear_env_starts_from_nothing() {
 fn argv0_is_looked_up_on_the_login_path_not_the_daemons() {
     let dir = tempfile::tempdir().unwrap();
     let tool = dir.path().join("mytool-0091");
-    // Written by a `sh` child: a fork in another test thread while this
-    // process held a write fd to it would make exec'ing it fail with
-    // ETXTBSY (Linux).
-    let status = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(r#"printf '#!/bin/sh\necho found\n' > "$1" && chmod 755 "$1""#)
-        .arg("sh")
-        .arg(&tool)
-        .status()
-        .unwrap();
-    assert!(status.success(), "writing {}", tool.display());
+    crate::test_util::write_exec(&tool, "#!/bin/sh\necho found\n");
     let base: EnvVars = vec![(
         "PATH".into(),
         format!("{}:/usr/bin:/bin", dir.path().display()).into(),

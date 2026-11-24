@@ -17,6 +17,8 @@ use fleet_proto::{
 use tempfile::TempDir;
 use tokio_util::codec::{Decoder, Encoder};
 
+mod support;
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Daemon(Child);
@@ -221,12 +223,10 @@ fn spawn_and_exit_are_logged_without_env_values() {
     let work = TempDir::new().unwrap();
     // A login shell exporting a sentinel: the captured env must never be logged.
     let shell = work.path().join("login.sh");
-    std::fs::write(
+    support::write_exec(
         &shell,
         "#!/bin/sh\nexport FLEET_LOG_SENTINEL=login-sentinel-7c3e\nexec /bin/sh -c \"$2\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let _d = start(
         dir.path(),
         &[("SHELL", shell.to_str().unwrap()), ("FLEETD_LOG", "trace")],

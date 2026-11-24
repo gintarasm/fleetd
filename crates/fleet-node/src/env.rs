@@ -409,22 +409,11 @@ OLDPWD=/\0FLEET_AGENT_ID=7\0EMPTY=\0\0__FLEET_END__\0logout junk";
         assert!(parse_env_dump(b"A=1\0\0__FLEET_END__\0").is_none());
     }
 
-    /// Writes an executable script. A `sh` child writes it, never this
-    /// process: a process another test thread forks while this one held the
-    /// file open for writing keeps that fd until its exec, and running the
-    /// script then fails with ETXTBSY (Linux), which the capture reports as
-    /// no environment.
+    /// Writes an executable script (see `test_util::write_exec`: ETXTBSY
+    /// there would read as no environment).
     fn script(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("shell.sh");
-        let status = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(r#"printf '%s' "$2" > "$1" && chmod 755 "$1""#)
-            .arg("sh")
-            .arg(&path)
-            .arg(body)
-            .status()
-            .unwrap();
-        assert!(status.success(), "writing {}", path.display());
+        crate::test_util::write_exec(&path, body);
         path
     }
 

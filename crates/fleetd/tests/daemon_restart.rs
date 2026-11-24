@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,9 @@ use fleet_proto::{
 };
 use tempfile::TempDir;
 use tokio_util::codec::{Decoder, Encoder};
+
+mod support;
+use support::script;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a client waits for the restarted daemon (the CLI's bound).
@@ -397,13 +400,6 @@ fn assert_no_gap(c: &mut Client, id: u64, n: u32) {
         );
     }
     assert!(last >= n - 24, "history ends early at {last}");
-}
-
-fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let p = dir.join(name);
-    fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
-    p
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -811,7 +807,7 @@ fn no_binary_named_restarts_onto_the_daemons_own_path_rebuilt() {
     use std::os::unix::fs::MetadataExt;
     let bin_dir = tempfile::tempdir().unwrap();
     let own = bin_dir.path().join("fleetd");
-    fs::copy(fleetd(), &own).unwrap();
+    support::copy_exec(fleetd(), &own);
     let daemon = Daemon::start_from(&own, &[]);
     let (mut c, hello) = daemon.connect();
     let shell = c.sh(SHELL);
@@ -820,7 +816,7 @@ fn no_binary_named_restarts_onto_the_daemons_own_path_rebuilt() {
 
     // A new build replaces the file at that path (a new inode).
     let next = bin_dir.path().join("fleetd.new");
-    fs::copy(fleetd(), &next).unwrap();
+    support::copy_exec(fleetd(), &next);
     fs::rename(&next, &own).unwrap();
     let rebuilt = fs::metadata(&own).unwrap().ino();
     assert_ne!(rebuilt, started_from);

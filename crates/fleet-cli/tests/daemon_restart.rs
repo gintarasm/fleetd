@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -100,11 +99,34 @@ fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
+/// Writes a `#!/bin/sh` script. A `sh` child writes it, never this process:
+/// a process another test thread forks while this one held the file open
+/// for writing keeps that fd until its exec, and executing the script then
+/// fails with ETXTBSY (Linux).
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let p = dir.join(name);
-    fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"printf '#!/bin/sh\n%s\n' "$2" > "$1" && chmod 755 "$1""#)
+        .arg("sh")
+        .arg(&p)
+        .arg(body)
+        .status()
+        .unwrap();
+    assert!(status.success(), "writing {}", p.display());
     p
+}
+
+/// Copies the executable `from` to `to` from a `cp` child, for the same
+/// reason as [`script`]: `fs::copy` holds `to` open for writing.
+fn copy_exec(from: &Path, to: &Path) {
+    let status = Command::new("cp").arg(from).arg(to).status().unwrap();
+    assert!(
+        status.success(),
+        "copying {} to {}",
+        from.display(),
+        to.display()
+    );
 }
 
 #[test]
@@ -150,12 +172,12 @@ fn no_binary_restarts_onto_the_daemons_own_path_as_rebuilt() {
     use std::os::unix::fs::MetadataExt;
     let bin_dir = TempDir::new().unwrap();
     let own = bin_dir.path().join("fleetd");
-    fs::copy(fleetd_bin(), &own).unwrap();
+    copy_exec(fleetd_bin(), &own);
     let d = Daemon::start_from(&own);
     let id = text(&fleet(d.dir.path(), &["spawn", "--", "cat"]).stdout);
     // A different build lands at the daemon's path (a new file there).
     let next = bin_dir.path().join("fleetd.new");
-    fs::copy(fleetd_bin(), &next).unwrap();
+    copy_exec(fleetd_bin(), &next);
     fs::rename(&next, &own).unwrap();
     let rebuilt = fs::metadata(&own).unwrap().ino();
     // macOS scans a new executable on its first run, which under load can

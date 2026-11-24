@@ -23,6 +23,8 @@ use fleet_proto::{
 use tempfile::TempDir;
 use tokio_util::codec::{Decoder, Encoder};
 
+mod support;
+
 const FLEETD: &str = env!("CARGO_BIN_EXE_fleetd");
 
 /// Builds `fleet` once, next to `fleetd`: `fleetd` execs it to decide (cargo
@@ -124,7 +126,7 @@ fn text(b: &[u8]) -> String {
 fn other_build() -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new().unwrap();
     let bin = dir.path().join("fleetd-other");
-    fs::copy(FLEETD, &bin).unwrap();
+    support::copy_exec(Path::new(FLEETD), &bin);
     (dir, bin)
 }
 

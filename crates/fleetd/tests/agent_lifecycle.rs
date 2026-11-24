@@ -17,6 +17,8 @@ use fleet_proto::{
 use tempfile::TempDir;
 use tokio_util::codec::{Decoder, Encoder};
 
+mod support;
+
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Daemon {
@@ -346,14 +348,12 @@ fn restart_unknown_is_an_error() {
 
 #[test]
 fn restart_whose_spawn_fails_keeps_the_old_agent() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = TempDir::new().unwrap();
     let bin = TempDir::new().unwrap();
     let _d = Daemon::start(dir.path());
     let mut a = Client::open(dir.path());
     let program = bin.path().join("agent.sh");
-    std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_exec(&program, "#!/bin/sh\nexit 0\n");
     let old = match a.request(request::Kind::Spawn(Box::new(SpawnAgent {
         program: program.to_string_lossy().into_owned(),
         cwd: bin.path().to_string_lossy().into_owned(),
