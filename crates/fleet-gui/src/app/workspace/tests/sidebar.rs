@@ -230,3 +230,83 @@ fn rows_show_the_branch_and_group_by_repository(cx: &mut TestAppContext) {
     s.cx.simulate_input("feat/git");
     assert_eq!(tabs_drawn(&mut s), [2]);
 }
+
+/// #147: the sidebar borrows the app state rather than a per-frame copy,
+/// so every title, status, bell and tab-mark change reaches the next
+/// frame. Fails if any of them is read from a snapshot that is not
+/// refreshed when it changes.
+#[gpui::test]
+fn each_frame_draws_the_current_titles_statuses_bells_and_marks(cx: &mut TestAppContext) {
+    use super::super::DrawnRow;
+    use crate::core::status::AgentStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    let mut s = setup(cx, &fake, dir.path());
+    agents(&mut s, &fake, vec![row(1, "/w", 1), row(2, "/w", 2)]);
+    s.app.update(s.cx, |a, cx| a.show_agent(1, cx));
+    fake.model(PaneId(1))
+        .lock()
+        .unwrap()
+        .on_attached(&AttachOk {
+            agent_id: 1,
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+    s.cx.run_until_parked();
+    let drawn = |s: &mut Setup<'_>, id: u64| -> DrawnRow {
+        s.cx.run_until_parked();
+        s.ws.read_with(s.cx, |w, _| {
+            w.drawn_rows.iter().find(|r| r.id == id).cloned().unwrap()
+        })
+    };
+    let output = |s: &mut Setup<'_>, bytes: &[u8]| {
+        fake.model(PaneId(1)).lock().unwrap().on_output(bytes);
+        s.ui.try_send(UiEvent::PaneChanged(PaneId(1))).unwrap();
+        s.cx.run_until_parked();
+    };
+    let before = drawn(&mut s, 1);
+    assert_eq!(before.mark, TabMark::Focused);
+    assert_eq!(before.status, Some(AgentStatus::Idle));
+    assert!(!before.bell);
+    assert_eq!(drawn(&mut s, 2).mark, TabMark::None);
+
+    // A title set after a frame shows on the next one, and so does its
+    // replacement.
+    output(&mut s, b"\x1b]2;building\x07");
+    assert_eq!(drawn(&mut s, 1).title, "building");
+    output(&mut s, b"\x1b]2;testing\x07");
+    assert_eq!(drawn(&mut s, 1).title, "testing");
+
+    // A bell away from the window marks the row and its status; seeing
+    // the pane clears both.
+    s.app.update(s.cx, |a, cx| a.set_window_active(false, cx));
+    output(&mut s, b"ding\x07");
+    let rang = drawn(&mut s, 1);
+    assert!(rang.bell);
+    assert_eq!(rang.status, Some(AgentStatus::NeedsYou));
+    s.app.update(s.cx, |a, cx| a.set_window_active(true, cx));
+    let seen = drawn(&mut s, 1);
+    assert!(!seen.bell);
+    assert_eq!(seen.status, Some(AgentStatus::Idle));
+
+    // Showing the other agent moves the tab marks.
+    s.app.update(s.cx, |a, cx| a.show_agent(2, cx));
+    assert_eq!(drawn(&mut s, 2).mark, TabMark::Focused);
+    assert_eq!(drawn(&mut s, 1).mark, TabMark::None);
+
+    // An AgentsChanged rename (the name wins over the title) reaches the
+    // rows too.
+    let mut renamed = row(1, "/w", 1);
+    renamed
+        .info
+        .labels
+        .insert(fleet_client::names::NAME_LABEL.into(), "renamed".into());
+    agents(&mut s, &fake, vec![renamed, row(2, "/w", 2)]);
+    assert_eq!(drawn(&mut s, 1).title, "renamed");
+    assert_eq!(
+        s.ws.read_with(s.cx, |w, _| w.drawn_rows.len()),
+        2,
+        "one drawn row per agent"
+    );
+}

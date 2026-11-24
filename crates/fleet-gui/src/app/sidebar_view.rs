@@ -32,6 +32,7 @@ use crate::core::approval::pending_text;
 use crate::core::git;
 use crate::core::icons::Icon;
 use crate::core::kill::{AgentButtons, agent_buttons};
+use crate::core::layout::MAX_PANES;
 use crate::core::question::open_question;
 use crate::core::row_preview::{preview_line, row_meta};
 use crate::core::session::AgentRow;
@@ -64,13 +65,53 @@ pub enum TabMark {
     None,
 }
 
+/// Each shown agent's [`TabMark`], one slot per pane: a frame's marks
+/// without a heap map (#147).
+#[derive(Clone, Copy, Debug)]
+pub struct TabMarks {
+    slots: [(u64, TabMark); MAX_PANES],
+    len: usize,
+}
+
+impl Default for TabMarks {
+    fn default() -> Self {
+        Self {
+            slots: [(0, TabMark::None); MAX_PANES],
+            len: 0,
+        }
+    }
+}
+
+impl TabMarks {
+    /// Marks `id`; [`TabMark::Focused`] wins over [`TabMark::Shown`] when
+    /// the agent is in more than one pane.
+    pub fn set(&mut self, id: u64, mark: TabMark) {
+        if let Some(slot) = self.slots[..self.len].iter_mut().find(|(i, _)| *i == id) {
+            if mark == TabMark::Focused {
+                slot.1 = mark;
+            }
+        } else if self.len < MAX_PANES {
+            self.slots[self.len] = (id, mark);
+            self.len += 1;
+        }
+    }
+
+    /// `id`'s mark; [`TabMark::None`] when no pane shows it.
+    pub fn get(&self, id: u64) -> TabMark {
+        self.slots[..self.len]
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map_or(TabMark::None, |(_, m)| *m)
+    }
+}
+
 /// What the sidebar draws, gathered from the app state.
 pub struct SidebarData<'a> {
     pub rows: &'a [AgentRow],
     pub now_ms: i64,
     /// OSC titles of agents shown in panes.
     pub titles: &'a HashMap<u64, String>,
-    pub mark: &'a dyn Fn(u64) -> TabMark,
+    pub marks: TabMarks,
     /// Each non-shell agent's status (ADR 0042).
     pub statuses: &'a HashMap<u64, AgentStatus>,
     /// Agents that rang the bell unseen: their row is tinted.
@@ -109,7 +150,7 @@ pub fn tab_title(row: &AgentRow, titles: &HashMap<u64, String>) -> String {
 pub fn render_sidebar(
     mut data: SidebarData<'_>,
     theme: &Theme,
-    cx: &mut Context<Workspace>,
+    cx: &Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let groups: Vec<_> = std::mem::take(&mut data.groups)
         .into_iter()
@@ -178,7 +219,7 @@ pub fn render_pending(
     rows: &[AgentRow],
     titles: &HashMap<u64, String>,
     theme: &Theme,
-    cx: &mut Context<Workspace>,
+    cx: &Context<Workspace>,
 ) -> Option<Div> {
     if pending.is_empty() {
         return None;
@@ -294,7 +335,7 @@ pub fn render_pending(
 fn render_filter(
     data: &SidebarData<'_>,
     theme: &Theme,
-    cx: &mut Context<Workspace>,
+    cx: &Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let chips: Vec<_> = StatusFilter::ALL
         .into_iter()
@@ -336,7 +377,7 @@ fn render_group(
     group: SidebarGroup,
     data: &SidebarData<'_>,
     theme: &Theme,
-    cx: &mut Context<Workspace>,
+    cx: &Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let tabs: Vec<_> = group
         .agents
@@ -407,11 +448,11 @@ fn render_tab(
     layout: RowLayout,
     data: &SidebarData<'_>,
     theme: &Theme,
-    cx: &mut Context<Workspace>,
+    cx: &Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let id = row.info.id;
     let state = row.info.state();
-    let mark = (data.mark)(id);
+    let mark = data.marks.get(id);
     let running = state == AgentState::Running;
     let dot_color = if running {
         theme.success
@@ -694,7 +735,7 @@ fn chip(
     key: String,
     value: String,
     theme: &Theme,
-    cx: &mut Context<Workspace>,
+    cx: &Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let tip = SharedString::from(format!("{key}={value}"));
     let tip_theme = *theme;
@@ -745,7 +786,7 @@ fn row_buttons(
     buttons: Vec<RowButton>,
     agent_id: u64,
     theme: &Theme,
-    cx: &mut Context<Workspace>,
+    cx: &Context<Workspace>,
 ) -> Option<Div> {
     if buttons.is_empty() {
         return None;

@@ -15,7 +15,7 @@ use gpui::{App, AppContext, Context, Entity, Global, Task, WindowHandle, px};
 use super::diff_pane::DiffPane;
 use super::new_agent::dir_choices;
 use super::pane_view::{InputSink, PaneChrome, PaneView};
-use super::sidebar_view::{TabMark, program_name};
+use super::sidebar_view::{TabMark, TabMarks, program_name};
 use super::theme::Theme;
 use super::workspace::Workspace;
 use crate::core::broadcast::{RETURN, RETURN_DELAY_MS, SendPlan, encode_text};
@@ -1376,9 +1376,10 @@ impl AppState {
         cx.notify();
     }
 
-    /// How each agent's tab relates to the panes.
-    pub fn tab_marks(&self) -> HashMap<u64, TabMark> {
-        let mut marks = HashMap::new();
+    /// How each agent's tab relates to the panes: one entry per pane, on
+    /// the stack, so a frame no longer builds a map (#147).
+    pub fn tab_marks(&self) -> TabMarks {
+        let mut marks = TabMarks::default();
         let layout = self.tabs.layout();
         for pane in layout.panes() {
             if let Some(id) = layout.agent(pane) {
@@ -1387,10 +1388,7 @@ impl AppState {
                 } else {
                     TabMark::Shown
                 };
-                let slot = marks.entry(id).or_insert(mark);
-                if mark == TabMark::Focused {
-                    *slot = mark;
-                }
+                marks.set(id, mark);
             }
         }
         marks

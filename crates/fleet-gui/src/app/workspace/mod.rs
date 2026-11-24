@@ -285,6 +285,9 @@ pub struct Workspace {
     /// selectors outlive the frame that drew them).
     #[cfg(test)]
     drawn_sidebar: Vec<(String, Vec<u64>)>,
+    /// What the last frame handed the sidebar for each row (#147).
+    #[cfg(test)]
+    drawn_rows: Vec<DrawnRow>,
     /// The settings the window last applied.
     look: Look,
     /// Panes easing in (opened or split), since when.
@@ -425,6 +428,8 @@ impl Workspace {
             sidebar_focus: cx.focus_handle(),
             #[cfg(test)]
             drawn_sidebar: Vec::new(),
+            #[cfg(test)]
+            drawn_rows: Vec::new(),
             graph,
             graph_shown: false,
             _magnify: magnify,
@@ -581,3 +586,34 @@ pub(super) fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests;
+
+/// One sidebar row as a frame saw it: a test reads it to catch the sidebar
+/// drawing from stale data (#147).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+struct DrawnRow {
+    id: u64,
+    title: String,
+    status: Option<crate::core::status::AgentStatus>,
+    bell: bool,
+    mark: crate::app::sidebar_view::TabMark,
+}
+
+#[cfg(test)]
+impl DrawnRow {
+    fn of(data: &crate::app::sidebar_view::SidebarData<'_>) -> Vec<DrawnRow> {
+        data.rows
+            .iter()
+            .map(|r| {
+                let id = r.info.id;
+                DrawnRow {
+                    id,
+                    title: crate::app::sidebar_view::tab_title(r, data.titles),
+                    status: data.statuses.get(&id).copied(),
+                    bell: data.bells.contains(&id),
+                    mark: data.marks.get(id),
+                }
+            })
+            .collect()
+    }
+}
