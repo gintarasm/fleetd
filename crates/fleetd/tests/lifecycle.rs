@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use fleetd::{Config, StartupError, startup};
 use tempfile::TempDir;
 
+mod support;
+
 /// Tests never run the developer's real login shell.
 const NO_LOGIN_ENV: (&str, &str) = ("FLEETD_LOGIN_ENV", "off");
 
@@ -351,12 +353,10 @@ fn stdio_autostart_local_keeps_ssh_auth_sock() {
 
 // ---- login-shell environment -------------------------------------------------
 
-/// Writes an executable script into `dir`.
+/// Writes an executable script into `dir` (`body` has its own `#!`).
 fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_exec(&path, body);
     path
 }
 

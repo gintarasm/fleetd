@@ -14,6 +14,8 @@ pub mod scope;
 pub mod scrollback;
 pub mod search;
 pub mod store;
+#[cfg(test)]
+mod test_util;
 pub mod token;
 pub mod term {
     pub use fleet_term::*;

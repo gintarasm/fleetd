@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use fleet_node::node::ACTIVITY_TICK;
 use fleet_proto::{
     AgentExited, AgentInfo, AgentState, Attach, AttachOk, Frame, FrameCodec, Hello, HistoryPage,
     KillAgent, ListAgents, PROTOCOL_VERSION, ReadHistory, Request, Response, SendInput, SetLabels,
@@ -1478,6 +1479,14 @@ fn agent_activity_is_throttled() {
     let mut c = Client::open(dir.path());
     // A 250-char line, printed as fast as possible on a 300-column grid.
     let script = "l=$(printf '%0250d' 0); while :; do echo \"$l\"; done";
+    // The node publishes an agent's activity at most once per tick, each
+    // tick at least ACTIVITY_TICK after the last, by the monotonic clock
+    // this process shares with the daemon. The k-th event (from 0) was
+    // published at least k ticks after the spawn, so it cannot arrive
+    // earlier. Bounded by the spawn, not by a window from the first event's
+    // arrival: a stall of this thread lets events queue in the socket and
+    // arrive together.
+    let spawned = Instant::now();
     let id = match c.request(request::Kind::Spawn(Box::new(SpawnAgent {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],
@@ -1489,33 +1498,43 @@ fn agent_activity_is_throttled() {
         other => panic!("spawn failed: {other:?}"),
     };
 
-    // Count the agent's activity events in the second after the first one.
-    let first = Instant::now() + TIMEOUT;
+    // The agent's events over 2 s after the spawn, and at least 3: it
+    // keeps reporting (up to TIMEOUT).
+    const MIN: usize = 3;
+    let window_end = spawned + Duration::from_secs(2);
     let mut events = Vec::new();
-    let mut window_end = first;
-    while let Some(frame) = c.frame_before(window_end) {
-        if let Frame::Event(fleet_proto::Event {
-            kind: Some(event::Kind::Activity(a)),
-        }) = frame
+    loop {
+        let deadline = if events.len() < MIN {
+            spawned + TIMEOUT
+        } else {
+            window_end
+        };
+        let Some(frame) = c.frame_before(deadline) else {
+            break;
+        };
+        if let Some(a) = activity_of(&frame)
             && a.agent_id == id
         {
-            if events.is_empty() {
-                window_end = Instant::now() + Duration::from_secs(1);
-            }
-            events.push(a);
+            events.push((spawned.elapsed(), a.clone()));
         }
     }
-    assert!(!events.is_empty(), "no activity within {TIMEOUT:?}");
+    let arrived: Vec<Duration> = events.iter().map(|(at, _)| *at).collect();
     assert!(
-        (2..=5).contains(&events.len()),
-        "{} activity events in 1s",
+        events.len() >= MIN,
+        "{} activity events within {TIMEOUT:?}: {arrived:?}",
         events.len()
     );
+    for (k, at) in arrived.iter().enumerate() {
+        assert!(
+            *at >= ACTIVITY_TICK * k as u32,
+            "event {k} arrived {at:?} after the spawn, sooner than {k} ticks: {arrived:?}"
+        );
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    for a in &events {
+    for (_, a) in &events {
         assert!(a.last_line.chars().count() <= 200, "{:?}", a.last_line);
         assert!(!a.last_line.is_empty());
         assert!(a.last_line.chars().all(|ch| ch == '0'), "{:?}", a.last_line);

@@ -354,14 +354,23 @@ fn entries(dir: &std::path::Path) -> Vec<String> {
 
 #[test]
 fn restart_whose_spawn_fails_leaves_nothing_and_releases_the_guard() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
     let program = bin.path().join("agent.sh");
+    // Written by a `sh` child, never this process: a process another test
+    // thread forks while this one held the file open for writing keeps that
+    // fd until its exec, and spawning the program then fails with ETXTBSY
+    // (Linux).
     let write_program = || {
-        std::fs::write(&program, "#!/bin/sh\necho hi; exit 0\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"printf '#!/bin/sh\necho hi; exit 0\n' > "$1" && chmod 755 "$1""#)
+            .arg("sh")
+            .arg(&program)
+            .status()
+            .unwrap();
+        assert!(status.success(), "writing {}", program.display());
     };
     write_program();
     let node = Node::open(dir.path()).unwrap();
